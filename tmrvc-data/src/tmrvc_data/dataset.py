@@ -35,12 +35,16 @@ class TMRVCDataset(Dataset):
         dataset: str,
         split: str = "train",
         cross_speaker_prob: float = CROSS_SPEAKER_PROB,
+        subset: float = 1.0,
     ) -> None:
         self.cache = cache
         self.dataset = dataset
         self.split = split
         self.cross_speaker_prob = cross_speaker_prob
         self.entries = cache.iter_entries(dataset, split)
+        if subset < 1.0:
+            k = max(1, int(len(self.entries) * subset))
+            self.entries = random.sample(self.entries, k)
 
         # Build speaker → entry indices mapping for cross-speaker swap
         self._speaker_to_indices: dict[str, list[int]] = {}
@@ -141,6 +145,7 @@ def create_dataloader(
     num_workers: int = 4,
     cross_speaker_prob: float = CROSS_SPEAKER_PROB,
     balanced_sampling: bool = True,
+    subset: float = 1.0,
 ) -> DataLoader:
     """Create a DataLoader with balanced speaker sampling.
 
@@ -162,6 +167,7 @@ def create_dataloader(
         dataset=dataset,
         split=split,
         cross_speaker_prob=cross_speaker_prob,
+        subset=subset,
     )
 
     sampler = None

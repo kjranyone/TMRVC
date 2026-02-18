@@ -91,6 +91,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training device (default: cpu).",
     )
     parser.add_argument(
+        "--subset",
+        type=float,
+        default=1.0,
+        help="Fraction of training data to use (0.0-1.0, default: 1.0=all).",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader workers (default: 0, use 0 on Windows).",
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Enable Weights & Biases logging.",
@@ -164,6 +176,8 @@ def main(argv: list[str] | None = None) -> None:
         cache_dir=args.cache_dir,
         dataset=args.dataset,
         batch_size=batch_size,
+        subset=args.subset,
+        num_workers=args.num_workers,
     )
 
     config = TrainerConfig(

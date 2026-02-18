@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Training device (default: cpu).",
     )
     parser.add_argument(
+        "--subset",
+        type=float,
+        default=1.0,
+        help="Fraction of training data to use (0.0-1.0, default: 1.0=all).",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose logging.",
@@ -184,6 +190,7 @@ def main(argv: list[str] | None = None) -> None:
         cache_dir=args.cache_dir,
         dataset=args.dataset,
         batch_size=batch_size,
+        subset=args.subset,
     )
 
     config = DistillationConfig(

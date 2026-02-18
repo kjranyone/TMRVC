@@ -25,9 +25,32 @@ tmrvc-data = { workspace = true }
 tmrvc-gui = { workspace = true }
 tmrvc-train = { workspace = true }
 tmrvc-export = { workspace = true }
+torch = [
+    { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+triton-xpu = [
+    { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+pytorch-triton-xpu = [
+    { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
 
 [tool.uv]
+environments = ["sys_platform == 'win32'"]
 constraint-dependencies = [
     "numba>=0.60",
     "llvmlite>=0.43",
+    "torch>=2.10",
+    "torchaudio>=2.10",
+]
+override-dependencies = [
+    "triton-xpu>=3.6.0",
 ]

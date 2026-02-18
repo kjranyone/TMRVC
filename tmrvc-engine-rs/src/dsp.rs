@@ -3,7 +3,7 @@ use rustfft::FftPlanner;
 
 use crate::constants::*;
 
-/// Initialize the mel filterbank matrix (N_MELS × N_FREQ_BINS).
+/// Initialize the mel filterbank matrix (N_MELS x N_FREQ_BINS).
 ///
 /// HTK-style mel scale. Output is stored row-major:
 /// filterbank[mel_bin * N_FREQ_BINS + freq_bin].
@@ -90,7 +90,7 @@ pub fn causal_stft(
 
 /// Compute log-mel spectrogram from STFT real/imag parts.
 ///
-/// power = real² + imag²
+/// power = real^2 + imag^2
 /// mel = filterbank @ power
 /// log_mel = log(max(mel, LOG_FLOOR))
 pub fn compute_log_mel(
@@ -110,7 +110,75 @@ pub fn compute_log_mel(
     }
 }
 
-/// Inverse STFT: mag[N_FREQ_BINS] + phase[N_FREQ_BINS] → time-domain signal [N_FFT].
+/// Compute log-mel spectrogram for an entire waveform (offline).
+///
+/// Uses the same STFT parameters as the streaming pipeline:
+/// N_FFT=1024, HOP=240, WIN=960, causal padding = PAST_CONTEXT (720 zeros).
+///
+/// Returns `(mel_data, num_frames)` where `mel_data` is `[N_MELS, num_frames]` row-major.
+pub fn compute_mel_offline(waveform: &[f32], filterbank: &[f32]) -> (Vec<f32>, usize) {
+    assert_eq!(filterbank.len(), N_MELS * N_FREQ_BINS);
+
+    // Causal padding: prepend PAST_CONTEXT zeros
+    let padded_len = waveform.len() + PAST_CONTEXT;
+    let num_frames = if padded_len >= WINDOW_LENGTH {
+        (padded_len - WINDOW_LENGTH) / HOP_LENGTH + 1
+    } else {
+        0
+    };
+
+    if num_frames == 0 {
+        return (vec![], 0);
+    }
+
+    // Build padded waveform
+    let mut padded = vec![0.0f32; padded_len];
+    padded[PAST_CONTEXT..].copy_from_slice(waveform);
+
+    // Pre-compute Hann window
+    let hann: Vec<f32> = (0..WINDOW_LENGTH)
+        .map(|i| {
+            let x = std::f32::consts::PI * 2.0 * i as f32 / WINDOW_LENGTH as f32;
+            0.5 * (1.0 - x.cos())
+        })
+        .collect();
+
+    let mut planner = FftPlanner::new();
+    let mut windowed = vec![0.0f32; WINDOW_LENGTH];
+    let mut fft_padded = vec![0.0f32; N_FFT];
+    let mut fft_real = vec![0.0f32; N_FREQ_BINS];
+    let mut fft_imag = vec![0.0f32; N_FREQ_BINS];
+    let mut mel_frame = vec![0.0f32; N_MELS];
+
+    // Output: [N_MELS, num_frames] row-major
+    let mut mel_data = vec![0.0f32; N_MELS * num_frames];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * HOP_LENGTH;
+        let context = &padded[start..start + WINDOW_LENGTH];
+
+        causal_stft(
+            context,
+            &hann,
+            &mut windowed,
+            &mut fft_padded,
+            &mut fft_real,
+            &mut fft_imag,
+            &mut planner,
+        );
+
+        compute_log_mel(&fft_real, &fft_imag, filterbank, &mut mel_frame);
+
+        // Store in [N_MELS, num_frames] row-major order
+        for m in 0..N_MELS {
+            mel_data[m * num_frames + frame_idx] = mel_frame[m];
+        }
+    }
+
+    (mel_data, num_frames)
+}
+
+/// Inverse STFT: mag[N_FREQ_BINS] + phase[N_FREQ_BINS] -> time-domain signal [N_FFT].
 ///
 /// Returns the windowed time-domain signal in `time_out[..WINDOW_LENGTH]`.
 pub fn istft(
@@ -170,6 +238,94 @@ pub fn update_context_buffer(context: &mut [f32], hop_input: &[f32]) {
     context[PAST_CONTEXT..WINDOW_LENGTH].copy_from_slice(hop_input);
 }
 
+/// Estimate per-frame log-F0 using normalized autocorrelation.
+///
+/// Returns ``log(f0_hz + 1.0)`` for voiced frames, ``0.0`` for unvoiced.
+/// The search range is 60-500 Hz.
+pub fn estimate_log_f0_autocorr(context: &[f32]) -> f32 {
+    assert_eq!(context.len(), WINDOW_LENGTH);
+
+    // Remove DC bias.
+    let mean = context.iter().sum::<f32>() / WINDOW_LENGTH as f32;
+
+    // Energy gate for silence.
+    let mut energy = 0.0f32;
+    for &x in context {
+        let v = x - mean;
+        energy += v * v;
+    }
+    if energy < 1e-4 {
+        return 0.0;
+    }
+
+    let min_hz = 60.0f32;
+    let max_hz = 500.0f32;
+    let min_lag = (SAMPLE_RATE as f32 / max_hz).floor() as usize;
+    let max_lag = (SAMPLE_RATE as f32 / min_hz).ceil() as usize;
+
+    if max_lag >= WINDOW_LENGTH || min_lag == 0 || min_lag > max_lag {
+        return 0.0;
+    }
+
+    let mut best_corr = 0.0f32;
+    let mut best_lag = 0usize;
+
+    for lag in min_lag..=max_lag {
+        let mut num = 0.0f32;
+        let mut den_a = 0.0f32;
+        let mut den_b = 0.0f32;
+
+        for i in lag..WINDOW_LENGTH {
+            let a = context[i] - mean;
+            let b = context[i - lag] - mean;
+            num += a * b;
+            den_a += a * a;
+            den_b += b * b;
+        }
+
+        let denom = (den_a * den_b).sqrt();
+        if denom <= 1e-8 {
+            continue;
+        }
+
+        let corr = num / denom;
+        if corr > best_corr {
+            best_corr = corr;
+            best_lag = lag;
+        }
+    }
+
+    // Voicing threshold.
+    if best_corr < 0.30 || best_lag == 0 {
+        return 0.0;
+    }
+
+    let f0_hz = SAMPLE_RATE as f32 / best_lag as f32;
+    (f0_hz + 1.0).ln()
+}
+
+/// Lightweight articulation proxy from one mel frame.
+///
+/// Larger values indicate stronger high-frequency emphasis.
+pub fn mel_articulation_proxy(mel_frame: &[f32]) -> f32 {
+    assert_eq!(mel_frame.len(), N_MELS);
+
+    let lo_end = N_MELS / 4;
+    let hi_start = N_MELS - lo_end;
+
+    let low_mean = if lo_end > 0 {
+        mel_frame[..lo_end].iter().sum::<f32>() / lo_end as f32
+    } else {
+        0.0
+    };
+    let high_mean = if hi_start < N_MELS {
+        mel_frame[hi_start..].iter().sum::<f32>() / (N_MELS - hi_start) as f32
+    } else {
+        0.0
+    };
+
+    high_mean - low_mean
+}
 // --- Mel scale conversion (HTK) ---
 
 fn hz_to_mel(hz: f32) -> f32 {
@@ -205,11 +361,151 @@ mod tests {
     }
 
     #[test]
+    fn test_mel_offline_basic() {
+        let mut fb = vec![0.0f32; N_MELS * N_FREQ_BINS];
+        init_mel_filterbank(&mut fb);
+
+        // 1 second of 1kHz sine at 24kHz
+        let n = SAMPLE_RATE;
+        let waveform: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect();
+
+        let (mel_data, num_frames) = compute_mel_offline(&waveform, &fb);
+
+        // Expected: (24000 + 720 - 960) / 240 + 1 = 99 frames
+        let padded_len = n + PAST_CONTEXT;
+        let expected_frames = (padded_len - WINDOW_LENGTH) / HOP_LENGTH + 1;
+        assert_eq!(num_frames, expected_frames);
+        assert_eq!(mel_data.len(), N_MELS * num_frames);
+
+        // All mel values should be finite
+        assert!(mel_data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_mel_offline_empty() {
+        let mut fb = vec![0.0f32; N_MELS * N_FREQ_BINS];
+        init_mel_filterbank(&mut fb);
+
+        // Too short for even one frame
+        let waveform = vec![0.0f32; 100];
+        let (mel_data, num_frames) = compute_mel_offline(&waveform, &fb);
+        assert_eq!(num_frames, 0);
+        assert!(mel_data.is_empty());
+    }
+
+    #[test]
+    fn test_mel_offline_matches_streaming() {
+        // Verify that offline mel matches frame-by-frame streaming computation
+        let mut fb = vec![0.0f32; N_MELS * N_FREQ_BINS];
+        init_mel_filterbank(&mut fb);
+
+        let n = HOP_LENGTH * 10; // 10 frames of audio
+        let waveform: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect();
+
+        // Offline
+        let (mel_offline, num_frames) = compute_mel_offline(&waveform, &fb);
+
+        // Streaming: process frame by frame with causal padding
+        let hann: Vec<f32> = (0..WINDOW_LENGTH)
+            .map(|i| {
+                let x = std::f32::consts::PI * 2.0 * i as f32 / WINDOW_LENGTH as f32;
+                0.5 * (1.0 - x.cos())
+            })
+            .collect();
+
+        let mut context = vec![0.0f32; WINDOW_LENGTH];
+        let mut planner = rustfft::FftPlanner::new();
+        let mut windowed = vec![0.0f32; WINDOW_LENGTH];
+        let mut padded = vec![0.0f32; N_FFT];
+        let mut fft_real = vec![0.0f32; N_FREQ_BINS];
+        let mut fft_imag = vec![0.0f32; N_FREQ_BINS];
+        let mut mel_frame = vec![0.0f32; N_MELS];
+
+        for frame_idx in 0..num_frames {
+            let hop_start = frame_idx * HOP_LENGTH;
+            let hop_end = (hop_start + HOP_LENGTH).min(waveform.len());
+            let mut hop = [0.0f32; HOP_LENGTH];
+            let copy_len = hop_end.saturating_sub(hop_start);
+            if copy_len > 0 {
+                hop[..copy_len].copy_from_slice(&waveform[hop_start..hop_start + copy_len]);
+            }
+
+            update_context_buffer(&mut context, &hop);
+            causal_stft(
+                &context,
+                &hann,
+                &mut windowed,
+                &mut padded,
+                &mut fft_real,
+                &mut fft_imag,
+                &mut planner,
+            );
+            compute_log_mel(&fft_real, &fft_imag, &fb, &mut mel_frame);
+
+            for m in 0..N_MELS {
+                let offline_val = mel_offline[m * num_frames + frame_idx];
+                let stream_val = mel_frame[m];
+                assert!(
+                    (offline_val - stream_val).abs() < 1e-4,
+                    "mismatch at mel={}, frame={}: offline={}, stream={}",
+                    m,
+                    frame_idx,
+                    offline_val,
+                    stream_val
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_overlap_add_silence() {
         let windowed = [0.0f32; WINDOW_LENGTH];
         let mut ola = [0.0f32; WINDOW_LENGTH];
         let mut hop_out = [0.0f32; HOP_LENGTH];
         overlap_add(&windowed, &mut ola, &mut hop_out);
         assert!(hop_out.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_estimate_log_f0_autocorr_sine() {
+        let freq = 220.0f32;
+        let context: Vec<f32> = (0..WINDOW_LENGTH)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect();
+
+        let log_f0 = estimate_log_f0_autocorr(&context);
+        assert!(log_f0 > 0.0);
+
+        let f0 = log_f0.exp() - 1.0;
+        assert!(
+            (f0 - freq).abs() < 20.0,
+            "estimated f0={}, expected {}",
+            f0,
+            freq
+        );
+    }
+
+    #[test]
+    fn test_estimate_log_f0_autocorr_silence() {
+        let context = vec![0.0f32; WINDOW_LENGTH];
+        let log_f0 = estimate_log_f0_autocorr(&context);
+        assert_eq!(log_f0, 0.0);
+    }
+
+    #[test]
+    fn test_mel_articulation_proxy() {
+        let mut mel = vec![0.0f32; N_MELS];
+        // Low bins weak, high bins strong -> positive proxy.
+        for v in &mut mel[..N_MELS / 4] {
+            *v = -4.0;
+        }
+        for v in &mut mel[N_MELS - N_MELS / 4..] {
+            *v = 2.0;
+        }
+        assert!(mel_articulation_proxy(&mel) > 0.0);
     }
 }

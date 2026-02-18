@@ -6,7 +6,7 @@ use egui::Ui;
 use tmrvc_engine_rs::constants::{HOP_LENGTH, HQ_THRESHOLD_Q, MAX_LOOKAHEAD_HOPS, SAMPLE_RATE};
 use tmrvc_engine_rs::processor::SharedStatus;
 
-/// Draw the monitoring panel (levels, inference time, latency).
+/// Draw the monitoring panel (levels, inference time, latency, style controls).
 pub fn draw_monitor(ui: &mut Ui, status: &Arc<SharedStatus>) {
     let input_db = status.input_level_db.load(Ordering::Relaxed);
     let output_db = status.output_level_db.load(Ordering::Relaxed);
@@ -17,6 +17,25 @@ pub fn draw_monitor(ui: &mut Ui, status: &Arc<SharedStatus>) {
     let overruns = status.overrun_count.load(Ordering::Relaxed);
     let underruns = status.underrun_count.load(Ordering::Relaxed);
     let q = status.latency_quality_q.load(Ordering::Relaxed);
+
+    let alpha = status.alpha_timbre.load(Ordering::Relaxed);
+    let beta = status.beta_prosody.load(Ordering::Relaxed);
+    let gamma = status.gamma_articulation.load(Ordering::Relaxed);
+    let estimated_log_f0 = status.estimated_log_f0.load(Ordering::Relaxed);
+    let style_target_log_f0 = status.style_target_log_f0.load(Ordering::Relaxed);
+    let style_target_artic = status.style_target_articulation.load(Ordering::Relaxed);
+    let style_loaded = status.style_loaded.load(Ordering::Relaxed);
+
+    let est_f0_hz = if estimated_log_f0 > 0.0 {
+        estimated_log_f0.exp() - 1.0
+    } else {
+        0.0
+    };
+    let target_f0_hz = if style_target_log_f0 > 0.0 {
+        style_target_log_f0.exp() - 1.0
+    } else {
+        0.0
+    };
 
     let hop_ms = HOP_LENGTH as f32 / SAMPLE_RATE as f32 * 1000.0;
 
@@ -70,6 +89,30 @@ pub fn draw_monitor(ui: &mut Ui, status: &Arc<SharedStatus>) {
         });
         ui.horizontal(|ui| {
             ui.label(format!("Latency-Quality q: {:.2}", q));
+        });
+
+        ui.add_space(4.0);
+
+        // Style/control observability
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "alpha/beta/gamma: {:.2} / {:.2} / {:.2}",
+                alpha, beta, gamma
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "F0 est/target: {:.1} / {:.1} Hz{}",
+                est_f0_hz,
+                target_f0_hz,
+                if style_loaded { "" } else { " (style off)" }
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Style articulation target: {:.3}",
+                style_target_artic
+            ));
         });
 
         // Frame count and underruns

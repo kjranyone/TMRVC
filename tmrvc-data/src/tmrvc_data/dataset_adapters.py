@@ -23,16 +23,21 @@ class DatasetAdapter:
 class VCTKAdapter(DatasetAdapter):
     """VCTK Corpus (48 kHz, 109 speakers, English).
 
-    Expected layout::
+    Supports two layouts:
+
+    VCTK 0.92 (preferred)::
 
         root/
             wav48_silence_trimmed/
                 p225/
                     p225_001_mic1.flac
-                    ...
-            txt/
+
+    Older VCTK::
+
+        root/
+            wav48/
                 p225/
-                    p225_001.txt
+                    p225_001.wav
     """
 
     name = "vctk"
@@ -46,12 +51,24 @@ class VCTKAdapter(DatasetAdapter):
         if not wav_dir.exists():
             raise FileNotFoundError(f"VCTK wav directory not found under {root}")
 
+        # Detect format: 0.92 uses *_mic1.flac, older uses *.wav
+        use_092 = wav_dir.name == "wav48_silence_trimmed"
+
         for spk_dir in sorted(wav_dir.iterdir()):
             if not spk_dir.is_dir():
                 continue
             speaker_id = spk_dir.name
-            for wav_path in sorted(spk_dir.glob("*_mic1.flac")):
-                utt_id = wav_path.stem.replace("_mic1", "")
+
+            if use_092:
+                pattern = "*_mic1.flac"
+            else:
+                pattern = "*.wav"
+
+            for wav_path in sorted(spk_dir.glob(pattern)):
+                if use_092:
+                    utt_id = wav_path.stem.replace("_mic1", "")
+                else:
+                    utt_id = wav_path.stem
                 import soundfile as sf
 
                 info = sf.info(str(wav_path))

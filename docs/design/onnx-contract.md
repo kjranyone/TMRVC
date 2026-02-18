@@ -396,35 +396,72 @@ def quantize_model(input_path: str, output_path: str):
 
 ---
 
-## 6. `.tmrvc_speaker` ファイルフォーマット
+## 6. `.tmrvc_speaker` ファイルフォーマット (v2)
 
 ### 6.1 バイナリレイアウト
 
 ```
-Offset  Size     Field
-──────  ─────    ──────────────────────────
-0x0000  4 bytes  Magic: "TMSP" (0x544D5350)
-0x0004  4 bytes  Version: uint32_le = 1
-0x0008  4 bytes  spk_embed_size: uint32_le = 192
-0x000C  4 bytes  lora_delta_size: uint32_le = 24576
-0x0010  768 B    spk_embed: float32[192]
-0x0310  98304 B  lora_delta: float32[24576]
-0x18310 32 bytes checksum: SHA-256 of all preceding bytes
-──────  ─────    ──────────────────────────
-Total: ~97 KB
+Offset   Size (bytes)    Field
+──────   ────────────    ──────────────────────────
+0x0000   4               Magic: "TMSP" (0x544D5350)
+0x0004   4               Version: uint32_le = 2
+0x0008   4               embed_size: uint32_le = 192
+0x000C   4               lora_size: uint32_le = 24576
+0x0010   4               metadata_size: uint32_le (JSON UTF-8 byte count)
+0x0014   4               thumbnail_size: uint32_le (常に 0: サムネイルは metadata JSON 内に base64 格納)
+0x0018   768             spk_embed: float32_le[192]
+0x0318   98304           lora_delta: float32_le[24576]
+0x18318  metadata_size   metadata_json: UTF-8 JSON
+         32              checksum: SHA-256 of all preceding bytes
 ```
 
-### 6.2 読み込み検証
+Header = 24 bytes. サムネイルはメタデータ JSON 内に `thumbnail_b64` として base64 エンコードで格納。
 
-```cpp
-bool SpeakerManager::loadSpeakerFile(const char* path) {
-    // 1. ファイルサイズチェック
-    // 2. Magic number 検証 ("TMSP")
-    // 3. Version 検証 (== 1)
-    // 4. SHA-256 checksum 検証
-    // 5. spk_embed と lora_delta を staging slot にコピー
-    // 6. Audio thread に SpeakerReady response を送信
+### 6.2 メタデータ JSON スキーマ
+
+```json
+{
+  "profile_name": "My Voice",
+  "author_name": "Author Name",
+  "co_author_name": "",
+  "licence_url": "",
+  "thumbnail_b64": "iVBORw0KGgo...",
+  "created_at": "2026-02-18T12:00:00Z",
+  "description": "",
+  "source_audio_files": ["ref1.wav", "ref2.wav"],
+  "source_sample_count": 480000,
+  "training_mode": "embedding",
+  "checkpoint_name": ""
 }
+```
+
+- `profile_name`: プロファイル表示名
+- `author_name`: 作成者名
+- `co_author_name`: 共同作成者名（任意、空文字 = なし）
+- `licence_url`: ライセンス確認 URL（任意、空文字 = なし）
+- `thumbnail_b64`: 100×100px RGB PNG を base64 エンコードした文字列（空文字 = なし）
+- `training_mode`: `"embedding"` | `"finetune"`
+- `checkpoint_name`: fine-tune 時のみ非空
+- 文字列フィールドは空文字許容。将来拡張時は不明キーを無視する。
+
+### 6.3 サムネイル
+
+- mel スペクトログラムのヒートマップ画像
+- サイズ: 100×100 px、RGB
+- 値域を min/max 正規化 → inferno 風カラーマップ、バイリニア補間
+- メタデータ JSON の `thumbnail_b64` フィールドに base64 エンコードで格納
+- `thumbnail_b64` が空文字の場合はサムネイルなし
+
+### 6.4 読み込み検証
+
+```
+1. ファイルサイズ ≥ HEADER(24) + embed(768) + lora(98304) + checksum(32)
+2. Magic number 検証 ("TMSP")
+3. Version 検証 (== 2)
+4. header の metadata_size / thumbnail_size から total size を計算・検証
+5. SHA-256 checksum 検証
+6. spk_embed, lora_delta, metadata を解析
+7. metadata.thumbnail_b64 から base64 デコードでサムネイル取得
 ```
 
 ---

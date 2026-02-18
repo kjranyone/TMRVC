@@ -88,6 +88,7 @@ class TrainWorker(BaseWorker):
             import torch
             from torch.utils.data import DataLoader
 
+            from tmrvc_core.device import get_device, pin_memory_for_device
             from tmrvc_data.dataset import TMRVCDataset, collate_fn
             from tmrvc_train.diffusion import FlowMatchingScheduler
             from tmrvc_train.models.teacher_unet import TeacherUNet
@@ -103,7 +104,7 @@ class TrainWorker(BaseWorker):
 
             # Build model
             self.log_message.emit("[TrainWorker] Building Teacher model...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = get_device()
             teacher = TeacherUNet().to(device)
 
             param_count = sum(p.numel() for p in teacher.parameters())
@@ -123,7 +124,7 @@ class TrainWorker(BaseWorker):
                 shuffle=True,
                 collate_fn=collate_fn,
                 num_workers=2,
-                pin_memory=(device == "cuda"),
+                pin_memory=pin_memory_for_device(device),
             )
 
             # Optimizer & scheduler

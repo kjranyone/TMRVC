@@ -12,7 +12,7 @@ struct DilatedConv {
     bias: Vec<f32>,    // [out_ch]
     history: Vec<f32>, // [buf_len * in_ch]
     hist_pos: usize,
-    buf_len: usize,    // (kernel_size - 1) * dilation + 1
+    buf_len: usize, // (kernel_size - 1) * dilation + 1
     in_ch: usize,
     out_ch: usize,
     kernel_size: usize,
@@ -56,8 +56,8 @@ impl DilatedConv {
                 let read_start = read_pos * self.in_ch;
                 let w_base = (o * self.in_ch) * self.kernel_size + k;
                 for i in 0..self.in_ch {
-                    sum += self.weight[w_base + i * self.kernel_size]
-                        * self.history[read_start + i];
+                    sum +=
+                        self.weight[w_base + i * self.kernel_size] * self.history[read_start + i];
                 }
             }
             output[o] = sum;
@@ -94,9 +94,9 @@ struct WaveNetLayer {
     gate_channels: usize,
     gated: bool,
     // Pre-allocated scratch
-    z: Vec<f32>,             // [gate_ch]
+    z: Vec<f32>,              // [gate_ch]
     activation_buf: Vec<f32>, // [ch]
-    out_1x1: Vec<f32>,      // [2*ch]
+    out_1x1: Vec<f32>,        // [2*ch]
 }
 
 impl WaveNetLayer {
@@ -121,12 +121,7 @@ impl WaveNetLayer {
     /// `raw_input`: the original audio sample (scalar).
     /// `condition`: [channels] — modified in-place (residual added).
     /// `skip_accum`: [channels] — skip connection accumulated.
-    fn process_sample(
-        &mut self,
-        raw_input: f32,
-        condition: &mut [f32],
-        skip_accum: &mut [f32],
-    ) {
+    fn process_sample(&mut self, raw_input: f32, condition: &mut [f32], skip_accum: &mut [f32]) {
         let ch = self.channels;
 
         // 1. Dilated conv on condition
@@ -226,10 +221,10 @@ pub(crate) struct WaveNet {
     head_size: usize,
     sample_rate: u32,
     // Pre-allocated scratch
-    condition: Vec<f32>,     // [channels]
+    condition: Vec<f32>,      // [channels]
     prev_condition: Vec<f32>, // [channels] (for multi-block)
-    skip_accum: Vec<f32>,    // [channels]
-    head_hidden: Vec<f32>,   // [head_size]
+    skip_accum: Vec<f32>,     // [channels]
+    head_hidden: Vec<f32>,    // [head_size]
 }
 
 impl WaveNet {
@@ -262,13 +257,7 @@ impl WaveNet {
             } else {
                 ch
             };
-            layer_arrays.push(LayerArray::new(
-                input_ch,
-                ch,
-                ks,
-                &config.dilations,
-                gated,
-            ));
+            layer_arrays.push(LayerArray::new(input_ch, ch, ks, &config.dilations, gated));
         }
 
         // Calculate expected weight count
@@ -307,7 +296,9 @@ impl WaveNet {
         for array in &mut layer_arrays {
             // Rechannel 1×1
             let n = array.channels * array.input_ch;
-            array.rechannel_weight.copy_from_slice(&weights[offset..offset + n]);
+            array
+                .rechannel_weight
+                .copy_from_slice(&weights[offset..offset + n]);
             offset += n;
             array
                 .rechannel_bias
@@ -577,10 +568,10 @@ mod tests {
         //   dilated_conv: [gate_ch, ch, ks] + [gate_ch] = 4*2*2 + 4 = 20
         weights.extend(vec![0.01f32; gate_ch * ch * ks]); // weight
         weights.extend(vec![0.0f32; gate_ch]); // bias
-        //   input_mixin: [gate_ch] + [gate_ch] = 8
+                                               //   input_mixin: [gate_ch] + [gate_ch] = 8
         weights.extend(vec![0.01f32; gate_ch]); // weight
         weights.extend(vec![0.0f32; gate_ch]); // bias
-        //   1x1 out: [2*ch, ch] + [2*ch] = 8 + 4 = 12
+                                               //   1x1 out: [2*ch, ch] + [2*ch] = 8 + 4 = 12
         weights.extend(vec![0.01f32; 2 * ch * ch]); // weight
         weights.extend(vec![0.0f32; 2 * ch]); // bias
 

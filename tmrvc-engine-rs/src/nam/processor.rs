@@ -137,10 +137,8 @@ impl NamChain {
             );
 
             let rs_from = self.resampler_from_nam.as_mut().unwrap();
-            let n_back = rs_from.process(
-                &self.nam_out_buf[..n_resampled],
-                &mut self.resample_out_buf,
-            );
+            let n_back =
+                rs_from.process(&self.nam_out_buf[..n_resampled], &mut self.resample_out_buf);
 
             // Copy back with mix
             let n_copy = samples.len().min(n_back);

@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod dsp;
+pub mod mel_thumbnail;
 pub mod nam;
 pub mod ort_bundle;
 pub mod ping_pong;
@@ -7,4 +8,8 @@ pub mod processor;
 pub mod resampler;
 pub mod ring_buffer;
 pub mod speaker;
+pub mod speaker_encoder;
+pub mod style;
 pub mod tensor_pool;
+pub mod voice_profile;
+pub mod wav_reader;

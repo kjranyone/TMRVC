@@ -14,6 +14,7 @@ from tmrvc_core.constants import (
     MAX_LOOKAHEAD_HOPS,
     N_IR_PARAMS,
 )
+from tmrvc_export.speaker_file import HEADER_SIZE
 from tmrvc_train.models.content_encoder import ContentEncoderStudent
 from tmrvc_train.models.converter import ConverterStudent, ConverterStudentHQ
 from tmrvc_train.models.ir_estimator import IREstimator
@@ -137,20 +138,25 @@ class TestONNXExportHQ:
         model.eval()
         path = export_converter_hq(model, tmp_onnx_dir / "converter_hq.onnx")
 
-        # PyTorch inference
+        # PyTorch inference (via the same wrapper used for export)
+        from tmrvc_export.export_onnx import _ConverterHQWrapper
+
+        wrapper = _ConverterHQWrapper(model).eval()
         content = torch.randn(1, D_CONTENT, 1 + MAX_LOOKAHEAD_HOPS)
         spk = torch.randn(1, D_SPEAKER)
+        lora = torch.zeros(1, LORA_DELTA_SIZE)
         ir = torch.randn(1, N_IR_PARAMS)
-        state_in = model.init_state()
+        state_in = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES)
 
         with torch.no_grad():
-            pt_out, pt_state = model(content, spk, ir, state_in)
+            pt_out, pt_state = wrapper(content, spk, lora, ir, state_in)
 
         # ONNX Runtime inference
         sess = ort.InferenceSession(str(path))
         ort_inputs = {
             "content": content.numpy(),
             "spk_embed": spk.numpy(),
+            "lora_delta": lora.numpy(),
             "ir_params": ir.numpy(),
             "state_in": state_in.numpy(),
         }
@@ -165,7 +171,7 @@ class TestONNXExportHQ:
 
 
 class TestSpeakerFile:
-    """Test .tmrvc_speaker file I/O."""
+    """Test .tmrvc_speaker v2 file I/O."""
 
     def test_write_and_read(self, tmp_path):
         from tmrvc_export.speaker_file import read_speaker_file, write_speaker_file
@@ -174,10 +180,12 @@ class TestSpeakerFile:
         lora_delta = np.random.randn(LORA_DELTA_SIZE).astype(np.float32)
 
         path = write_speaker_file(tmp_path / "test.tmrvc_speaker", spk_embed, lora_delta)
-        loaded_spk, loaded_lora = read_speaker_file(path)
+        loaded_spk, loaded_lora, meta, thumb = read_speaker_file(path)
 
         np.testing.assert_array_equal(loaded_spk, spk_embed)
         np.testing.assert_array_equal(loaded_lora, lora_delta)
+        assert meta["training_mode"] == "embedding"
+        assert thumb == b""
 
     def test_corrupted_checksum(self, tmp_path):
         from tmrvc_export.speaker_file import read_speaker_file, write_speaker_file
@@ -187,19 +195,20 @@ class TestSpeakerFile:
 
         path = write_speaker_file(tmp_path / "test.tmrvc_speaker", spk_embed, lora_delta)
 
-        # Corrupt one byte
+        # Corrupt one byte in the embed region
         data = bytearray(path.read_bytes())
-        data[20] ^= 0xFF
+        data[HEADER_SIZE + 10] ^= 0xFF
         path.write_bytes(bytes(data))
 
         with pytest.raises(ValueError, match="Checksum mismatch"):
             read_speaker_file(path)
 
     def test_invalid_magic(self, tmp_path):
-        from tmrvc_export.speaker_file import read_speaker_file, TOTAL_SIZE
+        from tmrvc_export.speaker_file import read_speaker_file
 
         path = tmp_path / "bad.tmrvc_speaker"
-        path.write_bytes(b"\x00" * TOTAL_SIZE)
+        # Write enough bytes to pass minimum size check
+        path.write_bytes(b"\x00" * (HEADER_SIZE + D_SPEAKER * 4 + LORA_DELTA_SIZE * 4 + 32))
 
         with pytest.raises(ValueError, match="Invalid magic"):
             read_speaker_file(path)
@@ -208,7 +217,61 @@ class TestSpeakerFile:
         from tmrvc_export.speaker_file import read_speaker_file
 
         path = tmp_path / "short.tmrvc_speaker"
-        path.write_bytes(b"TMSP\x01\x00")
+        path.write_bytes(b"TMSP\x02\x00")
 
         with pytest.raises(ValueError, match="Invalid file size"):
             read_speaker_file(path)
+
+    def test_metadata_roundtrip(self, tmp_path):
+        from tmrvc_export.speaker_file import read_speaker_file, write_speaker_file
+
+        spk_embed = np.random.randn(D_SPEAKER).astype(np.float32)
+        lora_delta = np.zeros(LORA_DELTA_SIZE, dtype=np.float32)
+        metadata = {
+            "profile_name": "Test Speaker",
+            "author_name": "Test Author",
+            "co_author_name": "Co-Author",
+            "licence_url": "https://example.com/licence",
+            "created_at": "2026-02-18T12:00:00Z",
+            "description": "A test voice",
+            "source_audio_files": ["ref1.wav", "ref2.wav"],
+            "source_sample_count": 480000,
+            "training_mode": "finetune",
+            "checkpoint_name": "distill.pt",
+        }
+
+        path = write_speaker_file(
+            tmp_path / "meta.tmrvc_speaker", spk_embed, lora_delta, metadata=metadata,
+        )
+        _, _, loaded_meta, _ = read_speaker_file(path)
+
+        assert loaded_meta["profile_name"] == "Test Speaker"
+        assert loaded_meta["author_name"] == "Test Author"
+        assert loaded_meta["co_author_name"] == "Co-Author"
+        assert loaded_meta["licence_url"] == "https://example.com/licence"
+        assert loaded_meta["created_at"] == "2026-02-18T12:00:00Z"
+        assert loaded_meta["source_audio_files"] == ["ref1.wav", "ref2.wav"]
+        assert loaded_meta["source_sample_count"] == 480000
+        assert loaded_meta["training_mode"] == "finetune"
+        assert loaded_meta["checkpoint_name"] == "distill.pt"
+
+    def test_thumbnail_roundtrip(self, tmp_path):
+        from tmrvc_export.speaker_file import read_speaker_file, write_speaker_file
+
+        spk_embed = np.random.randn(D_SPEAKER).astype(np.float32)
+        lora_delta = np.zeros(LORA_DELTA_SIZE, dtype=np.float32)
+        # Fake PNG data for testing
+        thumbnail = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+        path = write_speaker_file(
+            tmp_path / "thumb.tmrvc_speaker", spk_embed, lora_delta,
+            metadata={"profile_name": "Thumb Test"},
+            thumbnail_png=thumbnail,
+        )
+        _, _, meta, loaded_thumb = read_speaker_file(path)
+
+        assert loaded_thumb == thumbnail
+        assert meta["profile_name"] == "Thumb Test"
+        # Verify thumbnail_b64 is in metadata
+        import base64
+        assert meta["thumbnail_b64"] == base64.b64encode(thumbnail).decode("ascii")

@@ -61,6 +61,28 @@ fn resolve_speaker_path(persisted: &str) -> Option<PathBuf> {
     None
 }
 
+/// Search for the style file.
+/// Priority: 1. Persisted path 2. Default location.
+fn resolve_style_path(persisted: &str) -> Option<PathBuf> {
+    if !persisted.is_empty() {
+        let p = PathBuf::from(persisted);
+        if p.is_file() {
+            return Some(p);
+        }
+        nih_warn!("Persisted style_path not found: {:?}", p);
+    }
+    if let Some(dir) = default_data_dir() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("tmrvc_style") {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
 /// TMRVC Voice Conversion VST3 Plugin.
 pub struct TmrvcPlugin {
     params: Arc<TmrvcParams>,
@@ -234,10 +256,16 @@ impl Plugin for TmrvcPlugin {
         // Read parameters (smoothed values)
         let dry_wet = self.params.dry_wet.smoothed.next();
         let output_gain = self.params.output_gain.smoothed.next();
+        let alpha_timbre = self.params.alpha_timbre.smoothed.next();
+        let beta_prosody = self.params.beta_prosody.smoothed.next();
+        let gamma_articulation = self.params.gamma_articulation.smoothed.next();
         let latency_quality_q = self.params.latency_quality_q.smoothed.next();
         let frame_params = FrameParams {
             dry_wet,
             output_gain,
+            alpha_timbre,
+            beta_prosody,
+            gamma_articulation,
             latency_quality_q,
         };
 
@@ -312,13 +340,13 @@ impl Plugin for TmrvcPlugin {
 
         // Step 4.5: NAM processing (at DAW rate, on upsampled output)
         if self.params.nam_enabled.value() {
-            self.nam_chain
-                .set_mix(self.params.nam_mix.smoothed.next());
+            self.nam_chain.set_mix(self.params.nam_mix.smoothed.next());
             self.nam_chain.set_enabled(true);
             let nam_start = self.accum_out_read;
             let nam_end = self.accum_out_len;
             if nam_end > nam_start {
-                self.nam_chain.process(&mut self.accum_out[nam_start..nam_end]);
+                self.nam_chain
+                    .process(&mut self.accum_out[nam_start..nam_end]);
             }
         } else {
             self.nam_chain.set_enabled(false);
@@ -349,6 +377,7 @@ impl TmrvcPlugin {
     fn load_models_and_speaker(&mut self) {
         let persisted_models = self.params.models_dir.lock().clone();
         let persisted_speaker = self.params.speaker_path.lock().clone();
+        let persisted_style = self.params.style_path.lock().clone();
 
         // --- Models ---
         if let Some(dir) = resolve_models_dir(&persisted_models) {
@@ -386,7 +415,20 @@ impl TmrvcPlugin {
                 default_data_dir()
             );
         }
-
+        // --- Style (optional) ---
+        if let Some(path) = resolve_style_path(&persisted_style) {
+            match self.engine.load_style(&path) {
+                Ok(()) => {
+                    nih_log!("Style loaded from {:?}", path);
+                    *self.params.style_path.lock() = path.display().to_string();
+                }
+                Err(e) => {
+                    nih_error!("Failed to load style from {:?}: {}", path, e);
+                }
+            }
+        } else {
+            nih_log!("No style file found (optional).")
+        }
         if self.engine.is_ready() {
             nih_log!("TMRVC engine ready (models + speaker loaded)");
         } else {

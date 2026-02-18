@@ -253,12 +253,13 @@ class TestFinetuneCLI:
                 "--checkpoint", str(ckpt_path),
                 "--output", str(output_path),
                 "--steps", "5",
+                "--device", "cpu",
             ])
 
         assert output_path.exists()
 
         # Verify the speaker file is valid
-        spk_embed, lora_delta = read_speaker_file(output_path)
+        spk_embed, lora_delta, _meta, _thumb = read_speaker_file(output_path)
         assert spk_embed.shape == (D_SPEAKER,)
         assert lora_delta.shape == (LORA_DELTA_SIZE,)
         # lora_delta should not be all zeros (fine-tuned)

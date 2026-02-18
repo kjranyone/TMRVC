@@ -80,7 +80,7 @@ def normalize_loudness(
         return waveform
 
     normalised = pyln.normalize.loudness(audio_np, current_lufs, target_lufs)
-    return torch.from_numpy(normalised).unsqueeze(0)
+    return torch.from_numpy(normalised).float().unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------

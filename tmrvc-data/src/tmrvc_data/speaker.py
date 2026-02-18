@@ -11,6 +11,45 @@ from tmrvc_core.constants import D_SPEAKER, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
+_patched = False
+
+
+def _patch_speechbrain_deps() -> None:
+    """Patch compatibility issues between SpeechBrain 1.0.x and newer deps.
+
+    - torchaudio 2.9+ removed ``list_audio_backends()``.
+    - huggingface_hub 1.x removed the ``use_auth_token`` kwarg from
+      ``hf_hub_download``; SpeechBrain still passes it.
+    """
+    global _patched
+    if _patched:
+        return
+    _patched = True
+
+    import torchaudio
+
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: []
+
+    import functools
+
+    import huggingface_hub
+    import huggingface_hub.errors
+
+    _orig_download = huggingface_hub.hf_hub_download
+
+    @functools.wraps(_orig_download)
+    def _compat_download(*args, **kwargs):
+        kwargs.pop("use_auth_token", None)
+        try:
+            return _orig_download(*args, **kwargs)
+        except huggingface_hub.errors.EntryNotFoundError:
+            # SpeechBrain 1.0.x catches ValueError for missing optional files
+            # but newer huggingface_hub raises EntryNotFoundError instead.
+            raise ValueError("Entry not found (converted from EntryNotFoundError)")
+
+    huggingface_hub.hf_hub_download = _compat_download
+
 
 class SpeakerEncoder:
     """Extract speaker embeddings using SpeechBrain's ECAPA-TDNN.
@@ -25,6 +64,7 @@ class SpeakerEncoder:
     def _load_model(self) -> None:
         if self._model is not None:
             return
+        _patch_speechbrain_deps()
         from speechbrain.inference.speaker import EncoderClassifier
 
         self._model = EncoderClassifier.from_hparams(

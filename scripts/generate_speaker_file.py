@@ -73,10 +73,21 @@ def main(argv: list[str] | None = None) -> None:
     avg_embed = torch.stack(embeddings).mean(dim=0)
     avg_embed = F.normalize(avg_embed, p=2, dim=-1)
 
+    from datetime import datetime, timezone
+
     spk_embed_np = avg_embed.numpy().astype(np.float32)
     lora_delta_np = np.zeros(LORA_DELTA_SIZE, dtype=np.float32)
 
-    write_speaker_file(output_path, spk_embed_np, lora_delta_np)
+    metadata = {
+        "profile_name": args.name,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "description": "",
+        "source_audio_files": [Path(p).name for p in args.audio],
+        "source_sample_count": 0,
+        "training_mode": "embedding",
+        "checkpoint_name": "",
+    }
+    write_speaker_file(output_path, spk_embed_np, lora_delta_np, metadata=metadata)
     logger.info("Speaker file written to %s", output_path)
 
 
