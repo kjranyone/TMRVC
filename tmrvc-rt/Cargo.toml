@@ -1,0 +1,18 @@
+[package]
+name = "tmrvc-rt"
+version = "0.1.0"
+edition = "2021"
+description = "TMRVC real-time voice conversion standalone app"
+
+[dependencies]
+tmrvc-engine-rs = { path = "../tmrvc-engine-rs" }
+eframe = { version = "0.33", features = ["persistence"] }
+egui = "0.33"
+cpal = "0.15"
+rfd = "0.15"
+crossbeam-channel = "0.5"
+atomic_float = "1"
+displaydoc = "0.2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"

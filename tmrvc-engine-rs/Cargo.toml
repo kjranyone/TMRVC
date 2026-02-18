@@ -1,0 +1,15 @@
+[package]
+name = "tmrvc-engine-rs"
+version = "0.1.0"
+edition = "2021"
+description = "TMRVC streaming voice conversion engine (library)"
+
+[dependencies]
+ort = "2.0.0-rc.11"
+rustfft = "6.2"
+sha2 = "0.10"
+atomic_float = "1"
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

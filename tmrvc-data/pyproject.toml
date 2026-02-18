@@ -1,0 +1,30 @@
+[project]
+name = "tmrvc-data"
+version = "0.1.0"
+description = "TMRVC data: dataset adapters, preprocessing, feature extraction, caching"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "tmrvc-core",
+    "transformers>=4.36",
+    "speechbrain>=1.0",
+    "pyloudnorm>=0.1",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "torchcrepe>=0.0.22",
+]
+
+[project.scripts]
+tmrvc-preprocess = "tmrvc_data.cli.preprocess:main"
+tmrvc-extract-features = "tmrvc_data.cli.extract_features:main"
+tmrvc-verify-cache = "tmrvc_data.cli.verify_cache:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+tmrvc-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tmrvc_data"]

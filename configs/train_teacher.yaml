@@ -1,0 +1,72 @@
+# Teacher U-Net training configuration.
+#
+# Phase-specific overrides are specified in the `phases` section.
+# CLI flags (--phase, --lr, --max-steps) override these values.
+#
+# Usage:
+#   tmrvc-train-teacher --cache-dir data/cache --phase 0
+#   tmrvc-train-teacher --cache-dir data/cache --phase 1b --resume checkpoints/phase1a/latest.pt
+
+# --- Common settings ---
+batch_size: 64
+grad_clip: 1.0
+save_every: 10000
+log_every: 100
+checkpoint_dir: checkpoints
+warmup_steps: 5000
+
+# --- Phase-specific settings ---
+phases:
+  "0":
+    lr: 2.0e-4
+    max_steps: 100000
+    warmup_steps: 0
+    lambda_stft: 0.0
+    lambda_spk: 0.0
+    lambda_ir: 0.0
+    datasets: [vctk, jvs]
+    description: "Architecture verification — VCTK+JVS only, flow loss"
+
+  "1a":
+    lr: 1.0e-4
+    max_steps: 500000
+    warmup_steps: 5000
+    lambda_stft: 0.0
+    lambda_spk: 0.0
+    lambda_ir: 0.0
+    datasets: [vctk, jvs, libritts_r]
+    description: "Base flow matching — full T1+T2 corpus"
+
+  "1b":
+    lr: 5.0e-5
+    max_steps: 200000
+    warmup_steps: 0
+    lambda_stft: 0.5
+    lambda_spk: 0.3
+    lambda_ir: 0.0
+    datasets: [vctk, jvs, libritts_r]
+    description: "Perceptual fine-tune — add STFT + speaker loss"
+
+  "2":
+    lr: 5.0e-5
+    max_steps: 200000
+    warmup_steps: 0
+    lambda_stft: 0.5
+    lambda_spk: 0.3
+    lambda_ir: 0.1
+    datasets: [vctk, jvs, libritts_r]
+    rir_augment: true
+    description: "IR-robust — add RIR augmentation + IR loss"
+
+  "reflow":
+    lr: 5.0e-5
+    max_steps: 100000
+    warmup_steps: 0
+    use_ot_cfm: true
+    p_uncond: 0.1
+    description: "Reflow — straighten ODE trajectories using pre-generated pairs"
+
+# --- Advanced options ---
+use_ot_cfm: false            # Optimal Transport CFM (straighter trajectories)
+p_uncond: 0.0                # CFG-free conditioning dropout probability
+sway_coefficient: 0.0        # Sway sampling coefficient (0=uniform, 1.0=recommended)

@@ -1,0 +1,53 @@
+# Student distillation configuration.
+#
+# Phase A: ODE trajectory matching.
+# Phase B: Distribution Matching Distillation (DMD).
+#
+# Usage:
+#   tmrvc-distill --cache-dir data/cache --teacher-ckpt checkpoints/phase2/best.pt --phase A
+#   tmrvc-distill --cache-dir data/cache --teacher-ckpt checkpoints/phase2/best.pt --phase B --resume checkpoints/distill/phaseA.pt
+
+# --- Common settings ---
+batch_size: 64
+grad_clip: 1.0
+save_every: 10000
+log_every: 100
+checkpoint_dir: checkpoints/distill
+
+# --- Phase-specific settings ---
+phases:
+  "A":
+    lr: 1.0e-4
+    max_steps: 200000
+    warmup_steps: 5000
+    teacher_steps: 20
+    lambda_trajectory: 1.0
+    lambda_stft: 0.0
+    lambda_spk: 0.0
+    description: "ODE trajectory pre-training — match teacher multi-step predictions"
+
+  "B":
+    lr: 5.0e-5
+    max_steps: 100000
+    warmup_steps: 2000
+    lambda_dmd: 1.0
+    lambda_stft: 0.5
+    lambda_spk: 0.3
+    description: "Distribution Matching Distillation — single-step quality"
+
+  "B2":
+    lr: 5.0e-5
+    max_steps: 100000
+    warmup_steps: 2000
+    disc_lr: 2.0e-4
+    disc_update_ratio: 2
+    lambda_gan: 1.0
+    description: "DMD2 — GAN-based distribution matching (no regression loss)"
+
+  "C":
+    lr: 2.0e-5
+    max_steps: 50000
+    warmup_steps: 1000
+    lambda_stft: 0.5
+    lambda_sv: 0.5
+    description: "Metric Optimization — SV loss + spectral loss for direct quality tuning"

@@ -1,0 +1,18 @@
+[package]
+name = "tmrvc-vst"
+version = "0.1.0"
+edition = "2021"
+description = "TMRVC voice conversion VST3 plugin"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tmrvc-engine-rs = { path = "../tmrvc-engine-rs" }
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["vst3"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+atomic_float = "1"
+log = "0.4"
+anyhow = "1"
+dirs = "6"

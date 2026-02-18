@@ -1,0 +1,27 @@
+[project]
+name = "tmrvc-export"
+version = "0.1.0"
+description = "TMRVC export: ONNX export, quantization, parity verification"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "tmrvc-core",
+    "tmrvc-train",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
+    "onnxscript>=0.1",
+]
+
+[project.scripts]
+tmrvc-export = "tmrvc_export.cli.export:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+tmrvc-core = { workspace = true }
+tmrvc-train = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tmrvc_export"]

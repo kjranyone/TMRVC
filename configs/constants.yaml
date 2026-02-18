@@ -1,0 +1,80 @@
+# TMRVC Shared Constants
+# This file is the single source of truth for all constants.
+# Auto-generated to Python (tmrvc_core/constants.py) and C++ header.
+
+# --- Audio Processing ---
+sample_rate: 24000
+n_fft: 1024
+hop_length: 240          # 10ms @ 24kHz
+window_length: 960        # 40ms @ 24kHz
+n_mels: 80
+mel_fmin: 0.0
+mel_fmax: 12000.0
+n_freq_bins: 513          # n_fft // 2 + 1
+log_floor: 1.0e-10
+
+# --- Model Dimensions ---
+d_content: 256
+d_speaker: 192
+n_ir_params: 24           # 8 subbands x 3 parameters
+d_converter_hidden: 384
+d_vocoder_features: 513   # = n_freq_bins
+
+# --- Feature Extraction ---
+d_content_vec: 768        # ContentVec output dim
+content_vec_hop_ms: 20.0  # ContentVec native hop (ms)
+
+# --- Inference Parameters ---
+student_steps: 1
+ir_update_interval: 10    # frames (~100ms)
+
+# --- LoRA Parameters ---
+lora_rank: 4
+lora_alpha: 8
+n_lora_layers: 4
+lora_delta_size: 24576    # 4 layers x 6144
+
+# --- State Tensor Dimensions ---
+content_encoder_state_frames: 28
+ir_estimator_state_frames: 6
+converter_state_frames: 52
+vocoder_state_frames: 14
+
+# --- IR Subbands ---
+n_ir_subbands: 8
+ir_subband_edges_hz:
+  - 0
+  - 375
+  - 750
+  - 1500
+  - 3000
+  - 4500
+  - 6000
+  - 9000
+  - 12000
+
+# --- Teacher Architecture ---
+d_teacher_hidden: 512         # Teacher U-Net bottleneck
+teacher_down_channels: [128, 256, 384, 512]
+teacher_n_heads: 8            # Cross-attention heads
+
+# --- Global Timbre Memory ---
+gtm_n_entries: 8              # Number of memory entries
+gtm_d_entry: 48               # Dimension per entry (8 * 48 = 384 = d_converter_hidden)
+gtm_n_heads: 4                # Cross-attention heads
+
+# --- Lookahead / HQ Mode ---
+max_lookahead_hops: 6              # HQ mode lookahead (60ms)
+converter_hq_state_frames: 46     # sum of left_ctx for semi-causal
+hq_threshold_q: 0.3               # q > 0.3 で HQ mode 有効
+crossfade_frames: 10              # 100ms crossfade on mode switch
+
+# --- Training ---
+flow_matching_steps: 20       # Teacher sampling steps
+
+# --- Training Defaults ---
+default_batch_size: 64
+segment_min_sec: 5.0
+segment_max_sec: 15.0
+loudness_target_lufs: -23.0
+cross_speaker_prob: 0.2

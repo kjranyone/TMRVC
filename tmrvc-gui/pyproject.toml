@@ -1,0 +1,31 @@
+[project]
+name = "tmrvc-gui"
+version = "0.1.0"
+description = "TMRVC Research Studio — GUI application for voice conversion research workflow"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "sounddevice>=0.4",
+    "onnxruntime>=1.17",
+    "numpy>=1.26",
+    "tmrvc-core",
+    "tmrvc-data",
+    "tmrvc-export",
+]
+
+[project.scripts]
+tmrvc-gui = "tmrvc_gui.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+tmrvc-core = { workspace = true }
+tmrvc-data = { workspace = true }
+tmrvc-export = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tmrvc_gui"]

@@ -1,0 +1,27 @@
+# ONNX export configuration.
+#
+# Usage:
+#   tmrvc-export --checkpoint checkpoints/distill/best.pt --output-dir models/ --quantize --verify
+
+# Models to export
+models:
+  - content_encoder
+  - converter
+  - vocoder
+  - ir_estimator
+  - speaker_encoder
+
+# ONNX opset version
+opset_version: 18
+
+# Quantization targets (speaker_encoder excluded — offline only)
+quantize_targets:
+  - content_encoder
+  - converter
+  - vocoder
+  - ir_estimator
+
+# Parity verification thresholds
+parity:
+  atol: 5.0e-5
+  rtol: 1.0e-3

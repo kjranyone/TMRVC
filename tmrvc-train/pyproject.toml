@@ -1,0 +1,29 @@
+[project]
+name = "tmrvc-train"
+version = "0.1.0"
+description = "TMRVC train: model definitions, training, distillation"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "tmrvc-core",
+    "tmrvc-data",
+    "torch>=2.2",
+    "wandb>=0.16",
+    "accelerate>=0.25",
+]
+
+[project.scripts]
+tmrvc-train-teacher = "tmrvc_train.cli.train_teacher:main"
+tmrvc-distill = "tmrvc_train.cli.distill:main"
+tmrvc-finetune = "tmrvc_train.cli.finetune:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+tmrvc-core = { workspace = true }
+tmrvc-data = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tmrvc_train"]
