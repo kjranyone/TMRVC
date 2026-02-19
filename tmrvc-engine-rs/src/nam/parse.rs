@@ -47,8 +47,7 @@ struct RawMetadata {
 
 /// Parse a .nam JSON string into a `NamFile`.
 pub(crate) fn parse_nam_json(json_str: &str) -> Result<NamFile> {
-    let raw: RawNamFile =
-        serde_json::from_str(json_str).context("Failed to parse .nam JSON")?;
+    let raw: RawNamFile = serde_json::from_str(json_str).context("Failed to parse .nam JSON")?;
 
     // Version check: accept 0.5.x or missing version
     if let Some(ref ver) = raw.version {

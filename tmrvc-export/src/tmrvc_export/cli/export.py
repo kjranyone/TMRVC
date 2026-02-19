@@ -1,4 +1,4 @@
-"""``tmrvc-export`` — Export, quantize, and verify ONNX models.
+"""``tmrvc-export`` - Export, quantize, and verify ONNX models.
 
 Usage::
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 import torch
@@ -59,6 +60,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # torch.onnx exporter prints Unicode symbols; force UTF-8 stdio on Windows
+    # to avoid cp932 encode failures.
+    if sys.platform.startswith("win"):
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if callable(reconfigure):
+                try:
+                    reconfigure(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
 

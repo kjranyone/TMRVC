@@ -14,15 +14,24 @@ use crate::ui::controls::{self, ControlsState};
 use crate::ui::device_panel::{self, DevicePanelState};
 use crate::ui::model_panel::{self, ModelPanelEvent, ModelPanelState};
 use crate::ui::monitor;
+use crate::ui::voice_profile_panel::{self, VoiceProfileEvent, VoiceProfilePanelState};
 use eframe::egui;
 use tmrvc_engine_rs::constants::*;
 use tmrvc_engine_rs::processor::{FrameParams, SharedStatus, StreamingEngine};
 use tmrvc_engine_rs::ring_buffer::SpscRingBuffer;
 
+/// Messages sent from the voice profile worker thread to the GUI.
+enum ProfileProgressMsg {
+    Progress(String),
+    Done(String),
+    Error(String),
+}
+
 /// Commands sent from GUI thread to processor thread.
 pub enum Command {
     LoadModels(String),
     LoadSpeaker(String),
+    LoadStyle(String),
     Start,
     Stop,
     Quit,
@@ -34,19 +43,26 @@ pub struct TmrvcApp {
     device_panel: DevicePanelState,
     model_panel: ModelPanelState,
     controls: ControlsState,
+    voice_profile_panel: VoiceProfilePanelState,
 
-    // Shared atomics (GUI ↔ Processor)
+    // Voice profile creation worker
+    profile_progress_rx: Option<Receiver<ProfileProgressMsg>>,
+
+    // Shared atomics (GUI <-> Processor)
     dry_wet: Arc<AtomicF32>,
     output_gain: Arc<AtomicF32>,
+    alpha_timbre: Arc<AtomicF32>,
+    beta_prosody: Arc<AtomicF32>,
+    gamma_articulation: Arc<AtomicF32>,
     latency_quality_q: Arc<AtomicF32>,
     status: Arc<SharedStatus>,
 
-    // Ring buffers (cpal ↔ Processor)
+    // Ring buffers (cpal <-> Processor)
     input_ring: Arc<SpscRingBuffer>,
     output_ring: Arc<SpscRingBuffer>,
     underrun_count: Arc<AtomicU64>,
 
-    // Command channel (GUI → Processor)
+    // Command channel (GUI -> Processor)
     command_tx: Sender<Command>,
 
     // Audio stream (owned, kept alive)
@@ -68,6 +84,9 @@ impl TmrvcApp {
         // Shared state
         let dry_wet = Arc::new(AtomicF32::new(1.0));
         let output_gain = Arc::new(AtomicF32::new(1.0));
+        let alpha_timbre = Arc::new(AtomicF32::new(1.0));
+        let beta_prosody = Arc::new(AtomicF32::new(0.0));
+        let gamma_articulation = Arc::new(AtomicF32::new(0.0));
         let latency_quality_q = Arc::new(AtomicF32::new(0.0));
         let status = Arc::new(SharedStatus::new());
         let input_ring = Arc::new(SpscRingBuffer::new(RING_BUFFER_CAPACITY));
@@ -81,6 +100,9 @@ impl TmrvcApp {
         {
             let dry_wet = Arc::clone(&dry_wet);
             let output_gain = Arc::clone(&output_gain);
+            let alpha_timbre = Arc::clone(&alpha_timbre);
+            let beta_prosody = Arc::clone(&beta_prosody);
+            let gamma_articulation = Arc::clone(&gamma_articulation);
             let latency_quality_q = Arc::clone(&latency_quality_q);
             let status = Arc::clone(&status);
             let input_ring = Arc::clone(&input_ring);
@@ -93,6 +115,9 @@ impl TmrvcApp {
                         command_rx,
                         dry_wet,
                         output_gain,
+                        alpha_timbre,
+                        beta_prosody,
+                        gamma_articulation,
                         latency_quality_q,
                         status,
                         input_ring,
@@ -102,12 +127,55 @@ impl TmrvcApp {
                 .expect("Failed to spawn processor thread");
         }
 
+        let model_panel = ModelPanelState::new();
+
+        // Check if speaker_encoder.onnx is available
+        let encoder_available = if !model_panel.onnx_dir.is_empty() {
+            Path::new(&model_panel.onnx_dir)
+                .join("speaker_encoder.onnx")
+                .exists()
+        } else {
+            false
+        };
+
+        // Check if Python fine-tune CLI is available
+        let python_available = std::process::Command::new("tmrvc-finetune")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+
+        let voice_profile_panel = VoiceProfilePanelState::new(encoder_available, python_available);
+
+        if !model_panel.onnx_dir.is_empty() {
+            let _ = command_tx.send(Command::LoadModels(model_panel.onnx_dir.clone()));
+        }
+        if !model_panel.speaker_path.is_empty() {
+            let _ = command_tx.send(Command::LoadSpeaker(model_panel.speaker_path.clone()));
+        }
+        if !model_panel.style_path.is_empty() {
+            let _ = command_tx.send(Command::LoadStyle(model_panel.style_path.clone()));
+        }
+
+        let status_text =
+            if !model_panel.onnx_dir.is_empty() || !model_panel.speaker_path.is_empty() {
+                "Auto-loading default models/speaker...".to_string()
+            } else {
+                "Ready".to_string()
+            };
+
         Self {
             device_panel: DevicePanelState::new(input_names, output_names),
-            model_panel: ModelPanelState::new(),
+            model_panel,
             controls: ControlsState::new(),
+            voice_profile_panel,
+            profile_progress_rx: None,
             dry_wet,
             output_gain,
+            alpha_timbre,
+            beta_prosody,
+            gamma_articulation,
             latency_quality_q,
             status,
             input_ring,
@@ -115,7 +183,7 @@ impl TmrvcApp {
             underrun_count,
             command_tx,
             audio_stream: None,
-            status_text: "Ready".to_string(),
+            status_text,
             is_running: false,
         }
     }
@@ -141,9 +209,64 @@ impl eframe::App for TmrvcApp {
                     let _ = self.command_tx.send(Command::LoadSpeaker(path));
                     self.status_text = "Loading speaker...".to_string();
                 }
+                ModelPanelEvent::LoadStyle(path) => {
+                    let _ = self.command_tx.send(Command::LoadStyle(path));
+                    self.status_text = "Loading style...".to_string();
+                }
                 ModelPanelEvent::None => {}
             }
             ui.add_space(4.0);
+
+            // Voice profile panel
+            match voice_profile_panel::draw_voice_profile_panel(ui, &mut self.voice_profile_panel) {
+                VoiceProfileEvent::CreateEmbeddingProfile {
+                    audio_paths,
+                    output_path,
+                    profile_name,
+                    author_name,
+                    co_author_name,
+                    licence_url,
+                } => {
+                    self.start_embedding_profile(
+                        audio_paths,
+                        output_path,
+                        profile_name,
+                        author_name,
+                        co_author_name,
+                        licence_url,
+                    );
+                }
+                VoiceProfileEvent::CreateFinetunedProfile {
+                    audio_paths,
+                    output_path,
+                    checkpoint_path,
+                    profile_name,
+                    author_name,
+                    co_author_name,
+                    licence_url,
+                } => {
+                    self.start_finetuned_profile(
+                        audio_paths,
+                        output_path,
+                        checkpoint_path,
+                        profile_name,
+                        author_name,
+                        co_author_name,
+                        licence_url,
+                    );
+                }
+                VoiceProfileEvent::CreateStyleProfile {
+                    audio_paths,
+                    output_path,
+                } => {
+                    self.start_style_profile(audio_paths, output_path);
+                }
+                VoiceProfileEvent::None => {}
+            }
+            ui.add_space(4.0);
+
+            // Poll profile worker progress
+            self.poll_profile_progress();
 
             // Start / Stop buttons
             ui.horizontal(|ui| {
@@ -178,6 +301,12 @@ impl eframe::App for TmrvcApp {
                 self.dry_wet.store(self.controls.dry_wet, Ordering::Relaxed);
                 self.output_gain
                     .store(self.controls.gain_linear(), Ordering::Relaxed);
+                self.alpha_timbre
+                    .store(self.controls.alpha_timbre, Ordering::Relaxed);
+                self.beta_prosody
+                    .store(self.controls.beta_prosody, Ordering::Relaxed);
+                self.gamma_articulation
+                    .store(self.controls.gamma_articulation, Ordering::Relaxed);
                 self.latency_quality_q
                     .store(self.controls.latency_quality_q, Ordering::Relaxed);
             }
@@ -189,7 +318,7 @@ impl eframe::App for TmrvcApp {
         });
 
         // Request repaint for live monitoring (~30 fps)
-        if self.is_running {
+        if self.is_running || self.voice_profile_panel.creating {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
@@ -240,6 +369,230 @@ impl TmrvcApp {
         }
     }
 
+    fn start_embedding_profile(
+        &mut self,
+        audio_paths: Vec<String>,
+        output_path: String,
+        profile_name: String,
+        author_name: String,
+        co_author_name: String,
+        licence_url: String,
+    ) {
+        let onnx_dir = self.model_panel.onnx_dir.clone();
+        let encoder_path = Path::new(&onnx_dir).join("speaker_encoder.onnx");
+
+        let (tx, rx) = unbounded();
+        self.profile_progress_rx = Some(rx);
+        self.voice_profile_panel.creating = true;
+        self.voice_profile_panel.progress_message = "Creating speaker profile...".to_string();
+
+        let command_tx = self.command_tx.clone();
+
+        thread::Builder::new()
+            .name("voice-profile-worker".to_string())
+            .spawn(move || {
+                use tmrvc_engine_rs::speaker_encoder::SpeakerEncoderSession;
+                use tmrvc_engine_rs::voice_profile::{create_voice_profile, ProfileProgress};
+
+                let mut encoder = match SpeakerEncoderSession::load(&encoder_path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let _ = tx.send(ProfileProgressMsg::Error(format!(
+                            "Encoder load failed: {}",
+                            e
+                        )));
+                        return;
+                    }
+                };
+
+                let paths: Vec<std::path::PathBuf> =
+                    audio_paths.iter().map(std::path::PathBuf::from).collect();
+                let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+                let out_path = std::path::PathBuf::from(&output_path);
+
+                let mut progress_fn = |p: ProfileProgress| {
+                    let msg = match &p {
+                        ProfileProgress::LoadingAudio(i, n) => {
+                            format!("Loading audio... ({}/{})", i, n)
+                        }
+                        ProfileProgress::ComputingMel => "Computing mel...".to_string(),
+                        ProfileProgress::RunningEncoder => "Running encoder...".to_string(),
+                        ProfileProgress::Saving => "Saving...".to_string(),
+                        ProfileProgress::Done(path) => format!("Done: {}", path),
+                        ProfileProgress::Error(e) => format!("Error: {}", e),
+                    };
+                    let _ = tx.send(ProfileProgressMsg::Progress(msg));
+                };
+
+                match create_voice_profile(
+                    &mut encoder,
+                    &path_refs,
+                    &out_path,
+                    true, // embedding only
+                    &profile_name,
+                    &author_name,
+                    &co_author_name,
+                    &licence_url,
+                    &mut progress_fn,
+                ) {
+                    Ok(()) => {
+                        let _ = tx.send(ProfileProgressMsg::Done(output_path.clone()));
+                        // Auto-load the new profile
+                        let _ = command_tx.send(Command::LoadSpeaker(output_path));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProfileProgressMsg::Error(format!("{}", e)));
+                    }
+                }
+            })
+            .expect("Failed to spawn voice profile worker");
+    }
+    fn start_finetuned_profile(
+        &mut self,
+        audio_paths: Vec<String>,
+        output_path: String,
+        checkpoint_path: String,
+        profile_name: String,
+        author_name: String,
+        co_author_name: String,
+        licence_url: String,
+    ) {
+        let (tx, rx) = unbounded();
+        self.profile_progress_rx = Some(rx);
+        self.voice_profile_panel.creating = true;
+        self.voice_profile_panel.progress_message = "Starting fine-tune...".to_string();
+
+        let command_tx = self.command_tx.clone();
+
+        thread::Builder::new()
+            .name("voice-profile-finetune".to_string())
+            .spawn(move || {
+                let _ = tx.send(ProfileProgressMsg::Progress(
+                    "Running tmrvc-finetune...".to_string(),
+                ));
+
+                let mut cmd = std::process::Command::new("tmrvc-finetune");
+                cmd.arg("--audio-files");
+                for p in &audio_paths {
+                    cmd.arg(p);
+                }
+                cmd.arg("--checkpoint").arg(&checkpoint_path);
+                cmd.arg("--output").arg(&output_path);
+                if !profile_name.is_empty() {
+                    cmd.arg("--profile-name").arg(&profile_name);
+                }
+                if !author_name.is_empty() {
+                    cmd.arg("--author-name").arg(&author_name);
+                }
+                if !co_author_name.is_empty() {
+                    cmd.arg("--co-author-name").arg(&co_author_name);
+                }
+                if !licence_url.is_empty() {
+                    cmd.arg("--licence-url").arg(&licence_url);
+                }
+
+                match cmd.output() {
+                    Ok(output) => {
+                        if output.status.success() {
+                            let _ = tx.send(ProfileProgressMsg::Done(output_path.clone()));
+                            let _ = command_tx.send(Command::LoadSpeaker(output_path));
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let _ = tx.send(ProfileProgressMsg::Error(format!(
+                                "Fine-tune failed: {}",
+                                stderr
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProfileProgressMsg::Error(format!(
+                            "Failed to run tmrvc-finetune: {}",
+                            e
+                        )));
+                    }
+                }
+            })
+            .expect("Failed to spawn finetune worker");
+    }
+    fn start_style_profile(&mut self, audio_paths: Vec<String>, output_path: String) {
+        let (tx, rx) = unbounded();
+        self.profile_progress_rx = Some(rx);
+        self.voice_profile_panel.creating = true;
+        self.voice_profile_panel.progress_message = "Creating style profile...".to_string();
+
+        let command_tx = self.command_tx.clone();
+
+        thread::Builder::new()
+            .name("style-profile-worker".to_string())
+            .spawn(move || {
+                use tmrvc_engine_rs::voice_profile::{create_style_profile, ProfileProgress};
+
+                let paths: Vec<std::path::PathBuf> =
+                    audio_paths.iter().map(std::path::PathBuf::from).collect();
+                let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+                let out_path = std::path::PathBuf::from(&output_path);
+
+                let mut progress_fn = |p: ProfileProgress| {
+                    let msg = match &p {
+                        ProfileProgress::LoadingAudio(i, n) => {
+                            format!("Loading audio... ({}/{})", i, n)
+                        }
+                        ProfileProgress::ComputingMel => "Analyzing style features...".to_string(),
+                        ProfileProgress::RunningEncoder => "Running analysis...".to_string(),
+                        ProfileProgress::Saving => "Saving...".to_string(),
+                        ProfileProgress::Done(path) => format!("Done: {}", path),
+                        ProfileProgress::Error(e) => format!("Error: {}", e),
+                    };
+                    let _ = tx.send(ProfileProgressMsg::Progress(msg));
+                };
+
+                match create_style_profile(&path_refs, &out_path, &mut progress_fn) {
+                    Ok(()) => {
+                        let _ = tx.send(ProfileProgressMsg::Done(output_path.clone()));
+                        let _ = command_tx.send(Command::LoadStyle(output_path));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProfileProgressMsg::Error(format!("{}", e)));
+                    }
+                }
+            })
+            .expect("Failed to spawn style profile worker");
+    }
+    fn poll_profile_progress(&mut self) {
+        let Some(rx) = &self.profile_progress_rx else {
+            return;
+        };
+
+        let mut done = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ProfileProgressMsg::Progress(text) => {
+                    self.voice_profile_panel.progress_message = text;
+                }
+                ProfileProgressMsg::Done(path) => {
+                    self.voice_profile_panel.progress_message = format!("Done: {}", path);
+                    self.voice_profile_panel.creating = false;
+                    if path.ends_with(".tmrvc_style") {
+                        self.model_panel.style_path = path;
+                        self.status_text = "Style profile loaded".to_string();
+                    } else {
+                        self.model_panel.speaker_path = path;
+                        self.status_text = "Speaker profile loaded".to_string();
+                    }
+                    done = true;
+                }
+                ProfileProgressMsg::Error(err) => {
+                    self.voice_profile_panel.progress_message = format!("Error: {}", err);
+                    self.voice_profile_panel.creating = false;
+                    done = true;
+                }
+            }
+        }
+        if done {
+            self.profile_progress_rx = None;
+        }
+    }
+
     fn stop_vc(&mut self) {
         let _ = self.command_tx.send(Command::Stop);
         self.audio_stream = None; // Drop stops streams
@@ -280,7 +633,7 @@ impl EvalLogger {
                 let mut w = BufWriter::new(file);
                 if let Err(e) = writeln!(
                     w,
-                    "unix_ms,frame_idx,frame_ms,p50_ms,p95_ms,q_current,q_mean,overrun_count"
+                    "unix_ms,frame_idx,frame_ms,p50_ms,p95_ms,q_current,q_mean,alpha,beta,gamma,est_f0_hz,style_target_f0_hz,style_loaded,overrun_count"
                 ) {
                     log::warn!("Failed to write CSV header: {}", e);
                 } else {
@@ -316,6 +669,10 @@ impl EvalLogger {
         status.inference_ms.store(0.0, Ordering::Relaxed);
         status.inference_p50_ms.store(0.0, Ordering::Relaxed);
         status.inference_p95_ms.store(0.0, Ordering::Relaxed);
+        status.alpha_timbre.store(1.0, Ordering::Relaxed);
+        status.beta_prosody.store(0.0, Ordering::Relaxed);
+        status.gamma_articulation.store(0.0, Ordering::Relaxed);
+        status.estimated_log_f0.store(0.0, Ordering::Relaxed);
     }
 
     fn record(&mut self, frame_ms: f32, q: f32, status: &Arc<SharedStatus>) {
@@ -374,12 +731,41 @@ impl EvalLogger {
             .unwrap_or(0);
         let p50 = status.inference_p50_ms.load(Ordering::Relaxed);
         let p95 = status.inference_p95_ms.load(Ordering::Relaxed);
+        let alpha = status.alpha_timbre.load(Ordering::Relaxed);
+        let beta = status.beta_prosody.load(Ordering::Relaxed);
+        let gamma = status.gamma_articulation.load(Ordering::Relaxed);
+        let est_log_f0 = status.estimated_log_f0.load(Ordering::Relaxed);
+        let tgt_log_f0 = status.style_target_log_f0.load(Ordering::Relaxed);
+        let style_loaded = status.style_loaded.load(Ordering::Relaxed);
+        let est_f0_hz = if est_log_f0 > 0.0 {
+            est_log_f0.exp() - 1.0
+        } else {
+            0.0
+        };
+        let tgt_f0_hz = if tgt_log_f0 > 0.0 {
+            tgt_log_f0.exp() - 1.0
+        } else {
+            0.0
+        };
         let overruns = status.overrun_count.load(Ordering::Relaxed);
 
         if let Err(e) = writeln!(
             writer,
-            "{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
-            unix_ms, self.sample_idx, frame_ms, p50, p95, q, q_mean, overruns
+            "{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{},{}",
+            unix_ms,
+            self.sample_idx,
+            frame_ms,
+            p50,
+            p95,
+            q,
+            q_mean,
+            alpha,
+            beta,
+            gamma,
+            est_f0_hz,
+            tgt_f0_hz,
+            if style_loaded { 1 } else { 0 },
+            overruns
         ) {
             log::warn!("Failed to write evaluation CSV row: {}", e);
             return;
@@ -433,7 +819,7 @@ mod tests {
         logger.flush();
 
         let csv = fs::read_to_string(&csv_path).expect("failed to read eval csv");
-        assert!(csv.contains("p50_ms,p95_ms,q_current,q_mean,overrun_count"));
+        assert!(csv.contains("p50_ms,p95_ms,q_current,q_mean,alpha,beta,gamma,est_f0_hz,style_target_f0_hz,style_loaded,overrun_count"));
         assert!(csv.lines().count() >= 3); // header + at least 2 rows
         assert!(csv.contains(",0."));
         assert!(csv.contains(",1."));
@@ -447,6 +833,9 @@ fn processor_thread(
     command_rx: Receiver<Command>,
     dry_wet: Arc<AtomicF32>,
     output_gain: Arc<AtomicF32>,
+    alpha_timbre: Arc<AtomicF32>,
+    beta_prosody: Arc<AtomicF32>,
+    gamma_articulation: Arc<AtomicF32>,
     latency_quality_q: Arc<AtomicF32>,
     status: Arc<SharedStatus>,
     input_ring: Arc<SpscRingBuffer>,
@@ -467,6 +856,10 @@ fn processor_thread(
                 Command::LoadSpeaker(path) => match engine.load_speaker(Path::new(&path)) {
                     Ok(()) => log::info!("Speaker loaded"),
                     Err(e) => log::error!("Failed to load speaker: {}", e),
+                },
+                Command::LoadStyle(path) => match engine.load_style(Path::new(&path)) {
+                    Ok(()) => log::info!("Style loaded"),
+                    Err(e) => log::error!("Failed to load style: {}", e),
                 },
                 Command::Start => {
                     eval_logger.reset(&status);
@@ -499,13 +892,21 @@ fn processor_thread(
             let frame_params = FrameParams {
                 dry_wet: dry_wet.load(Ordering::Relaxed),
                 output_gain: output_gain.load(Ordering::Relaxed),
+                alpha_timbre: alpha_timbre.load(Ordering::Relaxed),
+                beta_prosody: beta_prosody.load(Ordering::Relaxed),
+                gamma_articulation: gamma_articulation.load(Ordering::Relaxed),
                 latency_quality_q: latency_quality_q.load(Ordering::Relaxed),
             };
             engine.process_one_frame(&input_buf, &mut output_buf, &frame_params);
             let frame_ms = status.inference_ms.load(Ordering::Relaxed);
-            let q = latency_quality_q.load(Ordering::Relaxed);
-            status.latency_quality_q.store(q, Ordering::Relaxed);
-            eval_logger.record(frame_ms, q, &status);
+            let q_effective = status.latency_quality_q.load(Ordering::Relaxed);
+            let a = alpha_timbre.load(Ordering::Relaxed);
+            let b = beta_prosody.load(Ordering::Relaxed);
+            let g = gamma_articulation.load(Ordering::Relaxed);
+            status.alpha_timbre.store(a, Ordering::Relaxed);
+            status.beta_prosody.store(b, Ordering::Relaxed);
+            status.gamma_articulation.store(g, Ordering::Relaxed);
+            eval_logger.record(frame_ms, q_effective, &status);
 
             // Write to output ring
             output_ring.write(&output_buf);

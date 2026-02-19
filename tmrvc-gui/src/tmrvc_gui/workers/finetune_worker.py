@@ -47,18 +47,20 @@ class FinetuneWorker(BaseWorker):
     def _run_finetune(self) -> None:
         import torch
 
+        from tmrvc_core.device import get_device
         from tmrvc_data.speaker import SpeakerEncoder
         from tmrvc_export.speaker_file import write_speaker_file
         from tmrvc_train.fewshot import FewShotConfig, FewShotFinetuner
         from tmrvc_train.models.content_encoder import ContentEncoderStudent
         from tmrvc_train.models.converter import ConverterStudent, ConverterStudentGTM
 
+        device = get_device()
         n_audio = len(self.audio_paths)
         total_work = n_audio + self.max_steps
 
         # 1. Speaker embedding extraction
-        self.log_message.emit("Extracting speaker embeddings...")
-        encoder = SpeakerEncoder()
+        self.log_message.emit(f"Extracting speaker embeddings on {device}...")
+        encoder = SpeakerEncoder(device=str(device))
         embeddings = []
         for i, path in enumerate(self.audio_paths):
             if self.is_cancelled:
@@ -79,6 +81,7 @@ class FinetuneWorker(BaseWorker):
 
         content_encoder = ContentEncoderStudent()
         content_encoder.load_state_dict(ckpt["content_encoder"])
+        content_encoder.to(device)
 
         if self.use_gtm:
             converter = ConverterStudentGTM()
@@ -86,6 +89,7 @@ class FinetuneWorker(BaseWorker):
         else:
             converter = ConverterStudent()
             converter.load_state_dict(ckpt["converter"])
+        converter.to(device)
 
         # 3. Fine-tune
         config = FewShotConfig(
@@ -108,11 +112,23 @@ class FinetuneWorker(BaseWorker):
                 self.metric.emit("loss", loss, step)
 
         # 4. Save .tmrvc_speaker
+        from datetime import datetime, timezone
+
         lora_delta = finetuner.get_lora_delta()
+        metadata = {
+            "profile_name": self.output_path.stem,
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "description": "",
+            "source_audio_files": [Path(p).name for p in self.audio_paths],
+            "source_sample_count": 0,
+            "training_mode": "finetune",
+            "checkpoint_name": self.checkpoint_path.name,
+        }
         write_speaker_file(
             self.output_path,
             spk_embed.numpy().astype("float32"),
             lora_delta.detach().numpy().astype("float32"),
+            metadata=metadata,
         )
         self.log_message.emit(f"Saved: {self.output_path}")
         self.finished.emit(True, f"Fine-tuning complete: {self.output_path}")

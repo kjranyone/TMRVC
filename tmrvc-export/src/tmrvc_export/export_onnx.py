@@ -16,8 +16,12 @@ from tmrvc_core.constants import (
     D_SPEAKER,
     D_VOCODER_FEATURES,
     IR_ESTIMATOR_STATE_FRAMES,
+    LORA_ALPHA,
+    LORA_DELTA_SIZE,
+    LORA_RANK,
     MAX_LOOKAHEAD_HOPS,
     N_IR_PARAMS,
+    N_LORA_LAYERS,
     N_MELS,
     VOCODER_STATE_FRAMES,
 )
@@ -34,6 +38,10 @@ from tmrvc_train.models.vocoder import VocoderStudent
 logger = logging.getLogger(__name__)
 
 _OPSET_VERSION = 18
+_LORA_SCALE = float(LORA_ALPHA) / float(LORA_RANK)
+_FILM_D_IN = D_SPEAKER + N_IR_PARAMS
+_FILM_D_OUT = D_CONVERTER_HIDDEN * 2
+_FILM_LAYER_PARAM_SIZE = _FILM_D_IN * LORA_RANK + LORA_RANK * _FILM_D_OUT
 
 
 class _ContentEncoderWrapper(torch.nn.Module):
@@ -51,18 +59,120 @@ class _ContentEncoderWrapper(torch.nn.Module):
 
 
 class _ConverterWrapper(torch.nn.Module):
-    def __init__(self, model: ConverterStudent | ConverterStudentGTM) -> None:
+    """Converter export wrapper with explicit LoRA delta input."""
+
+    def __init__(self, model: ConverterStudent) -> None:
         super().__init__()
         self.model = model
+
+    @staticmethod
+    def _film_lora_delta(
+        cond: torch.Tensor,
+        lora_delta: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        bsz = cond.shape[0]
+        layer_start = layer_idx * _FILM_LAYER_PARAM_SIZE
+
+        a_start = layer_start
+        a_end = a_start + _FILM_D_IN * LORA_RANK
+        b_end = a_end + LORA_RANK * _FILM_D_OUT
+
+        a = lora_delta[:, a_start:a_end].reshape(bsz, _FILM_D_IN, LORA_RANK)
+        b = lora_delta[:, a_end:b_end].reshape(bsz, LORA_RANK, _FILM_D_OUT)
+
+        low_rank = torch.bmm(cond.unsqueeze(1), a).squeeze(1)
+        delta = torch.bmm(low_rank.unsqueeze(1), b).squeeze(1)
+        return delta * _LORA_SCALE
 
     def forward(
         self,
         content: torch.Tensor,
         spk_embed: torch.Tensor,
+        lora_delta: torch.Tensor,
         ir_params: torch.Tensor,
         state_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pred_features, state_out = self.model(content, spk_embed, ir_params, state_in)
+        cond = torch.cat([spk_embed, ir_params], dim=-1)  # [B, 216]
+
+        x = self.model.input_proj(content)
+
+        states = self.model._split_state(state_in)
+        new_states = []
+
+        for i, (block, s_in) in enumerate(zip(self.model.blocks, states)):
+            x, s_out = block.conv_block(x, s_in)
+
+            gamma_beta = block.film.proj(cond)
+            if i < N_LORA_LAYERS:
+                gamma_beta = gamma_beta + self._film_lora_delta(cond, lora_delta, i)
+
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            x = gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
+            new_states.append(s_out)
+
+        pred_features = self.model.output_proj(x)
+        state_out = torch.cat(new_states, dim=-1)
+        return pred_features, state_out
+
+
+class _ConverterGTMWrapper(torch.nn.Module):
+    """GTM converter export wrapper with explicit LoRA delta input."""
+
+    def __init__(self, model: ConverterStudentGTM) -> None:
+        super().__init__()
+        self.model = model
+
+        self._gtm_d_in = model.gtm.proj.in_features
+        self._gtm_d_out = model.gtm.proj.out_features
+        self._gtm_layer_param_size = (
+            self._gtm_d_in * LORA_RANK + LORA_RANK * self._gtm_d_out
+        )
+
+    def _gtm_lora_delta(
+        self,
+        spk_embed: torch.Tensor,
+        lora_delta: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz = spk_embed.shape[0]
+        used = lora_delta[:, :self._gtm_layer_param_size]
+
+        a_end = self._gtm_d_in * LORA_RANK
+        a = used[:, :a_end].reshape(bsz, self._gtm_d_in, LORA_RANK)
+        b = used[:, a_end:].reshape(bsz, LORA_RANK, self._gtm_d_out)
+
+        low_rank = torch.bmm(spk_embed.unsqueeze(1), a).squeeze(1)
+        delta = torch.bmm(low_rank.unsqueeze(1), b).squeeze(1)
+        return delta * _LORA_SCALE
+
+    def forward(
+        self,
+        content: torch.Tensor,
+        spk_embed: torch.Tensor,
+        lora_delta: torch.Tensor,
+        ir_params: torch.Tensor,
+        state_in: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        base_memory = self.model.gtm.proj(spk_embed)
+        delta_memory = self._gtm_lora_delta(spk_embed, lora_delta)
+        timbre_memory = (base_memory + delta_memory).reshape(
+            -1,
+            self.model.gtm.n_entries,
+            self.model.gtm.d_entry,
+        )
+
+        x = self.model.input_proj(content)
+
+        states = self.model._split_state(state_in)
+        new_states = []
+        for block, s_in in zip(self.model.blocks, states):
+            x, s_out = block.conv_block(x, s_in)
+            x = x + block.timbre_attn(x, timbre_memory)
+            x = block.film_ir(x, ir_params)
+            new_states.append(s_out)
+
+        pred_features = self.model.output_proj(x)
+        state_out = torch.cat(new_states, dim=-1)
         return pred_features, state_out
 
 
@@ -90,11 +200,79 @@ class _IREstimatorWrapper(torch.nn.Module):
         return ir_params, state_out
 
 
+class _ConverterHQWrapper(torch.nn.Module):
+    """HQ converter export wrapper with explicit LoRA delta input."""
+
+    def __init__(self, model: ConverterStudentHQ) -> None:
+        super().__init__()
+        self.model = model
+
+    @staticmethod
+    def _film_lora_delta(
+        cond: torch.Tensor,
+        lora_delta: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        bsz = cond.shape[0]
+        layer_start = layer_idx * _FILM_LAYER_PARAM_SIZE
+
+        a_start = layer_start
+        a_end = a_start + _FILM_D_IN * LORA_RANK
+        b_end = a_end + LORA_RANK * _FILM_D_OUT
+
+        a = lora_delta[:, a_start:a_end].reshape(bsz, _FILM_D_IN, LORA_RANK)
+        b = lora_delta[:, a_end:b_end].reshape(bsz, LORA_RANK, _FILM_D_OUT)
+
+        low_rank = torch.bmm(cond.unsqueeze(1), a).squeeze(1)
+        delta = torch.bmm(low_rank.unsqueeze(1), b).squeeze(1)
+        return delta * _LORA_SCALE
+
+    def forward(
+        self,
+        content: torch.Tensor,
+        spk_embed: torch.Tensor,
+        lora_delta: torch.Tensor,
+        ir_params: torch.Tensor,
+        state_in: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cond = torch.cat([spk_embed, ir_params], dim=-1)  # [B, 216]
+
+        x = self.model.input_proj(content)
+
+        states = self.model._split_state(state_in)
+        new_states = []
+
+        for i, (block, s_in) in enumerate(zip(self.model.blocks, states)):
+            x, s_out = block.conv_block(x, s_in)
+
+            gamma_beta = block.film.proj(cond)
+            if i < N_LORA_LAYERS:
+                gamma_beta = gamma_beta + self._film_lora_delta(cond, lora_delta, i)
+
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            x = gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
+            new_states.append(s_out)
+
+        pred_features = self.model.output_proj(x)
+        state_out = torch.cat(new_states, dim=-1)
+        return pred_features, state_out
+
+
+def _prepare_output_path(output_path: Path) -> None:
+    """Remove stale ONNX/external-data files before export."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    for p in (output_path, Path(f"{output_path}.data")):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
 def export_content_encoder(
     model: ContentEncoderStudent, output_path: str | Path,
 ) -> Path:
     """Export content encoder to ONNX (streaming mode, T=1)."""
     output_path = Path(output_path)
+    _prepare_output_path(output_path)
     model.eval()
 
     wrapper = _ContentEncoderWrapper(model).eval()
@@ -115,40 +293,30 @@ def export_content_encoder(
     return output_path
 
 
-class _ConverterHQWrapper(torch.nn.Module):
-    def __init__(self, model: ConverterStudentHQ) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(
-        self,
-        content: torch.Tensor,
-        spk_embed: torch.Tensor,
-        ir_params: torch.Tensor,
-        state_in: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pred_features, state_out = self.model(content, spk_embed, ir_params, state_in)
-        return pred_features, state_out
-
-
 def export_converter(
     model: ConverterStudent | ConverterStudentGTM, output_path: str | Path,
 ) -> Path:
-    """Export converter to ONNX (streaming mode, T=1)."""
+    """Export converter to ONNX (streaming mode, T=1) with LoRA input."""
     output_path = Path(output_path)
+    _prepare_output_path(output_path)
     model.eval()
 
-    wrapper = _ConverterWrapper(model).eval()
+    if isinstance(model, ConverterStudentGTM):
+        wrapper = _ConverterGTMWrapper(model).eval()
+    else:
+        wrapper = _ConverterWrapper(model).eval()
+
     dummy_content = torch.zeros(1, D_CONTENT, 1)
     dummy_spk = torch.zeros(1, D_SPEAKER)
+    dummy_lora = torch.zeros(1, LORA_DELTA_SIZE)
     dummy_ir = torch.zeros(1, N_IR_PARAMS)
     dummy_state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES)
 
     torch.onnx.export(
         wrapper,
-        (dummy_content, dummy_spk, dummy_ir, dummy_state),
+        (dummy_content, dummy_spk, dummy_lora, dummy_ir, dummy_state),
         str(output_path),
-        input_names=["content", "spk_embed", "ir_params", "state_in"],
+        input_names=["content", "spk_embed", "lora_delta", "ir_params", "state_in"],
         output_names=["pred_features", "state_out"],
         dynamic_axes=None,
         opset_version=_OPSET_VERSION,
@@ -162,19 +330,21 @@ def export_converter_hq(
 ) -> Path:
     """Export HQ converter to ONNX (streaming mode, T_in=1+L, T_out=1)."""
     output_path = Path(output_path)
+    _prepare_output_path(output_path)
     model.eval()
 
     wrapper = _ConverterHQWrapper(model).eval()
     dummy_content = torch.zeros(1, D_CONTENT, 1 + MAX_LOOKAHEAD_HOPS)  # [1, 256, 7]
     dummy_spk = torch.zeros(1, D_SPEAKER)
+    dummy_lora = torch.zeros(1, LORA_DELTA_SIZE)
     dummy_ir = torch.zeros(1, N_IR_PARAMS)
     dummy_state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES)  # [1, 384, 46]
 
     torch.onnx.export(
         wrapper,
-        (dummy_content, dummy_spk, dummy_ir, dummy_state),
+        (dummy_content, dummy_spk, dummy_lora, dummy_ir, dummy_state),
         str(output_path),
-        input_names=["content", "spk_embed", "ir_params", "state_in"],
+        input_names=["content", "spk_embed", "lora_delta", "ir_params", "state_in"],
         output_names=["pred_features", "state_out"],
         dynamic_axes=None,
         opset_version=_OPSET_VERSION,
@@ -188,6 +358,7 @@ def export_vocoder(
 ) -> Path:
     """Export vocoder to ONNX (streaming mode, T=1)."""
     output_path = Path(output_path)
+    _prepare_output_path(output_path)
     model.eval()
 
     wrapper = _VocoderWrapper(model).eval()
@@ -212,6 +383,7 @@ def export_ir_estimator(
 ) -> Path:
     """Export IR estimator to ONNX (chunk mode, N=10)."""
     output_path = Path(output_path)
+    _prepare_output_path(output_path)
     model.eval()
 
     wrapper = _IREstimatorWrapper(model).eval()
@@ -236,6 +408,7 @@ def export_speaker_encoder(
 ) -> Path:
     """Export speaker encoder to ONNX (offline, variable-length input)."""
     output_path = Path(output_path)
+    _prepare_output_path(output_path)
     model.eval()
 
     # T_ref is variable (3-15 seconds, 300-1500 frames)
@@ -256,7 +429,7 @@ def export_speaker_encoder(
 
 def export_all(
     content_encoder: ContentEncoderStudent,
-    converter: ConverterStudent,
+    converter: ConverterStudent | ConverterStudentGTM,
     vocoder: VocoderStudent,
     ir_estimator: IREstimator,
     speaker_encoder: SpeakerEncoderWithLoRA,

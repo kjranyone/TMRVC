@@ -93,6 +93,58 @@ class TestDataset:
         assert batch.spk_embed.shape == (4, D_SPEAKER)
 
 
+    def test_subset_filters_entries(self, tmp_cache_dir):
+        cache = FeatureCache(tmp_cache_dir)
+        dataset_name = "test_subset"
+
+        for i in range(20):
+            spk = f"spk_{i % 4}"
+            fs = _make_feature_set(spk, f"utt_{i:03d}", 100)
+            fs.speaker_id = spk
+            fs.utterance_id = f"utt_{i:03d}"
+            cache.save(fs, dataset_name, "train")
+
+        # Full dataset
+        ds_full = TMRVCDataset(cache, dataset_name, "train", cross_speaker_prob=0.0)
+        assert len(ds_full) == 20
+
+        # 50% subset
+        ds_half = TMRVCDataset(
+            cache, dataset_name, "train", cross_speaker_prob=0.0, subset=0.5,
+        )
+        assert len(ds_half) == 10
+
+        # 10% subset (at least 1)
+        ds_tiny = TMRVCDataset(
+            cache, dataset_name, "train", cross_speaker_prob=0.0, subset=0.05,
+        )
+        assert len(ds_tiny) == 1
+
+    def test_subset_dataloader(self, tmp_cache_dir):
+        cache = FeatureCache(tmp_cache_dir)
+        dataset_name = "test_subset_dl"
+
+        for i in range(16):
+            spk = f"spk_{i % 4}"
+            fs = _make_feature_set(spk, f"utt_{i:03d}", 100)
+            fs.speaker_id = spk
+            fs.utterance_id = f"utt_{i:03d}"
+            cache.save(fs, dataset_name, "train")
+
+        loader = create_dataloader(
+            tmp_cache_dir,
+            dataset_name,
+            batch_size=4,
+            num_workers=0,
+            cross_speaker_prob=0.0,
+            balanced_sampling=False,
+            subset=0.5,
+        )
+        # 16 * 0.5 = 8 entries, batch_size=4, drop_last=True → 2 batches
+        batches = list(loader)
+        assert len(batches) == 2
+
+
 class TestBalancedSpeakerSampler:
     def test_covers_all_indices(self):
         speaker_ids = ["a", "a", "a", "b", "b", "c"]

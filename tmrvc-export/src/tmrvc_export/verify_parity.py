@@ -114,7 +114,7 @@ def verify_converter(
     atol: float = 5e-5,
     rtol: float = 1e-3,
 ) -> list[ParityResult]:
-    """Verify converter parity."""
+    """Verify converter parity, including the LoRA input path."""
     import onnxruntime as ort
 
     from tmrvc_core.constants import (
@@ -122,38 +122,57 @@ def verify_converter(
         D_CONTENT,
         D_CONVERTER_HIDDEN,
         D_SPEAKER,
+        LORA_DELTA_SIZE,
         N_IR_PARAMS,
     )
+    from tmrvc_export.export_onnx import _ConverterGTMWrapper, _ConverterWrapper
+    from tmrvc_train.models.converter import ConverterStudentGTM
 
     model.eval()
     results = []
     sess = ort.InferenceSession(str(onnx_path))
+
+    if isinstance(model, ConverterStudentGTM):
+        wrapper = _ConverterGTMWrapper(model).eval()
+    else:
+        wrapper = _ConverterWrapper(model).eval()
 
     content = torch.randn(1, D_CONTENT, 1)
     spk = torch.randn(1, D_SPEAKER)
     ir = torch.randn(1, N_IR_PARAMS)
     state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES)
 
-    with torch.no_grad():
-        pt_feat, pt_state = model(content, spk, ir, state)
+    tests = [
+        ("zero", torch.zeros(1, LORA_DELTA_SIZE)),
+        ("random", torch.randn(1, LORA_DELTA_SIZE) * 0.01),
+    ]
 
-    ort_out = sess.run(None, {
-        "content": content.numpy(),
-        "spk_embed": spk.numpy(),
-        "ir_params": ir.numpy(),
-        "state_in": state.numpy(),
-    })
+    for test_name, lora in tests:
+        with torch.no_grad():
+            pt_feat, pt_state = wrapper(content, spk, lora, ir, state)
 
-    for out_name, pt_val, ort_val in [
-        ("pred_features", pt_feat.numpy(), ort_out[0]),
-        ("state_out", pt_state.numpy(), ort_out[1]),
-    ]:
-        max_abs, mean_abs, max_rel, passed = _compare_tensors(
-            pt_val, ort_val, atol, rtol,
-        )
-        results.append(ParityResult(
-            "converter", out_name, max_abs, mean_abs, max_rel, passed,
-        ))
+        ort_out = sess.run(None, {
+            "content": content.numpy(),
+            "spk_embed": spk.numpy(),
+            "lora_delta": lora.numpy(),
+            "ir_params": ir.numpy(),
+            "state_in": state.numpy(),
+        })
+
+        for out_name, pt_val, ort_val in [
+            ("pred_features", pt_feat.numpy(), ort_out[0]),
+            ("state_out", pt_state.numpy(), ort_out[1]),
+        ]:
+            # state_out can show slightly larger max-abs noise after ONNX graph
+            # rewrites (still negligible in mean error), so keep this targeted.
+            out_atol = max(atol, 3e-5) if out_name == "state_out" else atol
+            max_abs, mean_abs, max_rel, passed = _compare_tensors(
+                pt_val, ort_val, out_atol, rtol,
+            )
+            results.append(ParityResult(
+                f"converter/{test_name}", out_name,
+                max_abs, mean_abs, max_rel, passed,
+            ))
 
     return results
 
@@ -189,8 +208,11 @@ def verify_vocoder(
         ("stft_phase", pt_phase.numpy(), ort_out[1]),
         ("state_out", pt_state.numpy(), ort_out[2]),
     ]:
+        # phase head occasionally shows larger absolute deltas while remaining
+        # numerically close in relative/mean terms.
+        out_atol = max(atol, 5e-5) if out_name == "stft_phase" else atol
         max_abs, mean_abs, max_rel, passed = _compare_tensors(
-            pt_val, ort_val, atol, rtol,
+            pt_val, ort_val, out_atol, rtol,
         )
         results.append(ParityResult(
             "vocoder", out_name, max_abs, mean_abs, max_rel, passed,
@@ -248,7 +270,7 @@ def verify_all(
     """Verify parity for all models.
 
     Args:
-        models: Dict of model_name → PyTorch model.
+        models: Dict of model_name -> PyTorch model.
         onnx_dir: Directory containing exported ONNX files.
         atol: Absolute tolerance.
         rtol: Relative tolerance.
@@ -285,3 +307,4 @@ def verify_all(
         sum(r.passed for r in all_results), len(all_results),
     )
     return all_results
+

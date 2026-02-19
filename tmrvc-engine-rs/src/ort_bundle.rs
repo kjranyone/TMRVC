@@ -1,24 +1,28 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::constants::*;
 
+const LORA_INPUT_NAME: &str = "lora_delta";
+
 /// Bundle of ONNX Runtime sessions for streaming inference.
 ///
-/// speaker_encoder is excluded — it runs offline and produces
+/// speaker_encoder is excluded - it runs offline and produces
 /// the .tmrvc_speaker file consumed by `speaker.rs`.
 ///
-/// `converter_hq` is optional — loaded only if `converter_hq.onnx` exists.
+/// `converter_hq` is optional - loaded only if `converter_hq.onnx` exists.
 pub struct OrtBundle {
     content_encoder: Session,
     ir_estimator: Session,
     converter: Session,
     converter_hq: Option<Session>,
     vocoder: Session,
+    converter_accepts_lora: bool,
+    converter_hq_accepts_lora: bool,
 }
 
 /// Helper to build a session with standard options.
@@ -31,10 +35,14 @@ fn build_session(model_path: impl AsRef<Path>) -> Result<Session> {
         .map_err(Into::into)
 }
 
+fn session_has_input(session: &Session, input_name: &str) -> bool {
+    session.inputs().iter().any(|inp| inp.name() == input_name)
+}
+
 impl OrtBundle {
     /// Load all streaming ONNX models from a directory.
     ///
-    /// `converter_hq.onnx` is optional — if present, HQ mode is available.
+    /// `converter_hq.onnx` is optional - if present, HQ mode is available.
     pub fn load(model_dir: &Path) -> Result<Self> {
         let content_encoder = build_session(model_dir.join("content_encoder.onnx"))
             .context("Failed to load content_encoder.onnx")?;
@@ -45,21 +53,30 @@ impl OrtBundle {
         let vocoder =
             build_session(model_dir.join("vocoder.onnx")).context("Failed to load vocoder.onnx")?;
 
+        let converter_accepts_lora = session_has_input(&converter, LORA_INPUT_NAME);
+        if !converter_accepts_lora {
+            bail!(
+                "converter.onnx must expose '{}' input (no backward-compat fallback)",
+                LORA_INPUT_NAME
+            );
+        }
+        log::info!("converter.onnx supports '{}' input", LORA_INPUT_NAME);
+
         // Optional HQ converter
         let hq_path = model_dir.join("converter_hq.onnx");
-        let converter_hq = if hq_path.exists() {
-            match build_session(&hq_path) {
-                Ok(sess) => {
-                    log::info!("HQ converter loaded from {:?}", hq_path);
-                    Some(sess)
-                }
-                Err(e) => {
-                    log::warn!("Failed to load converter_hq.onnx: {}", e);
-                    None
-                }
+        let (converter_hq, converter_hq_accepts_lora) = if hq_path.exists() {
+            let sess = build_session(&hq_path).context("Failed to load converter_hq.onnx")?;
+            if !session_has_input(&sess, LORA_INPUT_NAME) {
+                bail!(
+                    "converter_hq.onnx must expose '{}' input (no backward-compat fallback)",
+                    LORA_INPUT_NAME
+                );
             }
+            log::info!("HQ converter loaded from {:?}", hq_path);
+            log::info!("converter_hq.onnx supports '{}' input", LORA_INPUT_NAME);
+            (Some(sess), true)
         } else {
-            None
+            (None, false)
         };
 
         Ok(Self {
@@ -68,6 +85,8 @@ impl OrtBundle {
             converter,
             converter_hq,
             vocoder,
+            converter_accepts_lora,
+            converter_hq_accepts_lora,
         })
     }
 
@@ -76,7 +95,17 @@ impl OrtBundle {
         self.converter_hq.is_some()
     }
 
-    /// Run content_encoder: mel_frame[80] + f0[1] + state_in → content[256] + state_out
+    /// Returns true if converter.onnx accepts a `lora_delta` input.
+    pub fn converter_accepts_lora(&self) -> bool {
+        self.converter_accepts_lora
+    }
+
+    /// Returns true if converter_hq.onnx accepts a `lora_delta` input.
+    pub fn converter_hq_accepts_lora(&self) -> bool {
+        self.converter_hq_accepts_lora
+    }
+
+    /// Run content_encoder: mel_frame[80] + f0[1] + state_in -> content[256] + state_out
     pub fn run_content_encoder(
         &mut self,
         mel: &[f32],
@@ -100,7 +129,7 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run ir_estimator: mel_chunk[80x10] + state_in → ir_params[24] + state_out
+    /// Run ir_estimator: mel_chunk[80x10] + state_in -> ir_params[24] + state_out
     pub fn run_ir_estimator(
         &mut self,
         mel_chunk: &[f32],
@@ -122,11 +151,13 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run converter: content[256] + spk[192] + ir[24] + state → features[513] + state
+    /// Run converter: content[256] + spk[192] + lora[24576] + ir[24] + state
+    /// -> features[513] + state
     pub fn run_converter(
         &mut self,
         content: &[f32],
         spk_embed: &[f32],
+        lora_delta: &[f32],
         ir_params: &[f32],
         state_in: &[f32],
         features_out: &mut [f32],
@@ -135,6 +166,7 @@ impl OrtBundle {
         let outputs = self.converter.run(ort::inputs![
             "content" => Tensor::from_array(([1, D_CONTENT, 1], content.to_vec()))?,
             "spk_embed" => Tensor::from_array(([1usize, D_SPEAKER], spk_embed.to_vec()))?,
+            LORA_INPUT_NAME => Tensor::from_array(([1usize, LORA_DELTA_SIZE], lora_delta.to_vec()))?,
             "ir_params" => Tensor::from_array(([1usize, N_IR_PARAMS], ir_params.to_vec()))?,
             "state_in" => Tensor::from_array(([1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES], state_in.to_vec()))?,
         ])?;
@@ -148,12 +180,13 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run converter_hq: content[256×7] + spk[192] + ir[24] + state[384×46]
-    /// → features[513] + state
+    /// Run converter_hq: content[256x7] + spk[192] + lora[24576] + ir[24] + state
+    /// -> features[513] + state
     pub fn run_converter_hq(
         &mut self,
         content: &[f32],
         spk_embed: &[f32],
+        lora_delta: &[f32],
         ir_params: &[f32],
         state_in: &[f32],
         features_out: &mut [f32],
@@ -168,6 +201,7 @@ impl OrtBundle {
         let outputs = session.run(ort::inputs![
             "content" => Tensor::from_array(([1, D_CONTENT, t_in], content.to_vec()))?,
             "spk_embed" => Tensor::from_array(([1usize, D_SPEAKER], spk_embed.to_vec()))?,
+            LORA_INPUT_NAME => Tensor::from_array(([1usize, LORA_DELTA_SIZE], lora_delta.to_vec()))?,
             "ir_params" => Tensor::from_array(([1usize, N_IR_PARAMS], ir_params.to_vec()))?,
             "state_in" => Tensor::from_array(([1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES], state_in.to_vec()))?,
         ])?;
@@ -181,7 +215,7 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run vocoder: features[513] + state → mag[513] + phase[513] + state
+    /// Run vocoder: features[513] + state -> mag[513] + phase[513] + state
     pub fn run_vocoder(
         &mut self,
         features: &[f32],

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import sys
 from pathlib import Path
 
@@ -73,6 +74,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max utterances to process (0=all, for debugging).",
     )
     parser.add_argument(
+        "--subset",
+        type=float,
+        default=1.0,
+        help="Fraction of utterances to process (0.0-1.0, default: 1.0=all).",
+    )
+    parser.add_argument(
+        "--segment-min-sec",
+        type=float,
+        default=None,
+        help="Override minimum segment duration in seconds (default: constants.yaml).",
+    )
+    parser.add_argument(
+        "--segment-max-sec",
+        type=float,
+        default=None,
+        help="Override maximum segment duration in seconds (default: constants.yaml).",
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip utterances already in cache.",
@@ -97,6 +116,27 @@ def main(argv: list[str] | None = None) -> None:
     adapter = get_adapter(args.dataset)
     cache = FeatureCache(args.cache_dir)
 
+    # Collect utterances (needed for subset sampling)
+    all_utterances = list(adapter.iter_utterances(args.raw_dir, args.split))
+    total = len(all_utterances)
+    if args.subset < 1.0:
+        k = max(1, int(total * args.subset))
+        all_utterances = sorted(
+            random.sample(all_utterances, k),
+            key=lambda u: u.utterance_id,
+        )
+        logger.info("Subset %.0f%%: %d / %d utterances selected",
+                     args.subset * 100, k, total)
+    else:
+        logger.info("Total utterances: %d", total)
+
+    # Segment duration overrides
+    seg_kwargs: dict = {}
+    if args.segment_min_sec is not None:
+        seg_kwargs["min_sec"] = args.segment_min_sec
+    if args.segment_max_sec is not None:
+        seg_kwargs["max_sec"] = args.segment_max_sec
+
     logger.info("Loading extractors on %s ...", args.device)
     content_extractor = ContentVecExtractor(device=args.device)
     f0_extractor = create_f0_extractor(args.f0_method, device=args.device)
@@ -106,7 +146,7 @@ def main(argv: list[str] | None = None) -> None:
     skipped = 0
     errors = 0
 
-    for utt in adapter.iter_utterances(args.raw_dir, args.split):
+    for utt in all_utterances:
         if 0 < args.max_utterances <= processed:
             break
 
@@ -121,7 +161,7 @@ def main(argv: list[str] | None = None) -> None:
             waveform, sr = preprocess_audio(str(utt.audio_path))
 
             # 2. Segment if too long
-            for seg_idx, segment in enumerate(segment_utterance(waveform)):
+            for seg_idx, segment in enumerate(segment_utterance(waveform, **seg_kwargs)):
                 seg_id = (
                     f"{utt.utterance_id}_seg{seg_idx}" if seg_idx > 0
                     else utt.utterance_id

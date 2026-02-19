@@ -76,10 +76,23 @@ class _SpeakerGenerateWorker(QThread):
             avg_embed = torch.nn.functional.normalize(avg_embed, p=2, dim=-1)
 
             # Write speaker file (lora_delta = zeros for now)
+            from datetime import datetime, timezone
+
             spk_embed_np = avg_embed.numpy().astype(np.float32)
             lora_delta_np = np.zeros(LORA_DELTA_SIZE, dtype=np.float32)
 
-            write_speaker_file(self._output_path, spk_embed_np, lora_delta_np)
+            metadata = {
+                "profile_name": self._speaker_name,
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "description": "",
+                "source_audio_files": [Path(p).name for p in self._audio_paths],
+                "source_sample_count": 0,
+                "training_mode": "embedding",
+                "checkpoint_name": "",
+            }
+            write_speaker_file(
+                self._output_path, spk_embed_np, lora_delta_np, metadata=metadata,
+            )
 
             self.finished.emit(str(self._output_path))
         except Exception as exc:

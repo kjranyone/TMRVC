@@ -1,4 +1,4 @@
-"""``tmrvc-finetune`` — Few-shot LoRA fine-tuning CLI.
+"""`tmrvc-finetune` CLI for few-shot LoRA fine-tuning.
 
 Usage::
 
@@ -47,6 +47,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output .tmrvc_speaker file path.",
     )
     parser.add_argument(
+        "--profile-name",
+        type=str,
+        default=None,
+        help="Profile name stored in speaker metadata (default: output stem).",
+    )
+    parser.add_argument(
+        "--author-name",
+        type=str,
+        default="",
+        help="Author name stored in speaker metadata.",
+    )
+    parser.add_argument(
+        "--co-author-name",
+        type=str,
+        default="",
+        help="Co-author name stored in speaker metadata.",
+    )
+    parser.add_argument(
+        "--licence-url",
+        type=str,
+        default="",
+        help="Licence URL stored in speaker metadata.",
+    )
+    parser.add_argument(
         "--steps",
         type=int,
         default=None,
@@ -62,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--use-gtm",
         action="store_true",
         help="Use GTM adapter instead of FiLM LoRA.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use: 'auto' (XPU>CUDA>CPU), 'xpu', 'cuda', or 'cpu'.",
     )
     parser.add_argument(
         "--config",
@@ -112,6 +142,7 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
 
+    from tmrvc_core.device import get_device
     from tmrvc_data.speaker import SpeakerEncoder
     from tmrvc_export.speaker_file import write_speaker_file
     from tmrvc_train.fewshot import FewShotConfig, FewShotFinetuner
@@ -124,6 +155,10 @@ def main(argv: list[str] | None = None) -> None:
     lr = args.lr if args.lr is not None else file_cfg.get("lr", 1e-3)
     use_gtm = args.use_gtm or file_cfg.get("use_gtm", False)
 
+    # Device selection
+    device = get_device(args.device)
+    logger.info("Using device: %s", device)
+
     # 1. Collect audio paths
     audio_paths = _collect_audio_paths(args)
     logger.info("Found %d audio files", len(audio_paths))
@@ -135,6 +170,7 @@ def main(argv: list[str] | None = None) -> None:
     content_encoder = ContentEncoderStudent()
     content_encoder.load_state_dict(ckpt["content_encoder"])
     content_encoder.eval()
+    content_encoder.to(device)
 
     if use_gtm:
         converter = ConverterStudentGTM()
@@ -142,10 +178,11 @@ def main(argv: list[str] | None = None) -> None:
     else:
         converter = ConverterStudent()
         converter.load_state_dict(ckpt["converter"])
+    converter.to(device)
 
     # 3. Extract speaker embedding (average over all audio files)
     logger.info("Extracting speaker embeddings...")
-    spk_encoder = SpeakerEncoder()
+    spk_encoder = SpeakerEncoder(device=str(device))
     embeddings = []
     for path in audio_paths:
         emb = spk_encoder.extract_from_file(str(path))
@@ -171,14 +208,31 @@ def main(argv: list[str] | None = None) -> None:
             logger.info("Step %d/%d  loss=%.4f", step, config.max_steps, loss)
 
     # 5. Save .tmrvc_speaker
+    from datetime import datetime, timezone
+
     lora_delta = finetuner.get_lora_delta()
+    metadata = {
+        "profile_name": args.profile_name or args.output.stem,
+        "author_name": args.author_name,
+        "co_author_name": args.co_author_name,
+        "licence_url": args.licence_url,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "description": "",
+        "source_audio_files": [p.name for p in audio_paths],
+        "source_sample_count": 0,
+        "training_mode": "finetune",
+        "checkpoint_name": args.checkpoint.name,
+    }
     write_speaker_file(
         args.output,
         spk_embed.numpy().astype("float32"),
         lora_delta.detach().numpy().astype("float32"),
+        metadata=metadata,
     )
     logger.info("Saved: %s", args.output)
 
 
 if __name__ == "__main__":
     main()
+
+

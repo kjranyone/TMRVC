@@ -138,7 +138,7 @@ class MelSpectrogram(torch.nn.Module):
         power = stft.abs().pow(2)  # [B, n_freq, T_frames]
 
         # Apply mel filterbank
-        mel = torch.matmul(self.mel_basis.to(power.device), power)
+        mel = torch.matmul(self.mel_basis.to(device=power.device, dtype=power.dtype), power)
 
         # Log scale
         return mel.clamp(min=self.log_floor).log()
