@@ -1,0 +1,26 @@
+# Deterministic dataset registry for training data preparation.
+# Update `raw_dir` to your actual storage location and toggle `enabled`.
+#
+# Usage:
+#   uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu
+
+cache_dir: data/cache
+split: train
+
+datasets:
+  tsukuyomi:
+    enabled: true
+    # Keep training data inside this repository.
+    raw_dir: data/raw/tsukuyomi/corpus1
+
+  vctk:
+    enabled: false
+    raw_dir: data/raw/VCTK-Corpus
+
+  jvs:
+    enabled: false
+    raw_dir: data/raw/jvs_corpus
+
+  libritts_r:
+    enabled: false
+    raw_dir: data/raw/libritts_r

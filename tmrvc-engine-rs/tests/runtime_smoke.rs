@@ -83,6 +83,7 @@ fn smoke_streaming_engine_runs_onehop_inference() {
         beta_prosody: 0.0,
         gamma_articulation: 0.0,
         latency_quality_q: 0.0,
+        voice_source_alpha: 0.0,
     };
 
     // Feed several hops to warm up internal states and validate steady execution.
@@ -148,6 +149,7 @@ fn smoke_lora_contract_is_loadable_with_local_assets() {
         beta_prosody: 0.0,
         gamma_articulation: 0.0,
         latency_quality_q: 0.0,
+        voice_source_alpha: 0.0,
     };
     let input = [0.0f32; HOP_LENGTH];
     let mut output = [0.0f32; HOP_LENGTH];

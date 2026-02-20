@@ -16,7 +16,7 @@ from tmrvc_core.constants import (
     LORA_ALPHA,
     LORA_DELTA_SIZE,
     LORA_RANK,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
     N_LORA_LAYERS,
 )
 from tmrvc_train.models.converter import ConverterStudent, ConverterStudentGTM
@@ -115,7 +115,7 @@ class FewShotAdapter:
         optimizer: torch.optim.Optimizer,
         content: torch.Tensor,
         spk_embed: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         mel_target: torch.Tensor,
     ) -> float:
         """Single fine-tuning step.
@@ -146,7 +146,7 @@ class FewShotAdapter:
             handles.append(h)
 
         # Forward pass
-        pred_features, _ = self.converter(content, spk_embed, ir_params)
+        pred_features, _ = self.converter(content, spk_embed, acoustic_params)
 
         # L1 loss on mel portion
         loss = F.l1_loss(
@@ -214,7 +214,7 @@ class FewShotAdapterGTM:
         optimizer: torch.optim.Optimizer,
         content: torch.Tensor,
         spk_embed: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         mel_target: torch.Tensor,
     ) -> float:
         """Single fine-tuning step for GTM adapter.
@@ -238,7 +238,7 @@ class FewShotAdapterGTM:
         handle = self.converter.gtm.proj.register_forward_hook(lora_hook)
 
         # Forward pass
-        pred_features, _ = self.converter(content, spk_embed, ir_params)
+        pred_features, _ = self.converter(content, spk_embed, acoustic_params)
 
         # L1 loss on mel portion of output
         loss = F.l1_loss(
@@ -332,7 +332,7 @@ class FewShotFinetuner:
         data: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> Iterator[tuple[int, float]]:
         """Generator yielding ``(step, loss)`` for each training step."""
-        ir_params = torch.zeros(1, N_IR_PARAMS)
+        acoustic_params = torch.zeros(1, N_ACOUSTIC_PARAMS)
         spk = self.spk_embed.unsqueeze(0)
 
         for step in range(1, self.config.max_steps + 1):
@@ -350,7 +350,7 @@ class FewShotFinetuner:
 
             loss = self.adapter.finetune_step(
                 self.optimizer, content_seg, spk,
-                ir_params, mel_seg,
+                acoustic_params, mel_seg,
             )
             yield step, loss
 

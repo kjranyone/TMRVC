@@ -16,6 +16,7 @@ Created: 2026-02-16 (Asia/Tokyo)
 |---|---|---|---|---|---|---|---|
 | **T1 (必須)** | VCTK | 英語 | 109 | 48 kHz | ~44h | CC BY 4.0 | Phase 0 から |
 | **T1 (必須)** | JVS | 日本語 | 100 | 24 kHz | ~30h | CC BY-SA 4.0 | Phase 0 から |
+| **T1 (必須)** | つくよみちゃんコーパス | 日本語 | 1 | 96 kHz | ~0.3h (100文) | 独自 (§1.4) | Phase 0 から |
 | **T2 (標準)** | LibriTTS-R | 英語 | 2,456 | 24 kHz | ~585h | CC BY 4.0 | Phase 1 から |
 | **T3 (拡張)** | Emilia (EN+JA subset) | 多言語 | ~10K+ | 24 kHz | ~5-10Kh | Apache 2.0 | Phase 2 で品質不足の場合 |
 | **評価用** | JSUT | 日本語 | 1 | 48 kHz | ~10h | CC BY-SA 4.0 | 評価のみ |
@@ -23,10 +24,25 @@ Created: 2026-02-16 (Asia/Tokyo)
 **選定理由:**
 - VCTK: 48kHz の高品質多話者データ。話者ごとの発話数が多く VC 学習に最適
 - JVS: 日本語対応に不可欠。100 話者 × parallel/nonpara 読み上げ
+- つくよみちゃんコーパス: 萌え声・アニメ声スタイルの日本語データ。JVS と同じ声優統計コーパス 100 文を高音ウィスパー系の声で読み上げ。Voice source parameters (breathiness, formant_shift 等) の学習に不可欠。96kHz 高品質録音
 - LibriTTS-R: 話者多様性の確保 (2,456 話者)。24kHz だが content/speaker の汎化に有効
 - Emilia: Seed-VC が使用した大規模コーパス。品質天井の最大化に必要だが、高コスト
 
-### 1.2 RIR データセット (IR-aware 学習用)
+### 1.2 つくよみちゃんコーパス ライセンスノート
+
+- **配布元:** https://tyc.rei-yumesaki.net/material/corpus/
+- **ライセンス:** 独自 (著作権法第 30 条の 4 に基づく情報解析目的利用)
+  - 個人・法人、営利・非営利、研究・開発を問わず利用可能
+  - 声質を使用した音声変換ソフトの公開 (有料含む) 可能
+  - CC BY-SA のコピーレフト (継承) は不要
+- **クレジット:** 必須。学習済みモデル配布時に以下を明記:
+  - 「VOICEVOX:つくよみちゃん」ではなく **「つくよみちゃんコーパス」** と記載
+  - 公式サイト (https://tyc.rei-yumesaki.net/) へのリンク
+- **コーパス再配布:** 禁止 (ダウンロードは公式サイトから)
+- **仕様:** 96 kHz / 32-bit float、JVS 準拠 100 文
+- **前処理:** 96 kHz → 24 kHz にリサンプル後、通常パイプラインに投入
+
+### 1.3 RIR データセット (IR-aware 学習用)
 
 | データセット | RIR 数 | 用途 | 取得 |
 |---|---|---|---|
@@ -34,7 +50,7 @@ Created: 2026-02-16 (Asia/Tokyo)
 | **BUT ReverbDB** | ~1,500 | Training augmentation | 公式サイト |
 | **ACE Challenge** | ~200 | IR Estimator の GT ラベル | Zenodo |
 
-### 1.3 データ前処理パイプライン
+### 1.4 データ前処理パイプライン
 
 ```
 Raw Audio
@@ -61,51 +77,50 @@ Raw Audio
 
 ## 2. Teacher アーキテクチャの選択
 
-### 2.1 現行設計 vs 参考設計
+### 2.1 現行設計 (品質天井最大化版)
 
-| 項目 | 現行 (model-architecture.md §6) | 参考 (system_design.md §3) |
+| 項目 | 設定 | 根拠 |
 |---|---|---|
-| Backbone | U-Net + cross-attention, ~80M | DiT + U-Net skip, ~200M |
-| Content | HuBERT-base (768d) | WavLM-large layer 7 (1024d) |
-| Pitch | Continuous F0 (1d scalar) | Pitch VQVAE (128d) |
-| Speaker | Static embed (192d, FiLM) | Time-varying timbre tokens (64 tokens, cross-attn) |
-| Diffusion | v-prediction | OT-CFM v-prediction |
+| **Backbone** | U-Net + cross-attention, ~80M | GPU推論のためパラメータ制約なし |
+| **Content** | WavLM-large layer 7 (1024d) | 最高品質、speaker leakage 少ない |
+| **Content VQ** | Factorized VQ bottleneck (2×8192) | 残留 speaker 情報の除去 |
+| **Pitch** | Continuous F0 (1d scalar) | 十分実績あり |
+| **Speaker** | GTM (8×48) + LoRA | 時変 timbre、few-shot 対応 |
+| **Diffusion** | OT-CFM v-prediction | 軌道直線化、1-step 蒸留容易 |
 
-### 2.2 段階的アップグレード戦略
-
-Teacher は GPU 学習・推論のため、パラメータ数制約はない。
-品質天井が最終的な Student 品質を決定するため、**Teacher には最高の構成を使う**。
-
-ただし、一気に最大構成にせず、段階的に複雑化する:
+### 2.2 段階的アップグレード戦略 (更新)
 
 ```
-Step 1 (Phase 0): U-Net 80M + ContentVec + continuous F0
+Step 1 (Phase 0): U-Net 17M + ContentVec + Rectified Flow
   → アーキテクチャの検証、学習パイプラインのデバッグ
+  → 目標: SECS > 0.75
 
-Step 2 (Phase 1): 同じ構成で本格学習
-  → 品質天井を測定 (SECS, UTMOS)
+Step 2 (Phase 1): WavLM-large + OT-CFM + VQ bottleneck (本番構成)
+  → 品質天井の最大化
+  → OT-CFM で軌道直線化
+  → VQ で speaker leakage 対策
+  → 目標: SECS ≥ 0.90, UTMOS ≥ 4.0
 
-Step 3 (Phase 2 以降、品質不足の場合のみ):
-  → WavLM-large に切り替え (content 品質向上)
-  → Pitch VQVAE 追加 (F0 の robustness 向上)
-  → DiT backbone に変更 (品質天井の最大化)
-  → Time-varying timbre tokens (話者類似度向上)
+Step 3 (Phase 2): IR-robust 化 + Voice Source 蒸留
+  → RIR augmentation + Voice Source external distillation
+  → 目標: 残響条件下 SECS ≥ 0.86
 ```
 
-**判断基準:**
-- Phase 1 完了後に SECS ≥ 0.88 → Step 2 のまま蒸留に進む
-- Phase 1 完了後に SECS < 0.88 → Step 3 のアップグレードを検討
+**判断基準 (更新):**
+- Phase 0 完了後: SECS > 0.75 なら Phase 1 に進む
+- Phase 1 完了後: SECS ≥ 0.90 なら蒸留に進む
+- SECS < 0.90 の場合: データ増量 (Emilia) または構成見直し
 
-### 2.3 Content Teacher の選択
+### 2.3 Content Teacher の選択 (更新)
 
-| 選択肢 | Params | 品質 | 可用性 | 推奨 |
+| 選択肢 | Params | 出力次元 | 品質 | 推奨 |
 |---|---|---|---|---|
-| **ContentVec** | 95M | 良好 (content 特化) | HuggingFace | Phase 0-1 |
-| HuBERT-base | 95M | 良 | HuggingFace | 代替 |
-| WavLM-large layer 7 | 315M | 最高 | HuggingFace | Phase 2+ (品質不足時) |
+| ContentVec | 95M | 768d | 良好 | Phase 0 (検証用) |
+| HuBERT-base | 95M | 768d | 良 | 代替 |
+| **WavLM-large layer 7** | **317M** | **1024d** | **最高** | **Phase 1+ (本番)** |
 
-ContentVec は HuBERT-base から content 抽出に特化して学習されたモデルで、
-speaker 情報の漏洩が少ない。VC の content encoder teacher としては HuBERT-base より適切。
+WavLM-large は multi-layer 表現を持ち、layer 7 (中間層) が content と prosody の
+バランスに最適。ContentVec よりも speaker leakage が少なく、VC に適する。
 
 ---
 
@@ -118,7 +133,7 @@ speaker 情報の漏洩が少ない。VC の content encoder teacher として�
 GPU:  1x A100 spot (~$1.5/hr)
 
 データ: VCTK + JVS (T1, ~74h)
-モデル: U-Net 80M + ContentVec + F0 + ECAPA speaker
+モデル: U-Net 17M + ContentVec + F0 + ECAPA speaker
 
 学習:
   - Steps: 50K-100K
@@ -134,23 +149,32 @@ GPU:  1x A100 spot (~$1.5/hr)
   - 目標: 最低限の変換動作確認 (SECS > 0.7 程度)
 ```
 
-### Phase 1: Base Teacher 学習 (3-7 日, ~$100-300)
+### Phase 1: Base Teacher 学習 (3-7 日, ~$150-400)
 
 ```
 目的: 本格的な Teacher の学習。蒸留の入力となる品質の確保。
 GPU:  1x A100 ($1.5-2/hr)
 
-データ: VCTK + JVS + LibriTTS-R (T1+T2, ~660h)
+データ: VCTK + JVS + LibriTTS-R + つくよみちゃん (T1+T2, ~660h)
   ※ LibriTTS-R は 24kHz → mel 80-bin で統一
   ※ VCTK は 48→24kHz にリサンプル
+  ※ つくよみちゃんは voice source 多様性に寄与
+
+モデル構成 (品質天井最大化):
+  - Content: WavLM-large layer 7 (1024d) → projection → 256d
+  - VQ Bottleneck: Factorized VQ (2 codebooks × 8192 entries × 128d)
+  - Flow: OT-CFM with optimal transport pairing
+  - Speaker: GTM (8×48) cross-attention
 
 学習:
-  Phase 1a: Base flow matching
+  Phase 1a: Base OT-CFM training
     - Steps: 300K-500K
     - Batch: 64 (gradient accumulation)
     - lr: 1e-4, warmup 5K steps, cosine decay
-    - 損失: L_flow = E[||v_θ(x_t, t, cond) - v||²]
-    - 時間: ~2-4 日
+    - 損失: 
+        L_flow = OT-CFM velocity MSE
+        L_commit = λ_commit × VQ commitment loss (λ=0.25)
+    - 時間: ~3-5 日
 
   Phase 1b: Perceptual loss 追加
     - Phase 1a から fine-tune
@@ -164,16 +188,17 @@ GPU:  1x A100 ($1.5-2/hr)
     - lr: 5e-5
     - 時間: ~1-2 日
 
-品質目標:
-  - SECS ≥ 0.88 (10-step sampling)
-  - UTMOS ≥ 3.8
+品質目標 (更新):
+  - SECS ≥ 0.90 (10-step sampling)
+  - UTMOS ≥ 4.0
+  - Speaker leakage: ↓20% vs ContentVec (VQ 効果)
   - 生成音声の明瞭度が十分 (主観評価)
 ```
 
-### Phase 2: IR-robust 化 (2-3 日, ~$50-100)
+### Phase 2: IR-robust 化 + Voice Source 蒸留 (3-5 日, ~$100-200)
 
 ```
-目的: 残響・マイク特性に頑健な Teacher にする。
+目的: 残響・マイク特性に頑健な Teacher にする + Voice Source の明示的学習。
 GPU:  1x A100
 
 データ: Phase 1 と同じ + RIR augmentation (online)
@@ -182,19 +207,36 @@ GPU:  1x A100
   - Noise: SNR 15-40dB (p=0.3)
 
 モデル変更:
-  - IR conditioning path を追加
-  - IR Estimator (lightweight CNN) を同時に学習
-  - IR params (24-dim) を FiLM で Teacher に注入
+  - Acoustic conditioning path を追加
+  - Acoustic Estimator (lightweight CNN, 32-dim output) を同時に学習
+  - Voice Source 外部蒸留 (下記参照)
 
 学習:
   - Phase 1 checkpoint から fine-tune
   - Steps: 100K-200K
-  - 追加損失: L_ir = MSE(predicted_ir_params, gt_ir_params) (λ=0.1)
+  - 損失:
+      L_ir = MSE(predicted_acoustic_params[0:24], gt_ir_params)
+      L_voice_distill = MSE(predicted[24:32], external_estimator(audio))
+      λ_ir = 0.1, λ_voice = 0.2
   - lr: 5e-5
-  - 時間: ~2-3 日
+  - 時間: ~3-5 日
+
+Voice Source 外部蒸留:
+  外部の事前学習済み voice source 推定器 (例: NKF-stack, 
+  またはカスタム訓練した breathiness/tension 推定 CNN) を用いて
+  Teacher 側の Voice Source params を教師あり学習する。
+  
+  # 推定器 (凍結)
+  external_voice_estimator = load_pretrained_voice_source_model()
+  
+  # 学習時
+  with torch.no_grad():
+      voice_gt = external_voice_estimator(audio)  # [B, 8]
+  voice_pred = acoustic_estimator(audio)[:, 24:32]
+  L_voice = MSE(voice_pred, voice_gt)
 
 検証:
-  - [ ] Dry 条件: SECS ≥ 0.88 (Phase 1 から劣化なし)
+  - [ ] Dry 条件: SECS ≥ 0.90 (Phase 1 から劣化なし)
   - [ ] Reverberant 条件 (RT60=0.5s): SECS ≥ 0.84
   - [ ] IR params の推定精度: RT60 RMSE < 0.2s
 ```
@@ -216,7 +258,7 @@ Option B: Content encoder 強化 (+$100-200)
   - 100K-200K steps fine-tune
 
 Option C: Architecture upgrade (+$200-500)
-  - U-Net 80M → DiT 200M (system_design.md の構成)
+  - U-Net 17M → DiT ~200M (system_design.md の構成)
   - Pitch VQVAE + time-varying timbre tokens 追加
   - 500K+ steps (実質 re-train)
   - 品質天井: SECS 0.92+ を目指す
@@ -241,11 +283,11 @@ def forward_process(x_0, t):
 
 # Training step
 def train_step(model, batch):
-    content, f0, spk_embed, ir_params, mel_target = batch
+    content, f0, spk_embed, acoustic_params, mel_target = batch
     t = torch.rand(batch_size, 1, 1)  # uniform [0, 1]
     x_t, v_target = forward_process(mel_target, t)
 
-    v_pred = model(x_t, t, content, f0, spk_embed, ir_params)
+    v_pred = model(x_t, t, content, f0, spk_embed, acoustic_params)
     loss_flow = F.mse_loss(v_pred, v_target)
     return loss_flow
 ```
@@ -254,13 +296,13 @@ def train_step(model, batch):
 
 ```python
 # Euler ODE solver
-def sample(model, content, f0, spk_embed, ir_params, steps=10):
+def sample(model, content, f0, spk_embed, acoustic_params, steps=10):
     x = torch.randn(1, 80, T)  # start from noise
     dt = 1.0 / steps
 
     for i in range(steps):
         t = 1.0 - i * dt
-        v = model(x, t, content, f0, spk_embed, ir_params)
+        v = model(x, t, content, f0, spk_embed, acoustic_params)
         x = x - v * dt  # Euler step (reverse direction)
 
     return x  # predicted mel
@@ -276,8 +318,11 @@ def sample(model, content, f0, spk_embed, ir_params, steps=10):
 ├── Speaker (ECAPA 192d) ──▶ Linear(192 → 256) ──▶ FiLM (γ, β)
 │     ※ 全フレーム同じ値 (utterance-level)
 │
-├── IR params (24d) ──▶ Linear(24 → 256) ──▶ FiLM (γ, β)
+├── Acoustic params (32d) ──▶ Linear(32 → 256) ──▶ FiLM (γ, β)
 │     ※ Phase 2 で追加。Phase 0-1 では入力なし
+│     ※ 24 IR (環境) + 8 voice source (声質)
+│     ※ 蒸留時に VoiceSourceStatsTracker で話者別統計を収集
+│     ※ 推論時は voice_source_preset とブレンド可能 (alpha 制御)
 │
 └── Timestep (1d) ──▶ sinusoidal embedding (256d) ──▶ AdaLN or FiLM
 ```
@@ -443,6 +488,26 @@ scripts/generate_reflow_pairs.py で事前にペア生成 → phase=reflow で�
 `spk_embed[192] → memory[8, 48] → cross-attention with content[384, T]`
 ONNX I/O は変更なし (内部で展開)。`ConverterStudentGTM` として実装。
 
+### 7.7 Voice Source Presets (データ駆動プリセット)
+
+蒸留 Phase A/B/B2/C の全ステップで `VoiceSourceStatsTracker` が `acoustic_params[24..31]`
+の話者別 running mean を収集する。チェックポイント保存時に `.voice_source_stats.json` を自動出力。
+
+```python
+# 蒸留後: 萌え声グループのプリセット生成
+compute_group_preset("stats.json", patterns=["moe/*"], output_path="moe_preset.json")
+# → {"preset": [0.72, 0.45, ...], "matched_speakers": [...], "n_speakers": 5}
+```
+
+推論時は `.tmrvc_speaker` metadata の `voice_source_preset[8]` と推定値を alpha ブレンド:
+```
+blended[24+i] = lerp(estimated[24+i], preset[i], alpha)
+```
+- `alpha=0`: 推定値そのまま（既存動作と同一）
+- `alpha=1`: プリセット完全適用（「萌え寄せ」）
+
+詳細: `docs/design/acoustic-condition-pathway.md` §Voice Source Presets
+
 ### 7.6 DMD2 + Metric Optimization (NeurIPS 2024 + ICML 2025)
 
 **Phase B2 (DMD2):** GAN discriminator による分布レベルの蒸留。
@@ -460,20 +525,25 @@ Student が Teacher を超える可能性がある。
 Teacher の学習が完了したら、model-architecture.md §2.4 に従って蒸留を実行する。
 
 ```
-Teacher (80-200M, 10-step) が完成したら:
+Teacher (17-200M, 10-step) が完成したら:
 
 1. Teacher で蒸留用データを生成:
    各発話 × 各話者ペアで mel_teacher を生成
-   → (content, f0, spk_embed, ir_params, mel_teacher) の組を保存
+   → (content, f0, spk_embed, acoustic_params, mel_teacher) の組を保存
 
 2. Student (7.7M, causal CNN) を蒸留:
    Phase A: ODE trajectory pre-training (v-prediction matching)
    Phase B/B2: DMD/DMD2 (distribution matching)
    Phase C: Metric Optimization (SV + STFT direct optimization)
    + L_stft + L_spk
+   ※ 全 Phase で VoiceSourceStatsTracker が voice source params の話者別統計を自動収集
 
-3. Few-shot adaptation:
-   Target speaker の音声 → spk_embed + LoRA delta
+3. Voice source presets 生成:
+   蒸留完了後に compute_group_preset() で目的のスタイルグループの
+   voice source params 平均値を .tmrvc_speaker metadata に格納
+
+4. Few-shot adaptation:
+   Target speaker の音声 → spk_embed + LoRA delta + voice_source_preset
    → .tmrvc_speaker ファイルとして保存
 ```
 
@@ -502,6 +572,10 @@ Teacher (80-200M, 10-step) が完成したら:
 - [ ] 上記すべてクリア
 - [ ] Teacher の 10-step sampling が安定 (NaN/Inf なし)
 - [ ] 蒸留用データ生成パイプラインが動作
+
+### 蒸留完了後条件
+- [ ] VoiceSourceStatsTracker の統計 JSON が出力されている
+- [ ] 目的グループの voice_source_preset が compute_group_preset() で生成可能
 
 ---
 

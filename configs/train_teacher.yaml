@@ -66,6 +66,14 @@ phases:
     p_uncond: 0.1
     description: "Reflow — straighten ODE trajectories using pre-generated pairs"
 
+# --- Speaker group weighting ---
+# Groups with weight > 1 get more utterances per round-robin cycle,
+# increasing their representation without duplicating any utterance.
+speaker_groups:
+  moe:
+    speakers: ["moe/*"]
+    weight: 10
+
 # --- Advanced options ---
 use_ot_cfm: false            # Optimal Transport CFM (straighter trajectories)
 p_uncond: 0.0                # CFG-free conditioning dropout probability

@@ -33,6 +33,10 @@ pub struct SpeakerMetadata {
     pub source_sample_count: u64,
     pub training_mode: String,
     pub checkpoint_name: String,
+    #[serde(default)]
+    pub voice_source_preset: Option<Vec<f32>>,
+    #[serde(default)]
+    pub voice_source_param_names: Vec<String>,
 }
 
 /// Parsed .tmrvc_speaker v2 file.
@@ -43,6 +47,17 @@ pub struct SpeakerFile {
 }
 
 impl SpeakerFile {
+    /// Extract voice source preset as a fixed-size array, if present in metadata.
+    pub fn voice_source_preset(&self) -> Option<[f32; N_VOICE_SOURCE_PARAMS]> {
+        let vec = self.metadata.voice_source_preset.as_ref()?;
+        if vec.len() != N_VOICE_SOURCE_PARAMS {
+            return None;
+        }
+        let mut arr = [0.0f32; N_VOICE_SOURCE_PARAMS];
+        arr.copy_from_slice(vec);
+        Some(arr)
+    }
+
     /// Load and validate a .tmrvc_speaker v2 file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read(path).context("Failed to read speaker file")?;
@@ -300,6 +315,8 @@ mod tests {
             source_sample_count: 480000,
             training_mode: "embedding".to_string(),
             checkpoint_name: "".to_string(),
+            voice_source_preset: None,
+            voice_source_param_names: Vec::new(),
         };
 
         let original = SpeakerFile {

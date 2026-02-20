@@ -123,7 +123,7 @@ def verify_converter(
         D_CONVERTER_HIDDEN,
         D_SPEAKER,
         LORA_DELTA_SIZE,
-        N_IR_PARAMS,
+        N_ACOUSTIC_PARAMS,
     )
     from tmrvc_export.export_onnx import _ConverterGTMWrapper, _ConverterWrapper
     from tmrvc_train.models.converter import ConverterStudentGTM
@@ -139,7 +139,7 @@ def verify_converter(
 
     content = torch.randn(1, D_CONTENT, 1)
     spk = torch.randn(1, D_SPEAKER)
-    ir = torch.randn(1, N_IR_PARAMS)
+    acoustic = torch.randn(1, N_ACOUSTIC_PARAMS)
     state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES)
 
     tests = [
@@ -149,13 +149,13 @@ def verify_converter(
 
     for test_name, lora in tests:
         with torch.no_grad():
-            pt_feat, pt_state = wrapper(content, spk, lora, ir, state)
+            pt_feat, pt_state = wrapper(content, spk, lora, acoustic, state)
 
         ort_out = sess.run(None, {
             "content": content.numpy(),
             "spk_embed": spk.numpy(),
             "lora_delta": lora.numpy(),
-            "ir_params": ir.numpy(),
+            "acoustic_params": acoustic.numpy(),
             "state_in": state.numpy(),
         })
 
@@ -248,7 +248,7 @@ def verify_ir_estimator(
     })
 
     for out_name, pt_val, ort_val in [
-        ("ir_params", pt_ir.numpy(), ort_out[0]),
+        ("acoustic_params", pt_ir.numpy(), ort_out[0]),
         ("state_out", pt_state.numpy(), ort_out[1]),
     ]:
         max_abs, mean_abs, max_rel, passed = _compare_tensors(
@@ -257,6 +257,109 @@ def verify_ir_estimator(
         results.append(ParityResult(
             "ir_estimator", out_name, max_abs, mean_abs, max_rel, passed,
         ))
+
+    return results
+
+
+def verify_speaker_encoder(
+    model: torch.nn.Module,
+    onnx_path: str | Path,
+    atol: float = 5e-5,
+    rtol: float = 1e-3,
+) -> list[ParityResult]:
+    """Verify speaker encoder parity (variable-length mel input)."""
+    import onnxruntime as ort
+
+    from tmrvc_core.constants import LORA_DELTA_SIZE, N_MELS
+
+    model.eval()
+    results = []
+    sess = ort.InferenceSession(str(onnx_path))
+
+    for test_name, T_ref in [("short", 100), ("medium", 500), ("long", 1000)]:
+        mel_ref = torch.randn(1, N_MELS, T_ref)
+
+        with torch.no_grad():
+            pt_spk, pt_lora = model(mel_ref)
+
+        ort_out = sess.run(None, {"mel_ref": mel_ref.numpy()})
+
+        for out_name, pt_val, ort_val in [
+            ("spk_embed", pt_spk.numpy(), ort_out[0]),
+            ("lora_delta", pt_lora.numpy(), ort_out[1]),
+        ]:
+            max_abs, mean_abs, max_rel, passed = _compare_tensors(
+                pt_val, ort_val, atol, rtol,
+            )
+            results.append(ParityResult(
+                f"speaker_encoder/{test_name}", out_name,
+                max_abs, mean_abs, max_rel, passed,
+            ))
+
+    return results
+
+
+def verify_converter_hq(
+    model: torch.nn.Module,
+    onnx_path: str | Path,
+    atol: float = 5e-5,
+    rtol: float = 1e-3,
+) -> list[ParityResult]:
+    """Verify HQ converter parity (T_in = 1 + MAX_LOOKAHEAD_HOPS)."""
+    import onnxruntime as ort
+
+    from tmrvc_core.constants import (
+        CONVERTER_HQ_STATE_FRAMES,
+        D_CONTENT,
+        D_CONVERTER_HIDDEN,
+        D_SPEAKER,
+        LORA_DELTA_SIZE,
+        MAX_LOOKAHEAD_HOPS,
+        N_ACOUSTIC_PARAMS,
+    )
+    from tmrvc_export.export_onnx import _ConverterHQWrapper
+
+    model.eval()
+    results = []
+    sess = ort.InferenceSession(str(onnx_path))
+
+    wrapper = _ConverterHQWrapper(model).eval()
+
+    t_in = 1 + MAX_LOOKAHEAD_HOPS
+    content = torch.randn(1, D_CONTENT, t_in)
+    spk = torch.randn(1, D_SPEAKER)
+    acoustic = torch.randn(1, N_ACOUSTIC_PARAMS)
+    state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES)
+
+    tests = [
+        ("zero", torch.zeros(1, LORA_DELTA_SIZE)),
+        ("random", torch.randn(1, LORA_DELTA_SIZE) * 0.01),
+    ]
+
+    for test_name, lora in tests:
+        with torch.no_grad():
+            pt_feat, pt_state = wrapper(content, spk, lora, acoustic, state)
+
+        ort_out = sess.run(None, {
+            "content": content.numpy(),
+            "spk_embed": spk.numpy(),
+            "lora_delta": lora.numpy(),
+            "acoustic_params": acoustic.numpy(),
+            "state_in": state.numpy(),
+        })
+
+        for out_name, pt_val, ort_val in [
+            ("pred_features", pt_feat.numpy(), ort_out[0]),
+            ("state_out", pt_state.numpy(), ort_out[1]),
+        ]:
+            out_atol = max(atol, 3e-5) if out_name == "state_out" else atol
+            max_abs, mean_abs, max_rel, passed = _compare_tensors(
+                pt_val, ort_val, out_atol, rtol,
+            )
+            results.append(ParityResult(
+                f"converter_hq/{test_name}", out_name,
+                max_abs, mean_abs, max_rel, passed,
+            ))
 
     return results
 
@@ -284,8 +387,10 @@ def verify_all(
     verify_fns = {
         "content_encoder": verify_content_encoder,
         "converter": verify_converter,
+        "converter_hq": verify_converter_hq,
         "vocoder": verify_vocoder,
         "ir_estimator": verify_ir_estimator,
+        "speaker_encoder": verify_speaker_encoder,
     }
 
     for name, verify_fn in verify_fns.items():

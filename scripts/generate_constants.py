@@ -24,7 +24,9 @@ RUST_OUT = REPO_ROOT / "tmrvc-engine-rs" / "src" / "constants.rs"
 _RUNTIME_KEYS = {
     "sample_rate", "n_fft", "hop_length", "window_length",
     "n_mels", "mel_fmin", "mel_fmax", "n_freq_bins", "log_floor",
-    "d_content", "d_speaker", "n_ir_params", "d_converter_hidden",
+    "d_content", "d_speaker", "n_ir_params",
+    "n_voice_source_params", "n_acoustic_params",
+    "d_converter_hidden",
     "d_vocoder_features", "ir_update_interval",
     "lora_rank", "lora_delta_size",
     "content_encoder_state_frames", "ir_estimator_state_frames",
@@ -166,6 +168,7 @@ def generate_rust(cfg: dict) -> str:
         ],
         "model": [
             "d_content", "d_speaker", "n_ir_params",
+            "n_voice_source_params", "n_acoustic_params",
             "d_converter_hidden", "d_vocoder_features",
         ],
         "inference": ["ir_update_interval"],
@@ -245,7 +248,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    with open(YAML_PATH) as f:
+    with open(YAML_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     targets: list[tuple[Path, str]] = [

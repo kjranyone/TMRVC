@@ -6,7 +6,7 @@ from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, N_MELS
 from tmrvc_core.types import FeatureSet, TrainingBatch
 from tmrvc_data.cache import FeatureCache
 from tmrvc_data.dataset import TMRVCDataset, collate_fn, create_dataloader
-from tmrvc_data.sampler import BalancedSpeakerSampler
+from tmrvc_data.sampler import BalancedSpeakerSampler, SpeakerGroupConfig
 
 
 def _make_feature_set(speaker_id: str, utt_id: str, n_frames: int) -> FeatureSet:
@@ -165,3 +165,97 @@ class TestBalancedSpeakerSampler:
 
         # Should be more balanced than the raw 90/10 split
         assert b_count >= 10  # at least as many as the actual utterances
+
+
+class TestSpeakerGroupWeighting:
+    def test_speaker_groups_weighted_sampling(self):
+        """Weighted speaker appears more frequently in early rounds."""
+        # 100 utterances from speaker A, 10 from moe/tsukuyomi
+        speaker_ids = ["a"] * 100 + ["moe/tsukuyomi"] * 10
+        groups = [SpeakerGroupConfig(speakers=["moe/*"], weight=10)]
+        sampler = BalancedSpeakerSampler(speaker_ids, seed=42, speaker_groups=groups)
+        indices = list(sampler)
+
+        # All indices must be emitted exactly once
+        assert len(indices) == 110
+        assert set(indices) == set(range(110))
+
+        # Check first 20 indices: moe/tsukuyomi (weight=10) should have ~10 in first round
+        first_20 = indices[:20]
+        moe_in_first_20 = sum(1 for i in first_20 if speaker_ids[i] == "moe/tsukuyomi")
+        # With weight=10, moe yields 10 per round vs A yields 1.
+        # In the first round (2 speakers: A→1, moe→10 = 11 indices), moe gets 10.
+        assert moe_in_first_20 >= 5, f"Expected moe to appear frequently early, got {moe_in_first_20}"
+
+    def test_speaker_groups_fnmatch_multiple_speakers(self):
+        """fnmatch pattern matches multiple speakers in one group."""
+        speaker_ids = (
+            ["normal/spk1"] * 50
+            + ["normal/spk2"] * 50
+            + ["moe/tsukuyomi"] * 5
+            + ["moe/aoi"] * 5
+        )
+        groups = [SpeakerGroupConfig(speakers=["moe/*"], weight=10)]
+        sampler = BalancedSpeakerSampler(speaker_ids, seed=42, speaker_groups=groups)
+        indices = list(sampler)
+
+        assert len(indices) == 110
+        assert set(indices) == set(range(110))
+
+        # Both moe speakers should be weighted
+        first_30 = indices[:30]
+        moe_count = sum(1 for i in first_30 if speaker_ids[i].startswith("moe/"))
+        assert moe_count >= 5, f"Expected moe speakers early, got {moe_count}"
+
+    def test_speaker_groups_no_groups_default_behavior(self):
+        """Without speaker_groups, behavior matches original sampler."""
+        speaker_ids = ["a", "a", "b", "c"]
+        sampler_default = BalancedSpeakerSampler(speaker_ids, seed=99)
+        sampler_none = BalancedSpeakerSampler(speaker_ids, seed=99, speaker_groups=None)
+        sampler_empty = BalancedSpeakerSampler(speaker_ids, seed=99, speaker_groups=[])
+
+        assert list(sampler_default) == list(sampler_none)
+        assert list(sampler_default) == list(sampler_empty)
+
+    def test_speaker_groups_unknown_speaker_ignored(self):
+        """Unknown speakers in group config are silently ignored."""
+        speaker_ids = ["a", "a", "b"]
+        groups = [SpeakerGroupConfig(speakers=["nonexistent"], weight=5)]
+        sampler = BalancedSpeakerSampler(speaker_ids, seed=42, speaker_groups=groups)
+        indices = list(sampler)
+        assert len(indices) == 3
+        assert set(indices) == {0, 1, 2}
+
+    def test_speaker_groups_weight_one_no_effect(self):
+        """weight=1 produces same result as no groups."""
+        speaker_ids = ["a"] * 5 + ["b"] * 3
+        sampler_no_group = BalancedSpeakerSampler(speaker_ids, seed=42)
+        groups = [SpeakerGroupConfig(speakers=["b"], weight=1)]
+        sampler_w1 = BalancedSpeakerSampler(speaker_ids, seed=42, speaker_groups=groups)
+        assert list(sampler_no_group) == list(sampler_w1)
+
+    def test_create_dataloader_with_speaker_groups(self, tmp_cache_dir):
+        """create_dataloader accepts speaker_groups without error."""
+        cache = FeatureCache(tmp_cache_dir)
+        dataset_name = "test_sg"
+
+        for i in range(8):
+            spk = "moe/tsukuyomi" if i < 2 else f"spk_{i}"
+            fs = _make_feature_set(spk, f"utt_{i:03d}", 100)
+            fs.speaker_id = spk
+            fs.utterance_id = f"utt_{i:03d}"
+            cache.save(fs, dataset_name, "train")
+
+        groups = [SpeakerGroupConfig(speakers=["moe/*"], weight=5)]
+        loader = create_dataloader(
+            tmp_cache_dir,
+            dataset_name,
+            batch_size=4,
+            num_workers=0,
+            cross_speaker_prob=0.0,
+            speaker_groups=groups,
+        )
+
+        batch = next(iter(loader))
+        assert isinstance(batch, TrainingBatch)
+        assert batch.content.shape[0] == 4

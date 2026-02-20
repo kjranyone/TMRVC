@@ -18,7 +18,7 @@ from tmrvc_core.constants import (
 )
 from tmrvc_core.types import FeatureSet, TrainingBatch
 from tmrvc_data.cache import FeatureCache
-from tmrvc_data.sampler import BalancedSpeakerSampler
+from tmrvc_data.sampler import BalancedSpeakerSampler, SpeakerGroupConfig
 
 
 class TMRVCDataset(Dataset):
@@ -146,6 +146,7 @@ def create_dataloader(
     cross_speaker_prob: float = CROSS_SPEAKER_PROB,
     balanced_sampling: bool = True,
     subset: float = 1.0,
+    speaker_groups: list[SpeakerGroupConfig] | None = None,
 ) -> DataLoader:
     """Create a DataLoader with balanced speaker sampling.
 
@@ -157,6 +158,8 @@ def create_dataloader(
         num_workers: DataLoader workers.
         cross_speaker_prob: Probability of cross-speaker embedding swap.
         balanced_sampling: Use :class:`BalancedSpeakerSampler`.
+        subset: Fraction of data to use.
+        speaker_groups: Optional speaker group weight configs.
 
     Returns:
         Configured DataLoader yielding :class:`TrainingBatch`.
@@ -174,7 +177,9 @@ def create_dataloader(
     shuffle = True
     if balanced_sampling and len(ds) > 0:
         speaker_ids = [e["speaker_id"] for e in ds.entries]
-        sampler = BalancedSpeakerSampler(speaker_ids)
+        sampler = BalancedSpeakerSampler(
+            speaker_ids, speaker_groups=speaker_groups,
+        )
         shuffle = False  # sampler handles ordering
 
     return DataLoader(

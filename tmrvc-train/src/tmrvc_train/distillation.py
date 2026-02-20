@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from tmrvc_core.constants import IR_UPDATE_INTERVAL, N_IR_PARAMS
+from tmrvc_core.constants import IR_UPDATE_INTERVAL, N_IR_PARAMS, N_ACOUSTIC_PARAMS
 from tmrvc_core.types import TrainingBatch
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.losses import DMD2Loss, FlowMatchingLoss, MultiResolutionSTFTLoss, SVLoss, SpeakerConsistencyLoss
@@ -20,6 +20,7 @@ from tmrvc_train.models.discriminator import MelDiscriminator
 from tmrvc_train.models.ir_estimator import IREstimator
 from tmrvc_train.models.teacher_unet import TeacherUNet
 from tmrvc_train.models.vocoder import VocoderStudent
+from tmrvc_train.voice_source_stats import VoiceSourceStatsTracker
 
 logger = logging.getLogger(__name__)
 
@@ -100,36 +101,27 @@ class DistillationTrainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    def train_step_phase_a(self, batch: TrainingBatch) -> dict[str, float]:
-        """Phase A: ODE trajectory distillation.
+        # Voice source statistics tracker
+        self.voice_source_tracker = VoiceSourceStatsTracker()
 
-        Teacher runs multi-step ODE to produce trajectory.
-        Student tries to match teacher's velocity in 1 step.
+    def train_step_phase_a(self, batch: TrainingBatch) -> dict[str, float]:
+        """Phase A: Direct mel reconstruction pre-training.
+
+        Student learns to reconstruct mel from content features in 1 step.
+        No teacher velocity is used — the loss is direct L1 against mel_target.
         """
         device = next(self.converter.parameters()).device
-        B = batch.mel_target.shape[0]
 
         mel_target = batch.mel_target.to(device)
-        content_teacher = batch.content.to(device)
         f0 = batch.f0.to(device)
         spk_embed = batch.spk_embed.to(device)
-
-        # Generate teacher's velocity at a random timestep
-        t = torch.rand(B, 1, 1, device=device)
-        x_t, v_target = self.scheduler.forward_process(mel_target, t)
-
-        with torch.no_grad():
-            v_teacher = self.teacher(
-                x_t, t.squeeze(-1).squeeze(-1),
-                content_teacher, f0, spk_embed,
-            )
 
         # Student: content encoder → IR estimator → converter
         content_student = self.content_encoder(
             mel_target, f0,
         )[0]  # [B, 256, T]
 
-        # IR Estimator: predict IR params from mel chunks
+        # IR Estimator: predict acoustic params from mel chunks
         # Use chunks of IR_UPDATE_INTERVAL frames, pad if needed
         T = mel_target.shape[-1]
         if T >= IR_UPDATE_INTERVAL:
@@ -138,34 +130,46 @@ class DistillationTrainer:
             mel_chunk = torch.nn.functional.pad(
                 mel_target, (0, IR_UPDATE_INTERVAL - T),
             )
-        ir_params_pred = self.ir_estimator(mel_chunk)[0]  # [B, 24]
+        acoustic_params_pred = self.ir_estimator(mel_chunk)[0]  # [B, 32]
+
+        # Track voice source statistics
+        if batch.speaker_ids:
+            self.voice_source_tracker.update(acoustic_params_pred, batch.speaker_ids)
 
         pred_features = self.converter(
-            content_student, spk_embed, ir_params_pred,
+            content_student, spk_embed, acoustic_params_pred,
         )[0]  # [B, 513, T]
 
-        # Project converter output to mel space and match teacher velocity
+        # Direct mel reconstruction loss
         pred_mel = pred_features[:, :80, :]  # [B, 80, T]
 
         # Ensure time dimensions match
-        if pred_mel.shape[-1] != v_teacher.shape[-1]:
+        if pred_mel.shape[-1] != mel_target.shape[-1]:
             pred_mel = torch.nn.functional.interpolate(
-                pred_mel, size=v_teacher.shape[-1], mode="linear", align_corners=False,
+                pred_mel, size=mel_target.shape[-1], mode="linear", align_corners=False,
             )
 
-        # Loss: student mel prediction should match teacher velocity
-        loss_flow = self.flow_loss(pred_mel, v_teacher)
+        # Loss: direct L1 reconstruction against mel target
+        loss_mel = nn.functional.l1_loss(pred_mel, mel_target)
 
-        # IR Estimator regression loss: predict zero-room IR params
-        # (Teacher target: zeros, representing anechoic reference)
-        ir_target = torch.zeros_like(ir_params_pred)
-        loss_ir = torch.nn.functional.mse_loss(ir_params_pred, ir_target)
+        # IR params regression loss: zero-room target for env params (0-23)
+        ir_target = torch.zeros_like(acoustic_params_pred[:, :N_IR_PARAMS])
+        loss_ir = torch.nn.functional.mse_loss(
+            acoustic_params_pred[:, :N_IR_PARAMS], ir_target,
+        )
 
-        loss_total = loss_flow + self.config.lambda_ir * loss_ir
+        # Voice source params (24-31): reconstruction loss (encourage informative output)
+        voice_source = acoustic_params_pred[:, N_IR_PARAMS:]
+        loss_voice = torch.nn.functional.mse_loss(
+            voice_source, torch.zeros_like(voice_source),
+        )
+
+        loss_total = loss_mel + self.config.lambda_ir * (loss_ir + loss_voice)
 
         losses = {
-            "flow": loss_flow.item(),
+            "mel": loss_mel.item(),
             "ir": loss_ir.item(),
+            "voice": loss_voice.item(),
             "total": loss_total.item(),
         }
 
@@ -197,7 +201,7 @@ class DistillationTrainer:
         f0 = batch.f0.to(device)
         spk_embed = batch.spk_embed.to(device)
 
-        # Student forward: content encoder → IR estimator → converter
+        # Student forward: content encoder → acoustic estimator → converter
         content_student = self.content_encoder(mel_target, f0)[0]
         T = mel_target.shape[-1]
         if T >= IR_UPDATE_INTERVAL:
@@ -206,8 +210,8 @@ class DistillationTrainer:
             mel_chunk = torch.nn.functional.pad(
                 mel_target, (0, IR_UPDATE_INTERVAL - T),
             )
-        ir_params = self.ir_estimator(mel_chunk)[0]
-        pred_features = self.converter(content_student, spk_embed, ir_params)[0]
+        acoustic_params = self.ir_estimator(mel_chunk)[0]
+        pred_features = self.converter(content_student, spk_embed, acoustic_params)[0]
 
         # Vocoder: features → mag + phase
         mag, phase, _ = self.vocoder(pred_features)
@@ -229,7 +233,7 @@ class DistillationTrainer:
                 pred_mel_proxy, size=mel_target.shape[-1], mode="linear", align_corners=False,
             )
         v_fake = self.teacher(
-            pred_mel_proxy.detach(), t_student, content_teacher, f0, spk_embed,
+            pred_mel_proxy, t_student, content_teacher, f0, spk_embed,
         )
 
         loss_dmd = ((v_fake - v_real) ** 2).mean()
@@ -267,7 +271,7 @@ class DistillationTrainer:
     def _student_forward(
         self, batch: TrainingBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run student forward pass, returning (pred_features, ir_params, mel_target)."""
+        """Run student forward pass, returning (pred_features, acoustic_params, mel_target)."""
         device = next(self.converter.parameters()).device
         mel_target = batch.mel_target.to(device)
         f0 = batch.f0.to(device)
@@ -279,9 +283,14 @@ class DistillationTrainer:
             mel_chunk = mel_target[:, :, :IR_UPDATE_INTERVAL]
         else:
             mel_chunk = nn.functional.pad(mel_target, (0, IR_UPDATE_INTERVAL - T))
-        ir_params = self.ir_estimator(mel_chunk)[0]
-        pred_features = self.converter(content_student, spk_embed, ir_params)[0]
-        return pred_features, ir_params, mel_target
+        acoustic_params = self.ir_estimator(mel_chunk)[0]
+
+        # Track voice source statistics
+        if batch.speaker_ids:
+            self.voice_source_tracker.update(acoustic_params, batch.speaker_ids)
+
+        pred_features = self.converter(content_student, spk_embed, acoustic_params)[0]
+        return pred_features, acoustic_params, mel_target
 
     def train_step_phase_b2(self, batch: TrainingBatch) -> dict[str, float]:
         """Phase B2: DMD2 — GAN-based distribution matching.
@@ -296,7 +305,7 @@ class DistillationTrainer:
         mel_target = batch.mel_target.to(device)
 
         # Student forward
-        pred_features, ir_params, _ = self._student_forward(batch)
+        pred_features, acoustic_params, _ = self._student_forward(batch)
         pred_mel = pred_features[:, :80, :]  # [B, 80, T]
         if pred_mel.shape[-1] != mel_target.shape[-1]:
             pred_mel = nn.functional.interpolate(
@@ -449,6 +458,11 @@ class DistillationTrainer:
 
         torch.save(ckpt_data, ckpt_path)
         logger.info("Saved checkpoint to %s", ckpt_path)
+
+        # Save voice source stats alongside checkpoint
+        stats_path = ckpt_path.with_suffix(".voice_source_stats.json")
+        self.voice_source_tracker.save(stats_path)
+
         return ckpt_path
 
     def load_checkpoint(self, path: str | Path) -> None:
@@ -459,5 +473,17 @@ class DistillationTrainer:
         if "ir_estimator" in ckpt:
             self.ir_estimator.load_state_dict(ckpt["ir_estimator"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
+        if "discriminator" in ckpt and self.discriminator is not None:
+            self.discriminator.load_state_dict(ckpt["discriminator"])
+        if "disc_optimizer" in ckpt and self.disc_optimizer is not None:
+            self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
         self.global_step = ckpt["step"]
         logger.info("Loaded distillation checkpoint from %s (step %d)", path, self.global_step)
+
+        # Load voice source stats (best-effort)
+        stats_path = Path(path).with_suffix(".voice_source_stats.json")
+        if stats_path.exists():
+            try:
+                self.voice_source_tracker = VoiceSourceStatsTracker.load(stats_path)
+            except Exception as exc:
+                logger.warning("Failed to load voice source stats: %s", exc)

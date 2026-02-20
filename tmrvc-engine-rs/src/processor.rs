@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use atomic_float::AtomicF32;
+use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 use crate::constants::*;
@@ -109,6 +110,8 @@ pub struct FrameParams {
     /// When `q > HQ_THRESHOLD_Q` and a HQ converter model is loaded, the engine
     /// switches to semi-causal HQ mode with higher latency but better quality.
     pub latency_quality_q: f32,
+    /// Voice source preset blend strength: 0.0 = estimated (no blend), 1.0 = full preset.
+    pub voice_source_alpha: f32,
 }
 
 /// Shared atomic status values read by the GUI.
@@ -169,7 +172,7 @@ pub struct StreamingEngine {
     lora_delta_effective: Vec<f32>,
     style: Option<StyleFile>,
     smoothed_log_f0: f32,
-    ir_params_cached: [f32; N_IR_PARAMS],
+    acoustic_params_cached: [f32; N_ACOUSTIC_PARAMS],
     frame_counter: usize,
     fft_planner: FftPlanner<f32>,
     // Scratch buffers owned by the engine (avoids borrow-splitting issues with tensor_pool)
@@ -190,6 +193,8 @@ pub struct StreamingEngine {
     phase_out: Vec<f32>,
     voc_state_out: Vec<f32>,
     time_signal: Vec<f32>,
+    stft_complex_scratch: Vec<Complex<f32>>,
+    istft_complex_scratch: Vec<Complex<f32>>,
     status: Option<Arc<SharedStatus>>,
     models_loaded: bool,
     speaker_loaded: bool,
@@ -203,6 +208,7 @@ pub struct StreamingEngine {
     effective_q: f32,
     dry_bypass_frames: usize,
     last_hop_output: [f32; HOP_LENGTH],
+    voice_source_preset: Option<[f32; N_VOICE_SOURCE_PARAMS]>,
 }
 
 impl StreamingEngine {
@@ -221,7 +227,7 @@ impl StreamingEngine {
             lora_delta_effective: vec![0.0; LORA_DELTA_SIZE],
             style: None,
             smoothed_log_f0: 0.0,
-            ir_params_cached: [0.0; N_IR_PARAMS],
+            acoustic_params_cached: [0.0; N_ACOUSTIC_PARAMS],
             frame_counter: 0,
             fft_planner: FftPlanner::new(),
             context_copy: vec![0.0; WINDOW_LENGTH],
@@ -241,6 +247,8 @@ impl StreamingEngine {
             phase_out: vec![0.0; N_FREQ_BINS],
             voc_state_out: vec![0.0; D_CONTENT * VOCODER_STATE_FRAMES],
             time_signal: vec![0.0; WINDOW_LENGTH],
+            stft_complex_scratch: vec![Complex::new(0.0, 0.0); N_FFT],
+            istft_complex_scratch: vec![Complex::new(0.0, 0.0); N_FFT],
             status,
             models_loaded: false,
             speaker_loaded: false,
@@ -253,6 +261,7 @@ impl StreamingEngine {
             effective_q: 0.0,
             dry_bypass_frames: 0,
             last_hop_output: [0.0; HOP_LENGTH],
+            voice_source_preset: None,
         }
     }
 
@@ -270,6 +279,7 @@ impl StreamingEngine {
     pub fn load_speaker(&mut self, path: &Path) -> Result<()> {
         let spk = SpeakerFile::load(path)?;
         self.spk_embed = spk.spk_embed;
+        self.voice_source_preset = spk.voice_source_preset();
         self.lora_delta = spk.lora_delta;
         self.speaker_loaded = true;
 
@@ -374,6 +384,7 @@ impl StreamingEngine {
             &mut self.padded_scratch,
             &mut self.fft_real_scratch,
             &mut self.fft_imag_scratch,
+            &mut self.stft_complex_scratch,
             &mut self.fft_planner,
         );
 
@@ -449,12 +460,12 @@ impl StreamingEngine {
             };
             let skip_ir_update = self.consecutive_overruns > 3;
             if !skip_ir_update && self.frame_counter % ir_update_interval == 0 {
-                let mut ir_out = [0.0f32; N_IR_PARAMS];
+                let mut acoustic_out = [0.0f32; N_ACOUSTIC_PARAMS];
                 self.ir_state_out.fill(0.0);
                 if let Err(e) = bundle.run_ir_estimator(
                     self.tensor_pool.mel_chunk(),
                     self.states.ir_estimator.input(),
-                    &mut ir_out,
+                    &mut acoustic_out,
                     &mut self.ir_state_out,
                 ) {
                     log::warn!("ir_estimator failed: {}", e);
@@ -464,8 +475,8 @@ impl StreamingEngine {
                         .output()
                         .copy_from_slice(&self.ir_state_out);
                     self.states.ir_estimator.swap();
-                    self.ir_params_cached = ir_out;
-                    self.tensor_pool.ir_params_mut().copy_from_slice(&ir_out);
+                    self.acoustic_params_cached = acoustic_out;
+                    self.tensor_pool.acoustic_params_mut().copy_from_slice(&acoustic_out);
                 }
             }
 
@@ -489,7 +500,22 @@ impl StreamingEngine {
                 self.lora_delta_effective[i] = self.lora_delta[i] * alpha;
             }
 
-            // 9b. Run converter (live or HQ)
+            // 9b. Blend voice source preset into acoustic params (stack copy)
+            let acoustic_for_converter = {
+                let mut p = self.acoustic_params_cached;
+                if let Some(ref preset) = self.voice_source_preset {
+                    let alpha = params.voice_source_alpha.clamp(0.0, 1.0);
+                    if alpha > 0.0 {
+                        for i in 0..N_VOICE_SOURCE_PARAMS {
+                            p[N_IR_PARAMS + i] =
+                                (1.0 - alpha) * p[N_IR_PARAMS + i] + alpha * preset[i];
+                        }
+                    }
+                }
+                p
+            };
+
+            // 9c. Run converter (live or HQ)
             self.features_out.fill(0.0);
             if self.hq_mode && self.content_buffer.is_full() {
                 self.content_buffer
@@ -499,7 +525,7 @@ impl StreamingEngine {
                     &self.content_7_scratch,
                     &self.spk_embed_effective,
                     &self.lora_delta_effective,
-                    &self.ir_params_cached,
+                    &acoustic_for_converter,
                     self.states.converter_hq.input(),
                     &mut self.features_out,
                     &mut self.conv_hq_state_out,
@@ -519,7 +545,7 @@ impl StreamingEngine {
                     self.tensor_pool.content(),
                     &self.spk_embed_effective,
                     &self.lora_delta_effective,
-                    &self.ir_params_cached,
+                    &acoustic_for_converter,
                     self.states.converter.input(),
                     &mut self.features_out,
                     &mut self.conv_state_out,
@@ -541,7 +567,7 @@ impl StreamingEngine {
                 return;
             }
 
-            // 9c. Crossfade blending between old and new features
+            // 9d. Crossfade blending between old and new features
             if self.crossfade_counter > 0 {
                 let alpha = 1.0 - (self.crossfade_counter as f32 / CROSSFADE_FRAMES as f32);
                 for i in 0..N_FREQ_BINS {
@@ -555,7 +581,7 @@ impl StreamingEngine {
                 }
             }
 
-            // 9d. Articulation styling on converter output.
+            // 9e. Articulation styling on converter output.
             if let Some(style) = &self.style {
                 let gamma = params.gamma_articulation.clamp(0.0, 1.0);
                 if gamma > 0.0 {
@@ -605,6 +631,7 @@ impl StreamingEngine {
             self.tensor_pool.stft_phase(),
             self.tensor_pool.hann_window(),
             &mut self.time_signal,
+            &mut self.istft_complex_scratch,
             &mut self.fft_planner,
         );
 
@@ -689,7 +716,7 @@ impl StreamingEngine {
     pub fn reset(&mut self) {
         self.states.reset();
         self.tensor_pool.reset();
-        self.ir_params_cached = [0.0; N_IR_PARAMS];
+        self.acoustic_params_cached = [0.0; N_ACOUSTIC_PARAMS];
         self.frame_counter = 0;
         self.context_copy.fill(0.0);
         self.content_buffer.reset();

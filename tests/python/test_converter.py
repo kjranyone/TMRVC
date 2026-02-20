@@ -9,7 +9,7 @@ from tmrvc_core.constants import (
     D_CONVERTER_HIDDEN,
     D_SPEAKER,
     D_VOCODER_FEATURES,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
 )
 from tmrvc_train.models.converter import (
     ConverterStudent,
@@ -28,7 +28,7 @@ class TestConverterStudent:
     def test_training_mode_shape(self, model):
         content = torch.randn(2, D_CONTENT, 50)
         spk = torch.randn(2, D_SPEAKER)
-        ir = torch.randn(2, N_IR_PARAMS)
+        ir = torch.randn(2, N_ACOUSTIC_PARAMS)
         pred, state = model(content, spk, ir)
         assert pred.shape == (2, D_VOCODER_FEATURES, 50)
         assert state is None
@@ -36,7 +36,7 @@ class TestConverterStudent:
     def test_streaming_mode_shape(self, model):
         content = torch.randn(1, D_CONTENT, 1)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
         state_in = model.init_state()
 
         pred, state_out = model(content, spk, ir, state_in)
@@ -50,7 +50,7 @@ class TestConverterStudent:
         """Verify that different speaker embeddings produce different outputs."""
         model.eval()
         content = torch.randn(1, D_CONTENT, 5)
-        ir = torch.zeros(1, N_IR_PARAMS)
+        ir = torch.zeros(1, N_ACOUSTIC_PARAMS)
 
         spk1 = torch.randn(1, D_SPEAKER)
         spk2 = torch.randn(1, D_SPEAKER)
@@ -66,7 +66,7 @@ class TestConverterStudent:
         T = 10
         content = torch.randn(1, D_CONTENT, T)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
 
         with torch.no_grad():
             out_full, _ = model(content, spk, ir)
@@ -94,7 +94,7 @@ class TestConverterStudentGTM:
         """Output shape should match ConverterStudent."""
         content = torch.randn(2, D_CONTENT, 50)
         spk = torch.randn(2, D_SPEAKER)
-        ir = torch.randn(2, N_IR_PARAMS)
+        ir = torch.randn(2, N_ACOUSTIC_PARAMS)
         pred, state = model(content, spk, ir)
         assert pred.shape == (2, D_VOCODER_FEATURES, 50)
         assert state is None
@@ -103,7 +103,7 @@ class TestConverterStudentGTM:
         """State shape should be [1, 384, 52] matching ConverterStudent."""
         content = torch.randn(1, D_CONTENT, 1)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
         state_in = model.init_state()
 
         pred, state_out = model(content, spk, ir, state_in)
@@ -116,7 +116,7 @@ class TestConverterStudentGTM:
         T = 10
         content = torch.randn(1, D_CONTENT, T)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
 
         with torch.no_grad():
             out_full, _ = model(content, spk, ir)
@@ -136,7 +136,7 @@ class TestConverterStudentGTM:
         """Different speaker embeddings should produce different outputs."""
         model.eval()
         content = torch.randn(1, D_CONTENT, 5)
-        ir = torch.zeros(1, N_IR_PARAMS)
+        ir = torch.zeros(1, N_ACOUSTIC_PARAMS)
 
         spk1 = torch.randn(1, D_SPEAKER)
         spk2 = torch.randn(1, D_SPEAKER)
@@ -170,7 +170,7 @@ class TestConverterStudentHQ:
         """Training mode: T=50 → T=50 output (padding preserves length)."""
         content = torch.randn(2, D_CONTENT, 50)
         spk = torch.randn(2, D_SPEAKER)
-        ir = torch.randn(2, N_IR_PARAMS)
+        ir = torch.randn(2, N_ACOUSTIC_PARAMS)
         pred, state = model(content, spk, ir)
         assert pred.shape == (2, D_VOCODER_FEATURES, 50)
         assert state is None
@@ -180,7 +180,7 @@ class TestConverterStudentHQ:
         T_in = 1 + model.max_lookahead  # 7
         content = torch.randn(1, D_CONTENT, T_in)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
         state_in = model.init_state()
 
         pred, state_out = model(content, spk, ir, state_in)
@@ -198,7 +198,7 @@ class TestConverterStudentHQ:
         T = 20
         content = torch.randn(1, D_CONTENT, T)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
 
         # Training: full sequence
         with torch.no_grad():
@@ -242,7 +242,7 @@ class TestConverterStudentHQ:
 
         content = torch.randn(1, D_CONTENT, 20)
         spk = torch.randn(1, D_SPEAKER)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
 
         with torch.no_grad():
             out_causal, _ = causal(content, spk, ir)

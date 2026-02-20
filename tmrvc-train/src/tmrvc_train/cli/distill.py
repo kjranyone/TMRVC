@@ -131,6 +131,25 @@ def _load_config(config_path: Path | None, phase: str) -> dict:
     return cfg
 
 
+def _parse_speaker_groups(cfg: dict) -> list | None:
+    """Parse ``speaker_groups`` from config dict into SpeakerGroupConfig list."""
+    raw = cfg.pop("speaker_groups", None)
+    if not raw:
+        return None
+    from tmrvc_data.sampler import SpeakerGroupConfig
+
+    groups = []
+    for name, entry in raw.items():
+        groups.append(
+            SpeakerGroupConfig(
+                speakers=entry.get("speakers", []),
+                weight=int(entry.get("weight", 1)),
+            )
+        )
+        logger.info("Speaker group '%s': speakers=%s, weight=%d", name, groups[-1].speakers, groups[-1].weight)
+    return groups
+
+
 def _default_lr(phase: str) -> float:
     return {
         "A": 1e-4,
@@ -158,6 +177,7 @@ def main(argv: list[str] | None = None) -> None:
     save_every = args.save_every or file_cfg.get("save_every", 10_000)
     checkpoint_dir = args.checkpoint_dir or Path(file_cfg.get("checkpoint_dir", "checkpoints/distill"))
 
+    speaker_groups = _parse_speaker_groups(file_cfg)
     device = torch.device(args.device)
 
     # Load teacher
@@ -191,6 +211,7 @@ def main(argv: list[str] | None = None) -> None:
         dataset=args.dataset,
         batch_size=batch_size,
         subset=args.subset,
+        speaker_groups=speaker_groups,
     )
 
     config = DistillationConfig(

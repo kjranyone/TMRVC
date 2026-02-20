@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from tmrvc_core.constants import (
+    CONVERTER_HQ_STATE_FRAMES,
     CONVERTER_STATE_FRAMES,
     D_CONTENT,
     D_CONVERTER_HIDDEN,
@@ -14,7 +15,7 @@ from tmrvc_core.constants import (
     GTM_D_ENTRY,
     GTM_N_ENTRIES,
     GTM_N_HEADS,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
 )
 from tmrvc_train.modules import (
     CausalConvNeXtBlock,
@@ -61,7 +62,7 @@ class ConverterStudent(nn.Module):
 
     8 CausalConvNeXt blocks with FiLM, d=384, k=3, dilation=[1,1,2,2,4,4,6,6].
     State context: (k-1)*d per block = 2+2+4+4+8+8+12+12 = 52 frames.
-    Input: content[B, 256, T] + conditioning (spk_embed + ir_params).
+    Input: content[B, 256, T] + conditioning (spk_embed + acoustic_params).
     Output: pred_features[B, 513, T].
     """
 
@@ -71,14 +72,14 @@ class ConverterStudent(nn.Module):
         d_model: int = D_CONVERTER_HIDDEN,
         d_output: int = D_VOCODER_FEATURES,
         d_speaker: int = D_SPEAKER,
-        n_ir_params: int = N_IR_PARAMS,
+        n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         n_blocks: int = 8,
         kernel_size: int = 3,
         dilations: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.d_model = d_model
-        d_cond = d_speaker + n_ir_params  # 192 + 24 = 216
+        d_cond = d_speaker + n_acoustic_params  # 192 + 32 = 224
         dilations = dilations or [1, 1, 2, 2, 4, 4, 6, 6]
         assert len(dilations) == n_blocks
 
@@ -108,7 +109,7 @@ class ConverterStudent(nn.Module):
         self,
         content: torch.Tensor,
         spk_embed: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass.
@@ -116,13 +117,13 @@ class ConverterStudent(nn.Module):
         Args:
             content: ``[B, 256, T]`` content features.
             spk_embed: ``[B, 192]`` speaker embedding.
-            ir_params: ``[B, 24]`` IR parameters.
+            acoustic_params: ``[B, 32]`` acoustic condition parameters.
             state_in: ``[B, d_model, total_state]`` streaming state or None.
 
         Returns:
             Tuple of ``(pred_features [B, 513, T], state_out or None)``.
         """
-        cond = torch.cat([spk_embed, ir_params], dim=-1)  # [B, 216]
+        cond = torch.cat([spk_embed, acoustic_params], dim=-1)  # [B, 224]
 
         x = self.input_proj(content)  # [B, d_model, T]
 
@@ -159,12 +160,12 @@ class ConverterStudent(nn.Module):
 
 
 class ConverterBlockGTM(nn.Module):
-    """CausalConvNeXtBlock + TimbreCrossAttention(speaker) + FiLM(IR only)."""
+    """CausalConvNeXtBlock + TimbreCrossAttention(speaker) + FiLM(acoustic)."""
 
     def __init__(
         self,
         d_model: int,
-        n_ir_params: int,
+        n_acoustic_params: int,
         d_entry: int = GTM_D_ENTRY,
         n_heads: int = GTM_N_HEADS,
         kernel_size: int = 7,
@@ -175,7 +176,7 @@ class ConverterBlockGTM(nn.Module):
             d_model, kernel_size=kernel_size, dilation=dilation,
         )
         self.timbre_attn = TimbreCrossAttention(d_model, d_entry, n_heads)
-        self.film_ir = FiLMConditioner(n_ir_params, d_model)
+        self.film_acoustic = FiLMConditioner(n_acoustic_params, d_model)
 
     @property
     def context_size(self) -> int:
@@ -185,12 +186,12 @@ class ConverterBlockGTM(nn.Module):
         self,
         x: torch.Tensor,
         timbre_memory: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x, state_out = self.conv_block(x, state_in)
         x = x + self.timbre_attn(x, timbre_memory)
-        x = self.film_ir(x, ir_params)
+        x = self.film_acoustic(x, acoustic_params)
         return x, state_out
 
 
@@ -200,7 +201,7 @@ class ConverterStudentGTM(nn.Module):
     Same ONNX I/O contract as ConverterStudent: the GTM expansion happens
     internally from spk_embed, so the external interface is unchanged.
 
-    8 CausalConvNeXt blocks with TimbreCrossAttention + FiLM(IR),
+    8 CausalConvNeXt blocks with TimbreCrossAttention + FiLM(acoustic),
     d=384, k=3, dilation=[1,1,2,2,4,4,6,6].
     State: same 52-frame budget as ConverterStudent.
     """
@@ -211,7 +212,7 @@ class ConverterStudentGTM(nn.Module):
         d_model: int = D_CONVERTER_HIDDEN,
         d_output: int = D_VOCODER_FEATURES,
         d_speaker: int = D_SPEAKER,
-        n_ir_params: int = N_IR_PARAMS,
+        n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         n_blocks: int = 8,
         kernel_size: int = 3,
         dilations: list[int] | None = None,
@@ -236,7 +237,7 @@ class ConverterStudentGTM(nn.Module):
         # GTM converter blocks
         self.blocks = nn.ModuleList([
             ConverterBlockGTM(
-                d_model, n_ir_params,
+                d_model, n_acoustic_params,
                 d_entry=gtm_d_entry, n_heads=gtm_n_heads,
                 kernel_size=kernel_size, dilation=d,
             )
@@ -257,7 +258,7 @@ class ConverterStudentGTM(nn.Module):
         self,
         content: torch.Tensor,
         spk_embed: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass (same signature as ConverterStudent).
@@ -265,7 +266,7 @@ class ConverterStudentGTM(nn.Module):
         Args:
             content: ``[B, 256, T]`` content features.
             spk_embed: ``[B, 192]`` speaker embedding.
-            ir_params: ``[B, 24]`` IR parameters.
+            acoustic_params: ``[B, 32]`` acoustic condition parameters.
             state_in: ``[B, d_model, total_state]`` streaming state or None.
 
         Returns:
@@ -283,7 +284,7 @@ class ConverterStudentGTM(nn.Module):
 
         new_states = []
         for block, s_in in zip(self.blocks, states):
-            x, s_out = block(x, timbre_memory, ir_params, s_in)
+            x, s_out = block(x, timbre_memory, acoustic_params, s_in)
             new_states.append(s_out)
 
         x = self.output_proj(x)  # [B, 513, T]
@@ -387,7 +388,7 @@ class ConverterStudentHQ(nn.Module):
         d_model: int = D_CONVERTER_HIDDEN,
         d_output: int = D_VOCODER_FEATURES,
         d_speaker: int = D_SPEAKER,
-        n_ir_params: int = N_IR_PARAMS,
+        n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         n_blocks: int = 8,
         kernel_size: int = 3,
         dilations: list[int] | None = None,
@@ -396,7 +397,7 @@ class ConverterStudentHQ(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.max_lookahead = max_lookahead
-        d_cond = d_speaker + n_ir_params  # 216
+        d_cond = d_speaker + n_acoustic_params  # 224
         dilations = dilations or [1, 1, 2, 2, 4, 4, 6, 6]
         assert len(dilations) == n_blocks
 
@@ -424,12 +425,15 @@ class ConverterStudentHQ(nn.Module):
         # Precompute state slicing (left_context per block)
         self._state_sizes = [blk.left_context for blk in self.blocks]
         self._total_state = sum(self._state_sizes)
+        assert self._total_state == CONVERTER_HQ_STATE_FRAMES, (
+            f"Expected total HQ state {CONVERTER_HQ_STATE_FRAMES}, got {self._total_state}"
+        )
 
     def forward(
         self,
         content: torch.Tensor,
         spk_embed: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass.
@@ -438,14 +442,14 @@ class ConverterStudentHQ(nn.Module):
             content: ``[B, 256, T]`` content features.
                 Training: any T. Streaming: T = 1 + max_lookahead.
             spk_embed: ``[B, 192]`` speaker embedding.
-            ir_params: ``[B, 24]`` IR parameters.
+            acoustic_params: ``[B, 32]`` acoustic condition parameters.
             state_in: ``[B, d_model, total_state]`` streaming state or None.
 
         Returns:
             Training: ``(pred_features [B, 513, T], None)``.
             Streaming: ``(pred_features [B, 513, 1], state_out)``.
         """
-        cond = torch.cat([spk_embed, ir_params], dim=-1)  # [B, 216]
+        cond = torch.cat([spk_embed, acoustic_params], dim=-1)  # [B, 224]
 
         x = self.input_proj(content)  # [B, d_model, T]
 
@@ -488,10 +492,18 @@ class ConverterStudentHQ(nn.Module):
         so they can be directly copied. Fine-tuning adapts the model to
         semi-causal padding.
         """
+        # Infer conditioning dimensions from causal model's FiLM layer
+        d_cond = causal_model.blocks[0].film.proj.in_features  # d_speaker + n_acoustic_params
+        d_speaker_inferred = d_cond - N_ACOUSTIC_PARAMS
         hq = cls(
             d_input=causal_model.input_proj[0].in_channels,
             d_model=causal_model.d_model,
             d_output=causal_model.output_proj.out_channels,
+            d_speaker=d_speaker_inferred,
+            n_acoustic_params=N_ACOUSTIC_PARAMS,
+            n_blocks=len(causal_model.blocks),
+            kernel_size=causal_model.blocks[0].conv_block.kernel_size,
+            dilations=[blk.conv_block.dilation for blk in causal_model.blocks],
         )
         # Copy input/output projections
         hq.input_proj.load_state_dict(causal_model.input_proj.state_dict())

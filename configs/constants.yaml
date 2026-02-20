@@ -17,12 +17,22 @@ log_floor: 1.0e-10
 d_content: 256
 d_speaker: 192
 n_ir_params: 24           # 8 subbands x 3 parameters
+n_voice_source_params: 8  # breathiness(2) + tension(2) + jitter + shimmer + formant_shift + roughness
+n_acoustic_params: 32     # n_ir_params + n_voice_source_params
 d_converter_hidden: 384
 d_vocoder_features: 513   # = n_freq_bins
 
 # --- Feature Extraction ---
-d_content_vec: 768        # ContentVec output dim
+d_content_vec: 768        # ContentVec output dim (Phase 0)
+d_wavlm_large: 1024       # WavLM-large layer 7 output dim (Phase 1+)
+wavlm_layer: 7            # WavLM-large layer to use
 content_vec_hop_ms: 20.0  # ContentVec native hop (ms)
+
+# --- VQ Bottleneck (Speaker Leakage 対策) ---
+vq_n_codebooks: 2         # Factorized VQ: number of codebooks
+vq_codebook_size: 8192    # Entries per codebook
+vq_codebook_dim: 128      # Dimension per codebook (= d_content / vq_n_codebooks)
+vq_commitment_lambda: 0.25  # Commitment loss weight
 
 # --- Inference Parameters ---
 student_steps: 1
@@ -32,7 +42,7 @@ ir_update_interval: 10    # frames (~100ms)
 lora_rank: 4
 lora_alpha: 8
 n_lora_layers: 4
-lora_delta_size: 24576    # 4 layers x 6144
+lora_delta_size: 15872    # 4 layers x ((d_speaker+n_acoustic_params)*rank + rank*(d_converter_hidden*2)) = 4 x 3968
 
 # --- State Tensor Dimensions ---
 content_encoder_state_frames: 28
@@ -71,6 +81,14 @@ crossfade_frames: 10              # 100ms crossfade on mode switch
 
 # --- Training ---
 flow_matching_steps: 20       # Teacher sampling steps
+use_ot_cfm: true              # OT-CFM (optimal transport pairing) for straight trajectories
+ot_cfm_batch_ot: true         # Enable minibatch optimal transport pairing
+
+# --- Quality Targets (Phase 1+) ---
+target_secs_phase0: 0.75      # Minimum SECS for Phase 0 validation
+target_secs_phase1: 0.90      # Target SECS for Phase 1 (WavLM + VQ + OT-CFM)
+target_utmos_phase1: 4.0      # Target UTMOS for Phase 1
+target_secs_reverb: 0.86      # Target SECS under reverberant conditions (Phase 2)
 
 # --- Training Defaults ---
 default_batch_size: 64
@@ -78,3 +96,14 @@ segment_min_sec: 5.0
 segment_max_sec: 15.0
 loudness_target_lufs: -23.0
 cross_speaker_prob: 0.2
+
+# --- Voice Source Param Names (for presets, not runtime) ---
+voice_source_param_names:
+  - breathiness_low
+  - breathiness_high
+  - tension_low
+  - tension_high
+  - jitter
+  - shimmer
+  - formant_shift
+  - roughness

@@ -14,8 +14,8 @@ pub struct TensorPool {
 const OFF_MEL_FRAME: usize = 0; // [80]
 const OFF_F0_FRAME: usize = OFF_MEL_FRAME + N_MELS; // [1]
 const OFF_CONTENT: usize = OFF_F0_FRAME + 1; // [256]
-const OFF_IR_PARAMS: usize = OFF_CONTENT + D_CONTENT; // [24]
-const OFF_SPK_EMBED: usize = OFF_IR_PARAMS + N_IR_PARAMS; // [192]
+const OFF_ACOUSTIC_PARAMS: usize = OFF_CONTENT + D_CONTENT; // [32]
+const OFF_SPK_EMBED: usize = OFF_ACOUSTIC_PARAMS + N_ACOUSTIC_PARAMS; // [192]
 const OFF_PRED_FEATURES: usize = OFF_SPK_EMBED + D_SPEAKER; // [513]
 const OFF_STFT_MAG: usize = OFF_PRED_FEATURES + N_FREQ_BINS; // [513]
 const OFF_STFT_PHASE: usize = OFF_STFT_MAG + N_FREQ_BINS; // [513]
@@ -68,11 +68,11 @@ impl TensorPool {
         &mut self.data[OFF_CONTENT..OFF_CONTENT + D_CONTENT]
     }
 
-    pub fn ir_params(&self) -> &[f32] {
-        &self.data[OFF_IR_PARAMS..OFF_IR_PARAMS + N_IR_PARAMS]
+    pub fn acoustic_params(&self) -> &[f32] {
+        &self.data[OFF_ACOUSTIC_PARAMS..OFF_ACOUSTIC_PARAMS + N_ACOUSTIC_PARAMS]
     }
-    pub fn ir_params_mut(&mut self) -> &mut [f32] {
-        &mut self.data[OFF_IR_PARAMS..OFF_IR_PARAMS + N_IR_PARAMS]
+    pub fn acoustic_params_mut(&mut self) -> &mut [f32] {
+        &mut self.data[OFF_ACOUSTIC_PARAMS..OFF_ACOUSTIC_PARAMS + N_ACOUSTIC_PARAMS]
     }
 
     pub fn spk_embed(&self) -> &[f32] {

@@ -96,8 +96,8 @@ TensorPool: single malloc (total ~300 KB)
 │ 0x0000   320 B    mel_frame               [1, 80, 1]       │
 │ 0x0140   4 B      f0_frame                [1, 1, 1]        │
 │ 0x0144   1024 B   content                 [1, 256, 1]      │
-│ 0x0544   96 B     ir_params               [1, 24]          │
-│ 0x05A4   768 B    spk_embed               [1, 192]         │
+│ 0x0544   128 B    acoustic_params         [1, 32]          │
+│ 0x05C4   768 B    spk_embed               [1, 192]         │
 │ 0x0874   2052 B   pred_features           [1, 513, 1]      │
 │ 0x1078   2052 B   stft_mag                [1, 513, 1]      │
 │ 0x187C   2052 B   stft_phase              [1, 513, 1]      │
@@ -137,7 +137,7 @@ public:
     float* getMelFrame()       { return base_ + kOffsetMelFrame; }
     float* getF0Frame()        { return base_ + kOffsetF0Frame; }
     float* getContent()        { return base_ + kOffsetContent; }
-    float* getIRParams()       { return base_ + kOffsetIRParams; }
+    float* getAcousticParams() { return base_ + kOffsetAcousticParams; }
     float* getSpkEmbed()       { return base_ + kOffsetSpkEmbed; }
     float* getPredFeatures()   { return base_ + kOffsetPredFeatures; }
     float* getSTFTMag()        { return base_ + kOffsetSTFTMag; }
@@ -180,11 +180,11 @@ public:
 
     bool runIREstimator(
         const float* melChunk, const float* stateIn,
-        float* irParams, float* stateOut);
+        float* acousticParams, float* stateOut);
 
     bool runConverter(
         const float* content, const float* spkEmbed,
-        const float* irParams, const float* stateIn,
+        const float* acousticParams, const float* stateIn,
         float* predFeatures, float* stateOut);
 
     bool runVocoder(
@@ -541,7 +541,9 @@ private:
 
     // Frame processing state
     int irFrameCounter_ = 0;
-    float cachedIRParams_[kNIRParams] = {};
+    float cachedAcousticParams_[kNAcousticParams] = {};
+    float voiceSourcePreset_[kNVoiceSourceParams] = {};  // from .tmrvc_speaker
+    bool hasVoiceSourcePreset_ = false;
 
     // Atomic parameters
     std::atomic<float> dryWetMix_{1.0f};
@@ -616,6 +618,7 @@ void StreamingEngine::process(
 | **IR RT60** | 3 | 0.05 - 3.0 sec | 0.5 sec | Float |
 | **IR DRR** | 4 | -10.0 - +30.0 dB | 10.0 dB | Float |
 | **IR Tilt** | 5 | -6.0 - +6.0 dB/oct | 0.0 | Float |
+| **Voice Preset** | 6 | 0.0 - 1.0 | 0.0 (off) | Float |
 
 ### 8.2 パラメータの Audio Thread への伝達
 
@@ -859,7 +862,7 @@ target_link_libraries(TMRVCPlugin
 
 - [x] StreamingEngine は JUCE に非依存 (architecture.md §5.2)
 - [x] ONNX Runtime は C API only / 静的リンク (architecture.md §5.3)
-- [x] TensorPool の shapes が onnx-contract.md §2-3 と一致
+- [x] TensorPool の shapes が onnx-contract.md §2-3 と一致 (ir_params → acoustic_params[32])
 - [x] Ring Buffer サイズが streaming-design.md §4 と一致
 - [x] Audio thread は RT-safe (streaming-design.md §7.2)
 - [x] SPSC Queue protocol が streaming-design.md §7.3-7.4 と一致
@@ -867,3 +870,5 @@ target_link_libraries(TMRVCPlugin
 - [x] Latency reporting が streaming-design.md §8 と一致
 - [x] Graceful degradation が streaming-design.md §6 と一致
 - [x] Model dimensions が model-architecture.md と一致
+- [x] Voice Source Preset: speaker ファイルから読み込み、converter 呼び出し前にブレンド (RT-safe)
+- [x] Voice Preset パラメータ (ID=6) が VST3 パラメータ一覧に追加済み

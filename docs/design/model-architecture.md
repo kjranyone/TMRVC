@@ -60,19 +60,71 @@ mel_frame[1, 80, 1]  +  f0[1, 1, 1]  →  concat  →  [1, 81, 1]  →  input pr
 
 F0 は log-scale に変換 (log(f0+1))、unvoiced frames は 0。
 
-### 1.3 Knowledge Distillation (from ContentVec/WavLM)
+### 1.3 Knowledge Distillation (from WavLM-large)
+
+**Teacher 選択の根拠 (2026-02 更新):**
+
+| Teacher | Params | 出力次元 | 品質 | 推奨 |
+|---|---|---|---|---|
+| ContentVec | 95M | 768d | 良好 | Phase 0 (検証用) |
+| **WavLM-large layer 7** | **317M** | **1024d** | **最高** | **Phase 1+ (本番)** |
+
+WavLM-large は ContentVec よりも content 表現が豊かで、speaker leakage が少ない。
+layer 7 (中間層) を使用することで、content と prosody のバランスを最適化。
 
 ```
-ContentVec (Teacher, ~300M, non-causal, offline)
+WavLM-large layer 7 (Teacher, ~317M, non-causal, offline)
      │
-     │  audio → teacher_content[1, 768, T]
+     │  audio → teacher_content[1, 1024, T]
      │
      ├── per-frame MSE loss: ||student_content - proj(teacher_content)||²
      ├── cosine embedding loss: 1 - cos(student, proj(teacher))
      └── CTC auxiliary loss (optional): phoneme label prediction
 ```
 
-**Projection**: teacher 768-dim → 256-dim linear projection (学習時のみ使用)。
+**Projection**: teacher 1024-dim → 256-dim linear projection (学習時のみ使用)。
+
+### 1.3.1 VQ Bottleneck (Speaker Leakage 対策)
+
+TVTSyn (arXiv:2602.09389) に倣い、Content Encoder 出力に **Factorized VQ Bottleneck** を追加。
+content 特徴量を離散化することで、残留 speaker 情報を除去する。
+
+```
+Content Encoder 出力: content[1, 256, 1]
+       │
+       ▼
+┌─────────────────────────────────────────────┐
+│  Factorized VQ Bottleneck                    │
+│                                              │
+│  1. Split: content → [c1, c2] (128d each)   │
+│  2. Quantize each:                           │
+│     c1 → lookup(codebook_1) → q1            │
+│     c2 → lookup(codebook_2) → q2            │
+│  3. Concat: [q1, q2] → quantized[1, 256, 1] │
+│                                              │
+│  Codebook config:                            │
+│    - n_codebooks: 2                          │
+│    - codebook_size: 8192                     │
+│    - codebook_dim: 128                       │
+│    - commitment_loss: λ_commit = 0.25       │
+└─────────────────────────────────────────────┘
+       │
+       ▼
+Output: quantized_content[1, 256, 1]
+```
+
+**学習時:**
+- Straight-through estimator で勾配伝播
+- Commitment loss: ||content - detach(quantized)||²
+- Codebook 更新: EMA (exponential moving average)
+
+**推論時:**
+- VQ は ONNX export 時に焼き込み可能 (lookup table)
+- または runtime で VQ 実行 (追加 ~0.1ms/frame)
+
+**効果:**
+- Speaker similarity loss が低下 (leakage 除去)
+- Content 一致性が向上 (離散化による正則化)
 
 ### 1.4 パラメータ・計算量見積もり
 
@@ -167,9 +219,9 @@ class FiLMConditioner(nn.Module):
         return gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
 ```
 
-- `cond = concat(spk_embed[192], ir_params[24])` → 216-dim
+- `cond = concat(spk_embed[192], acoustic_params[32])` → 224-dim
 - 各 ConvNeXt block 内で適用
-- Speaker と IR の情報が各層で注入される
+- Speaker と acoustic (IR + voice source) の情報が各層で注入される
 
 ### 2.3 LoRA: Cross-Attention K/V への適用
 
@@ -406,11 +458,11 @@ Overlap-Add:
 
 ---
 
-## 4. IR Estimator (~1-3M params)
+## 4. IR Estimator / Acoustic Params Estimator (~1-3M params)
 
 ### 4.1 アーキテクチャ
 
-入力音声の音響環境 (残響特性、マイク特性) を推定する。
+入力音声の音響環境 (残響特性、マイク特性) および声質パラメータを推定する。
 amortized 実行 (10 フレーム = 100ms ごと)。
 
 ```
@@ -428,20 +480,39 @@ Input: mel_chunk[1, 80, 10]  ← 10 frames 分の mel (accumulated)
        ┌────────────────────────────────────────────┐
        │  MLP Head                                   │
        │  Linear(128 → 64) + SiLU                   │
-       │  Linear(64 → 24)                            │
+       │  Linear(64 → 32)                            │
        │  + Sigmoid/Tanh (range clamping)            │
        └──────────────┬─────────────────────────────┘
                       ↓
-Output: ir_params[1, 24]
+Output: acoustic_params[1, 32]
+        (24 IR params + 8 voice source params)
 ```
 
-### 4.2 出力仕様: 8 Subbands × 3 Parameters
+### 4.2 出力仕様: 24 IR params + 8 Voice Source params
+
+#### IR Parameters (indices 0-23): 8 Subbands × 3 Parameters
 
 | Index | Parameter | Description | Range | Activation |
 |---|---|---|---|---|
 | 0-7 | RT60 (sec) | 各サブバンドの残響時間 | [0.05, 3.0] | sigmoid × 2.95 + 0.05 |
 | 8-15 | DRR (dB) | Direct-to-Reverb Ratio | [-10, 30] | sigmoid × 40 - 10 |
 | 16-23 | Spectral tilt | マイク/部屋の周波数特性傾斜 | [-6, 6] | tanh × 6 |
+
+#### Voice Source Parameters (indices 24-31)
+
+| Index | Parameter | Description | Range |
+|---|---|---|---|
+| 24 | breathiness_low | 低域ブレス成分 | [0, 1] |
+| 25 | breathiness_high | 高域ブレス成分 | [0, 1] |
+| 26 | tension_low | 低域声帯張力 | [0, 1] |
+| 27 | tension_high | 高域声帯張力 | [0, 1] |
+| 28 | jitter | 基本周波数微細変動 | [0, 1] |
+| 29 | shimmer | 振幅微細変動 | [0, 1] |
+| 30 | formant_shift | フォルマントシフト | [-1, 1] |
+| 31 | roughness | 声の粗さ | [0, 1] |
+
+Voice source params は `.tmrvc_speaker` のプリセット値とランタイムブレンド可能。
+詳細は `docs/design/acoustic-condition-pathway.md` §Voice Source Presets を参照。
 
 **Subbands (24kHz, 8 bands):**
 
@@ -577,13 +648,13 @@ def create_speaker_file(audio_paths: list[str], output_path: str):
 Inputs:
   x_t:       noisy mel[1, 80, T]     ← diffusion noise level t の mel
   t:         timestep[1]             ← diffusion timestep
-  content:   [1, 768, T]            ← HuBERT/ContentVec features
+  content:   [1, 1024, T]            ← WavLM-large layer 7 features
   f0:        [1, 1, T]              ← log-F0 contour
   spk_embed: [1, 192]               ← speaker embedding
-  ir_params: [1, 24]                ← IR conditioning
+  acoustic_params: [1, 32]          ← acoustic conditioning (IR + voice source)
 
        ┌──────────────────────────────────────┐
-       │  U-Net (v-prediction)                 │
+       │  U-Net (v-prediction, OT-CFM)        │
        │                                       │
        │  Encoder:                             │
        │    Down Block 1: 80 → 128, /2         │
@@ -595,7 +666,7 @@ Inputs:
        │    ResBlock + Cross-Attention          │
        │    Q = x_t, K/V = content             │
        │    + F0 FiLM + Speaker FiLM           │
-       │    + IR FiLM + Timestep embedding     │
+       │    + Acoustic FiLM + Timestep embedding│
        │                                       │
        │  Decoder (with skip connections):     │
        │    Up Block 4: 512 → 384, ×2          │
@@ -612,22 +683,78 @@ Inputs:
 Output: v_predicted[1, 80, T]  (velocity in mel space)
 ```
 
-### 6.2 Diffusion: v-prediction
+### 6.2 OT-CFM: Optimal Transport Conditional Flow Matching (更新)
 
+従来の Rectified Flow から **OT-CFM (Matcha-TTS, StableVC)** に変更。
+minibatch 内で noise と data の最適輸送ペアを計算することで、軌道を直線化し少ステップ生成を可能にする。
+
+```python
+# Forward process (OT-CFM)
+def forward_process_otcfm(x_0, noise, t):
+    """
+    x_0: clean mel [B, 80, T]
+    noise: matched noise via optimal transport [B, 80, T]
+    t: timestep in [0, 1]
+    """
+    # Linear interpolation (OT path)
+    x_t = (1 - t) * noise + t * x_0
+    
+    # Velocity target (points directly to x_0)
+    v_target = x_0 - noise
+    
+    return x_t, v_target
+
+# Optimal Transport pairing
+def compute_ot_pairs(x_0_batch, noise_batch):
+    """
+    minibatch 内で noise と data の最適ペアを計算
+    使用: scipy.optimize.linear_sum_assignment
+    """
+    B = x_0_batch.shape[0]
+    
+    # Cost matrix: pairwise distances
+    cost = np.zeros((B, B))
+    for i in range(B):
+        for j in range(B):
+            cost[i, j] = np.linalg.norm(x_0_batch[i] - noise_batch[j])
+    
+    # Optimal assignment
+    row_ind, col_ind = linear_sum_assignment(cost)
+    
+    # Reorder noise to match optimal pairs
+    return noise_batch[col_ind]
+
+# Training step
+def train_step_otcfm(model, batch):
+    content, f0, spk_embed, acoustic_params, mel_target = batch
+    B = mel_target.shape[0]
+    
+    # Sample noise
+    noise = torch.randn_like(mel_target)
+    
+    # OT pairing (within batch)
+    noise_matched = compute_ot_pairs(mel_target.detach().cpu().numpy(), 
+                                      noise.detach().cpu().numpy())
+    noise_matched = torch.from_numpy(noise_matched).to(mel_target.device)
+    
+    # Sample timestep
+    t = torch.rand(B, 1, 1)
+    
+    # Forward process
+    x_t, v_target = forward_process_otcfm(mel_target, noise_matched, t)
+    
+    # Predict velocity
+    v_pred = model(x_t, t, content, f0, spk_embed, acoustic_params)
+    
+    # Loss
+    loss_flow = F.mse_loss(v_pred, v_target)
+    return loss_flow
 ```
-Forward process:
-  x_t = α_t × x_0 + σ_t × ε
 
-v-prediction target:
-  v = α_t × ε - σ_t × x_0
-
-Loss:
-  L = ||v_θ(x_t, t, cond) - v||²
-```
-
-- Rectified Flow schedule: α_t = 1-t, σ_t = t (linear interpolation)
-- Training steps: 10-20 steps for sampling
-- v-prediction は x0-prediction や ε-prediction より安定 (Salimans & Ho, 2022)
+**OT-CFM の利点:**
+- 軌道が直線化 → 少ない推論ステップで高品質
+- 1-step 蒸留がより容易 (Teacher 軌道が既に直線的)
+- StableVC (AAAI 2025) で実証済み
 
 ### 6.3 損失関数
 
@@ -698,16 +825,21 @@ INT8 量子化後:
 ## 8. 設計整合性チェックリスト
 
 - [x] Content Encoder 出力 (256d) が Converter 入力と一致
+- [x] Content Encoder Teacher: WavLM-large layer 7 (1024d) → projection (Phase 1+)
+- [x] VQ Bottleneck: 2 codebooks × 8192 × 128d で speaker leakage 対策
 - [x] Converter 出力 (513d) が Vocoder 入力 (513d) と一致
-- [x] IR Estimator 出力 (24d) が Converter の FiLM 入力と一致
+- [x] Acoustic Estimator 出力 (32d: 24 IR + 8 voice source) が Converter の FiLM 入力と一致
 - [x] Speaker Encoder 出力 (192d) が Converter の FiLM 入力と一致
+- [x] Voice Source Preset (8d) ブレンドが acoustic_params[24..31] に適用される
+- [x] Voice Source 外部蒸留が Phase 2 で有効
 - [x] LoRA delta サイズ (24576) が onnx-contract.md と一致
 - [x] State tensor shapes が onnx-contract.md §3 と一致
 - [x] 全 Live streaming models が causal (look-ahead = 0)
 - [x] ConverterStudentHQ は semi-causal (right_ctx=[1,1,2,2,0,0,0,0], state=46)
 - [x] パラメータ合計 (~7.7M) が CPU real-time に十分小さい
 - [x] Per-frame inference (~3ms) < hop time (10ms)
-- [x] Teacher は non-causal U-Net、Student は causal CNN (明確に分離)
+- [x] Teacher は OT-CFM v-prediction (軌道直線化)、Student は 1-step 蒸留
+- [x] 品質目標: Phase 1 で SECS ≥ 0.90, UTMOS ≥ 4.0
 
 ---
 
@@ -733,11 +865,11 @@ Student の妥当性は「単一の最速点」ではなく、`Latency-Quality` 
 | 話者性 | SECS / speaker cosine | 話者一致 |
 | 音質 | UTMOS / MCD / STFT loss proxy | 知覚品質 |
 
-### 9.3 受け入れ基準 (案)
+### 9.3 受け入れ基準 (更新)
 
 | Mode | レイテンシ | 品質条件 |
 |---|---|---|
-| Live | <= 30ms (reported) | SECS >= 0.88, UTMOS >= 3.8 |
+| Live | <= 30ms (reported) | SECS >= 0.90, UTMOS >= 4.0 |
 | Mix | <= 55ms (reported) | Live 比で WER 改善 or 同等, F0 corr 改善 |
 | Quality | <= 85ms (reported) | Live 比で WER/子音誤り/F0 RMSE の有意改善 |
 

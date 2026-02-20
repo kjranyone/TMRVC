@@ -27,6 +27,8 @@ n_freq_bins: 513          # n_fft / 2 + 1
 d_content: 256            # Content encoder output dimension
 d_speaker: 192            # Speaker embedding dimension
 n_ir_params: 24           # IR estimator output: 8 subbands × 3 (RT60, DRR, tilt)
+n_voice_source_params: 8  # Voice source params (breathiness, tension, jitter, shimmer, formant_shift, roughness)
+n_acoustic_params: 32     # = n_ir_params + n_voice_source_params
 d_converter_hidden: 384   # Converter hidden dimension
 d_vocoder_features: 513   # Vocoder input: STFT magnitude bins (= n_freq_bins)
 
@@ -63,6 +65,8 @@ constexpr int kNFreqBins        = 513;
 constexpr int kDContent         = 256;
 constexpr int kDSpeaker         = 192;
 constexpr int kNIRParams        = 24;
+constexpr int kNVoiceSourceParams = 8;
+constexpr int kNAcousticParams  = 32;
 constexpr int kDConverterHidden = 384;
 constexpr int kDVocoderFeatures = 513;
 constexpr int kStudentSteps     = 1;
@@ -82,10 +86,10 @@ constexpr int kNLoraLayers      = 4;
 | Model | File | Inputs | Outputs | Execution |
 |---|---|---|---|---|
 | **content_encoder** | `content_encoder.onnx` | mel_frame, f0, state_in | content, state_out | Per-frame (10ms) |
-| **ir_estimator** | `ir_estimator.onnx` | mel_chunk, state_in | ir_params, state_out | Every ~10 frames (~100ms) |
+| **ir_estimator** | `ir_estimator.onnx` | mel_chunk, state_in | acoustic_params, state_out | Every ~10 frames (~100ms) |
 | **speaker_encoder** | `speaker_encoder.onnx` | mel_ref | spk_embed, lora_delta | Offline only |
-| **converter** | `converter.onnx` | content, spk_embed, ir_params, state_in | pred_features, state_out | Per-frame (10ms), 1-step |
-| **converter_hq** | `converter_hq.onnx` | content, spk_embed, ir_params, state_in | pred_features, state_out | Per-frame (10ms), HQ mode, optional |
+| **converter** | `converter.onnx` | content, spk_embed, acoustic_params, state_in | pred_features, state_out | Per-frame (10ms), 1-step |
+| **converter_hq** | `converter_hq.onnx` | content, spk_embed, acoustic_params, state_in | pred_features, state_out | Per-frame (10ms), HQ mode, optional |
 | **vocoder** | `vocoder.onnx` | features, state_in | stft_mag, stft_phase, state_out | Per-frame (10ms) |
 
 ### 2.2 content_encoder
@@ -109,7 +113,7 @@ constexpr int kNLoraLayers      = 4;
 
 ### 2.3 ir_estimator
 
-入力音声の音響特性 (残響、マイク特性) を推定する。amortized 実行 (10 フレームに 1 回)。
+入力音声の音響環境 (残響、マイク特性) と声質特性 (息成分、緊張度等) を推定する。amortized 実行 (10 フレームに 1 回)。
 
 **Inputs:**
 
@@ -122,16 +126,22 @@ constexpr int kNLoraLayers      = 4;
 
 | Name | Shape | Type | Description |
 |---|---|---|---|
-| `ir_params` | `[1, 24]` | float32 | IR パラメータ (8 subbands × 3) |
+| `acoustic_params` | `[1, 32]` | float32 | Acoustic conditioning params (24 IR + 8 voice source) |
 | `state_out` | `[1, 128, 6]` | float32 | Updated hidden state |
 
-**ir_params の内訳:**
+**acoustic_params の内訳:**
 
 | Index | Parameter | Subband | Range |
 |---|---|---|---|
 | 0-7 | RT60 (sec) | 8 subbands (0-375, 375-750, ..., 9375-12000 Hz) | [0.05, 3.0] |
 | 8-15 | DRR (dB) | 同上 | [-10, 30] |
 | 16-23 | Spectral tilt (dB/oct) | 同上 | [-6, 6] |
+| 24-25 | Breathiness (low/high) | 2 subbands (<3kHz, ≥3kHz) | [0, 1] |
+| 26-27 | Tension (low/high) | 同上 | [-1, 1] |
+| 28 | Jitter | — | [0, 0.1] |
+| 29 | Shimmer | — | [0, 0.1] |
+| 30 | Formant shift | — | [-1, 1] |
+| 31 | Roughness | — | [0, 1] |
 
 ### 2.4 speaker_encoder
 
@@ -176,7 +186,7 @@ Content features を target speaker の音響特徴に変換する。1-step deno
 |---|---|---|---|
 | `content` | `[1, 256, 1]` | float32 | Content encoder 出力 |
 | `spk_embed` | `[1, 192]` | float32 | Speaker embedding (cached) |
-| `ir_params` | `[1, 24]` | float32 | IR パラメータ (cached) |
+| `acoustic_params` | `[1, 32]` | float32 | Acoustic conditioning params (cached) |
 | `state_in` | `[1, 384, 52]` | float32 | Causal conv の hidden state |
 
 **Outputs:**
@@ -202,7 +212,7 @@ HQ mode 用の semi-causal converter。Content Encoder で T=1 ずつ生成し�
 |---|---|---|---|
 | `content` | `[1, 256, 7]` | float32 | 7 フレーム分の content features (1 current + 6 lookahead) |
 | `spk_embed` | `[1, 192]` | float32 | Speaker embedding (cached) |
-| `ir_params` | `[1, 24]` | float32 | IR パラメータ (cached) |
+| `acoustic_params` | `[1, 32]` | float32 | Acoustic conditioning params (cached) |
 | `state_in` | `[1, 384, 46]` | float32 | Semi-causal conv の hidden state |
 
 **Outputs:**
@@ -442,6 +452,8 @@ Header = 24 bytes. サムネイルはメタデータ JSON 内に `thumbnail_b64`
 - `thumbnail_b64`: 100×100px RGB PNG を base64 エンコードした文字列（空文字 = なし）
 - `training_mode`: `"embedding"` | `"finetune"`
 - `checkpoint_name`: fine-tune 時のみ非空
+- `voice_source_preset`: 8 floats (voice source params) or `null` — ブレンド用プリセット
+- `voice_source_param_names`: パラメータ名リスト（自己文書化用）
 - 文字列フィールドは空文字許容。将来拡張時は不明キーを無視する。
 
 ### 6.3 サムネイル

@@ -51,3 +51,9 @@ phases:
     lambda_stft: 0.5
     lambda_sv: 0.5
     description: "Metric Optimization — SV loss + spectral loss for direct quality tuning"
+
+# --- Speaker group weighting ---
+speaker_groups:
+  moe:
+    speakers: ["moe/*"]
+    weight: 10

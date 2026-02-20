@@ -1,4 +1,7 @@
-"""IREstimator: causal CNN for impulse response parameter estimation."""
+"""IREstimator: causal CNN for acoustic condition parameter estimation.
+
+Estimates 32-dim acoustic parameters: 24 IR (environment) + 8 voice source.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +10,7 @@ import torch.nn as nn
 
 from tmrvc_core.constants import (
     IR_ESTIMATOR_STATE_FRAMES,
+    N_ACOUSTIC_PARAMS,
     N_IR_PARAMS,
     N_MELS,
 )
@@ -16,19 +20,19 @@ _D_IR_HIDDEN = 128
 
 
 class IREstimator(nn.Module):
-    """Estimate IR parameters from mel chunks.
+    """Estimate acoustic condition parameters from mel chunks.
 
     3 CausalConvNeXt blocks (d=128, k=3, dilation=[1,1,1]) + AdaptiveAvgPool + MLP head.
     State context: (k-1)*d per block = 2+2+2 = 6 frames.
     Input: mel_chunk[B, 80, N] (N = ir_update_interval = 10).
-    Output: ir_params[B, 24] (8 subbands x 3 params).
+    Output: acoustic_params[B, 32] (24 IR + 8 voice source).
     """
 
     def __init__(
         self,
         d_input: int = N_MELS,
         d_model: int = _D_IR_HIDDEN,
-        n_ir_params: int = N_IR_PARAMS,
+        n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         n_blocks: int = 3,
         kernel_size: int = 3,
         dilations: list[int] | None = None,
@@ -57,7 +61,7 @@ class IREstimator(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 64),
             nn.SiLU(),
-            nn.Linear(64, n_ir_params),
+            nn.Linear(64, n_acoustic_params),
         )
 
         # State slicing
@@ -67,7 +71,7 @@ class IREstimator(nn.Module):
             f"Expected total state {IR_ESTIMATOR_STATE_FRAMES}, got {self._total_state}"
         )
 
-        self.n_ir_params = n_ir_params
+        self.n_acoustic_params = n_acoustic_params
 
     def forward(
         self,
@@ -81,7 +85,7 @@ class IREstimator(nn.Module):
             state_in: ``[B, d_model, total_state]`` streaming state or None.
 
         Returns:
-            Tuple of ``(ir_params [B, 24], state_out or None)``.
+            Tuple of ``(acoustic_params [B, 32], state_out or None)``.
         """
         x = self.input_proj(mel_chunk)  # [B, d_model, N]
 
@@ -98,10 +102,11 @@ class IREstimator(nn.Module):
         # Temporal pooling → [B, d_model, 1] → [B, d_model]
         x = self.pool(x).squeeze(-1)
 
-        # MLP → raw params [B, 24]
+        # MLP → raw params [B, 32]
         raw = self.mlp(x)
 
         # Apply range constraints per parameter group
+        # --- IR parameters (0-23) ---
         # RT60 [0-7]: sigmoid * 2.95 + 0.05 → [0.05, 3.0]
         # DRR  [8-15]: sigmoid * 40 - 10 → [-10, 30]
         # Tilt [16-23]: tanh * 6 → [-6, 6]
@@ -109,12 +114,29 @@ class IREstimator(nn.Module):
         drr = torch.sigmoid(raw[:, 8:16]) * 40.0 - 10.0
         tilt = torch.tanh(raw[:, 16:24]) * 6.0
 
-        ir_params = torch.cat([rt60, drr, tilt], dim=-1)  # [B, 24]
+        # --- Voice source parameters (24-31) ---
+        # breathiness_low/high [24-25]: sigmoid → [0, 1]
+        breathiness = torch.sigmoid(raw[:, 24:26])
+        # tension_low/high [26-27]: tanh → [-1, 1]
+        tension = torch.tanh(raw[:, 26:28])
+        # jitter [28]: sigmoid * 0.1 → [0, 0.1]
+        jitter = torch.sigmoid(raw[:, 28:29]) * 0.1
+        # shimmer [29]: sigmoid * 0.1 → [0, 0.1]
+        shimmer = torch.sigmoid(raw[:, 29:30]) * 0.1
+        # formant_shift [30]: tanh → [-1, 1]
+        formant_shift = torch.tanh(raw[:, 30:31])
+        # roughness [31]: sigmoid → [0, 1]
+        roughness = torch.sigmoid(raw[:, 31:32])
+
+        acoustic_params = torch.cat(
+            [rt60, drr, tilt, breathiness, tension, jitter, shimmer, formant_shift, roughness],
+            dim=-1,
+        )  # [B, 32]
 
         if state_in is not None:
             state_out = torch.cat(new_states, dim=-1)
-            return ir_params, state_out
-        return ir_params, None
+            return acoustic_params, state_out
+        return acoustic_params, None
 
     def _split_state(self, state: torch.Tensor) -> list[torch.Tensor]:
         states = []

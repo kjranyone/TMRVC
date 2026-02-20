@@ -157,6 +157,15 @@ class RealtimeDemoPage(QWidget):
         gain_row.addWidget(self.gain_label)
         sliders_col.addRow("Output gain:", gain_row)
 
+        self.voice_preset_slider = QSlider(Qt.Orientation.Horizontal)
+        self.voice_preset_slider.setRange(0, 100)
+        self.voice_preset_slider.setValue(0)
+        self.voice_preset_label = QLabel("0%")
+        voice_preset_row = QHBoxLayout()
+        voice_preset_row.addWidget(self.voice_preset_slider)
+        voice_preset_row.addWidget(self.voice_preset_label)
+        sliders_col.addRow("Voice preset:", voice_preset_row)
+
         monitor_layout.addLayout(sliders_col)
         layout.addWidget(monitor_group)
 
@@ -192,6 +201,7 @@ class RealtimeDemoPage(QWidget):
         self.btn_stop.clicked.connect(self._on_stop)
         self.dry_wet_slider.valueChanged.connect(self._on_dry_wet_changed)
         self.output_gain_slider.valueChanged.connect(self._on_gain_changed)
+        self.voice_preset_slider.valueChanged.connect(self._on_voice_preset_changed)
 
     def _populate_audio_devices(self) -> None:
         """Enumerate audio devices using sounddevice."""
@@ -358,6 +368,12 @@ class RealtimeDemoPage(QWidget):
         self.gain_label.setText(f"{value} dB")
         if self._engine is not None:
             self._engine.set_output_gain(float(value))
+
+    def _on_voice_preset_changed(self, value: int) -> None:
+        """Handle voice preset alpha slider changes."""
+        self.voice_preset_label.setText(f"{value}%")
+        if self._engine is not None:
+            self._engine.set_voice_source_alpha(value / 100.0)
 
     # ------------------------------------------------------------------
     # Public helpers

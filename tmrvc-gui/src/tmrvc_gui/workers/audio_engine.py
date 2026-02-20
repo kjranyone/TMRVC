@@ -37,8 +37,10 @@ from tmrvc_core.constants import (
     LORA_DELTA_SIZE,
     N_FFT,
     N_FREQ_BINS,
+    N_ACOUSTIC_PARAMS,
     N_IR_PARAMS,
     N_MELS,
+    N_VOICE_SOURCE_PARAMS,
     SAMPLE_RATE,
     VOCODER_STATE_FRAMES,
     WINDOW_LENGTH,
@@ -328,7 +330,7 @@ class AudioEngine(QThread):
         self._mel_filterbank: np.ndarray = self._build_mel_filterbank()
 
         # ---- IR state ----
-        self._ir_params: np.ndarray = np.zeros((1, N_IR_PARAMS), dtype=np.float32)
+        self._acoustic_params: np.ndarray = np.zeros((1, N_ACOUSTIC_PARAMS), dtype=np.float32)
         self._mel_accumulator: list[np.ndarray] = []
         self._frame_counter: int = 0
 
@@ -345,6 +347,10 @@ class AudioEngine(QThread):
         self._dry_wet: float = 1.0   # 0.0 = fully dry, 1.0 = fully wet
         self._output_gain: float = 1.0  # linear gain
         self._stopped: bool = True
+
+        # ---- Voice source preset blending ----
+        self._voice_source_preset: Optional[np.ndarray] = None  # [8] float32
+        self._voice_source_alpha: float = 0.0  # 0=estimated, 1=full preset
 
     # ==================================================================
     # Model loading
@@ -717,14 +723,14 @@ class AudioEngine(QThread):
 
         Returns
         -------
-        ir_params : np.ndarray
-            Shape ``(1, N_IR_PARAMS)``.
+        acoustic_params : np.ndarray
+            Shape ``(1, N_ACOUSTIC_PARAMS)``.
         """
         state = self._states["ir_estimator"]
         session = self._sessions.get("ir_estimator")
 
         if session is None:
-            return np.zeros((1, N_IR_PARAMS), dtype=np.float32)
+            return np.zeros((1, N_ACOUSTIC_PARAMS), dtype=np.float32)
 
         outputs = session.run(
             None,
@@ -733,18 +739,23 @@ class AudioEngine(QThread):
                 "state_in": state.input,
             },
         )
-        ir_params = outputs[0]
+        acoustic_params = outputs[0]
         np.copyto(state.output, outputs[1])
         state.swap()
-        return ir_params
+        return acoustic_params
 
-    def _run_converter(self, content: np.ndarray) -> np.ndarray:
+    def _run_converter(
+        self, content: np.ndarray, acoustic_params: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Run the converter for one frame.
 
         Parameters
         ----------
         content : np.ndarray
             Shape ``(1, D_CONTENT, 1)``.
+        acoustic_params : np.ndarray or None
+            Shape ``(1, N_ACOUSTIC_PARAMS)``.  If *None*, uses
+            ``self._acoustic_params``.
 
         Returns
         -------
@@ -757,12 +768,15 @@ class AudioEngine(QThread):
         if session is None:
             return np.zeros((1, N_FREQ_BINS, 1), dtype=np.float32)
 
+        if acoustic_params is None:
+            acoustic_params = self._acoustic_params
+
         outputs = session.run(
             None,
             {
                 "content": content,
                 "spk_embed": self._spk_embed,
-                "ir_params": self._ir_params,
+                "acoustic_params": acoustic_params,
                 "state_in": state.input,
             },
         )
@@ -930,7 +944,7 @@ class AudioEngine(QThread):
         # ---- Reset state ----
         for state in self._states.values():
             state.reset()
-        self._ir_params[:] = 0.0
+        self._acoustic_params[:] = 0.0
         self._mel_accumulator.clear()
         self._frame_counter = 0
         self._ola_buffer[:] = 0.0
@@ -978,12 +992,13 @@ class AudioEngine(QThread):
                 mel_chunk = np.concatenate(
                     self._mel_accumulator[-IR_UPDATE_INTERVAL:], axis=2
                 )  # (1, N_MELS, IR_UPDATE_INTERVAL)
-                self._ir_params = self._run_ir_estimator(mel_chunk)
+                self._acoustic_params = self._run_ir_estimator(mel_chunk)
                 self._mel_accumulator.clear()
                 self._frame_counter = 0
 
-            # ---- 4c. Converter ----
-            pred_features = self._run_converter(content)
+            # ---- 4c. Converter (with voice source blend) ----
+            blended_params = self._blend_voice_source(self._acoustic_params)
+            pred_features = self._run_converter(content, blended_params)
 
             # ---- 4d. Vocoder ----
             stft_mag, stft_phase = self._run_vocoder(pred_features)
@@ -1014,6 +1029,58 @@ class AudioEngine(QThread):
     # ==================================================================
     # Control methods
     # ==================================================================
+
+    def set_voice_source_preset(self, preset: np.ndarray | None) -> None:
+        """Set the voice source preset for blending.
+
+        Parameters
+        ----------
+        preset : np.ndarray or None
+            Voice source preset of shape ``(N_VOICE_SOURCE_PARAMS,)``
+            (8 floats), or ``None`` to disable.
+        """
+        if preset is not None:
+            preset = np.asarray(preset, dtype=np.float32).ravel()
+            assert preset.shape == (N_VOICE_SOURCE_PARAMS,)
+        self._voice_source_preset = preset
+
+    def set_voice_source_alpha(self, alpha: float) -> None:
+        """Set the voice source blending strength.
+
+        Parameters
+        ----------
+        alpha : float
+            Blending ratio in ``[0.0, 1.0]``.  ``0.0`` uses the
+            estimated values (no blending), ``1.0`` uses the preset fully.
+        """
+        self._voice_source_alpha = max(0.0, min(1.0, alpha))
+
+    def _blend_voice_source(self, acoustic_params: np.ndarray) -> np.ndarray:
+        """Blend estimated voice source params with preset.
+
+        Returns a copy of ``acoustic_params`` with indices 24-31
+        blended according to ``_voice_source_alpha``.  The original
+        array is not modified.
+
+        Parameters
+        ----------
+        acoustic_params : np.ndarray
+            Shape ``(1, N_ACOUSTIC_PARAMS)``.
+
+        Returns
+        -------
+        np.ndarray
+            Blended copy, same shape.
+        """
+        if self._voice_source_preset is None or self._voice_source_alpha <= 0.0:
+            return acoustic_params
+        blended = acoustic_params.copy()
+        alpha = self._voice_source_alpha
+        blended[0, N_IR_PARAMS:] = (
+            (1.0 - alpha) * acoustic_params[0, N_IR_PARAMS:]
+            + alpha * self._voice_source_preset
+        )
+        return blended
 
     def set_dry_wet(self, ratio: float) -> None:
         """Set the dry/wet mix ratio.
@@ -1049,7 +1116,7 @@ class AudioEngine(QThread):
         """
         for state in self._states.values():
             state.reset()
-        self._ir_params[:] = 0.0
+        self._acoustic_params[:] = 0.0
         self._mel_accumulator.clear()
         self._frame_counter = 0
         self._ola_buffer[:] = 0.0

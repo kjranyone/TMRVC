@@ -1,8 +1,9 @@
-"""Dataset adapters: uniform interface over VCTK, JVS, LibriTTS-R."""
+"""Dataset adapters: uniform interface over supported corpora."""
 
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Iterator
 
@@ -183,10 +184,74 @@ class LibriTTSRAdapter(DatasetAdapter):
                         )
 
 
+class TsukuyomiAdapter(DatasetAdapter):
+    """Generic recursive adapter for Tsukuyomi-chan training audio.
+
+    Expected layout:
+      - Single-speaker:
+          root/*.wav
+          root/**/*.flac
+      - Multi-folder:
+          root/<speaker-ish-folder>/**/*.wav
+
+    Notes:
+      - The first directory component (if present) is used as speaker id.
+      - Unsupported characters are normalized to ``_`` for stable cache keys.
+    """
+
+    name = "tsukuyomi"
+    _AUDIO_EXTS = {".wav", ".flac", ".ogg"}
+
+    @staticmethod
+    def _sanitize(value: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z_\-]+", "_", value).strip("_")
+        return cleaned or "unknown"
+
+    def iter_utterances(
+        self, root: Path, split: str = "train"
+    ) -> Iterator[Utterance]:
+        if not root.exists():
+            raise FileNotFoundError(f"Tsukuyomi root not found: {root}")
+
+        audio_files = sorted(
+            p for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in self._AUDIO_EXTS
+        )
+        if not audio_files:
+            raise FileNotFoundError(
+                f"No audio files found under {root} (expected: {sorted(self._AUDIO_EXTS)})"
+            )
+
+        for wav_path in audio_files:
+            rel = wav_path.relative_to(root)
+            rel_no_ext = rel.with_suffix("")
+
+            # Use top-level folder as speaker id when available; otherwise single-speaker default.
+            speaker_raw = rel.parts[0] if len(rel.parts) > 1 else "tsukuyomi"
+            speaker_id = f"tsukuyomi_{self._sanitize(speaker_raw)}"
+
+            utt_raw = "_".join(rel_no_ext.parts)
+            utt_id = f"tsukuyomi_{self._sanitize(utt_raw)}"
+
+            import soundfile as sf
+
+            info = sf.info(str(wav_path))
+            yield Utterance(
+                utterance_id=utt_id,
+                speaker_id=speaker_id,
+                dataset="tsukuyomi",
+                audio_path=wav_path,
+                duration_sec=info.duration,
+                sample_rate=info.samplerate,
+                language="ja",
+            )
+
+
 ADAPTERS: dict[str, type[DatasetAdapter]] = {
     "vctk": VCTKAdapter,
     "jvs": JVSAdapter,
     "libritts_r": LibriTTSRAdapter,
+    "tsukuyomi": TsukuyomiAdapter,
 }
 
 

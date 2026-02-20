@@ -49,6 +49,8 @@ _DEFAULT_METADATA = {
     "source_sample_count": 0,
     "training_mode": "embedding",
     "checkpoint_name": "",
+    "voice_source_preset": None,
+    "voice_source_param_names": [],
 }
 
 

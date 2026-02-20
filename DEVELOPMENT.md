@@ -60,21 +60,21 @@ uv workspace 構成:
 |---|---|
 | `tmrvc-core` | 共有定数、mel 計算、型定義 |
 | `tmrvc-data` | データセット、前処理、augmentation |
+| `tmrvc-train` | モデル定義、学習、蒸留、Few-shot |
+| `tmrvc-export` | ONNX エクスポート、量子化、パリティ検証 |
 | `tmrvc-gui` | 開発用 GUI (PySide6) |
 
 ### Rust スタンドアロンアプリ (tmrvc-rt)
 
 ```bash
-cd tmrvc-rt
-
 # Debug ビルド
-cargo build
+cargo build -p tmrvc-rt
 
 # Release ビルド (推奨: 推論パフォーマンスに影響)
-cargo build --release
+cargo build -p tmrvc-rt --release
 
 # 実行
-cargo run --release
+cargo run -p tmrvc-rt --release
 ```
 
 ONNX Runtime は `ort` crate の `load-dynamic` feature で動的リンク。
@@ -104,13 +104,25 @@ uv run pytest tests/python/ --cov=tmrvc_core --cov=tmrvc_data
 uv run pytest tests/python/test_constants.py -v
 ```
 
-現在のテスト構成 (44 テスト):
+現在のテスト構成 (211 テスト):
 - `test_constants.py` — constants.yaml と Python 定数の整合性
+- `test_generate_constants.py` — 定数自動生成スクリプト
 - `test_audio.py` — 音声読み込み、リサンプル
 - `test_preprocessing.py` — 前処理パイプライン
 - `test_features.py` — STFT、mel、F0 抽出
 - `test_dataset.py` — データセットクラス
 - `test_cache.py` — キャッシュシステム
+- `test_modules.py` — CausalConvNeXt 等の共通モジュール
+- `test_content_encoder.py` — ContentEncoder Student
+- `test_converter.py` — Converter Student / HQ
+- `test_vocoder.py` — Vocoder Student
+- `test_teacher.py` — Teacher U-Net
+- `test_diffusion.py` — 拡散プロセス (OT-CFM, Sway, Reflow)
+- `test_discriminator.py` — MelDiscriminator (DMD2)
+- `test_losses.py` — 損失関数 (DMD2Loss, SVLoss)
+- `test_trainer.py` — Teacher / Distillation / Reflow Trainer, CLI
+- `test_export.py` — ONNX エクスポート
+- `test_fewshot_finetuner.py` — Few-shot LoRA ファインチューン
 
 ### ONNX パリティ検証 (将来)
 
@@ -127,7 +139,7 @@ uv run python -m tmrvc_export.verify_parity
 `configs/constants.yaml` が Single Source of Truth。
 
 - Python: `tmrvc-core/src/tmrvc_core/constants.py` (自動生成)
-- Rust: `tmrvc-rt/src/engine/constants.rs` (手動同期)
+- Rust: `tmrvc-engine-rs/src/constants.rs` (自動生成)
 - C++: `tmrvc-engine/include/tmrvc/constants.h` (自動生成、将来)
 
 定数を変更する場合は `constants.yaml` を編集し、各言語の定数ファイルを更新すること。
@@ -206,3 +218,23 @@ VST3/CLAP プラグイン化は薄いラッパー追加のみで実現可能。
 | `docs/design/cpp-engine-design.md` | TensorPool layout, SPSC Queue protocol |
 | `docs/design/model-architecture.md` | 各モデルの層構成, パラメータ数 |
 | `docs/design/training-plan.md` | コーパス構成, 学習フェーズ |
+
+## Structured Training Data Pipeline
+
+Use a registry file instead of searching for datasets manually.
+
+1. Edit `configs/datasets.yaml` and set each dataset `raw_dir` / `enabled`.
+2. Run deterministic preprocessing:
+
+```bash
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu --skip-existing
+```
+
+3. Check generated cache manifests:
+- `data/cache/_manifests/<dataset>_train.json`
+
+Example for Tsukuyomi only:
+
+```bash
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --datasets tsukuyomi --device xpu --skip-existing
+```

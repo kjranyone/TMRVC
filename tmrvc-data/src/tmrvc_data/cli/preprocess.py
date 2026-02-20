@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=["vctk", "jvs", "libritts_r"],
+        choices=["vctk", "jvs", "libritts_r", "tsukuyomi"],
         help="Dataset name.",
     )
     parser.add_argument(

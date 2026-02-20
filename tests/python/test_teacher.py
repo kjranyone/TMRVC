@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, N_IR_PARAMS, N_MELS
+from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, N_ACOUSTIC_PARAMS, N_MELS
 from tmrvc_train.models.teacher_unet import TeacherUNet
 
 
@@ -21,9 +21,9 @@ class TestTeacherUNet:
         content = torch.randn(B, D_CONTENT_VEC, T)
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
-        ir = torch.randn(B, N_IR_PARAMS)
+        acoustic = torch.randn(B, N_ACOUSTIC_PARAMS)
 
-        v_pred = model(x_t, t, content, f0, spk, ir)
+        v_pred = model(x_t, t, content, f0, spk, acoustic)
         assert v_pred.shape == (B, N_MELS, T)
 
     def test_forward_without_ir(self, model):
@@ -35,7 +35,7 @@ class TestTeacherUNet:
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
 
-        v_pred = model(x_t, t, content, f0, spk, ir_params=None)
+        v_pred = model(x_t, t, content, f0, spk, acoustic_params=None)
         assert v_pred.shape == (B, N_MELS, T)
 
     def test_timestep_2d(self, model):

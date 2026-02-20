@@ -6,7 +6,7 @@ import yaml
 
 _YAML_PATH = Path(__file__).resolve().parents[3] / "configs" / "constants.yaml"
 
-with open(_YAML_PATH) as f:
+with open(_YAML_PATH, encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
 # --- Audio Processing ---
@@ -24,6 +24,8 @@ LOG_FLOOR: float = _cfg["log_floor"]
 D_CONTENT: int = _cfg["d_content"]
 D_SPEAKER: int = _cfg["d_speaker"]
 N_IR_PARAMS: int = _cfg["n_ir_params"]
+N_VOICE_SOURCE_PARAMS: int = _cfg["n_voice_source_params"]
+N_ACOUSTIC_PARAMS: int = _cfg["n_acoustic_params"]
 D_CONVERTER_HIDDEN: int = _cfg["d_converter_hidden"]
 D_VOCODER_FEATURES: int = _cfg["d_vocoder_features"]
 
@@ -76,3 +78,6 @@ SEGMENT_MIN_SEC: float = _cfg["segment_min_sec"]
 SEGMENT_MAX_SEC: float = _cfg["segment_max_sec"]
 LOUDNESS_TARGET_LUFS: float = _cfg["loudness_target_lufs"]
 CROSS_SPEAKER_PROB: float = _cfg["cross_speaker_prob"]
+
+# --- Voice Source Param Names ---
+VOICE_SOURCE_PARAM_NAMES: list[str] = _cfg["voice_source_param_names"]

@@ -20,7 +20,7 @@ from tmrvc_core.constants import (
     LORA_DELTA_SIZE,
     LORA_RANK,
     MAX_LOOKAHEAD_HOPS,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
     N_LORA_LAYERS,
     N_MELS,
     VOCODER_STATE_FRAMES,
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 _OPSET_VERSION = 18
 _LORA_SCALE = float(LORA_ALPHA) / float(LORA_RANK)
-_FILM_D_IN = D_SPEAKER + N_IR_PARAMS
+_FILM_D_IN = D_SPEAKER + N_ACOUSTIC_PARAMS
 _FILM_D_OUT = D_CONVERTER_HIDDEN * 2
 _FILM_LAYER_PARAM_SIZE = _FILM_D_IN * LORA_RANK + LORA_RANK * _FILM_D_OUT
 
@@ -90,10 +90,10 @@ class _ConverterWrapper(torch.nn.Module):
         content: torch.Tensor,
         spk_embed: torch.Tensor,
         lora_delta: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cond = torch.cat([spk_embed, ir_params], dim=-1)  # [B, 216]
+        cond = torch.cat([spk_embed, acoustic_params], dim=-1)  # [B, 224]
 
         x = self.model.input_proj(content)
 
@@ -150,7 +150,7 @@ class _ConverterGTMWrapper(torch.nn.Module):
         content: torch.Tensor,
         spk_embed: torch.Tensor,
         lora_delta: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         base_memory = self.model.gtm.proj(spk_embed)
@@ -168,7 +168,7 @@ class _ConverterGTMWrapper(torch.nn.Module):
         for block, s_in in zip(self.model.blocks, states):
             x, s_out = block.conv_block(x, s_in)
             x = x + block.timbre_attn(x, timbre_memory)
-            x = block.film_ir(x, ir_params)
+            x = block.film_acoustic(x, acoustic_params)
             new_states.append(s_out)
 
         pred_features = self.model.output_proj(x)
@@ -196,8 +196,8 @@ class _IREstimatorWrapper(torch.nn.Module):
     def forward(
         self, mel_chunk: torch.Tensor, state_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        ir_params, state_out = self.model(mel_chunk, state_in)
-        return ir_params, state_out
+        acoustic_params, state_out = self.model(mel_chunk, state_in)
+        return acoustic_params, state_out
 
 
 class _ConverterHQWrapper(torch.nn.Module):
@@ -232,10 +232,10 @@ class _ConverterHQWrapper(torch.nn.Module):
         content: torch.Tensor,
         spk_embed: torch.Tensor,
         lora_delta: torch.Tensor,
-        ir_params: torch.Tensor,
+        acoustic_params: torch.Tensor,
         state_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cond = torch.cat([spk_embed, ir_params], dim=-1)  # [B, 216]
+        cond = torch.cat([spk_embed, acoustic_params], dim=-1)  # [B, 224]
 
         x = self.model.input_proj(content)
 
@@ -309,14 +309,14 @@ def export_converter(
     dummy_content = torch.zeros(1, D_CONTENT, 1)
     dummy_spk = torch.zeros(1, D_SPEAKER)
     dummy_lora = torch.zeros(1, LORA_DELTA_SIZE)
-    dummy_ir = torch.zeros(1, N_IR_PARAMS)
+    dummy_acoustic = torch.zeros(1, N_ACOUSTIC_PARAMS)
     dummy_state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES)
 
     torch.onnx.export(
         wrapper,
-        (dummy_content, dummy_spk, dummy_lora, dummy_ir, dummy_state),
+        (dummy_content, dummy_spk, dummy_lora, dummy_acoustic, dummy_state),
         str(output_path),
-        input_names=["content", "spk_embed", "lora_delta", "ir_params", "state_in"],
+        input_names=["content", "spk_embed", "lora_delta", "acoustic_params", "state_in"],
         output_names=["pred_features", "state_out"],
         dynamic_axes=None,
         opset_version=_OPSET_VERSION,
@@ -337,14 +337,14 @@ def export_converter_hq(
     dummy_content = torch.zeros(1, D_CONTENT, 1 + MAX_LOOKAHEAD_HOPS)  # [1, 256, 7]
     dummy_spk = torch.zeros(1, D_SPEAKER)
     dummy_lora = torch.zeros(1, LORA_DELTA_SIZE)
-    dummy_ir = torch.zeros(1, N_IR_PARAMS)
+    dummy_acoustic = torch.zeros(1, N_ACOUSTIC_PARAMS)
     dummy_state = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES)  # [1, 384, 46]
 
     torch.onnx.export(
         wrapper,
-        (dummy_content, dummy_spk, dummy_lora, dummy_ir, dummy_state),
+        (dummy_content, dummy_spk, dummy_lora, dummy_acoustic, dummy_state),
         str(output_path),
-        input_names=["content", "spk_embed", "lora_delta", "ir_params", "state_in"],
+        input_names=["content", "spk_embed", "lora_delta", "acoustic_params", "state_in"],
         output_names=["pred_features", "state_out"],
         dynamic_axes=None,
         opset_version=_OPSET_VERSION,
@@ -395,7 +395,7 @@ def export_ir_estimator(
         (dummy_mel, dummy_state),
         str(output_path),
         input_names=["mel_chunk", "state_in"],
-        output_names=["ir_params", "state_out"],
+        output_names=["acoustic_params", "state_out"],
         dynamic_axes=None,
         opset_version=_OPSET_VERSION,
     )

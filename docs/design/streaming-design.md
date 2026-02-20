@@ -108,9 +108,14 @@ processBlock(buffer, numSamples)
 │     │      → content[1, 256, 1], state_out
 │     │
 │     ├─ 3e. (every 10 frames) ir_estimator.Run(mel_accumulated)
-│     │      → ir_params[1, 24]  (cached between runs)
+│     │      → acoustic_params[1, 32]  (cached between runs)
+│     │      (24 IR params + 8 voice source params)
 │     │
-│     ├─ 3f. converter.Run(content, spk_embed, ir_params, state_in)
+│     ├─ 3e'. Voice Source Blend (if preset loaded):
+│     │      acoustic_params[24..31] = lerp(estimated, preset, α)
+│     │      (RT-safe: stack copy of [f32; 32] + 8 mul-add)
+│     │
+│     ├─ 3f. converter.Run(content, spk_embed, acoustic_params, state_in)
 │     │      → pred_features[1, F, 1], state_out
 │     │
 │     ├─ 3g. vocoder.Run(pred_features, state_in)
@@ -562,6 +567,7 @@ void computeMel(
 - [x] 48kHz↔24kHz は整数比 polyphase (効率的)
 - [x] 44.1kHz↔24kHz は有理数比 polyphase (正確)
 - [x] Graceful degradation: overrun 検知 → IR停止 → bypass
+- [x] Voice Source Blend は RT-safe (stack copy + 8 mul-add, zero allocation)
 
 ---
 

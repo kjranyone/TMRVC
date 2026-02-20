@@ -180,6 +180,8 @@ pub fn create_voice_profile(
         source_sample_count: total_samples,
         training_mode: "embedding".to_string(),
         checkpoint_name: String::new(),
+        voice_source_preset: None,
+        voice_source_param_names: Vec::new(),
     };
 
     // Save

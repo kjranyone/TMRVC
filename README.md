@@ -118,3 +118,11 @@ cargo build -p tmrvc-vst --release
 ## License
 
 MIT
+
+## Structured Data Prep
+
+Configure dataset locations in `configs/datasets.yaml`, then run:
+
+```bash
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu --skip-existing
+```

@@ -24,8 +24,12 @@ def test_d_vocoder_features_matches_freq_bins():
 
 
 def test_lora_delta_size():
-    # 4 layers × (384 × 4 + 4 × 384) × 2 (K+V) = 4 × 6144 = 24576
-    expected = constants.N_LORA_LAYERS * 6144
+    # Per-layer: (D_SPEAKER + N_ACOUSTIC_PARAMS) * LORA_RANK + LORA_RANK * (D_CONVERTER_HIDDEN * 2)
+    # = 224 * 4 + 4 * 768 = 3968
+    # 4 layers × 3968 = 15872
+    d_in = constants.D_SPEAKER + constants.N_ACOUSTIC_PARAMS
+    per_layer = d_in * constants.LORA_RANK + constants.LORA_RANK * (constants.D_CONVERTER_HIDDEN * 2)
+    expected = constants.N_LORA_LAYERS * per_layer
     assert constants.LORA_DELTA_SIZE == expected
 
 
@@ -39,12 +43,21 @@ def test_n_ir_params():
     assert constants.N_IR_PARAMS == constants.N_IR_SUBBANDS * 3
 
 
+def test_n_voice_source_params():
+    assert constants.N_VOICE_SOURCE_PARAMS == 8
+
+
+def test_n_acoustic_params():
+    # n_ir_params + n_voice_source_params
+    assert constants.N_ACOUSTIC_PARAMS == constants.N_IR_PARAMS + constants.N_VOICE_SOURCE_PARAMS
+
+
 def test_yaml_matches_python():
     """Ensure the YAML file matches the Python constants."""
     from pathlib import Path
 
     yaml_path = Path(__file__).resolve().parents[2] / "configs" / "constants.yaml"
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     assert cfg["sample_rate"] == constants.SAMPLE_RATE

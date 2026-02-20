@@ -97,6 +97,11 @@ class FiLMConditioner(nn.Module):
     def __init__(self, d_cond: int, d_model: int) -> None:
         super().__init__()
         self.proj = nn.Linear(d_cond, d_model * 2)
+        # Initialize so gamma ≈ 1, beta ≈ 0 → identity modulation at init
+        nn.init.normal_(self.proj.weight, mean=0.0, std=0.01)
+        with torch.no_grad():
+            self.proj.bias.zero_()
+            self.proj.bias[:d_model] = 1.0  # gamma bias → 1
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """Apply FiLM conditioning.

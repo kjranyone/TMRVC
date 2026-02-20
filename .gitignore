@@ -69,3 +69,6 @@ Desktop.ini
 .env
 .env.*
 !.env.example
+
+/logs/
+/outputs/

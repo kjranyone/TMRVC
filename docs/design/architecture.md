@@ -268,11 +268,16 @@ DAW Audio In (48kHz)
 │      │      (every ~10 frames, ~0.5ms amortized)                │
 │      │                                                          │
 │      │   speaker_encoder output: pre-loaded from                │
-│      │      .tmrvc_speaker file (spk_embed + LoRA delta)        │
+│      │      .tmrvc_speaker file (spk_embed + LoRA delta         │
+│      │      + voice_source_preset)                              │
+│      │                                                          │
+│      ├──▶ Voice Source Blend (if preset loaded):               │
+│      │      acoustic_params[24..31] = lerp(estimated, preset, α)│
+│      │      (RT-safe: stack copy + 8 mul-add, zero alloc)       │
 │      │                                                          │
 │      ▼                                                          │
 │  converter.onnx (1-step)                                        │
-│      content + spk_embed + ir_params → pred_features            │
+│      content + spk_embed + acoustic_params → pred_features      │
 │      (per-frame, ~2ms)                                          │
 │      │                                                          │
 │      ▼                                                          │
@@ -374,8 +379,9 @@ DAW Audio Out (48kHz)
 - `.tmrvc_speaker` ファイル (~100-500KB) にはバイナリ形式で格納:
   - `spk_embed[192]` (float32)
   - `lora_delta` (LoRA weights for cross-attn K/V)
+  - metadata JSON: `voice_source_preset[8]` (optional) — 声質パラメータのプリセット値
 - Worker thread でロード → double-buffered slot に書き込み → atomic swap
-- Audio thread は常にキャッシュされた embed/LoRA を参照するだけ
+- Audio thread は常にキャッシュされた embed/LoRA/voice_source_preset を参照するだけ
 
 ### 5.7 内部サンプルレート: 24kHz
 
@@ -396,9 +402,10 @@ DAW Audio Out (48kHz)
 |---|---|---|
 | 本資料 (アーキテクチャ) | `docs/design/architecture.md` | 全体の統合ビュー |
 | ストリーミング設計 | `docs/design/streaming-design.md` | §4.2 推論時フローの詳細化 |
-| ONNX I/O 仕様 | `docs/design/onnx-contract.md` | §5.1 の 5 モデル I/O 定義 |
+| ONNX I/O 仕様 | `docs/design/onnx-contract.md` | §5.1 の 5 モデル I/O 定義、`.tmrvc_speaker` metadata |
 | モデルアーキテクチャ | `docs/design/model-architecture.md` | §4.1 学習時フローの詳細化 |
 | C++ エンジン設計 | `docs/design/cpp-engine-design.md` | §5.2-5.3 の実装詳細 |
+| Acoustic Condition Pathway | `docs/design/acoustic-condition-pathway.md` | IR + Voice Source 統合条件付け、プリセットブレンド |
 | GUI 設計 | `docs/design/gui-design.md` | Research Studio GUI アプリケーション設計 |
 | Teacher 学習計画 | `docs/design/training-plan.md` | §4.1 学習時フローのコーパス・スケジュール詳細 |
 | 先行研究・コンセプト | `docs/reference/concept.md` | IR-aware 設計の根拠 |

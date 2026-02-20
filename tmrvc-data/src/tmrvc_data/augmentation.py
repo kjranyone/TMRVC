@@ -102,21 +102,20 @@ class Augmenter:
         low_gain = random.uniform(*self.config.eq_gain_db_range)
         high_gain = random.uniform(*self.config.eq_gain_db_range)
 
-        # Simple low shelf via biquad at 300 Hz
-        waveform = torchaudio.functional.lowpass_biquad(
-            waveform, SAMPLE_RATE, cutoff_freq=300.0
-        ) * (10.0 ** (low_gain / 20.0)) + torchaudio.functional.highpass_biquad(
-            waveform, SAMPLE_RATE, cutoff_freq=300.0
+        # Low shelf via blending: original + lowpass * (gain - 1)
+        # gain=1 (0dB) → identity, gain>1 → boost, gain<1 → cut
+        low_gain_linear = 10.0 ** (low_gain / 20.0)
+        low_filtered = torchaudio.functional.lowpass_biquad(
+            waveform, SAMPLE_RATE, cutoff_freq=300.0,
         )
+        waveform = waveform + low_filtered * (low_gain_linear - 1.0)
 
-        # High shelf via biquad at 4000 Hz
-        high_part = torchaudio.functional.highpass_biquad(
-            waveform, SAMPLE_RATE, cutoff_freq=4000.0
+        # High shelf via blending: original + highpass * (gain - 1)
+        high_gain_linear = 10.0 ** (high_gain / 20.0)
+        high_filtered = torchaudio.functional.highpass_biquad(
+            waveform, SAMPLE_RATE, cutoff_freq=4000.0,
         )
-        low_part = torchaudio.functional.lowpass_biquad(
-            waveform, SAMPLE_RATE, cutoff_freq=4000.0
-        )
-        waveform = low_part + high_part * (10.0 ** (high_gain / 20.0))
+        waveform = waveform + high_filtered * (high_gain_linear - 1.0)
 
         return waveform
 

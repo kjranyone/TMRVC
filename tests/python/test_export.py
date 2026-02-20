@@ -12,7 +12,7 @@ from tmrvc_core.constants import (
     D_VOCODER_FEATURES,
     LORA_DELTA_SIZE,
     MAX_LOOKAHEAD_HOPS,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
 )
 from tmrvc_export.speaker_file import HEADER_SIZE
 from tmrvc_train.models.content_encoder import ContentEncoderStudent
@@ -145,7 +145,7 @@ class TestONNXExportHQ:
         content = torch.randn(1, D_CONTENT, 1 + MAX_LOOKAHEAD_HOPS)
         spk = torch.randn(1, D_SPEAKER)
         lora = torch.zeros(1, LORA_DELTA_SIZE)
-        ir = torch.randn(1, N_IR_PARAMS)
+        ir = torch.randn(1, N_ACOUSTIC_PARAMS)
         state_in = torch.zeros(1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES)
 
         with torch.no_grad():
@@ -157,7 +157,7 @@ class TestONNXExportHQ:
             "content": content.numpy(),
             "spk_embed": spk.numpy(),
             "lora_delta": lora.numpy(),
-            "ir_params": ir.numpy(),
+            "acoustic_params": ir.numpy(),
             "state_in": state_in.numpy(),
         }
         ort_out = sess.run(None, ort_inputs)

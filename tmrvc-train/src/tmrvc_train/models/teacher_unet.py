@@ -10,7 +10,7 @@ from tmrvc_core.constants import (
     D_CONTENT_VEC,
     D_SPEAKER,
     D_TEACHER_HIDDEN,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
     N_MELS,
     TEACHER_DOWN_CHANNELS,
     TEACHER_N_HEADS,
@@ -165,7 +165,7 @@ class TeacherUNet(nn.Module):
         n_mels: int = N_MELS,
         d_content: int = D_CONTENT_VEC,
         d_speaker: int = D_SPEAKER,
-        n_ir_params: int = N_IR_PARAMS,
+        n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         d_hidden: int = D_TEACHER_HIDDEN,
         down_channels: list[int] | None = None,
         n_heads: int = TEACHER_N_HEADS,
@@ -188,7 +188,7 @@ class TeacherUNet(nn.Module):
         self.film_time = FiLMConditioner(d_hidden, d_hidden)
         self.film_f0 = FiLMConditioner(1, d_hidden)
         self.film_spk = FiLMConditioner(d_speaker, d_hidden)
-        self.film_ir = FiLMConditioner(n_ir_params, d_hidden)
+        self.film_acoustic = FiLMConditioner(n_acoustic_params, d_hidden)
 
         # Input conv
         self.input_conv = nn.Conv1d(n_mels, ch[0], kernel_size=3, padding=1)
@@ -222,7 +222,7 @@ class TeacherUNet(nn.Module):
         content: torch.Tensor,
         f0: torch.Tensor,
         spk_embed: torch.Tensor,
-        ir_params: torch.Tensor | None = None,
+        acoustic_params: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -232,7 +232,7 @@ class TeacherUNet(nn.Module):
             content: ``[B, 768, T]`` content features (from ContentVec/WavLM).
             f0: ``[B, 1, T]`` log-F0 contour.
             spk_embed: ``[B, 192]`` speaker embedding.
-            ir_params: ``[B, 24]`` IR parameters (optional, zeros if not available).
+            acoustic_params: ``[B, 32]`` acoustic parameters (optional, zeros if not available).
 
         Returns:
             ``[B, 80, T]`` predicted velocity.
@@ -248,9 +248,9 @@ class TeacherUNet(nn.Module):
         t_emb = self.time_embed(t)  # [B, d_hidden]
         t_emb = self.time_mlp(t_emb)  # [B, d_hidden]
 
-        # IR params default to zeros
-        if ir_params is None:
-            ir_params = torch.zeros(B, N_IR_PARAMS, device=x_t.device)
+        # Acoustic params default to zeros
+        if acoustic_params is None:
+            acoustic_params = torch.zeros(B, N_ACOUSTIC_PARAMS, device=x_t.device)
 
         # F0 mean for FiLM (collapse time to scalar)
         f0_mean = f0.mean(dim=-1)  # [B, 1]
@@ -279,7 +279,7 @@ class TeacherUNet(nn.Module):
         h = self.film_time(h, t_emb)
         h = self.film_f0(h, f0_mean)
         h = self.film_spk(h, spk_embed)
-        h = self.film_ir(h, ir_params)
+        h = self.film_acoustic(h, acoustic_params)
 
         h = self.bottleneck_out(h)
 

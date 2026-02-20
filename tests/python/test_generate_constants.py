@@ -43,7 +43,7 @@ def sample_cfg() -> dict:
 @pytest.fixture
 def full_cfg() -> dict:
     """Load the real constants.yaml."""
-    with open(YAML_PATH) as f:
+    with open(YAML_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

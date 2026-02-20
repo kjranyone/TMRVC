@@ -57,6 +57,7 @@ pub fn init_mel_filterbank(filterbank: &mut [f32]) {
 /// - `windowed`: scratch for windowed signal [WINDOW_LENGTH]
 /// - `padded`: scratch for zero-padded signal [N_FFT]
 /// - `fft_real_out`, `fft_imag_out`: output real/imag parts [N_FREQ_BINS each]
+/// - `complex_scratch`: pre-allocated complex buffer [N_FFT]
 /// - `planner`: rustfft planner (reuses internal scratch)
 pub fn causal_stft(
     context_buffer: &[f32],
@@ -65,6 +66,7 @@ pub fn causal_stft(
     padded: &mut [f32],
     fft_real_out: &mut [f32],
     fft_imag_out: &mut [f32],
+    complex_scratch: &mut [Complex<f32>],
     planner: &mut FftPlanner<f32>,
 ) {
     // 1. Apply window
@@ -76,15 +78,17 @@ pub fn causal_stft(
     padded[..WINDOW_LENGTH].copy_from_slice(&windowed[..WINDOW_LENGTH]);
     padded[WINDOW_LENGTH..N_FFT].fill(0.0);
 
-    // 3. FFT (in-place, complex)
+    // 3. FFT (in-place, complex) — uses pre-allocated buffer
     let fft = planner.plan_fft_forward(N_FFT);
-    let mut complex_buf: Vec<Complex<f32>> = padded.iter().map(|&r| Complex::new(r, 0.0)).collect();
-    fft.process(&mut complex_buf);
+    for (c, &r) in complex_scratch.iter_mut().zip(padded.iter()) {
+        *c = Complex::new(r, 0.0);
+    }
+    fft.process(complex_scratch);
 
     // 4. Extract first N_FREQ_BINS (positive frequencies)
     for i in 0..N_FREQ_BINS {
-        fft_real_out[i] = complex_buf[i].re;
-        fft_imag_out[i] = complex_buf[i].im;
+        fft_real_out[i] = complex_scratch[i].re;
+        fft_imag_out[i] = complex_scratch[i].im;
     }
 }
 
@@ -121,8 +125,8 @@ pub fn compute_mel_offline(waveform: &[f32], filterbank: &[f32]) -> (Vec<f32>, u
 
     // Causal padding: prepend PAST_CONTEXT zeros
     let padded_len = waveform.len() + PAST_CONTEXT;
-    let num_frames = if padded_len >= WINDOW_LENGTH {
-        (padded_len - WINDOW_LENGTH) / HOP_LENGTH + 1
+    let num_frames = if padded_len >= N_FFT {
+        (padded_len - N_FFT) / HOP_LENGTH + 1
     } else {
         0
     };
@@ -148,6 +152,7 @@ pub fn compute_mel_offline(waveform: &[f32], filterbank: &[f32]) -> (Vec<f32>, u
     let mut fft_padded = vec![0.0f32; N_FFT];
     let mut fft_real = vec![0.0f32; N_FREQ_BINS];
     let mut fft_imag = vec![0.0f32; N_FREQ_BINS];
+    let mut complex_scratch = vec![Complex::new(0.0f32, 0.0); N_FFT];
     let mut mel_frame = vec![0.0f32; N_MELS];
 
     // Output: [N_MELS, num_frames] row-major
@@ -164,6 +169,7 @@ pub fn compute_mel_offline(waveform: &[f32], filterbank: &[f32]) -> (Vec<f32>, u
             &mut fft_padded,
             &mut fft_real,
             &mut fft_imag,
+            &mut complex_scratch,
             &mut planner,
         );
 
@@ -181,32 +187,36 @@ pub fn compute_mel_offline(waveform: &[f32], filterbank: &[f32]) -> (Vec<f32>, u
 /// Inverse STFT: mag[N_FREQ_BINS] + phase[N_FREQ_BINS] -> time-domain signal [N_FFT].
 ///
 /// Returns the windowed time-domain signal in `time_out[..WINDOW_LENGTH]`.
+/// `complex_scratch`: pre-allocated complex buffer [N_FFT].
 pub fn istft(
     mag: &[f32],
     phase: &[f32],
     hann_window: &[f32],
     time_out: &mut [f32],
+    complex_scratch: &mut [Complex<f32>],
     planner: &mut FftPlanner<f32>,
 ) {
     // 1. Construct full complex spectrum (Hermitian symmetry)
-    let mut complex_buf = vec![Complex::new(0.0f32, 0.0); N_FFT];
+    for c in complex_scratch.iter_mut() {
+        *c = Complex::new(0.0, 0.0);
+    }
     for i in 0..N_FREQ_BINS {
         let (sin, cos) = phase[i].sin_cos();
-        complex_buf[i] = Complex::new(mag[i] * cos, mag[i] * sin);
+        complex_scratch[i] = Complex::new(mag[i] * cos, mag[i] * sin);
     }
     // Mirror for negative frequencies (conjugate symmetry)
     for i in 1..N_FFT - N_FREQ_BINS + 1 {
-        complex_buf[N_FFT - i] = complex_buf[i].conj();
+        complex_scratch[N_FFT - i] = complex_scratch[i].conj();
     }
 
     // 2. IFFT
     let ifft = planner.plan_fft_inverse(N_FFT);
-    ifft.process(&mut complex_buf);
+    ifft.process(complex_scratch);
 
     // 3. Normalize and window
     let scale = 1.0 / N_FFT as f32;
     for i in 0..WINDOW_LENGTH {
-        time_out[i] = complex_buf[i].re * scale * hann_window[i];
+        time_out[i] = complex_scratch[i].re * scale * hann_window[i];
     }
 }
 
@@ -373,9 +383,9 @@ mod tests {
 
         let (mel_data, num_frames) = compute_mel_offline(&waveform, &fb);
 
-        // Expected: (24000 + 720 - 960) / 240 + 1 = 99 frames
+        // Expected: (24000 + 720 - 1024) / 240 + 1 = 99 frames
         let padded_len = n + PAST_CONTEXT;
-        let expected_frames = (padded_len - WINDOW_LENGTH) / HOP_LENGTH + 1;
+        let expected_frames = (padded_len - N_FFT) / HOP_LENGTH + 1;
         assert_eq!(num_frames, expected_frames);
         assert_eq!(mel_data.len(), N_MELS * num_frames);
 
@@ -423,6 +433,7 @@ mod tests {
         let mut padded = vec![0.0f32; N_FFT];
         let mut fft_real = vec![0.0f32; N_FREQ_BINS];
         let mut fft_imag = vec![0.0f32; N_FREQ_BINS];
+        let mut complex_scratch = vec![Complex::new(0.0f32, 0.0); N_FFT];
         let mut mel_frame = vec![0.0f32; N_MELS];
 
         for frame_idx in 0..num_frames {
@@ -442,6 +453,7 @@ mod tests {
                 &mut padded,
                 &mut fft_real,
                 &mut fft_imag,
+                &mut complex_scratch,
                 &mut planner,
             );
             compute_log_mel(&fft_real, &fft_imag, &fb, &mut mel_frame);

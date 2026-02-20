@@ -7,7 +7,7 @@ Frame-by-frame causal streaming アーキテクチャ（10ms hop 単位）で処
 
 - **内部サンプルレート:** 24kHz（DAW の 44.1/48kHz とはポリフェーズリサンプルで接続）
 - **推論:** 5 ONNX モデル（実行頻度が異なるため分割）を ONNX Runtime C API で実行
-- **学習:** Teacher (diffusion U-Net, ~80M) → Student (causal CNN, ~7.7M) に蒸留
+- **学習:** Teacher (diffusion U-Net, ~17M) → Student (causal CNN, ~7.7M) に蒸留
 - **学習データ:** VCTK + JVS (T1) → LibriTTS-R (T2) → Emilia (T3) 段階的追加
 
 ## Architecture
@@ -42,6 +42,126 @@ TMRVC/
 
 Python と C++ は **ONNX ファイル** と **constants.yaml → 自動生成ヘッダ** でのみ接続。
 
+## Training Data & Artifacts
+
+`data/`, `checkpoints/`, `models/`, `logs/` はすべて **gitignore 対象**。
+絶対に git に追加しないこと。
+
+### ディレクトリレイアウト
+
+```
+TMRVC/                        # リポジトリルート
+├── data/                     # ★ gitignore — 全学習データ
+│   ├── raw/                  # 生音声 (ダウンロード・手動配置)
+│   │   ├── VCTK-Corpus/      #   T1: 英語 109 話者 48kHz ~44h
+│   │   ├── jvs_corpus/       #   T1: 日本語 100 話者 24kHz ~30h
+│   │   ├── tsukuyomi/        #   T1: 萌え声 1 話者 96kHz ~0.3h
+│   │   ├── libritts_r/       #   T2: 英語 2,456 話者 24kHz ~585h
+│   │   └── rir/              #   RIR データ (AIR, BUT ReverbDB 等)
+│   │       ├── air/
+│   │       └── but_reverb/
+│   ├── cache/                # 前処理済み特徴量 (FeatureCache)
+│   │   ├── _manifests/       #   検証メタデータ
+│   │   ├── vctk/train/{speaker_id}/{utt_id}/
+│   │   │   ├── mel.npy       #     [80, T] log-mel
+│   │   │   ├── content.npy   #     [768, T] ContentVec
+│   │   │   ├── f0.npy        #     [1, T] Hz
+│   │   │   ├── spk_embed.npy #     [192]
+│   │   │   └── meta.json
+│   │   ├── jvs/train/...
+│   │   ├── tsukuyomi/train/...
+│   │   └── libritts_r/train/...
+│   ├── fewshot_test/         # Few-shot テスト用音声 (数ファイル)
+│   └── sample_voice/         # デモ・手動テスト用音声
+│
+├── checkpoints/              # ★ gitignore — PyTorch チェックポイント
+│   ├── teacher_step*.pt      #   Teacher 学習チェックポイント
+│   └── distill/              #   蒸留チェックポイント (Phase A/B/B2/C)
+│       ├── phaseA_step*.pt
+│       └── ...
+│
+├── models/                   # ★ gitignore — ONNX モデル + speaker ファイル
+│   ├── fp32/                 #   FP32 ONNX (content_encoder / converter / vocoder / ir_estimator / converter_hq)
+│   ├── int8/                 #   INT8 量子化版 (将来)
+│   ├── test_speaker.tmrvc_speaker
+│   └── demo_fewshot.tmrvc_speaker
+│
+├── logs/                     # ★ gitignore — 学習ログ
+│   └── train_teacher_*.log
+│
+└── configs/
+    ├── constants.yaml        # 共有定数 (source of truth)
+    ├── datasets.yaml         # データセットレジストリ (パス設定)
+    ├── train_teacher.yaml    # Teacher 学習設定
+    └── train_student.yaml    # 蒸留設定
+```
+
+### データパイプライン
+
+```
+1. 生音声取得         data/raw/{dataset}/     手動ダウンロード or スクリプト
+       ↓
+2. 前処理 (特徴量抽出) data/cache/{dataset}/   scripts/prepare_datasets.py
+       ↓
+3. Teacher 学習       checkpoints/            tmrvc-train-teacher
+       ↓
+4. 蒸留               checkpoints/distill/    tmrvc-distill
+       ↓
+5. ONNX エクスポート  models/fp32/            tmrvc-export
+       ↓
+6. 推論               models/fp32/ を参照     tmrvc-engine-rs / tmrvc-gui
+```
+
+### データセットレジストリ (`configs/datasets.yaml`)
+
+前処理の入出力パスを一元管理する。`raw_dir` を実際のローカルパスに書き換えて使う。
+パスはリポジトリルートからの相対パス、または絶対パスで指定可能。
+
+```bash
+# 前処理実行 (enabled: true のデータセットのみ処理)
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu
+```
+
+### CLI コマンドとパス指定
+
+```bash
+# Teacher 学習
+uv run tmrvc-train-teacher --cache-dir data/cache --phase 0 --device xpu
+
+# 蒸留
+uv run tmrvc-distill --cache-dir data/cache \
+  --teacher-ckpt checkpoints/teacher_step8000.pt --phase A --device xpu
+
+# ONNX エクスポート
+uv run tmrvc-export --checkpoint checkpoints/distill/best.pt \
+  --output-dir models/fp32 --verify
+
+# Few-shot
+uv run tmrvc-finetune --cache-dir data/cache \
+  --checkpoint checkpoints/distill/best.pt \
+  --audio-dir data/sample_voice/ --device xpu
+```
+
+### Rust 側の環境変数
+
+Rust エンジン (tmrvc-engine-rs, tmrvc-rt) は以下の環境変数でモデル・話者パスを上書き可能:
+
+| 変数 | デフォルト | 用途 |
+|---|---|---|
+| `TMRVC_MODEL_DIR` | `models/fp32` (ワークスペース相対) | ONNX モデルディレクトリ |
+| `TMRVC_SPEAKER_PATH` | `models/test_speaker.tmrvc_speaker` | 話者ファイル |
+| `TMRVC_STYLE_PATH` | — | スタイルファイル (.tmrvc_style) |
+| `TMRVC_ONNX_DIR` | `models/fp32` | tmrvc-rt GUI 用 |
+
+### 重要なルール
+
+1. **`data/raw/` のファイルは絶対に git に追加しない** (vctk.zip だけで 11GB)
+2. **`data/cache/` は再生成可能** — `scripts/prepare_datasets.py` で復元
+3. **`checkpoints/` は学習の成果物** — 削除すると学習のやり直しが必要
+4. **`models/fp32/` は `tmrvc-export` で再生成可能** — チェックポイントがあれば復元可能
+5. **`configs/datasets.yaml` の `raw_dir` はマシン固有** — 他者環境では書き換えが必要
+6. **RIR データは `rir_dirs` で指定** — `data/raw/rir/` に配置し、学習 YAML の augmentation config で参照
+
 ## Design Documents (docs/design/)
 
 | File | Content |
@@ -52,6 +172,7 @@ Python と C++ は **ONNX ファイル** と **constants.yaml → 自動生成�
 | `model-architecture.md` | Content Encoder / Converter / Vocoder / IR Estimator / Speaker Encoder / Teacher の詳細 |
 | `cpp-engine-design.md` | C++ エンジンクラス設計、TensorPool メモリレイアウト、SPSC Queue、VST3 統合 |
 | `training-plan.md` | Teacher 学習計画: コーパス構成、4フェーズ学習、コスト見積もり、蒸留接続 |
+| `acoustic-condition-pathway.md` | IR→Acoustic Pathway 拡張: 24dim環境 + 8dim声質 = 32dim統合条件付け |
 
 設計変更時はこれらの整合性チェックリスト（各ファイル末尾）を確認すること。
 
@@ -60,7 +181,7 @@ Python と C++ は **ONNX ファイル** と **constants.yaml → 自動生成�
 ```
 sample_rate: 24000    hop_length: 240 (10ms)    n_mels: 80
 n_fft: 1024           window_length: 960         d_content: 256
-d_speaker: 192        n_ir_params: 24            d_converter_hidden: 384
+d_speaker: 192        n_acoustic_params: 32      d_converter_hidden: 384
 ```
 
 ## Tech Stack
@@ -81,7 +202,7 @@ d_speaker: 192        n_ir_params: 24            d_converter_hidden: 384
 3. **TensorPool は単一 contiguous allocation** (~281KB): 動的確保なし
 4. **State tensor は Ping-Pong double buffering**: in-place 更新を回避
 5. **Worker Thread との通信は lock-free SPSC Queue のみ**
-6. **IR pathway は Few-shot 時に凍結**: 環境特性と話者特性を分離
+6. **Acoustic pathway は Few-shot 時に凍結**: 環境特性・声質特性と話者特性を分離
 
 ## Building
 
@@ -106,3 +227,19 @@ cd build && ctest
 # ONNX パリティ検証 (Python vs C++)
 uv run python -m tmrvc_export.verify_parity
 ```
+
+## Runtime Device Policy (Updated 2026-02-19)
+
+- This workspace should use Intel XPU when available.
+- For training-related CLIs, prefer `--device xpu`:
+  - `tmrvc-train-teacher`
+  - `tmrvc-distill`
+  - `tmrvc-finetune`
+- Do not default to `--device cpu` unless XPU is unavailable.
+- Quick check:
+
+```bash
+uv run python -c "import torch; print(torch.xpu.is_available())"
+```
+
+- Windows note: keep `--num-workers 0` unless explicitly tuned.

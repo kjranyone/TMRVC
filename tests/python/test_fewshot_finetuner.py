@@ -13,7 +13,7 @@ from tmrvc_core.constants import (
     D_CONTENT,
     D_SPEAKER,
     LORA_DELTA_SIZE,
-    N_IR_PARAMS,
+    N_ACOUSTIC_PARAMS,
 )
 
 
@@ -37,14 +37,14 @@ class TestFewShotAdapterGTMFinetuneStep:
         B, T = 1, 20
         content = torch.randn(B, D_CONTENT, T)
         spk_embed = torch.randn(B, D_SPEAKER)
-        ir_params = torch.zeros(B, N_IR_PARAMS)
+        acoustic_params = torch.zeros(B, N_ACOUSTIC_PARAMS)
         mel_target = torch.randn(B, 80, T)
 
         # Record initial LoRA params
         initial_a = adapter.lora_layer.lora_A.data.clone()
         initial_b = adapter.lora_layer.lora_B.data.clone()
 
-        loss = adapter.finetune_step(optimizer, content, spk_embed, ir_params, mel_target)
+        loss = adapter.finetune_step(optimizer, content, spk_embed, acoustic_params, mel_target)
 
         assert isinstance(loss, float)
         assert loss > 0.0
@@ -68,10 +68,10 @@ class TestFewShotAdapterGTMFinetuneStep:
         B, T = 1, 10
         content = torch.randn(B, D_CONTENT, T)
         spk_embed = torch.randn(B, D_SPEAKER)
-        ir_params = torch.zeros(B, N_IR_PARAMS)
+        acoustic_params = torch.zeros(B, N_ACOUSTIC_PARAMS)
         mel_target = torch.randn(B, 80, T)
 
-        adapter.finetune_step(optimizer, content, spk_embed, ir_params, mel_target)
+        adapter.finetune_step(optimizer, content, spk_embed, acoustic_params, mel_target)
 
         assert torch.allclose(converter.gtm.proj.weight.data, original_weight), (
             "GTM projection weight must be restored after finetune_step"
