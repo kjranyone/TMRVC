@@ -20,6 +20,8 @@ n_ir_params: 24           # 8 subbands x 3 parameters
 n_voice_source_params: 8  # breathiness(2) + tension(2) + jitter + shimmer + formant_shift + roughness
 n_acoustic_params: 32     # n_ir_params + n_voice_source_params
 d_converter_hidden: 384
+d_ir_estimator_hidden: 128
+d_vocoder_hidden: 256     # = d_content (vocoder internal width)
 d_vocoder_features: 513   # = n_freq_bins
 
 # --- Feature Extraction ---

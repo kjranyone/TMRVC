@@ -1,4 +1,4 @@
-"""Feature extractors: ContentVec (768-d) and F0 (RMVPE / torchcrepe)."""
+"""Feature extractors: ContentVec (768-d), WavLM-large (1024-d), and F0 (RMVPE / torchcrepe)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Protocol
 import torch
 import torch.nn.functional as F
 
-from tmrvc_core.constants import D_CONTENT_VEC, HOP_LENGTH, SAMPLE_RATE
+from tmrvc_core.constants import D_CONTENT_VEC, D_WAVLM_LARGE, HOP_LENGTH, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 class ContentExtractor(Protocol):
     """Protocol for content feature extractors."""
 
+    @property
+    def output_dim(self) -> int:
+        """Output dimension of the content features."""
+        ...
+
     def extract(self, waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
         """Extract content features.
 
@@ -30,7 +35,7 @@ class ContentExtractor(Protocol):
             sample_rate: Audio sample rate.
 
         Returns:
-            ``[768, T_frames]`` content features at 10 ms hop.
+            ``[output_dim, T_frames]`` content features at 10 ms hop.
         """
         ...
 
@@ -45,6 +50,10 @@ class ContentVecExtractor:
     def __init__(self, device: str = "cpu") -> None:
         self.device = torch.device(device)
         self._model = None
+
+    @property
+    def output_dim(self) -> int:
+        return D_CONTENT_VEC  # 768
 
     def _load_model(self) -> None:
         if self._model is not None:
@@ -92,9 +101,6 @@ class ContentVecExtractor:
         features = features.transpose(0, 1)  # [768, T_cv]
 
         # Interpolate 20 ms → 10 ms (2x upsample)
-        # Expected output frames from 24 kHz audio:
-        expected_frames = waveform.shape[-1] * sample_rate // (16000 * 160)
-        # Simple 2x interpolation as per design
         features = F.interpolate(
             features.unsqueeze(0),
             scale_factor=2.0,
@@ -103,6 +109,104 @@ class ContentVecExtractor:
         ).squeeze(0)  # [768, T_out]
 
         return features.cpu()
+
+
+class WavLMExtractor:
+    """Extract WavLM-large layer 7 features (1024-d) and interpolate to 10 ms hop.
+
+    WavLM-large operates at 16 kHz with hop=320 (20 ms).
+    We interpolate 2x to match the TMRVC 10 ms hop.
+    """
+
+    def __init__(self, device: str = "cpu", layer: int = 7) -> None:
+        self.device = torch.device(device)
+        self.layer = layer
+        self._model = None
+
+    @property
+    def output_dim(self) -> int:
+        return D_WAVLM_LARGE  # 1024
+
+    def _load_model(self) -> None:
+        if self._model is not None:
+            return
+        from transformers import WavLMModel
+
+        self._model = WavLMModel.from_pretrained("microsoft/wavlm-large")
+        self._model.eval().to(self.device)
+        logger.info(
+            "WavLM-large model loaded on %s (layer %d)", self.device, self.layer
+        )
+
+    @torch.inference_mode()
+    def extract(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int = SAMPLE_RATE,
+    ) -> torch.Tensor:
+        """Extract and interpolate WavLM-large layer 7 features.
+
+        Args:
+            waveform: ``[1, T]`` audio at any sample rate (will be resampled to 16 kHz).
+            sample_rate: Input sample rate.
+
+        Returns:
+            ``[1024, T_frames]`` features at 10 ms hop.
+        """
+        self._load_model()
+
+        # Resample to 16 kHz (WavLM native rate)
+        if sample_rate != 16000:
+            import torchaudio.functional as AF
+
+            waveform = AF.resample(waveform, sample_rate, 16000)
+
+        waveform = waveform.to(self.device)
+
+        # WavLM expects [B, T]
+        if waveform.dim() == 2 and waveform.shape[0] == 1:
+            input_wav = waveform
+        else:
+            input_wav = waveform.unsqueeze(0) if waveform.dim() == 1 else waveform
+
+        outputs = self._model(input_wav, output_hidden_states=True, return_dict=True)
+        # hidden_states[0] is embedding, hidden_states[i] is output of layer i-1
+        # So hidden_states[layer+1] is output of layer `layer`
+        features = outputs.hidden_states[self.layer + 1]  # [B, T_wavlm, 1024]
+        features = features.squeeze(0)  # [T_wavlm, 1024]
+        features = features.transpose(0, 1)  # [1024, T_wavlm]
+
+        # Interpolate 20 ms → 10 ms (2x upsample)
+        features = F.interpolate(
+            features.unsqueeze(0),
+            scale_factor=2.0,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(0)  # [1024, T_out]
+
+        return features.cpu()
+
+
+def create_content_extractor(
+    teacher_type: str = "contentvec",
+    device: str = "cpu",
+    **kwargs,
+) -> ContentVecExtractor | WavLMExtractor:
+    """Factory for content feature extractors.
+
+    Args:
+        teacher_type: ``"contentvec"`` (768d) or ``"wavlm"`` (1024d).
+        device: Device for inference.
+        **kwargs: Additional arguments (e.g., ``layer`` for WavLM).
+
+    Returns:
+        Content extractor instance.
+    """
+    if teacher_type == "contentvec":
+        return ContentVecExtractor(device=device)
+    if teacher_type == "wavlm":
+        return WavLMExtractor(device=device, **kwargs)
+    raise ValueError(f"Unknown content teacher type: {teacher_type!r}")
 
 
 # ============================================================================

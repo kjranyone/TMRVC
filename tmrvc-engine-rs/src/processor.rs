@@ -80,10 +80,10 @@ impl ModelStates {
     fn new() -> Self {
         Self {
             content_encoder: PingPongState::new([1, D_CONTENT, CONTENT_ENC_STATE_FRAMES]),
-            ir_estimator: PingPongState::new([1, 128, IR_EST_STATE_FRAMES]),
+            ir_estimator: PingPongState::new([1, D_IR_ESTIMATOR_HIDDEN, IR_EST_STATE_FRAMES]),
             converter: PingPongState::new([1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES]),
             converter_hq: PingPongState::new([1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES]),
-            vocoder: PingPongState::new([1, D_CONTENT, VOCODER_STATE_FRAMES]),
+            vocoder: PingPongState::new([1, D_VOCODER_HIDDEN, VOCODER_STATE_FRAMES]),
         }
     }
 
@@ -234,18 +234,18 @@ impl StreamingEngine {
             mel_filterbank_copy,
             windowed_scratch: vec![0.0; WINDOW_LENGTH],
             padded_scratch: vec![0.0; N_FFT],
-            fft_real_scratch: vec![0.0; N_FFT],
-            fft_imag_scratch: vec![0.0; N_FFT],
+            fft_real_scratch: vec![0.0; N_FREQ_BINS],
+            fft_imag_scratch: vec![0.0; N_FREQ_BINS],
             content_out: vec![0.0; D_CONTENT],
             content_state_out: vec![0.0; D_CONTENT * CONTENT_ENC_STATE_FRAMES],
-            ir_state_out: vec![0.0; 128 * IR_EST_STATE_FRAMES],
+            ir_state_out: vec![0.0; D_IR_ESTIMATOR_HIDDEN * IR_EST_STATE_FRAMES],
             features_out: vec![0.0; N_FREQ_BINS],
             content_7_scratch: vec![0.0; D_CONTENT * (MAX_LOOKAHEAD_HOPS + 1)],
             conv_hq_state_out: vec![0.0; D_CONVERTER_HIDDEN * CONVERTER_HQ_STATE_FRAMES],
             conv_state_out: vec![0.0; D_CONVERTER_HIDDEN * CONVERTER_STATE_FRAMES],
             mag_out: vec![0.0; N_FREQ_BINS],
             phase_out: vec![0.0; N_FREQ_BINS],
-            voc_state_out: vec![0.0; D_CONTENT * VOCODER_STATE_FRAMES],
+            voc_state_out: vec![0.0; D_VOCODER_HIDDEN * VOCODER_STATE_FRAMES],
             time_signal: vec![0.0; WINDOW_LENGTH],
             stft_complex_scratch: vec![Complex::new(0.0, 0.0); N_FFT],
             istft_complex_scratch: vec![Complex::new(0.0, 0.0); N_FFT],
@@ -458,7 +458,7 @@ impl StreamingEngine {
             } else {
                 IR_UPDATE_INTERVAL
             };
-            let skip_ir_update = self.consecutive_overruns > 3;
+            let skip_ir_update = self.consecutive_overruns >= 3;
             if !skip_ir_update && self.frame_counter % ir_update_interval == 0 {
                 let mut acoustic_out = [0.0f32; N_ACOUSTIC_PARAMS];
                 self.ir_state_out.fill(0.0);
@@ -483,8 +483,11 @@ impl StreamingEngine {
             // 9. Determine target mode from effective latency-quality q
             let target_hq = self.effective_q > HQ_THRESHOLD_Q && bundle.has_hq_converter();
 
-            // Initiate mode switch with crossfade
-            if target_hq != self.hq_mode && self.crossfade_counter == 0 {
+            // Initiate mode switch with crossfade.
+            // When switching TO HQ, wait until content_buffer is full to avoid
+            // running the live converter while flagged as HQ.
+            let can_switch_to_hq = !target_hq || self.content_buffer.is_full();
+            if target_hq != self.hq_mode && self.crossfade_counter == 0 && can_switch_to_hq {
                 self.crossfade_counter = CROSSFADE_FRAMES;
                 self.crossfade_direction = target_hq;
                 self.prev_features
@@ -569,13 +572,13 @@ impl StreamingEngine {
 
             // 9d. Crossfade blending between old and new features
             if self.crossfade_counter > 0 {
+                self.crossfade_counter -= 1;
                 let alpha = 1.0 - (self.crossfade_counter as f32 / CROSSFADE_FRAMES as f32);
                 for i in 0..N_FREQ_BINS {
                     self.features_out[i] =
                         (1.0 - alpha) * self.prev_features[i] + alpha * self.features_out[i];
                 }
                 self.prev_features.copy_from_slice(&self.features_out);
-                self.crossfade_counter -= 1;
                 if self.crossfade_counter == 0 {
                     self.hq_mode = self.crossfade_direction;
                 }
@@ -677,9 +680,9 @@ impl StreamingEngine {
             self.consecutive_overruns = 0;
         }
 
-        if self.consecutive_overruns > 3 {
+        if self.consecutive_overruns >= 3 {
             self.effective_q = (self.effective_q - 0.2).max(0.0);
-            if self.hq_mode {
+            if self.hq_mode && self.crossfade_counter == 0 {
                 self.crossfade_counter = CROSSFADE_FRAMES;
                 self.crossfade_direction = false; // to live
                 log::warn!("Overrun detected, degrading to live mode");

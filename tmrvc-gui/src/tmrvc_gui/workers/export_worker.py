@@ -16,10 +16,12 @@ from .base_worker import BaseWorker
 
 logger = logging.getLogger(__name__)
 
-# The 5 ONNX model names that compose the TMRVC inference pipeline.
+# The ONNX model names that compose the TMRVC inference pipeline.
+# converter_hq is optional (HQ mode only).
 MODEL_NAMES: list[str] = [
     "content_encoder",
     "converter",
+    "converter_hq",
     "vocoder",
     "ir_estimator",
     "speaker_encoder",
@@ -29,6 +31,7 @@ MODEL_NAMES: list[str] = [
 _EXPORT_MAP = {
     "content_encoder": "export_content_encoder",
     "converter": "export_converter",
+    "converter_hq": "export_converter_hq",
     "vocoder": "export_vocoder",
     "ir_estimator": "export_ir_estimator",
     "speaker_encoder": "export_speaker_encoder",
@@ -48,7 +51,7 @@ def _load_models_from_checkpoint(
         Dict of model_name → instantiated PyTorch model in eval mode.
     """
     from tmrvc_train.models.content_encoder import ContentEncoderStudent
-    from tmrvc_train.models.converter import ConverterStudent
+    from tmrvc_train.models.converter import ConverterStudent, ConverterStudentHQ
     from tmrvc_train.models.ir_estimator import IREstimator
     from tmrvc_train.models.speaker_encoder import SpeakerEncoderWithLoRA
     from tmrvc_train.models.vocoder import VocoderStudent
@@ -56,6 +59,7 @@ def _load_models_from_checkpoint(
     _MODEL_CLASSES: dict[str, type] = {
         "content_encoder": ContentEncoderStudent,
         "converter": ConverterStudent,
+        "converter_hq": ConverterStudentHQ,
         "vocoder": VocoderStudent,
         "ir_estimator": IREstimator,
         "speaker_encoder": SpeakerEncoderWithLoRA,
@@ -70,16 +74,23 @@ def _load_models_from_checkpoint(
             raise ValueError(f"Unknown model: {name}")
 
         model = cls()
-        state_key = f"{name}_state_dict"
-        # Try both naming conventions
-        if state_key in ckpt:
-            model.load_state_dict(ckpt[state_key])
-        elif "model_state_dict" in ckpt and name in ckpt.get("models", {}):
-            model.load_state_dict(ckpt["models"][name])
+
+        if name == "converter_hq" and name not in ckpt:
+            # Initialize from causal converter weights if no dedicated weights
+            if "converter" in models:
+                model = ConverterStudentHQ.from_causal(models["converter"])
+            elif "converter" in ckpt:
+                causal = ConverterStudent()
+                causal.load_state_dict(ckpt["converter"])
+                model = ConverterStudentHQ.from_causal(causal)
+            else:
+                logger.warning("No converter weights found for converter_hq init")
+                continue
         else:
-            logger.warning(
-                "No state dict found for %s in checkpoint, using random init", name,
-            )
+            if name not in ckpt:
+                logger.warning("Key '%s' not in checkpoint, skipping", name)
+                continue
+            model.load_state_dict(ckpt[name])
 
         model.eval()
         models[name] = model

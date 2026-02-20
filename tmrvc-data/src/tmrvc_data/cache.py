@@ -21,10 +21,10 @@ class FeatureCache:
 
         cache_dir/{dataset}/{split}/{speaker}/{utterance}/
             mel.npy         # [80, T]
-            content.npy     # [768, T]
+            content.npy     # [content_dim, T] where content_dim ∈ {768, 1024}
             f0.npy          # [1, T]
             spk_embed.npy   # [192]
-            meta.json       # {utterance_id, speaker_id, n_frames, ...}
+            meta.json       # {utterance_id, speaker_id, n_frames, content_dim, ...}
     """
 
     def __init__(self, cache_dir: str | Path) -> None:
@@ -40,8 +40,12 @@ class FeatureCache:
         features: FeatureSet,
         dataset: str,
         split: str = "train",
+        waveform: torch.Tensor | None = None,
     ) -> Path:
         """Save a FeatureSet to disk as individual .npy files.
+
+        Args:
+            waveform: Optional ``[1, T_samples]`` waveform for audio-level augmentation.
 
         Returns:
             Path to the utterance directory.
@@ -56,12 +60,16 @@ class FeatureCache:
         np.save(utt_dir / "f0.npy", features.f0.numpy())
         np.save(utt_dir / "spk_embed.npy", features.spk_embed.numpy())
 
+        if waveform is not None:
+            np.save(utt_dir / "waveform.npy", waveform.numpy())
+
         meta = {
             "utterance_id": features.utterance_id,
             "speaker_id": features.speaker_id,
             "n_frames": features.n_frames,
+            "content_dim": features.content_dim,
         }
-        with open(utt_dir / "meta.json", "w") as f:
+        with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f)
 
         return utt_dir
@@ -73,11 +81,13 @@ class FeatureCache:
         speaker_id: str,
         utterance_id: str,
         mmap: bool = True,
+        load_waveform: bool = False,
     ) -> FeatureSet:
         """Load a FeatureSet from disk.
 
         Args:
             mmap: If True, use ``mmap_mode='r'`` for zero-copy reads.
+            load_waveform: If True, also load ``waveform.npy`` (if it exists).
         """
         utt_dir = self._utt_dir(dataset, split, speaker_id, utterance_id)
         mmap_mode = "r" if mmap else None
@@ -87,8 +97,18 @@ class FeatureCache:
         f0 = np.load(utt_dir / "f0.npy", mmap_mode=mmap_mode)
         spk_embed = np.load(utt_dir / "spk_embed.npy", mmap_mode=mmap_mode)
 
-        with open(utt_dir / "meta.json") as f:
+        with open(utt_dir / "meta.json", encoding="utf-8") as f:
             meta = json.load(f)
+
+        content_dim = meta["content_dim"]
+
+        waveform = None
+        if load_waveform:
+            wav_path = utt_dir / "waveform.npy"
+            if wav_path.exists():
+                waveform = torch.from_numpy(
+                    np.array(np.load(wav_path, mmap_mode=mmap_mode))
+                )
 
         return FeatureSet(
             mel=torch.from_numpy(np.array(mel)),
@@ -98,6 +118,8 @@ class FeatureCache:
             utterance_id=meta["utterance_id"],
             speaker_id=meta["speaker_id"],
             n_frames=meta["n_frames"],
+            content_dim=content_dim,
+            waveform=waveform,
         )
 
     def exists(
@@ -107,9 +129,7 @@ class FeatureCache:
         utt_dir = self._utt_dir(dataset, split, speaker_id, utterance_id)
         return (utt_dir / "meta.json").exists()
 
-    def iter_entries(
-        self, dataset: str, split: str = "train"
-    ) -> list[dict[str, str]]:
+    def iter_entries(self, dataset: str, split: str = "train") -> list[dict[str, str]]:
         """List all cached entries for a dataset/split.
 
         Returns:
@@ -149,10 +169,16 @@ class FeatureCache:
             utt_dir = self._utt_dir(
                 dataset, split, entry["speaker_id"], entry["utterance_id"]
             )
-            required_files = ["mel.npy", "content.npy", "f0.npy", "spk_embed.npy", "meta.json"]
+            required_files = [
+                "mel.npy",
+                "content.npy",
+                "f0.npy",
+                "spk_embed.npy",
+                "meta.json",
+            ]
             if all((utt_dir / f).exists() for f in required_files):
                 try:
-                    with open(utt_dir / "meta.json") as f:
+                    with open(utt_dir / "meta.json", encoding="utf-8") as f:
                         meta = json.load(f)
                     mel = np.load(utt_dir / "mel.npy", mmap_mode="r")
                     assert mel.shape[0] == 80

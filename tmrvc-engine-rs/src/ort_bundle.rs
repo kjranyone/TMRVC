@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
-use ort::value::Tensor;
+use ort::value::TensorRef;
 
 use crate::constants::*;
 
@@ -115,9 +115,9 @@ impl OrtBundle {
         state_out: &mut [f32],
     ) -> Result<()> {
         let outputs = self.content_encoder.run(ort::inputs![
-            "mel_frame" => Tensor::from_array(([1, N_MELS, 1], mel.to_vec()))?,
-            "f0" => Tensor::from_array(([1usize, 1, 1], f0.to_vec()))?,
-            "state_in" => Tensor::from_array(([1, D_CONTENT, CONTENT_ENC_STATE_FRAMES], state_in.to_vec()))?,
+            "mel_frame" => TensorRef::from_array_view(([1, N_MELS, 1], mel))?,
+            "f0" => TensorRef::from_array_view(([1usize, 1, 1], f0))?,
+            "state_in" => TensorRef::from_array_view(([1, D_CONTENT, CONTENT_ENC_STATE_FRAMES], state_in))?,
         ])?;
 
         let content = outputs["content"].try_extract_tensor::<f32>()?;
@@ -129,21 +129,21 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run ir_estimator: mel_chunk[80x10] + state_in -> ir_params[24] + state_out
+    /// Run ir_estimator: mel_chunk[80x10] + state_in -> acoustic_params[32] + state_out
     pub fn run_ir_estimator(
         &mut self,
         mel_chunk: &[f32],
         state_in: &[f32],
-        ir_params_out: &mut [f32],
+        acoustic_params_out: &mut [f32],
         state_out: &mut [f32],
     ) -> Result<()> {
         let outputs = self.ir_estimator.run(ort::inputs![
-            "mel_chunk" => Tensor::from_array(([1, N_MELS, IR_UPDATE_INTERVAL], mel_chunk.to_vec()))?,
-            "state_in" => Tensor::from_array(([1, 128usize, IR_EST_STATE_FRAMES], state_in.to_vec()))?,
+            "mel_chunk" => TensorRef::from_array_view(([1, N_MELS, IR_UPDATE_INTERVAL], mel_chunk))?,
+            "state_in" => TensorRef::from_array_view(([1, D_IR_ESTIMATOR_HIDDEN, IR_EST_STATE_FRAMES], state_in))?,
         ])?;
 
-        let ir = outputs["ir_params"].try_extract_tensor::<f32>()?;
-        ir_params_out.copy_from_slice(ir.1);
+        let ir = outputs["acoustic_params"].try_extract_tensor::<f32>()?;
+        acoustic_params_out.copy_from_slice(ir.1);
 
         let state = outputs["state_out"].try_extract_tensor::<f32>()?;
         state_out.copy_from_slice(state.1);
@@ -151,24 +151,24 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run converter: content[256] + spk[192] + lora[24576] + ir[24] + state
+    /// Run converter: content[256] + spk[192] + lora[15872] + acoustic[32] + state
     /// -> features[513] + state
     pub fn run_converter(
         &mut self,
         content: &[f32],
         spk_embed: &[f32],
         lora_delta: &[f32],
-        ir_params: &[f32],
+        acoustic_params: &[f32],
         state_in: &[f32],
         features_out: &mut [f32],
         state_out: &mut [f32],
     ) -> Result<()> {
         let outputs = self.converter.run(ort::inputs![
-            "content" => Tensor::from_array(([1, D_CONTENT, 1], content.to_vec()))?,
-            "spk_embed" => Tensor::from_array(([1usize, D_SPEAKER], spk_embed.to_vec()))?,
-            LORA_INPUT_NAME => Tensor::from_array(([1usize, LORA_DELTA_SIZE], lora_delta.to_vec()))?,
-            "ir_params" => Tensor::from_array(([1usize, N_IR_PARAMS], ir_params.to_vec()))?,
-            "state_in" => Tensor::from_array(([1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES], state_in.to_vec()))?,
+            "content" => TensorRef::from_array_view(([1, D_CONTENT, 1], content))?,
+            "spk_embed" => TensorRef::from_array_view(([1usize, D_SPEAKER], spk_embed))?,
+            LORA_INPUT_NAME => TensorRef::from_array_view(([1usize, LORA_DELTA_SIZE], lora_delta))?,
+            "acoustic_params" => TensorRef::from_array_view(([1usize, N_ACOUSTIC_PARAMS], acoustic_params))?,
+            "state_in" => TensorRef::from_array_view(([1, D_CONVERTER_HIDDEN, CONVERTER_STATE_FRAMES], state_in))?,
         ])?;
 
         let feats = outputs["pred_features"].try_extract_tensor::<f32>()?;
@@ -180,14 +180,14 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Run converter_hq: content[256x7] + spk[192] + lora[24576] + ir[24] + state
+    /// Run converter_hq: content[256x7] + spk[192] + lora[15872] + acoustic[32] + state
     /// -> features[513] + state
     pub fn run_converter_hq(
         &mut self,
         content: &[f32],
         spk_embed: &[f32],
         lora_delta: &[f32],
-        ir_params: &[f32],
+        acoustic_params: &[f32],
         state_in: &[f32],
         features_out: &mut [f32],
         state_out: &mut [f32],
@@ -199,11 +199,11 @@ impl OrtBundle {
 
         let t_in = 1 + MAX_LOOKAHEAD_HOPS;
         let outputs = session.run(ort::inputs![
-            "content" => Tensor::from_array(([1, D_CONTENT, t_in], content.to_vec()))?,
-            "spk_embed" => Tensor::from_array(([1usize, D_SPEAKER], spk_embed.to_vec()))?,
-            LORA_INPUT_NAME => Tensor::from_array(([1usize, LORA_DELTA_SIZE], lora_delta.to_vec()))?,
-            "ir_params" => Tensor::from_array(([1usize, N_IR_PARAMS], ir_params.to_vec()))?,
-            "state_in" => Tensor::from_array(([1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES], state_in.to_vec()))?,
+            "content" => TensorRef::from_array_view(([1, D_CONTENT, t_in], content))?,
+            "spk_embed" => TensorRef::from_array_view(([1usize, D_SPEAKER], spk_embed))?,
+            LORA_INPUT_NAME => TensorRef::from_array_view(([1usize, LORA_DELTA_SIZE], lora_delta))?,
+            "acoustic_params" => TensorRef::from_array_view(([1usize, N_ACOUSTIC_PARAMS], acoustic_params))?,
+            "state_in" => TensorRef::from_array_view(([1, D_CONVERTER_HIDDEN, CONVERTER_HQ_STATE_FRAMES], state_in))?,
         ])?;
 
         let feats = outputs["pred_features"].try_extract_tensor::<f32>()?;
@@ -225,8 +225,8 @@ impl OrtBundle {
         state_out: &mut [f32],
     ) -> Result<()> {
         let outputs = self.vocoder.run(ort::inputs![
-            "features" => Tensor::from_array(([1, N_FREQ_BINS, 1], features.to_vec()))?,
-            "state_in" => Tensor::from_array(([1, D_CONTENT, VOCODER_STATE_FRAMES], state_in.to_vec()))?,
+            "features" => TensorRef::from_array_view(([1, N_FREQ_BINS, 1], features))?,
+            "state_in" => TensorRef::from_array_view(([1, D_VOCODER_HIDDEN, VOCODER_STATE_FRAMES], state_in))?,
         ])?;
 
         let mag = outputs["stft_mag"].try_extract_tensor::<f32>()?;

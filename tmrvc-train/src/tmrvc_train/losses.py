@@ -66,18 +66,23 @@ class MultiResolutionSTFTLoss(nn.Module):
         Returns:
             Scalar loss (sum of spectral convergence + log-mag L1 across resolutions).
         """
-        # If inputs are mel spectrograms [B, C, T], flatten to [B, C*T] for STFT
-        # But typically this is used on waveforms. For mel, we use direct L1.
+        # If inputs are mel spectrograms [B, C, T], reshape to [B*C, T]
+        # treating each mel bin as an independent 1D signal for multi-res STFT.
         if pred.dim() == 3:
-            # Mel-domain: compute L1 directly across resolutions is not applicable
-            # Fall back to L1 on mel features
-            return F.l1_loss(pred, target)
+            B, C, T = pred.shape
+            pred = pred.reshape(B * C, T)
+            target = target.reshape(B * C, T)
 
         total_loss = torch.tensor(0.0, device=pred.device)
+        n_valid = 0
 
         for n_fft, hop, win in zip(
             self.fft_sizes, self.hop_sizes, self.win_sizes
         ):
+            # Skip resolution if T is too short for this FFT size
+            if pred.shape[-1] < n_fft:
+                continue
+
             pred_mag = compute_stft(pred, n_fft=n_fft, hop_length=hop, window_length=win)
             target_mag = compute_stft(target, n_fft=n_fft, hop_length=hop, window_length=win)
 
@@ -92,8 +97,12 @@ class MultiResolutionSTFTLoss(nn.Module):
             log_mag_l1 = F.l1_loss(log_pred, log_target)
 
             total_loss = total_loss + sc + log_mag_l1
+            n_valid += 1
 
-        return total_loss / len(self.fft_sizes)
+        if n_valid == 0:
+            return F.l1_loss(pred, target)
+
+        return total_loss / n_valid
 
 
 class DMD2Loss(nn.Module):

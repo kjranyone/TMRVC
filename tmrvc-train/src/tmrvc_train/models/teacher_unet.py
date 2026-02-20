@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tmrvc_core.constants import (
-    D_CONTENT_VEC,
     D_SPEAKER,
     D_TEACHER_HIDDEN,
+    D_WAVLM_LARGE,
     N_ACOUSTIC_PARAMS,
     N_MELS,
     TEACHER_DOWN_CHANNELS,
@@ -70,7 +70,7 @@ class CrossAttention(nn.Module):
 
         x_t = self.norm(x_t)
 
-        q = self.q_proj(x_t)   # [B, T, C]
+        q = self.q_proj(x_t)  # [B, T, C]
         k = self.k_proj(ctx_t)  # [B, T_ctx, C]
         v = self.v_proj(ctx_t)  # [B, T_ctx, C]
 
@@ -106,14 +106,18 @@ class DownBlock(nn.Module):
             self.attn = CrossAttention(out_ch, d_context, n_heads)
 
     def forward(
-        self, x: torch.Tensor, context: torch.Tensor | None = None,
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self.downsample(x)
         x = self.res(x)
         if self.has_attn and context is not None:
             # Align context length to x
             if context.shape[-1] != x.shape[-1]:
-                context = F.interpolate(context, size=x.shape[-1], mode="linear", align_corners=False)
+                context = F.interpolate(
+                    context, size=x.shape[-1], mode="linear", align_corners=False
+                )
             x = self.attn(x, context)
         return x
 
@@ -131,14 +135,19 @@ class UpBlock(nn.Module):
         has_attn: bool = False,
     ) -> None:
         super().__init__()
-        self.upsample = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=4, stride=2, padding=1)
+        self.upsample = nn.ConvTranspose1d(
+            in_ch, out_ch, kernel_size=4, stride=2, padding=1
+        )
         self.res = ResBlock(out_ch + skip_ch, out_ch)
         self.has_attn = has_attn
         if has_attn:
             self.attn = CrossAttention(out_ch, d_context, n_heads)
 
     def forward(
-        self, x: torch.Tensor, skip: torch.Tensor, context: torch.Tensor | None = None,
+        self,
+        x: torch.Tensor,
+        skip: torch.Tensor,
+        context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = self.upsample(x)
         # Align time dimension with skip
@@ -148,7 +157,9 @@ class UpBlock(nn.Module):
         x = self.res(x)
         if self.has_attn and context is not None:
             if context.shape[-1] != x.shape[-1]:
-                context = F.interpolate(context, size=x.shape[-1], mode="linear", align_corners=False)
+                context = F.interpolate(
+                    context, size=x.shape[-1], mode="linear", align_corners=False
+                )
             x = self.attn(x, context)
         return x
 
@@ -158,12 +169,15 @@ class TeacherUNet(nn.Module):
 
     4-stage encoder/decoder with cross-attention at stages 3, 4 and bottleneck.
     Conditioning: content (cross-attn K/V), F0/speaker/IR/timestep (FiLM).
+
+    Content dimension is 1024d (WavLM-large layer 7) by default.
+    For Phase 0 with ContentVec (768d), pass d_content=768.
     """
 
     def __init__(
         self,
         n_mels: int = N_MELS,
-        d_content: int = D_CONTENT_VEC,
+        d_content: int = D_WAVLM_LARGE,
         d_speaker: int = D_SPEAKER,
         n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         d_hidden: int = D_TEACHER_HIDDEN,
@@ -229,7 +243,8 @@ class TeacherUNet(nn.Module):
         Args:
             x_t: ``[B, 80, T]`` noisy mel at timestep t.
             t: ``[B]`` or ``[B, 1]`` diffusion timestep in [0, 1].
-            content: ``[B, 768, T]`` content features (from ContentVec/WavLM).
+            content: ``[B, 1024, T]`` content features (from WavLM-large layer 7).
+                For ContentVec (768d), pass d_content=768 at init.
             f0: ``[B, 1, T]`` log-F0 contour.
             spk_embed: ``[B, 192]`` speaker embedding.
             acoustic_params: ``[B, 32]`` acoustic parameters (optional, zeros if not available).
@@ -272,7 +287,9 @@ class TeacherUNet(nn.Module):
         # Align context for bottleneck attention
         ctx_bn = ctx
         if ctx_bn.shape[-1] != h.shape[-1]:
-            ctx_bn = F.interpolate(ctx_bn, size=h.shape[-1], mode="linear", align_corners=False)
+            ctx_bn = F.interpolate(
+                ctx_bn, size=h.shape[-1], mode="linear", align_corners=False
+            )
         h = self.bottleneck_attn(h, ctx_bn)
 
         # FiLM conditioning
@@ -294,6 +311,6 @@ class TeacherUNet(nn.Module):
 
         # Ensure output matches input time dimension
         if v_pred.shape[-1] != x_t.shape[-1]:
-            v_pred = v_pred[:, :, :x_t.shape[-1]]
+            v_pred = v_pred[:, :, : x_t.shape[-1]]
 
         return v_pred

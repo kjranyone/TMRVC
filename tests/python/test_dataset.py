@@ -31,18 +31,30 @@ class TestCollate:
         result = collate_fn(batch)
 
         assert isinstance(result, TrainingBatch)
-        assert result.content.shape == (3, D_CONTENT_VEC, 150)  # padded to max
-        assert result.f0.shape == (3, 1, 150)
-        assert result.mel_target.shape == (3, N_MELS, 150)
+        # max=150 snaps to bucket boundary 250
+        assert result.content.shape == (3, D_CONTENT_VEC, 250)
+        assert result.f0.shape == (3, 1, 250)
+        assert result.mel_target.shape == (3, N_MELS, 250)
         assert result.spk_embed.shape == (3, D_SPEAKER)
         assert result.lengths.tolist() == [100, 150, 80]
         assert len(result.utterance_ids) == 3
         assert len(result.speaker_ids) == 3
 
+    def test_batch_shapes_no_bucket(self):
+        """max_frames overrides bucket boundaries."""
+        batch = [
+            _make_feature_set("spk_a", "utt_1", 100),
+            _make_feature_set("spk_b", "utt_2", 150),
+        ]
+        result = collate_fn(batch, max_frames=200)
+        assert result.content.shape == (3 if len(batch) == 3 else 2, D_CONTENT_VEC, 200)
+
     def test_single_item(self):
         batch = [_make_feature_set("spk_a", "utt_1", 50)]
         result = collate_fn(batch)
-        assert result.content.shape == (1, D_CONTENT_VEC, 50)
+        # 50 snaps to bucket boundary 250
+        assert result.content.shape == (1, D_CONTENT_VEC, 250)
+        assert result.lengths.tolist() == [50]
 
 
 class TestDataset:

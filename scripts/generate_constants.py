@@ -22,17 +22,35 @@ RUST_OUT = REPO_ROOT / "tmrvc-engine-rs" / "src" / "constants.rs"
 
 # Keys relevant to the Rust/C++ runtime engine (exclude training-only keys).
 _RUNTIME_KEYS = {
-    "sample_rate", "n_fft", "hop_length", "window_length",
-    "n_mels", "mel_fmin", "mel_fmax", "n_freq_bins", "log_floor",
-    "d_content", "d_speaker", "n_ir_params",
-    "n_voice_source_params", "n_acoustic_params",
+    "sample_rate",
+    "n_fft",
+    "hop_length",
+    "window_length",
+    "n_mels",
+    "mel_fmin",
+    "mel_fmax",
+    "n_freq_bins",
+    "log_floor",
+    "d_content",
+    "d_speaker",
+    "n_ir_params",
+    "n_voice_source_params",
+    "n_acoustic_params",
     "d_converter_hidden",
-    "d_vocoder_features", "ir_update_interval",
-    "lora_rank", "lora_delta_size",
-    "content_encoder_state_frames", "ir_estimator_state_frames",
-    "converter_state_frames", "vocoder_state_frames",
-    "max_lookahead_hops", "converter_hq_state_frames",
-    "hq_threshold_q", "crossfade_frames",
+    "d_ir_estimator_hidden",
+    "d_vocoder_hidden",
+    "d_vocoder_features",
+    "ir_update_interval",
+    "lora_rank",
+    "lora_delta_size",
+    "content_encoder_state_frames",
+    "ir_estimator_state_frames",
+    "converter_state_frames",
+    "vocoder_state_frames",
+    "max_lookahead_hops",
+    "converter_hq_state_frames",
+    "hq_threshold_q",
+    "crossfade_frames",
 }
 
 # Rust name overrides (YAML key → Rust const name) for backward compat.
@@ -45,6 +63,7 @@ _RUST_NAME_MAP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
+
 
 def _py_value(v: object) -> str:
     if isinstance(v, bool):
@@ -74,6 +93,7 @@ def generate_python(cfg: dict) -> str:
 # ---------------------------------------------------------------------------
 # C++
 # ---------------------------------------------------------------------------
+
 
 def _cpp_type(v: object) -> str:
     if isinstance(v, bool):
@@ -113,9 +133,7 @@ def generate_cpp(cfg: dict) -> str:
         ctype = _cpp_type(val)
         cval = _cpp_value(val)
         if isinstance(val, list):
-            lines.append(
-                f"constexpr std::array<int, {len(val)}> {name} = {cval};"
-            )
+            lines.append(f"constexpr std::array<int, {len(val)}> {name} = {cval};")
         else:
             lines.append(f"constexpr {ctype} {name} = {cval};")
     lines += [
@@ -129,6 +147,7 @@ def generate_cpp(cfg: dict) -> str:
 # ---------------------------------------------------------------------------
 # Rust
 # ---------------------------------------------------------------------------
+
 
 def _rust_type(v: object) -> str:
     if isinstance(v, bool):
@@ -163,23 +182,40 @@ def generate_rust(cfg: dict) -> str:
 
     sections = {
         "audio": [
-            "sample_rate", "n_fft", "hop_length", "window_length",
-            "n_mels", "mel_fmin", "mel_fmax", "n_freq_bins", "log_floor",
+            "sample_rate",
+            "n_fft",
+            "hop_length",
+            "window_length",
+            "n_mels",
+            "mel_fmin",
+            "mel_fmax",
+            "n_freq_bins",
+            "log_floor",
         ],
         "model": [
-            "d_content", "d_speaker", "n_ir_params",
-            "n_voice_source_params", "n_acoustic_params",
-            "d_converter_hidden", "d_vocoder_features",
+            "d_content",
+            "d_speaker",
+            "n_ir_params",
+            "n_voice_source_params",
+            "n_acoustic_params",
+            "d_converter_hidden",
+            "d_ir_estimator_hidden",
+            "d_vocoder_hidden",
+            "d_vocoder_features",
         ],
         "inference": ["ir_update_interval"],
         "lora": ["lora_rank", "lora_delta_size"],
         "state": [
-            "content_encoder_state_frames", "ir_estimator_state_frames",
-            "converter_state_frames", "vocoder_state_frames",
+            "content_encoder_state_frames",
+            "ir_estimator_state_frames",
+            "converter_state_frames",
+            "vocoder_state_frames",
         ],
         "hq": [
-            "max_lookahead_hops", "converter_hq_state_frames",
-            "hq_threshold_q", "crossfade_frames",
+            "max_lookahead_hops",
+            "converter_hq_state_frames",
+            "hq_threshold_q",
+            "crossfade_frames",
         ],
     }
 
@@ -215,13 +251,10 @@ def generate_rust(cfg: dict) -> str:
     lines.append("")
     lines.append("// --- Derived constants ---")
     lines.append("pub const RING_BUFFER_CAPACITY: usize = 4096;")
+    lines.append("pub const MAX_DAW_BLOCK_SIZE: usize = 4096;")
     lines.append("")
-    lines.append(
-        "// Past context for causal windowing: WINDOW_LENGTH - HOP_LENGTH"
-    )
-    lines.append(
-        "pub const PAST_CONTEXT: usize = WINDOW_LENGTH - HOP_LENGTH;"
-    )
+    lines.append("// Past context for causal windowing: WINDOW_LENGTH - HOP_LENGTH")
+    lines.append("pub const PAST_CONTEXT: usize = WINDOW_LENGTH - HOP_LENGTH;")
     lines.append("")
 
     return "\n".join(lines)
@@ -230,6 +263,7 @@ def generate_rust(cfg: dict) -> str:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def _write_if_changed(path: Path, content: str) -> bool:
     """Write content to path. Return True if file was changed."""
@@ -243,7 +277,8 @@ def _write_if_changed(path: Path, content: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--check", action="store_true",
+        "--check",
+        action="store_true",
         help="Verify generated files are up-to-date (exit 1 if stale).",
     )
     args = parser.parse_args()

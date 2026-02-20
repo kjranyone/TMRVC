@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from tmrvc_core.constants import IR_UPDATE_INTERVAL, N_IR_PARAMS
 from tmrvc_core.types import TrainingBatch
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.losses import FlowMatchingLoss, MultiResolutionSTFTLoss, SpeakerConsistencyLoss
@@ -32,10 +33,12 @@ class TrainerConfig:
     lambda_stft: float = 0.5
     lambda_spk: float = 0.3
     lambda_ir: float = 0.1
+    lambda_voice: float = 0.2
     grad_clip: float = 1.0
     use_wandb: bool = False
     use_ot_cfm: bool = False
     p_uncond: float = 0.0  # Probability of dropping conditioning (CFG-free training)
+    voice_source_checkpoint: str | None = None
 
 
 class TeacherTrainer:
@@ -54,6 +57,8 @@ class TeacherTrainer:
         optimizer: torch.optim.Optimizer,
         dataloader: DataLoader,
         config: TrainerConfig,
+        ir_estimator: nn.Module | None = None,
+        voice_source_loss: nn.Module | None = None,
     ) -> None:
         self.teacher = teacher
         self.scheduler = scheduler
@@ -65,6 +70,10 @@ class TeacherTrainer:
         self.flow_loss = FlowMatchingLoss()
         self.stft_loss = MultiResolutionSTFTLoss()
         self.spk_loss = SpeakerConsistencyLoss()
+
+        # Phase 2: IR estimator and voice source loss
+        self.ir_estimator = ir_estimator
+        self.voice_source_loss = voice_source_loss
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -107,6 +116,12 @@ class TeacherTrainer:
         content = batch.content.to(device)
         f0 = batch.f0.to(device)
         spk_embed = batch.spk_embed.to(device)
+        T = mel_target.shape[-1]
+
+        # Length mask: [B, 1, T] — 1 for valid frames, 0 for padding
+        lengths = batch.lengths.to(device)
+        time_mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        time_mask = time_mask.unsqueeze(1).float()  # [B, 1, T]
 
         # Conditioning dropout (CFG-free training)
         if self.config.p_uncond > 0.0:
@@ -122,37 +137,70 @@ class TeacherTrainer:
         # Random timestep
         t = torch.rand(B, 1, 1, device=device)
 
-        # Forward process
+        # Forward process (zero noise in padded regions — F5-TTS/VoiceFlow style)
         if self.config.use_ot_cfm:
-            x_t, v_target = self.scheduler.ot_forward_process(mel_target, t)
+            x_t, v_target = self.scheduler.ot_forward_process(mel_target, t, mask=time_mask)
         else:
-            x_t, v_target = self.scheduler.forward_process(mel_target, t)
+            x_t, v_target = self.scheduler.forward_process(mel_target, t, mask=time_mask)
 
-        # Teacher prediction
+        # Phase 2: compute IR params BEFORE teacher forward so we can condition on them
+        phase = self.config.phase
+        acoustic_params_pred = None
+        if phase == "2" and self.ir_estimator is not None:
+            T = mel_target.shape[-1]
+            if T >= IR_UPDATE_INTERVAL:
+                mel_chunk = mel_target[:, :, :IR_UPDATE_INTERVAL]
+            else:
+                mel_chunk = nn.functional.pad(
+                    mel_target, (0, IR_UPDATE_INTERVAL - T),
+                )
+            acoustic_params_pred = self.ir_estimator(mel_chunk)[0]  # [B, 32]
+
+        # Teacher prediction (single forward — with IR params in Phase 2)
         v_pred = self.teacher(
             x_t, t.squeeze(-1).squeeze(-1), content, f0, spk_embed,
+            acoustic_params=acoustic_params_pred,
         )
 
-        # Losses
+        # Losses (masked by valid lengths to ignore padding)
         losses = {}
-        loss_total = self.flow_loss(v_pred, v_target)
+        loss_total = self.flow_loss(v_pred, v_target, mask=time_mask)
         losses["flow"] = loss_total.item()
 
-        phase = self.config.phase
         if phase in ("1b", "2"):
-            l_stft = self.stft_loss(v_pred, v_target)
+            # Mask pred/target before STFT: zero out padded regions
+            v_pred_masked = v_pred * time_mask
+            v_target_masked = v_target * time_mask
+            l_stft = self.stft_loss(v_pred_masked, v_target_masked)
             l_stft_weighted = self.config.lambda_stft * l_stft
             loss_total = loss_total + l_stft_weighted
             losses["stft"] = l_stft.item()
 
         if phase in ("1b", "2"):
-            # Speaker consistency on predicted velocity (proxy)
-            pred_mean = v_pred.mean(dim=-1)  # [B, 80]
-            target_mean = v_target.mean(dim=-1)  # [B, 80]
+            # Speaker consistency: masked time-average
+            denom = time_mask.sum(dim=-1).clamp(min=1)  # [B, 1]
+            pred_mean = (v_pred * time_mask).sum(dim=-1) / denom  # [B, 80]
+            target_mean = (v_target * time_mask).sum(dim=-1) / denom
             l_spk = self.spk_loss(pred_mean, target_mean)
             l_spk_weighted = self.config.lambda_spk * l_spk
             loss_total = loss_total + l_spk_weighted
             losses["spk"] = l_spk.item()
+
+        if phase == "2" and acoustic_params_pred is not None:
+            # IR params regression: zero-room target for env params (0:N_IR_PARAMS)
+            ir_target = torch.zeros_like(acoustic_params_pred[:, :N_IR_PARAMS])
+            l_ir = nn.functional.mse_loss(
+                acoustic_params_pred[:, :N_IR_PARAMS], ir_target,
+            )
+            loss_total = loss_total + self.config.lambda_ir * l_ir
+            losses["ir"] = l_ir.item()
+
+            # Voice source external distillation (optional)
+            if self.voice_source_loss is not None:
+                voice_source = acoustic_params_pred[:, N_IR_PARAMS:]
+                l_voice = self.voice_source_loss(mel_target, voice_source)
+                loss_total = loss_total + self.config.lambda_voice * l_voice
+                losses["voice"] = l_voice.item()
 
         losses["total"] = loss_total.item()
 
@@ -279,9 +327,15 @@ class ReflowTrainer:
         content = batch.content.to(device)
         f0 = batch.f0.to(device)
         spk_embed = batch.spk_embed.to(device)
+        T = x_0_teacher.shape[-1]
+
+        # Length mask for padding zeroing
+        lengths = batch.lengths.to(device)
+        time_mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        time_mask = time_mask.unsqueeze(1).float()  # [B, 1, T]
 
         if x_1_noise is not None:
-            x_1 = x_1_noise.to(device)
+            x_1 = x_1_noise.to(device) * time_mask
         else:
             # Generate noise endpoint on-the-fly (slower but doesn't require pre-generation)
             with torch.no_grad():
@@ -290,21 +344,23 @@ class ReflowTrainer:
                     self.teacher, x_0_teacher, steps=20,
                     content=content, f0=f0, spk_embed=spk_embed,
                 )
+                x_1 = x_1 * time_mask
                 self.teacher.train()
 
         # Random timestep
         t = torch.rand(B, 1, 1, device=device)
 
-        # Reflow forward process
-        x_t, v_target = self.scheduler.reflow_forward_process(x_0_teacher, x_1, t)
+        # Reflow forward process (x_0 and x_1 already masked)
+        x_0_masked = x_0_teacher * time_mask
+        x_t, v_target = self.scheduler.reflow_forward_process(x_0_masked, x_1, t)
 
         # Teacher prediction
         v_pred = self.teacher(
             x_t, t.squeeze(-1).squeeze(-1), content, f0, spk_embed,
         )
 
-        # Loss
-        loss = self.flow_loss(v_pred, v_target)
+        # Loss (masked)
+        loss = self.flow_loss(v_pred, v_target, mask=time_mask)
         losses = {"flow": loss.item(), "total": loss.item()}
 
         # Backward

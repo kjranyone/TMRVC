@@ -78,13 +78,15 @@ impl SpeakerFile {
         }
 
         // Version
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(data[4..8].try_into().expect("version field is 4 bytes"));
         if version != VERSION {
             bail!("Unsupported version: {} (expected {})", version, VERSION);
         }
 
         // Embed size
-        let embed_size = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let embed_size =
+            u32::from_le_bytes(data[8..12].try_into().expect("embed_size field is 4 bytes"))
+                as usize;
         if embed_size != D_SPEAKER {
             bail!(
                 "Speaker embed size mismatch: expected {}, got {}",
@@ -94,7 +96,9 @@ impl SpeakerFile {
         }
 
         // Lora size
-        let lora_size = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        let lora_size =
+            u32::from_le_bytes(data[12..16].try_into().expect("lora_size field is 4 bytes"))
+                as usize;
         if lora_size != LORA_DELTA_SIZE {
             bail!(
                 "LoRA delta size mismatch: expected {}, got {}",
@@ -104,10 +108,18 @@ impl SpeakerFile {
         }
 
         // Metadata size
-        let metadata_size = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let metadata_size = u32::from_le_bytes(
+            data[16..20]
+                .try_into()
+                .expect("metadata_size field is 4 bytes"),
+        ) as usize;
 
         // Thumbnail size
-        let thumbnail_size = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+        let thumbnail_size = u32::from_le_bytes(
+            data[20..24]
+                .try_into()
+                .expect("thumbnail_size field is 4 bytes"),
+        ) as usize;
 
         // Verify total size
         let expected_size = HEADER_SIZE
@@ -136,7 +148,7 @@ impl SpeakerFile {
         let mut spk_embed = [0.0f32; D_SPEAKER];
         let embed_bytes = &data[HEADER_SIZE..HEADER_SIZE + D_SPEAKER * 4];
         for (i, chunk) in embed_bytes.chunks_exact(4).enumerate() {
-            spk_embed[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+            spk_embed[i] = f32::from_le_bytes(chunk.try_into().expect("embed chunk is 4 bytes"));
         }
 
         // Parse lora_delta
@@ -144,7 +156,7 @@ impl SpeakerFile {
         let lora_bytes = &data[lora_offset..lora_offset + LORA_DELTA_SIZE * 4];
         let mut lora_delta = vec![0.0f32; LORA_DELTA_SIZE];
         for (i, chunk) in lora_bytes.chunks_exact(4).enumerate() {
-            lora_delta[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+            lora_delta[i] = f32::from_le_bytes(chunk.try_into().expect("lora chunk is 4 bytes"));
         }
 
         // Parse metadata JSON

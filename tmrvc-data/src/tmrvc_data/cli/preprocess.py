@@ -21,7 +21,7 @@ from tmrvc_core.constants import HOP_LENGTH, SAMPLE_RATE
 from tmrvc_core.types import FeatureSet
 from tmrvc_data.cache import FeatureCache
 from tmrvc_data.dataset_adapters import get_adapter
-from tmrvc_data.features import ContentVecExtractor, create_f0_extractor
+from tmrvc_data.features import create_content_extractor, create_f0_extractor
 from tmrvc_data.preprocessing import preprocess_audio, segment_utterance
 from tmrvc_data.speaker import SpeakerEncoder
 
@@ -63,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="F0 extraction method.",
     )
     parser.add_argument(
+        "--content-teacher",
+        default="contentvec",
+        choices=["contentvec", "wavlm"],
+        help="Content feature extractor: contentvec (768d, Phase 0) or wavlm (1024d, Phase 1+).",
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         help="Device for model inference (default: cpu).",
@@ -97,7 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip utterances already in cache.",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Verbose logging.",
     )
@@ -125,8 +132,9 @@ def main(argv: list[str] | None = None) -> None:
             random.sample(all_utterances, k),
             key=lambda u: u.utterance_id,
         )
-        logger.info("Subset %.0f%%: %d / %d utterances selected",
-                     args.subset * 100, k, total)
+        logger.info(
+            "Subset %.0f%%: %d / %d utterances selected", args.subset * 100, k, total
+        )
     else:
         logger.info("Total utterances: %d", total)
 
@@ -138,9 +146,17 @@ def main(argv: list[str] | None = None) -> None:
         seg_kwargs["max_sec"] = args.segment_max_sec
 
     logger.info("Loading extractors on %s ...", args.device)
-    content_extractor = ContentVecExtractor(device=args.device)
+    content_extractor = create_content_extractor(
+        args.content_teacher, device=args.device
+    )
     f0_extractor = create_f0_extractor(args.f0_method, device=args.device)
     spk_encoder = SpeakerEncoder(device=args.device)
+
+    logger.info(
+        "Content extractor: %s (dim=%d)",
+        args.content_teacher,
+        content_extractor.output_dim,
+    )
 
     processed = 0
     skipped = 0
@@ -161,15 +177,18 @@ def main(argv: list[str] | None = None) -> None:
             waveform, sr = preprocess_audio(str(utt.audio_path))
 
             # 2. Segment if too long
-            for seg_idx, segment in enumerate(segment_utterance(waveform, **seg_kwargs)):
+            for seg_idx, segment in enumerate(
+                segment_utterance(waveform, **seg_kwargs)
+            ):
                 seg_id = (
-                    f"{utt.utterance_id}_seg{seg_idx}" if seg_idx > 0
+                    f"{utt.utterance_id}_seg{seg_idx}"
+                    if seg_idx > 0
                     else utt.utterance_id
                 )
 
                 # 3. Extract features
                 mel = compute_mel(segment)  # [1, 80, T]
-                mel = mel.squeeze(0)        # [80, T]
+                mel = mel.squeeze(0)  # [80, T]
                 n_frames = mel.shape[1]
 
                 content = content_extractor.extract(segment, sr)  # [768, T']
@@ -202,6 +221,7 @@ def main(argv: list[str] | None = None) -> None:
                     utterance_id=seg_id,
                     speaker_id=utt.speaker_id,
                     n_frames=n_frames,
+                    content_dim=content_extractor.output_dim,
                 )
                 cache.save(features, args.dataset, args.split)
                 processed += 1
@@ -209,7 +229,9 @@ def main(argv: list[str] | None = None) -> None:
                 if processed % 100 == 0:
                     logger.info(
                         "Processed %d utterances (skipped %d, errors %d)",
-                        processed, skipped, errors,
+                        processed,
+                        skipped,
+                        errors,
                     )
 
         except Exception:
@@ -218,7 +240,9 @@ def main(argv: list[str] | None = None) -> None:
 
     logger.info(
         "Done. Processed=%d, Skipped=%d, Errors=%d",
-        processed, skipped, errors,
+        processed,
+        skipped,
+        errors,
     )
 
 

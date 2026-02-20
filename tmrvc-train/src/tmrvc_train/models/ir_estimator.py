@@ -9,14 +9,13 @@ import torch
 import torch.nn as nn
 
 from tmrvc_core.constants import (
+    D_IR_ESTIMATOR_HIDDEN,
     IR_ESTIMATOR_STATE_FRAMES,
     N_ACOUSTIC_PARAMS,
     N_IR_PARAMS,
     N_MELS,
 )
 from tmrvc_train.modules import CausalConvNeXtBlock
-
-_D_IR_HIDDEN = 128
 
 
 class IREstimator(nn.Module):
@@ -31,7 +30,7 @@ class IREstimator(nn.Module):
     def __init__(
         self,
         d_input: int = N_MELS,
-        d_model: int = _D_IR_HIDDEN,
+        d_model: int = D_IR_ESTIMATOR_HIDDEN,
         n_acoustic_params: int = N_ACOUSTIC_PARAMS,
         n_blocks: int = 3,
         kernel_size: int = 3,

@@ -91,7 +91,7 @@ class Augmenter:
         return convolved
 
     def apply_eq(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Apply random low/high shelf EQ.
+        """Apply random low/high shelf EQ using proper shelf filters.
 
         Args:
             waveform: ``[1, T]`` audio at 24 kHz.
@@ -102,20 +102,14 @@ class Augmenter:
         low_gain = random.uniform(*self.config.eq_gain_db_range)
         high_gain = random.uniform(*self.config.eq_gain_db_range)
 
-        # Low shelf via blending: original + lowpass * (gain - 1)
-        # gain=1 (0dB) → identity, gain>1 → boost, gain<1 → cut
-        low_gain_linear = 10.0 ** (low_gain / 20.0)
-        low_filtered = torchaudio.functional.lowpass_biquad(
-            waveform, SAMPLE_RATE, cutoff_freq=300.0,
+        # Low shelf: bass_biquad accepts gain in dB directly, Q=0.707 (Butterworth)
+        waveform = torchaudio.functional.bass_biquad(
+            waveform, SAMPLE_RATE, gain=low_gain, central_freq=300.0, Q=0.707,
         )
-        waveform = waveform + low_filtered * (low_gain_linear - 1.0)
-
-        # High shelf via blending: original + highpass * (gain - 1)
-        high_gain_linear = 10.0 ** (high_gain / 20.0)
-        high_filtered = torchaudio.functional.highpass_biquad(
-            waveform, SAMPLE_RATE, cutoff_freq=4000.0,
+        # High shelf: treble_biquad accepts gain in dB directly
+        waveform = torchaudio.functional.treble_biquad(
+            waveform, SAMPLE_RATE, gain=high_gain, central_freq=4000.0, Q=0.707,
         )
-        waveform = waveform + high_filtered * (high_gain_linear - 1.0)
 
         return waveform
 

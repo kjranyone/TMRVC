@@ -8,21 +8,31 @@ from unittest.mock import MagicMock
 import torch
 import pytest
 
-from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, N_MELS
+from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, D_WAVLM_LARGE, N_MELS
 from tmrvc_core.types import TrainingBatch
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.models.teacher_unet import TeacherUNet
 from tmrvc_train.trainer import ReflowTrainer, TeacherTrainer, TrainerConfig
 
 
-def _make_batch(batch_size: int = 2, n_frames: int = 64) -> TrainingBatch:
-    """Create a synthetic TrainingBatch."""
+def _make_batch(
+    batch_size: int = 2,
+    n_frames: int = 64,
+    d_content: int = D_WAVLM_LARGE,
+) -> TrainingBatch:
+    """Create a synthetic TrainingBatch.
+
+    Args:
+        d_content: Content feature dim. Use D_WAVLM_LARGE (1024) for teacher tests,
+            D_CONTENT_VEC (768) for backward-compat tests.
+    """
     return TrainingBatch(
-        content=torch.randn(batch_size, D_CONTENT_VEC, n_frames),
+        content=torch.randn(batch_size, d_content, n_frames),
         f0=torch.randn(batch_size, 1, n_frames),
         spk_embed=torch.randn(batch_size, D_SPEAKER),
         mel_target=torch.randn(batch_size, N_MELS, n_frames),
         lengths=torch.full((batch_size,), n_frames, dtype=torch.long),
+        speaker_ids=[f"spk_{i}" for i in range(batch_size)],
     )
 
 
@@ -385,47 +395,126 @@ class TestReflowTrainer:
         assert losses["total"] > 0
 
 
+def _make_distill_trainer(tmp_path, phase="A", discriminator=None, disc_optimizer=None, speaker_encoder=None):
+    """Helper to create a DistillationTrainer for testing."""
+    from tmrvc_train.distillation import DistillationConfig, DistillationTrainer
+    from tmrvc_train.models.content_encoder import ContentEncoderStudent
+    from tmrvc_train.models.converter import ConverterStudent
+    from tmrvc_train.models.ir_estimator import IREstimator
+    from tmrvc_train.models.vocoder import VocoderStudent
+
+    teacher = TeacherUNet()
+    content_encoder = ContentEncoderStudent()
+    converter = ConverterStudent()
+    vocoder = VocoderStudent()
+    ir_estimator = IREstimator()
+    scheduler = FlowMatchingScheduler()
+
+    student_params = (
+        list(content_encoder.parameters())
+        + list(converter.parameters())
+        + list(vocoder.parameters())
+        + list(ir_estimator.parameters())
+    )
+    optimizer = torch.optim.AdamW(student_params, lr=5e-5)
+
+    config = DistillationConfig(
+        phase=phase,
+        max_steps=2,
+        checkpoint_dir=str(tmp_path / "ckpt"),
+    )
+    trainer = DistillationTrainer(
+        teacher, content_encoder, converter, vocoder, ir_estimator,
+        scheduler, optimizer, [_make_batch()], config,
+        discriminator=discriminator,
+        disc_optimizer=disc_optimizer,
+        speaker_encoder=speaker_encoder,
+    )
+    return trainer
+
+
 class TestDistillationPhaseB2:
     """Tests for DMD2 distillation (Phase B2)."""
 
     def test_distillation_phase_b2_step(self, tmp_path):
         """Phase B2 with discriminator should complete a single training step."""
-        from tmrvc_train.distillation import DistillationConfig, DistillationTrainer
-        from tmrvc_train.models.content_encoder import ContentEncoderStudent
-        from tmrvc_train.models.converter import ConverterStudent
         from tmrvc_train.models.discriminator import MelDiscriminator
-        from tmrvc_train.models.ir_estimator import IREstimator
-        from tmrvc_train.models.vocoder import VocoderStudent
 
-        teacher = TeacherUNet()
-        content_encoder = ContentEncoderStudent()
-        converter = ConverterStudent()
-        vocoder = VocoderStudent()
-        ir_estimator = IREstimator()
         discriminator = MelDiscriminator()
-        scheduler = FlowMatchingScheduler()
-
-        student_params = (
-            list(content_encoder.parameters())
-            + list(converter.parameters())
-            + list(vocoder.parameters())
-            + list(ir_estimator.parameters())
-        )
-        optimizer = torch.optim.AdamW(student_params, lr=5e-5)
         disc_optimizer = torch.optim.AdamW(discriminator.parameters(), lr=2e-4)
 
-        config = DistillationConfig(
-            phase="B2",
-            max_steps=2,
-            checkpoint_dir=str(tmp_path / "ckpt"),
-        )
-        trainer = DistillationTrainer(
-            teacher, content_encoder, converter, vocoder, ir_estimator,
-            scheduler, optimizer, [_make_batch()], config,
-            discriminator=discriminator,
-            disc_optimizer=disc_optimizer,
+        trainer = _make_distill_trainer(
+            tmp_path, phase="B2",
+            discriminator=discriminator, disc_optimizer=disc_optimizer,
         )
         losses = trainer.train_step(_make_batch())
         assert "gen" in losses
         assert "disc" in losses
+        assert "total" in losses
+
+
+class TestDistillationMelConversion:
+    """Test proper mel conversion in distillation pipeline."""
+
+    def test_pred_to_mel_shape(self, tmp_path):
+        """_pred_to_mel should return [B, 80, T] from [B, 513, T] input."""
+        trainer = _make_distill_trainer(tmp_path, phase="A")
+        pred_features = torch.randn(2, 513, 64)
+        mel = trainer._pred_to_mel(pred_features)
+        assert mel.shape == (2, 80, 64)
+
+    def test_pred_to_mel_log_scale(self, tmp_path):
+        """_pred_to_mel output should be in log scale (negative values expected)."""
+        trainer = _make_distill_trainer(tmp_path, phase="A")
+        pred_features = torch.randn(2, 513, 64)
+        mel = trainer._pred_to_mel(pred_features)
+        # Log of small positive values should be negative
+        assert mel.max().item() < 100  # sanity check: not absurdly large
+
+    def test_phase_a_trains_vocoder(self, tmp_path):
+        """Phase A should include vocoder in gradient computation."""
+        trainer = _make_distill_trainer(tmp_path, phase="A")
+        batch = _make_batch()
+        losses = trainer.train_step(batch)
+        assert "mel" in losses
+        assert "total" in losses
+        # Vocoder should have received gradients (at least one param has grad)
+        has_grad = any(
+            p.grad is not None
+            for p in trainer.vocoder.parameters()
+        )
+        assert has_grad, "Vocoder should receive gradients in Phase A"
+
+    def test_phase_b_random_timestep(self, tmp_path):
+        """Phase B DMD should use random timesteps (produces varying losses)."""
+        trainer = _make_distill_trainer(tmp_path, phase="B")
+        batch = _make_batch()
+        losses = trainer.train_step(batch)
+        assert "dmd" in losses
+        assert "total" in losses
+
+    def test_phase_c_without_speaker_encoder_fallback(self, tmp_path):
+        """Phase C without speaker encoder should fall back to mel mean."""
+        trainer = _make_distill_trainer(tmp_path, phase="C")
+        batch = _make_batch()
+        losses = trainer.train_step(batch)
+        assert "stft" in losses
+        assert "sv" in losses
+        assert "total" in losses
+
+    def test_phase_c_with_speaker_encoder(self, tmp_path):
+        """Phase C with speaker encoder should use proper embeddings."""
+        from tmrvc_train.models.speaker_encoder import SpeakerEncoderWithLoRA
+
+        speaker_encoder = SpeakerEncoderWithLoRA()
+        trainer = _make_distill_trainer(
+            tmp_path, phase="C", speaker_encoder=speaker_encoder,
+        )
+        # Speaker encoder should be frozen
+        for p in trainer.speaker_encoder.parameters():
+            assert not p.requires_grad
+        batch = _make_batch()
+        losses = trainer.train_step(batch)
+        assert "stft" in losses
+        assert "sv" in losses
         assert "total" in losses

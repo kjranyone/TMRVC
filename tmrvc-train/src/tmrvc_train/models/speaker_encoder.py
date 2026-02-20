@@ -20,7 +20,7 @@ class SpeakerEncoderWithLoRA(nn.Module):
 
     Outputs:
     - spk_embed[B, 192]: L2-normalised speaker embedding.
-    - lora_delta[B, 24576]: LoRA weight deltas for converter FiLM layers.
+    - lora_delta[B, LORA_DELTA_SIZE]: LoRA weight deltas for converter FiLM layers.
     """
 
     # ECAPA-TDNN intermediate dim (from SpeechBrain's attentive stat pooling)

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import torch
 
+from tmrvc_core.constants import D_CONTENT_VEC
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.models.teacher_unet import TeacherUNet
 from tmrvc_train.trainer import TeacherTrainer, TrainerConfig
@@ -103,6 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="DataLoader workers (default: 0, use 0 on Windows).",
     )
     parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Fixed frame count per batch (crop/pad). Default: 400. "
+        "Prevents XPU kernel recompilation. Set to 0 to disable.",
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Enable Weights & Biases logging.",
@@ -183,14 +191,28 @@ def main(argv: list[str] | None = None) -> None:
     speaker_groups = _parse_speaker_groups(file_cfg)
     device = torch.device(args.device)
 
-    # Create model
-    teacher = TeacherUNet().to(device)
+    # Create model — Phase 0 uses ContentVec (768d), Phase 1+ uses WavLM-large (1024d)
+    d_content = D_CONTENT_VEC if args.phase == "0" else None  # None = default (D_WAVLM_LARGE)
+    teacher = TeacherUNet(**({"d_content": d_content} if d_content else {})).to(device)
     scheduler = FlowMatchingScheduler()
 
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr, weight_decay=0.01)
 
+    # Create augmenter (Phase 2 with rir_augment)
+    augmenter = None
+    if args.phase == "2" and file_cfg.get("rir_augment", False):
+        from tmrvc_data.augmentation import Augmenter, AugmentationConfig
+
+        rir_dirs = file_cfg.get("rir_dirs", [])
+        augmenter = Augmenter(AugmentationConfig(
+            rir_dirs=[Path(d) for d in rir_dirs],
+        ))
+        logger.info("Augmentation enabled (rir_dirs=%s)", rir_dirs)
+
     # Create dataloader
     from tmrvc_data.dataset import create_dataloader
+
+    max_frames = args.max_frames if args.max_frames is not None else file_cfg.get("max_frames", 400)
 
     dataloader = create_dataloader(
         cache_dir=args.cache_dir,
@@ -199,6 +221,8 @@ def main(argv: list[str] | None = None) -> None:
         subset=args.subset,
         num_workers=args.num_workers,
         speaker_groups=speaker_groups,
+        augmenter=augmenter,
+        max_frames=max_frames,
     )
 
     config = TrainerConfig(
@@ -212,9 +236,41 @@ def main(argv: list[str] | None = None) -> None:
         lambda_spk=file_cfg.get("lambda_spk", 0.3),
         lambda_ir=file_cfg.get("lambda_ir", 0.1),
         use_wandb=args.wandb,
+        use_ot_cfm=file_cfg.get("use_ot_cfm", False),
+        p_uncond=file_cfg.get("p_uncond", 0.0),
     )
 
-    trainer = TeacherTrainer(teacher, scheduler, optimizer, dataloader, config)
+    # Phase 2: create IR estimator and optional voice source loss
+    ir_estimator = None
+    voice_source_loss = None
+    if args.phase == "2":
+        from tmrvc_train.models.ir_estimator import IREstimator
+
+        ir_estimator = IREstimator().to(device)
+        optimizer.add_param_group({"params": ir_estimator.parameters()})
+
+        vs_ckpt = file_cfg.get("voice_source_checkpoint")
+        if vs_ckpt:
+            from tmrvc_train.models.voice_source_estimator import (
+                VoiceSourceDistillationLoss,
+                create_voice_source_teacher,
+            )
+
+            vs_teacher = create_voice_source_teacher(vs_ckpt, device=str(device))
+            if vs_teacher is not None:
+                voice_source_loss = VoiceSourceDistillationLoss(vs_teacher)
+                logger.info("Voice source distillation enabled from %s", vs_ckpt)
+
+    if args.phase == "reflow":
+        from tmrvc_train.trainer import ReflowTrainer
+
+        trainer = ReflowTrainer(teacher, scheduler, optimizer, dataloader, config)
+    else:
+        trainer = TeacherTrainer(
+            teacher, scheduler, optimizer, dataloader, config,
+            ir_estimator=ir_estimator,
+            voice_source_loss=voice_source_loss,
+        )
 
     if args.resume:
         trainer.load_checkpoint(args.resume)
@@ -224,11 +280,14 @@ def main(argv: list[str] | None = None) -> None:
         args.phase, lr, max_steps,
     )
 
-    while trainer.global_step < max_steps:
-        trainer.train_epoch()
+    try:
+        while trainer.global_step < max_steps:
+            trainer.train_epoch()
+    except KeyboardInterrupt:
+        logger.info("Interrupted at step %d, saving checkpoint...", trainer.global_step)
 
     trainer.save_checkpoint()
-    logger.info("Training complete.")
+    logger.info("Training complete (step %d).", trainer.global_step)
 
 
 if __name__ == "__main__":

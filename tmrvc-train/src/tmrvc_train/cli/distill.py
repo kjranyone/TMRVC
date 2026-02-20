@@ -107,6 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fraction of training data to use (0.0-1.0, default: 1.0=all).",
     )
     parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Fixed frame count per batch (crop/pad). Default: 400. "
+        "Prevents XPU kernel recompilation. Set to 0 to disable.",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose logging.",
@@ -180,14 +187,16 @@ def main(argv: list[str] | None = None) -> None:
     speaker_groups = _parse_speaker_groups(file_cfg)
     device = torch.device(args.device)
 
-    # Load teacher
-    teacher = TeacherUNet().to(device)
+    # Load teacher — infer d_content from checkpoint
     ckpt = torch.load(args.teacher_ckpt, map_location=device, weights_only=False)
+    d_content = ckpt["model_state_dict"]["content_proj.weight"].shape[1]
+    teacher = TeacherUNet(d_content=d_content).to(device)
     teacher.load_state_dict(ckpt["model_state_dict"])
     logger.info("Loaded teacher from %s", args.teacher_ckpt)
 
     # Create student models
-    content_encoder = ContentEncoderStudent().to(device)
+    use_vq = file_cfg.get("use_vq", False)
+    content_encoder = ContentEncoderStudent(use_vq=use_vq).to(device)
     converter = ConverterStudent().to(device)
     vocoder = VocoderStudent().to(device)
     ir_estimator = IREstimator().to(device)
@@ -203,8 +212,21 @@ def main(argv: list[str] | None = None) -> None:
     )
     optimizer = torch.optim.AdamW(student_params, lr=lr, weight_decay=0.01)
 
+    # Create augmenter (if rir_augment enabled)
+    augmenter = None
+    if file_cfg.get("rir_augment", False):
+        from tmrvc_data.augmentation import Augmenter, AugmentationConfig
+
+        rir_dirs = file_cfg.get("rir_dirs", [])
+        augmenter = Augmenter(AugmentationConfig(
+            rir_dirs=[Path(d) for d in rir_dirs],
+        ))
+        logger.info("Augmentation enabled (rir_dirs=%s)", rir_dirs)
+
     # Dataloader
     from tmrvc_data.dataset import create_dataloader
+
+    max_frames = args.max_frames if args.max_frames is not None else file_cfg.get("max_frames", 400)
 
     dataloader = create_dataloader(
         cache_dir=args.cache_dir,
@@ -212,6 +234,8 @@ def main(argv: list[str] | None = None) -> None:
         batch_size=batch_size,
         subset=args.subset,
         speaker_groups=speaker_groups,
+        augmenter=augmenter,
+        max_frames=max_frames,
     )
 
     config = DistillationConfig(
@@ -223,11 +247,47 @@ def main(argv: list[str] | None = None) -> None:
         lambda_stft=file_cfg.get("lambda_stft", 0.5),
         lambda_spk=file_cfg.get("lambda_spk", 0.3),
         lambda_ir=file_cfg.get("lambda_ir", 0.1),
+        disc_lr=file_cfg.get("disc_lr", 2e-4),
+        disc_update_ratio=file_cfg.get("disc_update_ratio", 2),
+        lambda_gan=file_cfg.get("lambda_gan", 1.0),
     )
+
+    # Discriminator for Phase B2 (DMD2)
+    discriminator = None
+    disc_optimizer = None
+    if args.phase == "B2":
+        from tmrvc_train.models.discriminator import MelDiscriminator
+
+        discriminator = MelDiscriminator().to(device)
+        disc_optimizer = torch.optim.AdamW(
+            discriminator.parameters(), lr=config.disc_lr, weight_decay=0.01,
+        )
+        if args.resume:
+            ckpt_data = torch.load(args.resume, map_location=device, weights_only=False)
+            if "discriminator" in ckpt_data:
+                discriminator.load_state_dict(ckpt_data["discriminator"])
+            if "disc_optimizer" in ckpt_data:
+                disc_optimizer.load_state_dict(ckpt_data["disc_optimizer"])
+        logger.info("Discriminator loaded for Phase B2 DMD2")
+
+    # Speaker encoder for Phase C SV loss
+    speaker_encoder = None
+    if args.phase == "C":
+        from tmrvc_train.models.speaker_encoder import SpeakerEncoderWithLoRA
+
+        speaker_encoder = SpeakerEncoderWithLoRA().to(device)
+        if args.resume:
+            ckpt_data = torch.load(args.resume, map_location=device, weights_only=False)
+            if "speaker_encoder" in ckpt_data:
+                speaker_encoder.load_state_dict(ckpt_data["speaker_encoder"])
+        logger.info("Speaker encoder loaded for Phase C SV loss")
 
     trainer = DistillationTrainer(
         teacher, content_encoder, converter, vocoder, ir_estimator,
         scheduler, optimizer, dataloader, config,
+        discriminator=discriminator,
+        disc_optimizer=disc_optimizer,
+        speaker_encoder=speaker_encoder,
     )
 
     if args.resume:

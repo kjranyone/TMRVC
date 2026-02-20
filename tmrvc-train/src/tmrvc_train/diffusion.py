@@ -17,17 +17,23 @@ class FlowMatchingScheduler:
         self,
         x_0: torch.Tensor,
         t: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Add noise to clean data via rectified flow.
 
         Args:
             x_0: ``[B, C, T]`` clean mel spectrogram.
             t: ``[B, 1, 1]`` timestep in [0, 1].
+            mask: ``[B, 1, T]`` length mask (1=valid, 0=pad). If provided,
+                noise and x_0 are zeroed in padded regions (F5-TTS/VoiceFlow style).
 
         Returns:
             Tuple of (x_t [B, C, T], v_target [B, C, T]).
         """
         noise = torch.randn_like(x_0)
+        if mask is not None:
+            noise = noise * mask
+            x_0 = x_0 * mask
         x_t = (1.0 - t) * x_0 + t * noise
         v_target = noise - x_0
         return x_t, v_target
@@ -36,6 +42,7 @@ class FlowMatchingScheduler:
         self,
         x_0: torch.Tensor,
         t: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Add noise via Optimal Transport Conditional Flow Matching.
 
@@ -45,11 +52,16 @@ class FlowMatchingScheduler:
         Args:
             x_0: ``[B, C, T]`` clean mel spectrogram.
             t: ``[B, 1, 1]`` timestep in [0, 1].
+            mask: ``[B, 1, T]`` length mask (1=valid, 0=pad). If provided,
+                noise and x_0 are zeroed in padded regions.
 
         Returns:
             Tuple of (x_t [B, C, T], v_target [B, C, T]).
         """
         noise = torch.randn_like(x_0)
+        if mask is not None:
+            noise = noise * mask
+            x_0 = x_0 * mask
         B = x_0.shape[0]
         if B > 1:
             # Minibatch OT: find optimal pairing between data and noise

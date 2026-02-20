@@ -15,6 +15,7 @@ from tmrvc_core.constants import (
     GTM_D_ENTRY,
     GTM_N_ENTRIES,
     GTM_N_HEADS,
+    MAX_LOOKAHEAD_HOPS,
     N_ACOUSTIC_PARAMS,
 )
 from tmrvc_train.modules import (
@@ -504,6 +505,7 @@ class ConverterStudentHQ(nn.Module):
             n_blocks=len(causal_model.blocks),
             kernel_size=causal_model.blocks[0].conv_block.kernel_size,
             dilations=[blk.conv_block.dilation for blk in causal_model.blocks],
+            max_lookahead=MAX_LOOKAHEAD_HOPS,
         )
         # Copy input/output projections
         hq.input_proj.load_state_dict(causal_model.input_proj.state_dict())

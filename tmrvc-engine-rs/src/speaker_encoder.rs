@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
-use ort::value::Tensor;
+use ort::value::TensorRef;
 
 use crate::constants::*;
 
@@ -63,7 +63,7 @@ impl SpeakerEncoderSession {
         assert_eq!(mel_data.len(), N_MELS * num_frames);
 
         let outputs = self.session.run(ort::inputs![
-            "mel_ref" => Tensor::from_array(([1usize, N_MELS, num_frames], mel_data.to_vec()))?,
+            "mel_ref" => TensorRef::from_array_view(([1usize, N_MELS, num_frames], mel_data))?,
         ])?;
 
         // Extract spk_embed

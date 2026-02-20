@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, N_ACOUSTIC_PARAMS, N_MELS
+from tmrvc_core.constants import D_SPEAKER, D_WAVLM_LARGE, N_ACOUSTIC_PARAMS, N_MELS
 from tmrvc_train.models.teacher_unet import TeacherUNet
 
 
@@ -18,7 +18,7 @@ class TestTeacherUNet:
         B, T = 2, 64
         x_t = torch.randn(B, N_MELS, T)
         t = torch.rand(B)
-        content = torch.randn(B, D_CONTENT_VEC, T)
+        content = torch.randn(B, D_WAVLM_LARGE, T)
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
         acoustic = torch.randn(B, N_ACOUSTIC_PARAMS)
@@ -31,7 +31,7 @@ class TestTeacherUNet:
         B, T = 1, 32
         x_t = torch.randn(B, N_MELS, T)
         t = torch.rand(B)
-        content = torch.randn(B, D_CONTENT_VEC, T)
+        content = torch.randn(B, D_WAVLM_LARGE, T)
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
 
@@ -43,7 +43,7 @@ class TestTeacherUNet:
         B, T = 1, 32
         x_t = torch.randn(B, N_MELS, T)
         t = torch.rand(B, 1)
-        content = torch.randn(B, D_CONTENT_VEC, T)
+        content = torch.randn(B, D_WAVLM_LARGE, T)
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
 
@@ -54,7 +54,7 @@ class TestTeacherUNet:
         model.eval()
         B, T = 1, 32
         x_t = torch.randn(B, N_MELS, T)
-        content = torch.randn(B, D_CONTENT_VEC, T)
+        content = torch.randn(B, D_WAVLM_LARGE, T)
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
 
@@ -69,7 +69,7 @@ class TestTeacherUNet:
         B, T = 1, 48  # Must be divisible by 16 (4 x stride-2)
         x_t = torch.randn(B, N_MELS, T)
         t = torch.rand(B)
-        content = torch.randn(B, D_CONTENT_VEC, T)
+        content = torch.randn(B, D_WAVLM_LARGE, T)
         f0 = torch.randn(B, 1, T)
         spk = torch.randn(B, D_SPEAKER)
 

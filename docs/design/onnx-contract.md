@@ -88,8 +88,8 @@ constexpr int kNLoraLayers      = 4;
 | **content_encoder** | `content_encoder.onnx` | mel_frame, f0, state_in | content, state_out | Per-frame (10ms) |
 | **ir_estimator** | `ir_estimator.onnx` | mel_chunk, state_in | acoustic_params, state_out | Every ~10 frames (~100ms) |
 | **speaker_encoder** | `speaker_encoder.onnx` | mel_ref | spk_embed, lora_delta | Offline only |
-| **converter** | `converter.onnx` | content, spk_embed, acoustic_params, state_in | pred_features, state_out | Per-frame (10ms), 1-step |
-| **converter_hq** | `converter_hq.onnx` | content, spk_embed, acoustic_params, state_in | pred_features, state_out | Per-frame (10ms), HQ mode, optional |
+| **converter** | `converter.onnx` | content, spk_embed, acoustic_params, lora_delta, state_in | pred_features, state_out | Per-frame (10ms), 1-step |
+| **converter_hq** | `converter_hq.onnx` | content, spk_embed, acoustic_params, lora_delta, state_in | pred_features, state_out | Per-frame (10ms), HQ mode, optional |
 | **vocoder** | `vocoder.onnx` | features, state_in | stft_mag, stft_phase, state_out | Per-frame (10ms) |
 
 ### 2.2 content_encoder
@@ -158,22 +158,22 @@ constexpr int kNLoraLayers      = 4;
 | Name | Shape | Type | Description |
 |---|---|---|---|
 | `spk_embed` | `[1, 192]` | float32 | Speaker embedding vector (L2 normalized) |
-| `lora_delta` | `[1, R]` | float32 | LoRA weight delta (flattened). R = n_lora_layers × 2 × (d_in × rank + rank × d_out) |
+| `lora_delta` | `[1, R]` | float32 | LoRA weight delta (flattened). R = n_lora_layers × (d_cond × rank + rank × d_model_x2) |
 
 **lora_delta サイズ計算:**
 
 ```
-Per layer (cross-attn K and V):
-  K_down: d_converter_hidden × lora_rank = 384 × 4 = 1,536
-  K_up:   lora_rank × d_converter_hidden = 4 × 384 = 1,536
-  V_down: 384 × 4 = 1,536
-  V_up:   4 × 384 = 1,536
-  Per layer total: 6,144
+Per layer (FiLM projection LoRA):
+  d_cond = d_speaker + n_acoustic_params = 192 + 32 = 224
+  d_model_x2 = d_converter_hidden × 2 = 384 × 2 = 768
+  lora_A: d_cond × lora_rank = 224 × 4 = 896
+  lora_B: lora_rank × d_model_x2 = 4 × 768 = 3,072
+  Per layer total: 3,968
 
-Total: n_lora_layers × 6,144 = 4 × 6,144 = 24,576 floats
-R = 24,576
-lora_delta shape: [1, 24576]
-Memory: 24,576 × 4 bytes = 96 KB
+Total: n_lora_layers × 3,968 = 4 × 3,968 = 15,872 floats
+R = 15,872
+lora_delta shape: [1, 15872]
+Memory: 15,872 × 4 bytes ≈ 62 KB
 ```
 
 ### 2.5 converter
@@ -187,6 +187,7 @@ Content features を target speaker の音響特徴に変換する。1-step deno
 | `content` | `[1, 256, 1]` | float32 | Content encoder 出力 |
 | `spk_embed` | `[1, 192]` | float32 | Speaker embedding (cached) |
 | `acoustic_params` | `[1, 32]` | float32 | Acoustic conditioning params (cached) |
+| `lora_delta` | `[1, 15872]` | float32 | Speaker LoRA weight delta (cached) |
 | `state_in` | `[1, 384, 52]` | float32 | Causal conv の hidden state |
 
 **Outputs:**
@@ -196,8 +197,8 @@ Content features を target speaker の音響特徴に変換する。1-step deno
 | `pred_features` | `[1, 513, 1]` | float32 | Predicted STFT features for vocoder |
 | `state_out` | `[1, 384, 52]` | float32 | Updated hidden state |
 
-> **Note:** LoRA delta は enrollment 時に converter の weights に merge 済み。
-> 推論時の converter は vanilla inference (LoRA のオーバーヘッドなし)。
+> **Note:** LoRA delta は runtime input として毎フレーム渡される。
+> 話者切替時は lora_delta テンソルの差し替えのみで対応可能（ONNX モデルの再ロード不要）。
 
 ### 2.5b converter_hq (optional)
 
@@ -213,6 +214,7 @@ HQ mode 用の semi-causal converter。Content Encoder で T=1 ずつ生成し�
 | `content` | `[1, 256, 7]` | float32 | 7 フレーム分の content features (1 current + 6 lookahead) |
 | `spk_embed` | `[1, 192]` | float32 | Speaker embedding (cached) |
 | `acoustic_params` | `[1, 32]` | float32 | Acoustic conditioning params (cached) |
+| `lora_delta` | `[1, 15872]` | float32 | Speaker LoRA weight delta (cached) |
 | `state_in` | `[1, 384, 46]` | float32 | Semi-causal conv の hidden state |
 
 **Outputs:**
@@ -416,12 +418,12 @@ Offset   Size (bytes)    Field
 0x0000   4               Magic: "TMSP" (0x544D5350)
 0x0004   4               Version: uint32_le = 2
 0x0008   4               embed_size: uint32_le = 192
-0x000C   4               lora_size: uint32_le = 24576
+0x000C   4               lora_size: uint32_le = 15872
 0x0010   4               metadata_size: uint32_le (JSON UTF-8 byte count)
 0x0014   4               thumbnail_size: uint32_le (常に 0: サムネイルは metadata JSON 内に base64 格納)
 0x0018   768             spk_embed: float32_le[192]
-0x0318   98304           lora_delta: float32_le[24576]
-0x18318  metadata_size   metadata_json: UTF-8 JSON
+0x0318   63488           lora_delta: float32_le[15872]
+0x10118  metadata_size   metadata_json: UTF-8 JSON
          32              checksum: SHA-256 of all preceding bytes
 ```
 

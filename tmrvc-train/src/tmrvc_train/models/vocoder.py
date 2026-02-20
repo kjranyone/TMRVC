@@ -6,13 +6,11 @@ import torch
 import torch.nn as nn
 
 from tmrvc_core.constants import (
-    D_CONTENT,
     D_VOCODER_FEATURES,
+    D_VOCODER_HIDDEN,
     VOCODER_STATE_FRAMES,
 )
 from tmrvc_train.modules import CausalConvNeXtBlock
-
-_D_VOCODER_HIDDEN = D_CONTENT  # 256
 
 
 class VocoderStudent(nn.Module):
@@ -27,7 +25,7 @@ class VocoderStudent(nn.Module):
     def __init__(
         self,
         d_input: int = D_VOCODER_FEATURES,
-        d_model: int = _D_VOCODER_HIDDEN,
+        d_model: int = D_VOCODER_HIDDEN,
         d_output: int = D_VOCODER_FEATURES,
         n_blocks: int = 4,
         kernel_size: int = 3,

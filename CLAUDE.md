@@ -228,7 +228,7 @@ cd build && ctest
 uv run python -m tmrvc_export.verify_parity
 ```
 
-## Runtime Device Policy (Updated 2026-02-19)
+## Runtime Device Policy (Updated 2026-02-20)
 
 - This workspace should use Intel XPU when available.
 - For training-related CLIs, prefer `--device xpu`:
@@ -243,3 +243,23 @@ uv run python -c "import torch; print(torch.xpu.is_available())"
 ```
 
 - Windows note: keep `--num-workers 0` unless explicitly tuned.
+
+### フォールバック禁止ポリシー
+
+- XPU で `DEVICE_LOST` エラーが出た場合、CPU にフォールバックしない
+- バッチサイズを下げる、デバイスの回復を待つ等で対処する
+- 後方互換性のためのフォールバックコードも書かない（スパゲティコードの原因）
+- データが古い場合はデータ自体を修正する（コード側で `.get()` デフォルト値を入れない）
+
+### XPU バッチ形状の最適化
+
+XPU (Intel Arc) は JIT カーネルコンパイルを行うため、テンソル形状が変わるたびに
+再コンパイルが発生し **10〜18 倍の速度低下** を引き起こす。
+
+- `--max-frames 400` がデフォルト（Teacher 学習・蒸留の両方）
+  - VCTK 中央値 301 フレーム / 95th pct 569 に合わせた設定
+  - 全バッチを固定 400 フレームに crop/pad し、カーネル形状を 1 種類に固定
+  - パディング領域のノイズはゼロ化（F5-TTS/VoiceFlow 方式 = Approach A）
+  - 400 フレーム超の発話はランダムクロップ
+- `--max-frames 0` で無効化可能（バケットバッチングにフォールバック: [250,500,750,1000]）
+- Few-shot (`tmrvc-finetune`) は固定 200 フレームで動作するため影響なし

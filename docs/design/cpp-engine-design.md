@@ -125,6 +125,11 @@ TensorPool: single malloc (total ~300 KB)
 └────────────────────────────────────────────────────────────┘
 ```
 
+> **Note (Rust Implementation):** The Rust implementation in `tmrvc-engine-rs` uses separate `Vec<f32>` 
+> allocations for each buffer rather than a single contiguous allocation. State buffers are managed 
+> via `PingPongState` structs with independent `Vec` backing. Both approaches achieve the same goal: 
+> **no dynamic allocation during inference**. All buffers are pre-allocated at initialization time.
+
 ### 2.3 TensorPool API
 
 ```cpp

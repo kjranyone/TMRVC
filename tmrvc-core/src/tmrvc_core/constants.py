@@ -27,11 +27,33 @@ N_IR_PARAMS: int = _cfg["n_ir_params"]
 N_VOICE_SOURCE_PARAMS: int = _cfg["n_voice_source_params"]
 N_ACOUSTIC_PARAMS: int = _cfg["n_acoustic_params"]
 D_CONVERTER_HIDDEN: int = _cfg["d_converter_hidden"]
+D_IR_ESTIMATOR_HIDDEN: int = _cfg["d_ir_estimator_hidden"]
+D_VOCODER_HIDDEN: int = _cfg["d_vocoder_hidden"]
 D_VOCODER_FEATURES: int = _cfg["d_vocoder_features"]
 
 # --- Feature Extraction ---
 D_CONTENT_VEC: int = _cfg["d_content_vec"]
 CONTENT_VEC_HOP_MS: float = _cfg["content_vec_hop_ms"]
+
+# --- WavLM (Phase 1+) ---
+D_WAVLM_LARGE: int = _cfg["d_wavlm_large"]
+WAVLM_LAYER: int = _cfg["wavlm_layer"]
+
+# --- VQ Bottleneck ---
+VQ_N_CODEBOOKS: int = _cfg["vq_n_codebooks"]
+VQ_CODEBOOK_SIZE: int = _cfg["vq_codebook_size"]
+VQ_CODEBOOK_DIM: int = _cfg["vq_codebook_dim"]
+VQ_COMMITMENT_LAMBDA: float = _cfg["vq_commitment_lambda"]
+
+# --- OT-CFM ---
+USE_OT_CFM: bool = _cfg["use_ot_cfm"]
+OT_CFM_BATCH_OT: bool = _cfg["ot_cfm_batch_ot"]
+
+# --- Quality Targets ---
+TARGET_SECS_PHASE0: float = _cfg["target_secs_phase0"]
+TARGET_SECS_PHASE1: float = _cfg["target_secs_phase1"]
+TARGET_UTMOS_PHASE1: float = _cfg["target_utmos_phase1"]
+TARGET_SECS_REVERB: float = _cfg["target_secs_reverb"]
 
 # --- Inference Parameters ---
 STUDENT_STEPS: int = _cfg["student_steps"]

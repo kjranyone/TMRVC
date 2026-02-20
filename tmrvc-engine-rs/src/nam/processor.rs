@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::constants::MAX_DAW_BLOCK_SIZE;
 use crate::resampler::PolyphaseResampler;
 
 use super::NamModel;
@@ -35,10 +36,10 @@ impl NamChain {
             resampler_to_nam: None,
             resampler_from_nam: None,
             daw_rate,
-            nam_in_buf: Vec::new(),
-            nam_out_buf: Vec::new(),
-            resample_out_buf: Vec::new(),
-            dry_buf: Vec::new(),
+            nam_in_buf: vec![0.0; MAX_DAW_BLOCK_SIZE * 2],
+            nam_out_buf: vec![0.0; MAX_DAW_BLOCK_SIZE * 2],
+            resample_out_buf: vec![0.0; MAX_DAW_BLOCK_SIZE * 2],
+            dry_buf: vec![0.0; MAX_DAW_BLOCK_SIZE],
             enabled: false,
             mix: 1.0,
         }
@@ -88,6 +89,7 @@ impl NamChain {
     ///
     /// **RT-safe** — no allocation or I/O.
     /// If no model is loaded or NAM is disabled, this is a no-op.
+    /// If samples.len() exceeds MAX_DAW_BLOCK_SIZE, processing is skipped.
     pub fn process(&mut self, samples: &mut [f32]) {
         if !self.enabled {
             return;
@@ -97,51 +99,30 @@ impl NamChain {
             None => return,
         };
 
-        if self.resampler_to_nam.is_none() {
-            // No resampling: process in-place at DAW rate
-            // Save dry signal for mix
-            if (self.mix - 1.0).abs() > 1e-6 {
-                if self.dry_buf.len() < samples.len() {
-                    // This shouldn't happen in steady-state, but handle gracefully
-                    self.dry_buf.resize(samples.len(), 0.0);
-                }
-                self.dry_buf[..samples.len()].copy_from_slice(samples);
-            }
-
-            // Use nam_out_buf as scratch for model output
-            if self.nam_out_buf.len() < samples.len() {
-                self.nam_out_buf.resize(samples.len(), 0.0);
-            }
-            model.process(samples, &mut self.nam_out_buf[..samples.len()]);
-
-            // Mix
-            if (self.mix - 1.0).abs() > 1e-6 {
-                let m = self.mix;
-                for i in 0..samples.len() {
-                    samples[i] = self.dry_buf[i] * (1.0 - m) + self.nam_out_buf[i] * m;
-                }
-            } else {
-                samples.copy_from_slice(&self.nam_out_buf[..samples.len()]);
-            }
-        } else {
+        if let (Some(rs_to), Some(rs_from)) =
+            (&mut self.resampler_to_nam, &mut self.resampler_from_nam)
+        {
             // Resampling path
-            let rs_to = self.resampler_to_nam.as_mut().unwrap();
             let n_resampled = rs_to.process(samples, &mut self.nam_in_buf);
 
-            if self.nam_out_buf.len() < n_resampled {
-                self.nam_out_buf.resize(n_resampled, 0.0);
+            if n_resampled > self.nam_out_buf.len() {
+                debug_assert!(
+                    false,
+                    "n_resampled = {} exceeds nam_out_buf capacity",
+                    n_resampled
+                );
+                return;
             }
+
             model.process(
                 &self.nam_in_buf[..n_resampled],
                 &mut self.nam_out_buf[..n_resampled],
             );
 
-            let rs_from = self.resampler_from_nam.as_mut().unwrap();
             let n_back =
                 rs_from.process(&self.nam_out_buf[..n_resampled], &mut self.resample_out_buf);
 
-            // Copy back with mix
-            let n_copy = samples.len().min(n_back);
+            let n_copy = samples.len().min(n_back).min(self.resample_out_buf.len());
             if (self.mix - 1.0).abs() > 1e-6 {
                 let m = self.mix;
                 for i in 0..n_copy {
@@ -149,6 +130,31 @@ impl NamChain {
                 }
             } else {
                 samples[..n_copy].copy_from_slice(&self.resample_out_buf[..n_copy]);
+            }
+        } else {
+            // No resampling: process in-place at DAW rate
+            if samples.len() > self.dry_buf.len() || samples.len() > self.nam_out_buf.len() {
+                debug_assert!(
+                    false,
+                    "samples.len() = {} exceeds pre-allocated buffer",
+                    samples.len()
+                );
+                return;
+            }
+
+            if (self.mix - 1.0).abs() > 1e-6 {
+                self.dry_buf[..samples.len()].copy_from_slice(samples);
+            }
+
+            model.process(samples, &mut self.nam_out_buf[..samples.len()]);
+
+            if (self.mix - 1.0).abs() > 1e-6 {
+                let m = self.mix;
+                for i in 0..samples.len() {
+                    samples[i] = self.dry_buf[i] * (1.0 - m) + self.nam_out_buf[i] * m;
+                }
+            } else {
+                samples.copy_from_slice(&self.nam_out_buf[..samples.len()]);
             }
         }
     }
