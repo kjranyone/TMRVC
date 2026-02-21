@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 from tmrvc_core.constants import IR_UPDATE_INTERVAL, N_IR_PARAMS
@@ -59,10 +61,12 @@ class TeacherTrainer:
         config: TrainerConfig,
         ir_estimator: nn.Module | None = None,
         voice_source_loss: nn.Module | None = None,
+        lr_scheduler: LambdaLR | None = None,
     ) -> None:
         self.teacher = teacher
         self.scheduler = scheduler
         self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
         self.dataloader = dataloader
         self.config = config
         self.global_step = 0
@@ -210,6 +214,8 @@ class TeacherTrainer:
         if self.config.grad_clip > 0:
             nn.utils.clip_grad_norm_(self.teacher.parameters(), self.config.grad_clip)
         self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
         return losses
 
@@ -232,7 +238,8 @@ class TeacherTrainer:
 
                 if self.global_step % self.config.log_every == 0:
                     loss_str = ", ".join(f"{k}={v:.4f}" for k, v in losses.items())
-                    logger.info("Step %d: %s", self.global_step, loss_str)
+                    cur_lr = self.optimizer.param_groups[0]["lr"]
+                    logger.info("Step %d: %s (lr=%.2e)", self.global_step, loss_str, cur_lr)
 
                     if self._wandb is not None:
                         self._wandb.log(losses, step=self.global_step)
@@ -255,24 +262,59 @@ class TeacherTrainer:
         else:
             ckpt_path = Path(path)
 
-        torch.save(
-            {
-                "step": self.global_step,
-                "model_state_dict": self.teacher.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "config": self.config,
-            },
-            ckpt_path,
-        )
+        ckpt_data = {
+            "step": self.global_step,
+            "model_state_dict": self.teacher.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "config": self.config,
+        }
+        if self.lr_scheduler is not None:
+            ckpt_data["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        torch.save(ckpt_data, ckpt_path)
         logger.info("Saved checkpoint to %s", ckpt_path)
         return ckpt_path
 
     def load_checkpoint(self, path: str | Path) -> None:
         """Load model checkpoint."""
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        self.teacher.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        state_dict = ckpt["model_state_dict"]
+        # Migrate old key names: film_ir → film_acoustic
+        keys_to_rename = [
+            (k, k.replace("film_ir.", "film_acoustic."))
+            for k in list(state_dict.keys())
+            if "film_ir." in k
+        ]
+        for old_key, new_key in keys_to_rename:
+            state_dict[new_key] = state_dict.pop(old_key)
+            logger.info("Migrated checkpoint key: %s → %s", old_key, new_key)
+        # Pad film_acoustic weights if n_ir_params (24) → n_acoustic_params (32)
+        model_sd = self.teacher.state_dict()
+        shapes_changed = False
+        for key in list(state_dict.keys()):
+            if key in model_sd and state_dict[key].shape != model_sd[key].shape:
+                old_shape = state_dict[key].shape
+                new_shape = model_sd[key].shape
+                new_tensor = torch.zeros(new_shape, dtype=state_dict[key].dtype)
+                slices = tuple(slice(0, min(o, n)) for o, n in zip(old_shape, new_shape))
+                new_tensor[slices] = state_dict[key][slices]
+                state_dict[key] = new_tensor
+                shapes_changed = True
+                logger.info("Padded %s: %s → %s", key, old_shape, new_shape)
+        self.teacher.load_state_dict(state_dict)
+        if shapes_changed:
+            logger.warning("Shape changes detected — optimizer state reset")
+        else:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt["step"]
+        # Restore LR scheduler state if available
+        if self.lr_scheduler is not None and "lr_scheduler_state_dict" in ckpt:
+            self.lr_scheduler.load_state_dict(ckpt["lr_scheduler_state_dict"])
+            logger.info("Restored LR scheduler state")
+        elif self.lr_scheduler is not None:
+            # Checkpoint predates scheduler — fast-forward to current step
+            for _ in range(self.global_step):
+                self.lr_scheduler.step()
+            logger.info("LR scheduler fast-forwarded to step %d", self.global_step)
         logger.info("Loaded checkpoint from %s (step %d)", path, self.global_step)
 
 

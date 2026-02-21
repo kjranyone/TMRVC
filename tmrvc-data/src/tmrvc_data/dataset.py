@@ -29,23 +29,34 @@ class TMRVCDataset(Dataset):
     Supports cross-speaker conditioning augmentation: with probability
     ``cross_speaker_prob``, the speaker embedding is swapped with one
     from a different speaker in the same batch.
+
+    ``dataset`` can be a single name or a list of names for multi-dataset
+    training.  Each entry stores its originating dataset so that
+    :meth:`FeatureCache.load` resolves the correct directory.
     """
 
     def __init__(
         self,
         cache: FeatureCache,
-        dataset: str,
+        dataset: str | list[str],
         split: str = "train",
         cross_speaker_prob: float = CROSS_SPEAKER_PROB,
         subset: float = 1.0,
         augmenter: Augmenter | None = None,
     ) -> None:
         self.cache = cache
-        self.dataset = dataset
+        self.datasets = [dataset] if isinstance(dataset, str) else list(dataset)
         self.split = split
         self.cross_speaker_prob = cross_speaker_prob
         self.augmenter = augmenter
-        self.entries = cache.iter_entries(dataset, split)
+
+        # Collect entries from all datasets
+        self.entries: list[dict[str, str]] = []
+        for ds_name in self.datasets:
+            for entry in cache.iter_entries(ds_name, split):
+                entry["dataset"] = ds_name
+                self.entries.append(entry)
+
         if subset < 1.0:
             k = max(1, int(len(self.entries) * subset))
             self.entries = random.sample(self.entries, k)
@@ -62,11 +73,12 @@ class TMRVCDataset(Dataset):
 
     def __getitem__(self, idx: int) -> FeatureSet:
         entry = self.entries[idx]
+        ds_name = entry["dataset"]
         load_waveform = self.augmenter is not None and bool(
             self.augmenter.config.rir_dirs
         )
         features = self.cache.load(
-            self.dataset,
+            ds_name,
             self.split,
             entry["speaker_id"],
             entry["utterance_id"],
@@ -148,7 +160,7 @@ class TMRVCDataset(Dataset):
                 other_idx = random.choice(self._speaker_to_indices[other_sid])
                 other_entry = self.entries[other_idx]
                 other_features = self.cache.load(
-                    self.dataset,
+                    other_entry["dataset"],
                     self.split,
                     other_entry["speaker_id"],
                     other_entry["utterance_id"],
@@ -255,7 +267,7 @@ def collate_fn(
 
 def create_dataloader(
     cache_dir: str | Path,
-    dataset: str,
+    dataset: str | list[str],
     split: str = "train",
     batch_size: int = DEFAULT_BATCH_SIZE,
     num_workers: int = 4,
@@ -270,7 +282,8 @@ def create_dataloader(
 
     Args:
         cache_dir: Root cache directory.
-        dataset: Dataset name (e.g. ``"vctk"``).
+        dataset: Dataset name (e.g. ``"vctk"``) or list of names for
+            multi-dataset training (e.g. ``["vctk", "jvs", "libritts_r"]``).
         split: Split name.
         batch_size: Batch size.
         num_workers: DataLoader workers.

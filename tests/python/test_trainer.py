@@ -164,6 +164,16 @@ class TestTrainTeacherCLI:
         assert args.lr is None
         assert args.config is None
 
+    def test_build_parser_multi_dataset(self):
+        from tmrvc_train.cli.train_teacher import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "--cache-dir", "/data",
+            "--dataset", "vctk,jvs,libritts_r",
+        ])
+        assert args.dataset == "vctk,jvs,libritts_r"
+
     def test_build_parser_all_args(self):
         from tmrvc_train.cli.train_teacher import build_parser
 

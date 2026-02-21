@@ -74,13 +74,19 @@ class TestTrimSilence:
 
 class TestSegmentation:
     def test_short_audio_single_segment(self):
-        # 3 seconds < min_sec (5s) → no segments
-        waveform = torch.randn(1, SAMPLE_RATE * 3)
+        # 1 second < min_sec (2s) → no segments
+        waveform = torch.randn(1, SAMPLE_RATE * 1)
         segments = list(segment_utterance(waveform))
         assert len(segments) == 0
 
+    def test_above_min_sec_single_segment(self):
+        # 3 seconds >= min_sec (2s) → one segment
+        waveform = torch.randn(1, SAMPLE_RATE * 3)
+        segments = list(segment_utterance(waveform))
+        assert len(segments) == 1
+
     def test_medium_audio_single_segment(self):
-        # 10 seconds → within [5, 15] → one segment
+        # 10 seconds → within [2, 15] → one segment
         waveform = torch.randn(1, SAMPLE_RATE * 10)
         segments = list(segment_utterance(waveform))
         assert len(segments) == 1

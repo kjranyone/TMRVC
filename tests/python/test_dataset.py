@@ -105,6 +105,72 @@ class TestDataset:
         assert batch.spk_embed.shape == (4, D_SPEAKER)
 
 
+    def test_multi_dataset(self, tmp_cache_dir):
+        """Multi-dataset TMRVCDataset merges entries from all datasets."""
+        cache = FeatureCache(tmp_cache_dir)
+
+        # Dataset A: 4 entries from 2 speakers
+        for i in range(4):
+            spk = f"spk_a{i % 2}"
+            fs = _make_feature_set(spk, f"utt_{i:03d}", 100)
+            cache.save(fs, "ds_alpha", "train")
+
+        # Dataset B: 6 entries from 3 speakers
+        for i in range(6):
+            spk = f"spk_b{i % 3}"
+            fs = _make_feature_set(spk, f"utt_{i:03d}", 120)
+            cache.save(fs, "ds_beta", "train")
+
+        ds = TMRVCDataset(cache, ["ds_alpha", "ds_beta"], "train", cross_speaker_prob=0.0)
+        assert len(ds) == 10
+
+        # Verify entries have correct dataset keys
+        ds_alpha_entries = [e for e in ds.entries if e["dataset"] == "ds_alpha"]
+        ds_beta_entries = [e for e in ds.entries if e["dataset"] == "ds_beta"]
+        assert len(ds_alpha_entries) == 4
+        assert len(ds_beta_entries) == 6
+
+        # Verify items load correctly
+        item = ds[0]
+        assert isinstance(item, FeatureSet)
+        assert item.mel.shape[0] == N_MELS
+
+    def test_multi_dataset_dataloader(self, tmp_cache_dir):
+        """create_dataloader works with a list of dataset names."""
+        cache = FeatureCache(tmp_cache_dir)
+
+        for i in range(4):
+            fs = _make_feature_set(f"spk_x{i}", f"utt_{i:03d}", 100)
+            cache.save(fs, "ds_one", "train")
+        for i in range(4):
+            fs = _make_feature_set(f"spk_y{i}", f"utt_{i:03d}", 100)
+            cache.save(fs, "ds_two", "train")
+
+        loader = create_dataloader(
+            tmp_cache_dir,
+            ["ds_one", "ds_two"],
+            batch_size=4,
+            num_workers=0,
+            cross_speaker_prob=0.0,
+            balanced_sampling=False,
+        )
+        batch = next(iter(loader))
+        assert isinstance(batch, TrainingBatch)
+        assert batch.content.shape[0] == 4
+
+    def test_single_dataset_string_still_works(self, tmp_cache_dir):
+        """Passing a single string still works (backward compat)."""
+        cache = FeatureCache(tmp_cache_dir)
+
+        for i in range(4):
+            fs = _make_feature_set(f"spk_{i}", f"utt_{i:03d}", 100)
+            cache.save(fs, "ds_compat", "train")
+
+        ds = TMRVCDataset(cache, "ds_compat", "train", cross_speaker_prob=0.0)
+        assert len(ds) == 4
+        # All entries should have dataset key
+        assert all(e["dataset"] == "ds_compat" for e in ds.entries)
+
     def test_subset_filters_entries(self, tmp_cache_dir):
         cache = FeatureCache(tmp_cache_dir)
         dataset_name = "test_subset"

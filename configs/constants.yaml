@@ -94,7 +94,7 @@ target_secs_reverb: 0.86      # Target SECS under reverberant conditions (Phase 
 
 # --- Training Defaults ---
 default_batch_size: 64
-segment_min_sec: 5.0
+segment_min_sec: 2.0
 segment_max_sec: 15.0
 loudness_target_lufs: -23.0
 cross_speaker_prob: 0.2

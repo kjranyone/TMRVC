@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 from pathlib import Path
 
 import torch
+from torch.optim.lr_scheduler import LambdaLR
 
 from tmrvc_core.constants import D_CONTENT_VEC
 from tmrvc_train.diffusion import FlowMatchingScheduler
@@ -41,8 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dataset",
-        required=True,
-        help="Dataset name (e.g. 'vctk', 'jvs', 'libritts_r').",
+        default=None,
+        help="Dataset name(s), comma-separated (e.g. 'vctk,jvs,libritts_r'). "
+        "Overrides YAML config 'datasets' list.",
     )
     parser.add_argument(
         "--phase",
@@ -188,6 +191,15 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint_dir = args.checkpoint_dir or Path(file_cfg.get("checkpoint_dir", "checkpoints"))
     warmup_steps = file_cfg.get("warmup_steps", 0)
 
+    # Resolve dataset list: CLI --dataset overrides YAML 'datasets'
+    if args.dataset:
+        datasets = [d.strip() for d in args.dataset.split(",")]
+    else:
+        datasets = file_cfg.pop("datasets", None)
+        if not datasets:
+            parser.error("--dataset is required (or specify 'datasets' in YAML config)")
+    logger.info("Datasets: %s", datasets)
+
     speaker_groups = _parse_speaker_groups(file_cfg)
     device = torch.device(args.device)
 
@@ -197,6 +209,16 @@ def main(argv: list[str] | None = None) -> None:
     scheduler = FlowMatchingScheduler()
 
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=lr, weight_decay=0.01)
+
+    # LR scheduler: linear warmup + cosine decay
+    def _lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    lr_scheduler = LambdaLR(optimizer, lr_lambda=_lr_lambda)
+    logger.info("LR scheduler: warmup=%d steps, cosine decay to step %d", warmup_steps, max_steps)
 
     # Create augmenter (Phase 2 with rir_augment)
     augmenter = None
@@ -216,7 +238,7 @@ def main(argv: list[str] | None = None) -> None:
 
     dataloader = create_dataloader(
         cache_dir=args.cache_dir,
-        dataset=args.dataset,
+        dataset=datasets,
         batch_size=batch_size,
         subset=args.subset,
         num_workers=args.num_workers,
@@ -270,6 +292,7 @@ def main(argv: list[str] | None = None) -> None:
             teacher, scheduler, optimizer, dataloader, config,
             ir_estimator=ir_estimator,
             voice_source_loss=voice_source_loss,
+            lr_scheduler=lr_scheduler,
         )
 
     if args.resume:
