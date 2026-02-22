@@ -43,12 +43,14 @@ class TMRVCDataset(Dataset):
         cross_speaker_prob: float = CROSS_SPEAKER_PROB,
         subset: float = 1.0,
         augmenter: Augmenter | None = None,
+        max_frames: int = 0,
     ) -> None:
         self.cache = cache
         self.datasets = [dataset] if isinstance(dataset, str) else list(dataset)
         self.split = split
         self.cross_speaker_prob = cross_speaker_prob
         self.augmenter = augmenter
+        self.max_frames = max_frames
 
         # Collect entries from all datasets
         self.entries: list[dict[str, str]] = []
@@ -84,6 +86,7 @@ class TMRVCDataset(Dataset):
             entry["utterance_id"],
             mmap=True,
             load_waveform=load_waveform,
+            max_frames=self.max_frames,
         )
 
         # Feature-level augmentation
@@ -309,6 +312,7 @@ def create_dataloader(
         cross_speaker_prob=cross_speaker_prob,
         subset=subset,
         augmenter=augmenter,
+        max_frames=max_frames,
     )
 
     sampler = None

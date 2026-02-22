@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from pathlib import Path
 
 import numpy as np
@@ -82,25 +83,42 @@ class FeatureCache:
         utterance_id: str,
         mmap: bool = True,
         load_waveform: bool = False,
+        max_frames: int = 0,
     ) -> FeatureSet:
         """Load a FeatureSet from disk.
 
         Args:
             mmap: If True, use ``mmap_mode='r'`` for zero-copy reads.
             load_waveform: If True, also load ``waveform.npy`` (if it exists).
+            max_frames: If > 0 and the utterance is longer, random-crop at the
+                mmap level so that only the needed slice is read from disk.
+                This avoids materializing the full array for long utterances.
         """
         utt_dir = self._utt_dir(dataset, split, speaker_id, utterance_id)
         mmap_mode = "r" if mmap else None
 
-        mel = np.load(utt_dir / "mel.npy", mmap_mode=mmap_mode)
-        content = np.load(utt_dir / "content.npy", mmap_mode=mmap_mode)
-        f0 = np.load(utt_dir / "f0.npy", mmap_mode=mmap_mode)
+        mel_mm = np.load(utt_dir / "mel.npy", mmap_mode=mmap_mode)
+        content_mm = np.load(utt_dir / "content.npy", mmap_mode=mmap_mode)
+        f0_mm = np.load(utt_dir / "f0.npy", mmap_mode=mmap_mode)
         spk_embed = np.load(utt_dir / "spk_embed.npy", mmap_mode=mmap_mode)
 
         with open(utt_dir / "meta.json", encoding="utf-8") as f:
             meta = json.load(f)
 
         content_dim = meta["content_dim"]
+
+        # Lazy crop: only materialize the needed frames from mmap
+        T = mel_mm.shape[-1]
+        if max_frames > 0 and T > max_frames:
+            start = random.randint(0, T - max_frames)
+            end = start + max_frames
+            mel = np.array(mel_mm[:, start:end])
+            content = np.array(content_mm[:, start:end])
+            f0 = np.array(f0_mm[:, start:end])
+        else:
+            mel = np.array(mel_mm)
+            content = np.array(content_mm)
+            f0 = np.array(f0_mm)
 
         waveform = None
         if load_waveform:
@@ -111,9 +129,9 @@ class FeatureCache:
                 )
 
         return FeatureSet(
-            mel=torch.from_numpy(np.array(mel)),
-            content=torch.from_numpy(np.array(content)),
-            f0=torch.from_numpy(np.array(f0)),
+            mel=torch.from_numpy(mel),
+            content=torch.from_numpy(content),
+            f0=torch.from_numpy(f0),
             spk_embed=torch.from_numpy(np.array(spk_embed)),
             utterance_id=meta["utterance_id"],
             speaker_id=meta["speaker_id"],
