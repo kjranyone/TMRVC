@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 
 [tool.uv.workspace]
-members = ["tmrvc-core", "tmrvc-data", "tmrvc-gui", "tmrvc-train", "tmrvc-export"]
+members = ["tmrvc-core", "tmrvc-data", "tmrvc-gui", "tmrvc-train", "tmrvc-export", "tmrvc-serve"]
 
 [dependency-groups]
 dev = [
@@ -15,6 +15,7 @@ dev = [
     "tmrvc-gui",
     "tmrvc-train",
     "tmrvc-export",
+    "tmrvc-serve",
     "pytest>=8.0",
     "pytest-cov>=5.0",
 ]
@@ -25,6 +26,7 @@ tmrvc-data = { workspace = true }
 tmrvc-gui = { workspace = true }
 tmrvc-train = { workspace = true }
 tmrvc-export = { workspace = true }
+tmrvc-serve = { workspace = true }
 torch = [
     { index = "pytorch-xpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

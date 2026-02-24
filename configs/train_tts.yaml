@@ -1,0 +1,35 @@
+# TTS Front-end Training Configuration
+# Trains: TextEncoder, DurationPredictor, F0Predictor, ContentSynthesizer
+# Frozen: ContentEncoder, Converter, Vocoder (VC-trained weights)
+
+batch_size: 32
+max_frames: 400
+lr: 1.0e-4
+warmup_steps: 5000
+max_steps: 200000
+save_every: 10000
+log_every: 100
+checkpoint_dir: checkpoints/tts
+grad_clip: 1.0
+
+# Loss weights
+lambda_duration: 1.0
+lambda_f0: 0.5
+lambda_content: 1.0
+lambda_voiced: 0.2
+
+# Datasets (Phase 2: basic TTS)
+datasets:
+  - jsut
+  - ljspeech
+  - vctk
+  - jvs
+
+# Frozen models (loaded from VC checkpoint)
+frozen:
+  - content_encoder
+  - converter
+  - vocoder
+  - speaker_encoder
+
+use_wandb: false

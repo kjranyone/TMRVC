@@ -65,3 +65,69 @@ class TrainingBatch:
     utterance_ids: list[str] = field(default_factory=list)
     speaker_ids: list[str] = field(default_factory=list)
     content_dim: int = 768  # Track content feature dimension
+
+
+# --- TTS Extension ---
+
+
+@dataclass
+class TTSFeatureSet:
+    """Cached features for a single TTS utterance.
+
+    Extends FeatureSet with phoneme-level alignment information.
+    """
+
+    mel: torch.Tensor  # [80, T]
+    content: torch.Tensor  # [content_dim, T]
+    f0: torch.Tensor  # [1, T]
+    spk_embed: torch.Tensor  # [192]
+    phoneme_ids: torch.Tensor  # [L] — phoneme index sequence
+    durations: torch.Tensor  # [L] — frames per phoneme
+    language_id: int = 0  # 0=ja, 1=en, 2=zh, 3=other
+    utterance_id: str = ""
+    speaker_id: str = ""
+    n_frames: int = 0
+    n_phonemes: int = 0
+    content_dim: int = 768
+    text: str = ""
+
+
+@dataclass
+class TTSBatch:
+    """Collated TTS batch returned by the DataLoader.
+
+    Includes both frame-level features (mel, content, f0) and
+    phoneme-level features (phoneme_ids, durations) with separate lengths.
+    """
+
+    phoneme_ids: torch.Tensor  # [B, L_max] — padded phoneme sequences
+    durations: torch.Tensor  # [B, L_max] — frames per phoneme
+    language_ids: torch.Tensor  # [B] — language index
+    content: torch.Tensor  # [B, content_dim, T]
+    f0: torch.Tensor  # [B, 1, T]
+    spk_embed: torch.Tensor  # [B, 192]
+    mel_target: torch.Tensor  # [B, 80, T]
+    frame_lengths: torch.Tensor  # [B] — unpadded frame counts
+    phoneme_lengths: torch.Tensor  # [B] — unpadded phoneme counts
+    utterance_ids: list[str] = field(default_factory=list)
+    speaker_ids: list[str] = field(default_factory=list)
+    content_dim: int = 768
+    style: torch.Tensor | None = None  # [B, d_style] optional style vec
+
+    def to(self, device: torch.device | str) -> TTSBatch:
+        """Transfer all tensor fields to device."""
+        return TTSBatch(
+            phoneme_ids=self.phoneme_ids.to(device),
+            durations=self.durations.to(device),
+            language_ids=self.language_ids.to(device),
+            content=self.content.to(device),
+            f0=self.f0.to(device),
+            spk_embed=self.spk_embed.to(device),
+            mel_target=self.mel_target.to(device),
+            frame_lengths=self.frame_lengths.to(device),
+            phoneme_lengths=self.phoneme_lengths.to(device),
+            utterance_ids=self.utterance_ids,
+            speaker_ids=self.speaker_ids,
+            content_dim=self.content_dim,
+            style=self.style.to(device) if self.style is not None else None,
+        )

@@ -24,3 +24,53 @@ datasets:
   libritts_r:
     enabled: false
     raw_dir: data/raw/libritts_r
+
+  # --- TTS Datasets ---
+  jsut:
+    enabled: false
+    raw_dir: data/raw/jsut_ver1.1
+    type: tts
+    language: ja
+    speakers: 1
+    hours: 10
+
+  ljspeech:
+    enabled: false
+    raw_dir: data/raw/LJSpeech-1.1
+    type: tts
+    language: en
+    speakers: 1
+    hours: 24
+
+  # --- Emotion / Expressive Datasets ---
+  jvnv:
+    enabled: false
+    raw_dir: data/raw/jvnv
+    type: emotion
+    language: ja
+    speakers: 4
+    hours: 4
+
+  expresso:
+    enabled: false
+    raw_dir: data/raw/expresso
+    type: emotion
+    language: en
+    speakers: 4
+    hours: 40
+
+  emov_db:
+    enabled: false
+    raw_dir: data/raw/EmoV-DB
+    type: emotion
+    language: en
+    speakers: 4
+    hours: 7
+
+  ravdess:
+    enabled: false
+    raw_dir: data/raw/ravdess
+    type: emotion
+    language: en
+    speakers: 24
+    hours: 2

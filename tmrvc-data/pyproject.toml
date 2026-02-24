@@ -14,6 +14,12 @@ dependencies = [
     "torchcrepe>=0.0.22",
 ]
 
+[project.optional-dependencies]
+tts = [
+    "pyopenjtalk>=0.3",
+    "phonemizer>=3.2",
+]
+
 [project.scripts]
 tmrvc-preprocess = "tmrvc_data.cli.preprocess:main"
 tmrvc-extract-features = "tmrvc_data.cli.extract_features:main"

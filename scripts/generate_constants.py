@@ -51,6 +51,18 @@ _RUNTIME_KEYS = {
     "converter_hq_state_frames",
     "hq_threshold_q",
     "crossfade_frames",
+    # TTS extension
+    "d_style",
+    "n_style_params",
+    "d_text_encoder",
+    "n_text_encoder_layers",
+    "n_text_encoder_heads",
+    "text_encoder_ff_dim",
+    "phoneme_vocab_size",
+    "n_emotion_categories",
+    "d_f0_predictor",
+    "d_content_synthesizer",
+    "n_languages",
 }
 
 # Rust name overrides (YAML key → Rust const name) for backward compat.
@@ -69,6 +81,8 @@ def _py_value(v: object) -> str:
     if isinstance(v, bool):
         return str(v)
     if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, str):
         return repr(v)
     if isinstance(v, list):
         inner = ", ".join(_py_value(x) for x in v)
@@ -217,6 +231,19 @@ def generate_rust(cfg: dict) -> str:
             "hq_threshold_q",
             "crossfade_frames",
         ],
+        "tts": [
+            "d_style",
+            "n_style_params",
+            "d_text_encoder",
+            "n_text_encoder_layers",
+            "n_text_encoder_heads",
+            "text_encoder_ff_dim",
+            "phoneme_vocab_size",
+            "n_emotion_categories",
+            "d_f0_predictor",
+            "d_content_synthesizer",
+            "n_languages",
+        ],
     }
 
     section_headers = {
@@ -226,6 +253,7 @@ def generate_rust(cfg: dict) -> str:
         "lora": "\n// --- LoRA parameters ---",
         "state": "\n// --- State tensor context lengths ---",
         "hq": "\n// --- Lookahead / HQ mode ---",
+        "tts": "\n// --- TTS extension ---",
     }
 
     # Remove the initial audio header since we add it per section

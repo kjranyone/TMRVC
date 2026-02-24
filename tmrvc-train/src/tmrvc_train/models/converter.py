@@ -17,6 +17,7 @@ from tmrvc_core.constants import (
     GTM_N_HEADS,
     MAX_LOOKAHEAD_HOPS,
     N_ACOUSTIC_PARAMS,
+    N_STYLE_PARAMS,
 )
 from tmrvc_train.modules import (
     CausalConvNeXtBlock,
@@ -519,3 +520,73 @@ class ConverterStudentHQ(nn.Module):
             hq_block.film.load_state_dict(causal_block.film.state_dict())
 
         return hq
+
+
+# ---------------------------------------------------------------------------
+# TTS-mode Converter (extended FiLM conditioning)
+# ---------------------------------------------------------------------------
+
+
+def migrate_film_weights(
+    src_film: FiLMConditioner,
+    dst_film: FiLMConditioner,
+) -> None:
+    """Copy FiLM weights from smaller d_cond to larger d_cond.
+
+    The extra conditioning dimensions are zero-initialized so they
+    produce identity modulation (gamma=1, beta=0) until fine-tuned.
+
+    Args:
+        src_film: Source FiLM with d_cond_old (e.g., 224).
+        dst_film: Destination FiLM with d_cond_new (e.g., 256).
+    """
+    d_old = src_film.proj.in_features
+    d_new = dst_film.proj.in_features
+    assert d_new >= d_old, f"dst d_cond ({d_new}) must be >= src d_cond ({d_old})"
+
+    with torch.no_grad():
+        # Zero out all weights first, then copy existing columns
+        dst_film.proj.weight.zero_()
+        dst_film.proj.weight[:, :d_old] = src_film.proj.weight
+        # Copy bias as-is (same output dimension)
+        dst_film.proj.bias.copy_(src_film.proj.bias)
+
+
+def converter_from_vc_checkpoint(
+    vc_model: ConverterStudent,
+    n_style_params: int = N_STYLE_PARAMS,
+) -> ConverterStudent:
+    """Create a TTS-mode ConverterStudent from a VC checkpoint.
+
+    Extends FiLM conditioning from d_speaker + n_acoustic_params (224)
+    to d_speaker + n_style_params (256). Existing weights are preserved;
+    new style dimensions are zero-initialized for identity modulation.
+
+    Args:
+        vc_model: Trained VC ConverterStudent.
+        n_style_params: New conditioning dimension (default: 64).
+
+    Returns:
+        New ConverterStudent with extended FiLM conditioning.
+    """
+    tts_model = ConverterStudent(
+        d_input=vc_model.input_proj[0].in_channels,
+        d_model=vc_model.d_model,
+        d_output=vc_model.output_proj.out_channels,
+        d_speaker=D_SPEAKER,
+        n_acoustic_params=n_style_params,
+        n_blocks=len(vc_model.blocks),
+        kernel_size=vc_model.blocks[0].conv_block.kernel_size,
+        dilations=[blk.conv_block.dilation for blk in vc_model.blocks],
+    )
+
+    # Copy input/output projections
+    tts_model.input_proj.load_state_dict(vc_model.input_proj.state_dict())
+    tts_model.output_proj.load_state_dict(vc_model.output_proj.state_dict())
+
+    # Copy block weights with FiLM migration
+    for tts_block, vc_block in zip(tts_model.blocks, vc_model.blocks):
+        tts_block.conv_block.load_state_dict(vc_block.conv_block.state_dict())
+        migrate_film_weights(vc_block.film, tts_block.film)
+
+    return tts_model

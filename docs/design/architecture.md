@@ -408,6 +408,9 @@ DAW Audio Out (48kHz)
 | Acoustic Condition Pathway | `docs/design/acoustic-condition-pathway.md` | IR + Voice Source 統合条件付け、プリセットブレンド |
 | GUI 設計 | `docs/design/gui-design.md` | Research Studio GUI アプリケーション設計 |
 | Teacher 学習計画 | `docs/design/training-plan.md` | §4.1 学習時フローのコーパス・スケジュール詳細 |
+| TTS アーキテクチャ | `docs/design/tts-architecture.md` | TTS モジュール構成、VC 流用設計、テンソル仕様 |
+| TTS 学習計画 | `docs/design/tts-training-plan.md` | Phase 2-5 ロードマップ、データセット、リソース見積もり |
+| TTS スタイル・文脈統合 | `docs/design/tts-style-design.md` | StyleEncoder、LLM 統合、VTuber 配信設計 |
 | 先行研究・コンセプト | `docs/reference/concept.md` | IR-aware 設計の根拠 |
 | 参考: 旧システム設計 | `docs/reference/system_design.md` | 品質目標・蒸留手法・データセット計画の参考 |
 

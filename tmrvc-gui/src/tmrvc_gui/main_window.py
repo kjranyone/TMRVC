@@ -20,7 +20,9 @@ from tmrvc_gui.pages.enrollment import EnrollmentPage
 from tmrvc_gui.pages.evaluation import EvaluationPage
 from tmrvc_gui.pages.onnx_export import OnnxExportPage
 from tmrvc_gui.pages.realtime_demo import RealtimeDemoPage
+from tmrvc_gui.pages.script import ScriptPage
 from tmrvc_gui.pages.teacher_train import TeacherTrainPage
+from tmrvc_gui.pages.tts import TTSPage
 
 _TABS: list[tuple[str, type[QWidget]]] = [
     ("Data Prep", DataPrepPage),
@@ -30,6 +32,8 @@ _TABS: list[tuple[str, type[QWidget]]] = [
     ("Speaker Enrollment", EnrollmentPage),
     ("Realtime Demo", RealtimeDemoPage),
     ("ONNX Export", OnnxExportPage),
+    ("TTS", TTSPage),
+    ("Script", ScriptPage),
 ]
 
 

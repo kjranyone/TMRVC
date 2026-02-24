@@ -14,6 +14,8 @@ dependencies = [
 
 [project.scripts]
 tmrvc-train-teacher = "tmrvc_train.cli.train_teacher:main"
+tmrvc-train-tts = "tmrvc_train.cli.train_tts:main"
+tmrvc-train-style = "tmrvc_train.cli.train_style:main"
 tmrvc-distill = "tmrvc_train.cli.distill:main"
 tmrvc-finetune = "tmrvc_train.cli.finetune:main"
 

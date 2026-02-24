@@ -103,3 +103,16 @@ CROSS_SPEAKER_PROB: float = _cfg["cross_speaker_prob"]
 
 # --- Voice Source Param Names ---
 VOICE_SOURCE_PARAM_NAMES: list[str] = _cfg["voice_source_param_names"]
+
+# --- TTS Extension ---
+D_STYLE: int = _cfg["d_style"]
+N_STYLE_PARAMS: int = _cfg["n_style_params"]
+D_TEXT_ENCODER: int = _cfg["d_text_encoder"]
+N_TEXT_ENCODER_LAYERS: int = _cfg["n_text_encoder_layers"]
+N_TEXT_ENCODER_HEADS: int = _cfg["n_text_encoder_heads"]
+TEXT_ENCODER_FF_DIM: int = _cfg["text_encoder_ff_dim"]
+PHONEME_VOCAB_SIZE: int = _cfg["phoneme_vocab_size"]
+N_EMOTION_CATEGORIES: int = _cfg["n_emotion_categories"]
+D_F0_PREDICTOR: int = _cfg["d_f0_predictor"]
+D_CONTENT_SYNTHESIZER: int = _cfg["d_content_synthesizer"]
+N_LANGUAGES: int = _cfg["n_languages"]

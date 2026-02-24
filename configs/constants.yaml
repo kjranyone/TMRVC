@@ -109,3 +109,16 @@ voice_source_param_names:
   - shimmer
   - formant_shift
   - roughness
+
+# --- TTS Extension ---
+d_style: 32                       # Emotion style additional dimensions
+n_style_params: 64                # n_acoustic_params(32) + d_style(32)
+d_text_encoder: 256               # TextEncoder hidden dimension
+n_text_encoder_layers: 6          # Transformer encoder layers
+n_text_encoder_heads: 4           # Multi-head attention heads
+text_encoder_ff_dim: 1024         # Feed-forward dimension
+phoneme_vocab_size: 200           # Unified IPA phoneme vocabulary
+n_emotion_categories: 12          # happy,sad,angry,fearful,surprised,disgusted,neutral,bored,excited,tender,sarcastic,whisper
+d_f0_predictor: 128               # F0Predictor hidden dimension
+d_content_synthesizer: 256        # ContentSynthesizer hidden dimension (= d_content)
+n_languages: 4                    # ja, en, zh, other

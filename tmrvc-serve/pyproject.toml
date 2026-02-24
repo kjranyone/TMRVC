@@ -1,20 +1,20 @@
 [project]
-name = "tmrvc-export"
+name = "tmrvc-serve"
 version = "0.1.0"
-description = "TMRVC export: ONNX export, quantization, parity verification"
+description = "TMRVC serve: FastAPI TTS server with WebSocket support"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "tmrvc-core",
     "tmrvc-train",
-    "onnx>=1.15",
-    "onnxruntime>=1.17",
-    "onnxscript>=0.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.0",
 ]
 
 [project.scripts]
-tmrvc-export = "tmrvc_export.cli.export:main"
-tmrvc-create-character = "tmrvc_export.cli.create_character:main"
+tmrvc-serve = "tmrvc_serve.cli:main"
+tmrvc-generate-script = "tmrvc_serve.cli_generate:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -25,4 +25,4 @@ tmrvc-core = { workspace = true }
 tmrvc-train = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tmrvc_export"]
+packages = ["src/tmrvc_serve"]
