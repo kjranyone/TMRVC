@@ -134,11 +134,11 @@ def main(argv: list[str] | None = None) -> None:
 
     file_cfg = _load_config(args.config)
 
-    lr = args.lr or file_cfg.get("lr", 1e-4)
-    max_steps = args.max_steps or file_cfg.get("max_steps", 200_000)
-    batch_size = args.batch_size or file_cfg.get("batch_size", 32)
-    save_every = args.save_every or file_cfg.get("save_every", 10_000)
-    checkpoint_dir = args.checkpoint_dir or Path(file_cfg.get("checkpoint_dir", "checkpoints/tts"))
+    lr = args.lr if args.lr is not None else file_cfg.get("lr", 1e-4)
+    max_steps = args.max_steps if args.max_steps is not None else file_cfg.get("max_steps", 200_000)
+    batch_size = args.batch_size if args.batch_size is not None else file_cfg.get("batch_size", 32)
+    save_every = args.save_every if args.save_every is not None else file_cfg.get("save_every", 10_000)
+    checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir is not None else Path(file_cfg.get("checkpoint_dir", "checkpoints/tts"))
     warmup_steps = file_cfg.get("warmup_steps", 5000)
     max_frames = args.max_frames if args.max_frames is not None else file_cfg.get("max_frames", 400)
 

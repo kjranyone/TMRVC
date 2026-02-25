@@ -7,6 +7,7 @@ pub struct ControlsState {
     pub alpha_timbre: f32,       // 0.0 to 1.0
     pub beta_prosody: f32,       // 0.0 to 1.0
     pub gamma_articulation: f32, // 0.0 to 1.0
+    pub voice_source_alpha: f32, // 0.0 to 1.0
     pub latency_quality_q: f32,  // 0.0 (Live) to 1.0 (Quality)
 }
 
@@ -18,6 +19,7 @@ impl ControlsState {
             alpha_timbre: 1.0,
             beta_prosody: 0.0,
             gamma_articulation: 0.0,
+            voice_source_alpha: 0.0,
             latency_quality_q: 0.0,
         }
     }
@@ -101,6 +103,17 @@ pub fn draw_controls(ui: &mut Ui, state: &mut ControlsState) -> bool {
                 changed = true;
             }
             ui.label(format!("{:.2}", state.latency_quality_q));
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("VSrc   ");
+            if ui
+                .add(egui::Slider::new(&mut state.voice_source_alpha, 0.0..=1.0).show_value(false))
+                .changed()
+            {
+                changed = true;
+            }
+            ui.label(format!("{:.2}", state.voice_source_alpha));
         });
     });
 

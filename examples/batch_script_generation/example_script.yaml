@@ -1,0 +1,38 @@
+title: "Demo Dialogue"
+situation: "Two friends chatting at a cafe after school."
+
+characters:
+  sakura:
+    name: "Sakura"
+    personality: "Cheerful and energetic high school girl"
+    voice_description: "Bright, slightly high-pitched, expressive"
+    language: ja
+    # speaker_file: path/to/sakura.tmrvc_speaker  # Uncomment and set path
+  yuki:
+    name: "Yuki"
+    personality: "Calm and thoughtful, speaks softly"
+    voice_description: "Soft, lower register, measured pace"
+    language: ja
+    # speaker_file: path/to/yuki.tmrvc_speaker
+
+entries:
+  - speaker: sakura
+    text: "ゆきちゃん、今日のテストどうだった？"
+    hint: "excited, curious"
+
+  - speaker: yuki
+    text: "うーん、まあまあかな。数学がちょっと難しかった。"
+    hint: "thoughtful, slightly worried"
+
+  - speaker: sakura
+    text: "えー！私も！あの最後の問題、全然わからなかった！"
+    hint: "surprised, sympathetic"
+
+  - speaker: yuki
+    text: "でも、英語はけっこうできたと思う。"
+    hint: "relieved, modest"
+
+  - speaker: sakura
+    text: "さすがゆきちゃん！英語得意だもんね。"
+    hint: "admiring, happy"
+    speed: 1.1

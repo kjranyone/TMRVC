@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> None:
     file_cfg = _load_config(args.config)
     max_steps = args.steps if args.steps is not None else file_cfg.get("steps", 200)
     lr = args.lr if args.lr is not None else file_cfg.get("lr", 1e-3)
-    use_gtm = args.use_gtm or file_cfg.get("use_gtm", False)
+    use_gtm = args.use_gtm if args.use_gtm else file_cfg.get("use_gtm", False)
 
     # Device selection
     device = get_device(args.device)

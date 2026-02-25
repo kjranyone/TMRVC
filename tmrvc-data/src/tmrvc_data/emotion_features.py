@@ -366,5 +366,133 @@ def parse_dataset(name: str, data_dir: str | Path) -> list[EmotionEntry]:
     return parsers[name](data_dir)
 
 
+def compute_prosody(
+    audio: "np.ndarray",
+    sr: int,
+) -> list[float]:
+    """Compute prosody features from audio: [speaking_rate, energy, pitch_range].
+
+    All values are normalized to roughly [0, 1] range for MSE regression.
+
+    Args:
+        audio: 1-D float32 audio array.
+        sr: Sample rate.
+
+    Returns:
+        [speaking_rate, energy, pitch_range] as floats.
+    """
+    import numpy as np
+
+    # 1. Speaking rate proxy: syllable-rate estimated from energy envelope peaks
+    #    Simple approach: count energy peaks per second
+    frame_len = int(sr * 0.025)  # 25ms frames
+    hop = int(sr * 0.010)  # 10ms hop
+    n_frames = max(1, (len(audio) - frame_len) // hop + 1)
+
+    energy_frames = np.array([
+        np.sqrt(np.mean(audio[i * hop : i * hop + frame_len] ** 2))
+        for i in range(n_frames)
+    ])
+
+    # Normalize energy for peak detection
+    e_max = energy_frames.max()
+    if e_max > 1e-8:
+        e_norm = energy_frames / e_max
+    else:
+        return [0.0, 0.0, 0.0]
+
+    # Count peaks above 30% of max as syllable-like events
+    threshold = 0.3
+    above = e_norm > threshold
+    # Count rising edges
+    peaks = 0
+    for i in range(1, len(above)):
+        if above[i] and not above[i - 1]:
+            peaks += 1
+
+    duration_sec = len(audio) / sr
+    # Typical syllable rate: 3-8 per second → normalize to [0,1] with 6 syl/s as midpoint
+    rate_raw = peaks / max(duration_sec, 0.1)
+    speaking_rate = min(1.0, rate_raw / 10.0)
+
+    # 2. Energy: RMS in dB, normalized
+    rms = np.sqrt(np.mean(audio ** 2))
+    rms_db = 20 * np.log10(max(rms, 1e-8))
+    # Typical speech range: -40 to -10 dB → normalize to [0, 1]
+    energy = _clamp((rms_db + 40) / 30, 0.0, 1.0)
+
+    # 3. Pitch range: use simple autocorrelation for F0 estimation
+    #    More robust than FFT for short segments
+    f0_values = _estimate_f0_autocorr(audio, sr)
+    if len(f0_values) > 2:
+        f0_lo = np.percentile(f0_values, 10)
+        f0_hi = np.percentile(f0_values, 90)
+        # Pitch range in semitones
+        if f0_lo > 0:
+            semitone_range = 12 * np.log2(f0_hi / f0_lo)
+        else:
+            semitone_range = 0.0
+        # Typical range: 3-20 semitones → normalize to [0, 1]
+        pitch_range = _clamp(semitone_range / 24.0, 0.0, 1.0)
+    else:
+        pitch_range = 0.0
+
+    return [round(speaking_rate, 4), round(energy, 4), round(pitch_range, 4)]
+
+
+def _estimate_f0_autocorr(
+    audio: "np.ndarray",
+    sr: int,
+    frame_len_sec: float = 0.04,
+    hop_sec: float = 0.02,
+    f0_min: float = 60.0,
+    f0_max: float = 500.0,
+) -> list[float]:
+    """Estimate F0 values using autocorrelation method.
+
+    Returns a list of detected F0 values (Hz) for voiced frames.
+    """
+    import numpy as np
+
+    frame_len = int(sr * frame_len_sec)
+    hop = int(sr * hop_sec)
+    min_lag = max(1, int(sr / f0_max))
+    max_lag = int(sr / f0_min)
+
+    f0_values: list[float] = []
+
+    for start in range(0, len(audio) - frame_len, hop):
+        frame = audio[start : start + frame_len]
+        # Check if frame has enough energy
+        if np.sqrt(np.mean(frame ** 2)) < 1e-4:
+            continue
+
+        # Normalized autocorrelation
+        frame = frame - frame.mean()
+        norm = np.sum(frame ** 2)
+        if norm < 1e-10:
+            continue
+
+        corr = np.correlate(frame, frame, mode="full")
+        corr = corr[len(frame) - 1 :]  # Only positive lags
+        corr = corr / norm
+
+        # Search for peak in valid lag range
+        search = corr[min_lag : min(max_lag + 1, len(corr))]
+        if len(search) == 0:
+            continue
+
+        peak_idx = np.argmax(search)
+        peak_val = search[peak_idx]
+
+        # Voiced if autocorrelation peak > 0.3
+        if peak_val > 0.3:
+            lag = peak_idx + min_lag
+            f0 = sr / lag
+            f0_values.append(f0)
+
+    return f0_values
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))

@@ -117,6 +117,10 @@ class TestCharacterProfile:
         c = CharacterProfile(name="test")
         assert c.default_style.emotion == "neutral"
 
+    def test_unsupported_language_raises(self):
+        with pytest.raises(ValueError, match="Unsupported language"):
+            CharacterProfile(name="test", language="other")
+
 
 class TestDialogueTurn:
     def test_basic_turn(self):

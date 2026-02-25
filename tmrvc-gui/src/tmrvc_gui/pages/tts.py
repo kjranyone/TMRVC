@@ -39,6 +39,8 @@ class TTSPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._worker = None
+        self._last_audio: "numpy.ndarray | None" = None
+        self._last_sr: int = 24000
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -149,6 +151,7 @@ class TTSPage(QWidget):
 
         self.btn_play = QPushButton("Play")
         self.btn_play.setEnabled(False)
+        self.btn_play.clicked.connect(self._on_play)
         action_row.addWidget(self.btn_play)
 
         self.btn_save = QPushButton("Save WAV...")
@@ -256,16 +259,38 @@ class TTSPage(QWidget):
         self.btn_generate.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self.append_log(message)
-        if success:
+        if success and self._worker is not None and self._worker.audio is not None:
+            self._last_audio = self._worker.audio
             self.btn_play.setEnabled(True)
             self.btn_save.setEnabled(True)
         self._worker = None
+
+    def _on_play(self) -> None:
+        if self._last_audio is None:
+            self.append_log("No audio to play.")
+            return
+        try:
+            import sounddevice as sd
+            sd.play(self._last_audio, self._last_sr)
+            self.append_log("Playing audio...")
+        except ImportError:
+            self.append_log("ERROR: sounddevice not installed. Run: pip install sounddevice")
+        except Exception as e:
+            self.append_log(f"ERROR: Playback failed: {e}")
 
     def _on_save(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Audio", "output.wav",
             "WAV Files (*.wav);;All Files (*)",
         )
-        if path:
-            self.append_log(f"Saving to {path}...")
-            # TODO: save last generated audio to path
+        if not path:
+            return
+        if self._last_audio is None:
+            self.append_log("ERROR: No audio to save.")
+            return
+        try:
+            import soundfile as sf
+            sf.write(path, self._last_audio, self._last_sr)
+            self.append_log(f"Saved to {path}")
+        except Exception as e:
+            self.append_log(f"ERROR: Save failed: {e}")

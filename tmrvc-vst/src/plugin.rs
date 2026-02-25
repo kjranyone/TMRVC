@@ -115,6 +115,9 @@ pub struct TmrvcPlugin {
     /// Scratch buffer for resampler output processing
     upsample_scratch: Vec<f32>,
 
+    /// Last latency value reported to the host.
+    reported_latency_samples: u32,
+
     /// NAM (Neural Amp Modeler) processing chain
     nam_chain: NamChain,
 }
@@ -135,6 +138,7 @@ impl Default for TmrvcPlugin {
             resample_scratch: Vec::new(),
             engine_out_scratch: Vec::new(),
             upsample_scratch: Vec::new(),
+            reported_latency_samples: 0,
             nam_chain: NamChain::new(48000),
         }
     }
@@ -207,6 +211,7 @@ impl Plugin for TmrvcPlugin {
             * buffer_config.sample_rate)
             .round() as u32;
         context.set_latency_samples(latency_samples);
+        self.reported_latency_samples = latency_samples;
 
         // --- NAM chain ---
         self.nam_chain = NamChain::new(daw_rate_u32);
@@ -246,7 +251,7 @@ impl Plugin for TmrvcPlugin {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let num_samples = buffer.samples();
         if num_samples == 0 {
@@ -259,6 +264,7 @@ impl Plugin for TmrvcPlugin {
         let alpha_timbre = self.params.alpha_timbre.smoothed.next();
         let beta_prosody = self.params.beta_prosody.smoothed.next();
         let gamma_articulation = self.params.gamma_articulation.smoothed.next();
+        let voice_source_alpha = self.params.voice_source_alpha.smoothed.next();
         let latency_quality_q = self.params.latency_quality_q.smoothed.next();
         let frame_params = FrameParams {
             dry_wet,
@@ -266,6 +272,7 @@ impl Plugin for TmrvcPlugin {
             alpha_timbre,
             beta_prosody,
             gamma_articulation,
+            voice_source_alpha,
             latency_quality_q,
         };
 
@@ -364,6 +371,14 @@ impl Plugin for TmrvcPlugin {
         // Zero-fill if not enough output yet (startup transient)
         for s in samples[to_write..num_samples].iter_mut() {
             *s = 0.0;
+        }
+
+        // Keep DAW PDC in sync with runtime mode.
+        let target_latency_ms = if self.engine.is_hq_mode() { 80.0 } else { 20.0 };
+        let latency_samples = ((target_latency_ms / 1000.0) * self.daw_rate).round() as u32;
+        if latency_samples != self.reported_latency_samples {
+            context.set_latency_samples(latency_samples);
+            self.reported_latency_samples = latency_samples;
         }
 
         ProcessStatus::Normal

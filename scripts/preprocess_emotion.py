@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> None:
     from tmrvc_core.audio import compute_mel
     from tmrvc_core.constants import SAMPLE_RATE
     from tmrvc_core.dialogue_types import EMOTION_TO_ID
-    from tmrvc_data.emotion_features import parse_dataset, RAVDESS_VAD
+    from tmrvc_data.emotion_features import compute_prosody, parse_dataset, RAVDESS_VAD
 
     raw_dir = args.raw_dir
     if not raw_dir.exists():
@@ -108,11 +108,13 @@ def main(argv: list[str] | None = None) -> None:
             # VAD from entry fields
             vad = [entry.valence, entry.arousal, entry.dominance]
 
+            prosody = compute_prosody(audio, SAMPLE_RATE)
+
             emotion_meta = {
                 "emotion_id": emotion_id,
                 "emotion": entry.emotion,
                 "vad": vad,
-                "prosody": [0.0, 0.0, 0.0],  # TODO: compute from audio
+                "prosody": prosody,
             }
             with open(utt_dir / "emotion.json", "w", encoding="utf-8") as f:
                 json.dump(emotion_meta, f, ensure_ascii=False)

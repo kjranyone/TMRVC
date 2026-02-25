@@ -1,7 +1,8 @@
-"""Grapheme-to-phoneme frontend for Japanese and English.
+"""Grapheme-to-phoneme frontend for Japanese, English, Chinese, and Korean.
 
 Converts text to a unified IPA-based phoneme sequence with language ID.
-Japanese uses pyopenjtalk, English uses phonemizer (espeak-ng backend).
+Japanese uses pyopenjtalk.
+English/Chinese/Korean use phonemizer (espeak-ng backend).
 """
 
 from __future__ import annotations
@@ -39,6 +40,25 @@ _EN_CONSONANTS = [
     "tʃ", "dʒ",
 ]
 
+# Mandarin Chinese IPA (common subset used by espeak outputs)
+_ZH_VOWELS = [
+    "a", "ɑ", "e", "ə", "ɤ", "i", "u", "y", "o", "ɚ",
+]
+_ZH_CONSONANTS = [
+    "p", "pʰ", "t", "tʰ", "k", "kʰ", "m", "n", "ŋ", "f",
+    "s", "ʂ", "ɕ", "ʐ", "ɻ", "l", "tɕ", "tɕʰ", "ts", "tsʰ", "ʈʂ", "ʈʂʰ",
+]
+_ZH_TONES = ["˥", "˦", "˧", "˨", "˩", "1", "2", "3", "4", "5"]
+
+# Korean IPA (common subset used by espeak outputs)
+_KO_VOWELS = [
+    "a", "e", "i", "o", "u", "ɯ", "ʌ", "ɛ", "ø", "y", "ɐ",
+]
+_KO_CONSONANTS = [
+    "p", "pʰ", "p͈", "t", "tʰ", "t͈", "k", "kʰ", "k͈",
+    "s", "s͈", "h", "m", "n", "ŋ", "l", "ɾ", "tɕ", "tɕʰ", "tɕ͈", "j", "w",
+]
+
 # Shared suprasegmentals
 _PROSODY = ["ˈ", "ˌ", "ː", "̃"]
 
@@ -47,7 +67,10 @@ _ALL_PHONES = (
     _SPECIAL
     + sorted(set(
         _JA_VOWELS + _JA_CONSONANTS + _JA_SPECIAL
-        + _EN_VOWELS + _EN_CONSONANTS + _PROSODY
+        + _EN_VOWELS + _EN_CONSONANTS
+        + _ZH_VOWELS + _ZH_CONSONANTS + _ZH_TONES
+        + _KO_VOWELS + _KO_CONSONANTS
+        + _PROSODY
     ))
 )
 
@@ -72,7 +95,7 @@ SIL_ID = PHONE2ID["<sil>"]
 LANG_JA = 0
 LANG_EN = 1
 LANG_ZH = 2
-LANG_OTHER = 3
+LANG_KO = 3
 
 
 @dataclass
@@ -116,29 +139,58 @@ def _g2p_japanese(text: str) -> list[str]:
     return phonemes
 
 
-def _g2p_english(text: str) -> list[str]:
-    """Convert English text to phoneme list using phonemizer."""
+def _g2p_phonemizer(text: str, language_options: list[str]) -> list[str]:
+    """Convert text to phoneme list using phonemizer/espeak.
+
+    Tries language codes in order and returns the first successful result.
+    """
     try:
         from phonemizer import phonemize
         from phonemizer.separator import Separator
     except ImportError:
         raise ImportError(
-            "phonemizer is required for English G2P. "
+            "phonemizer is required for non-Japanese G2P. "
             "Install with: pip install phonemizer"
         )
 
-    # Use espeak-ng backend with IPA output
-    result = phonemize(
-        text,
-        language="en-us",
-        backend="espeak",
-        separator=Separator(phone=" ", word=" <sil> ", syllable=""),
-        strip=True,
-        preserve_punctuation=False,
-    )
+    last_error: Exception | None = None
+    for lang in language_options:
+        try:
+            result = phonemize(
+                text,
+                language=lang,
+                backend="espeak",
+                separator=Separator(phone=" ", word=" <sil> ", syllable=""),
+                strip=True,
+                preserve_punctuation=False,
+            )
+            phonemes = [p for p in result.split() if p]
+            if phonemes:
+                return phonemes
+        except Exception as e:  # pragma: no cover - backend-dependent
+            last_error = e
+            logger.debug("phonemizer failed for language=%s: %s", lang, e)
 
-    phonemes = [p for p in result.split() if p]
-    return phonemes
+    if last_error is not None:
+        raise RuntimeError(
+            f"phonemizer failed for languages={language_options}: {last_error}"
+        )
+    return []
+
+
+def _g2p_english(text: str) -> list[str]:
+    """Convert English text to phoneme list using phonemizer."""
+    return _g2p_phonemizer(text, ["en-us", "en"])
+
+
+def _g2p_chinese(text: str) -> list[str]:
+    """Convert Chinese text to phoneme list using phonemizer."""
+    return _g2p_phonemizer(text, ["cmn", "zh", "zh-cn"])
+
+
+def _g2p_korean(text: str) -> list[str]:
+    """Convert Korean text to phoneme list using phonemizer."""
+    return _g2p_phonemizer(text, ["ko", "ko-kr"])
 
 
 def text_to_phonemes(
@@ -149,7 +201,7 @@ def text_to_phonemes(
 
     Args:
         text: Input text string.
-        language: Language code ("ja", "en").
+        language: Language code ("ja", "en", "zh", "ko").
 
     Returns:
         G2PResult with phoneme IDs tensor and metadata.
@@ -160,6 +212,12 @@ def text_to_phonemes(
     elif language == "en":
         phonemes = _g2p_english(text)
         lang_id = LANG_EN
+    elif language == "zh":
+        phonemes = _g2p_chinese(text)
+        lang_id = LANG_ZH
+    elif language == "ko":
+        phonemes = _g2p_korean(text)
+        lang_id = LANG_KO
     else:
         raise ValueError(f"Unsupported language: {language}")
 

@@ -54,6 +54,7 @@ pub struct TmrvcApp {
     alpha_timbre: Arc<AtomicF32>,
     beta_prosody: Arc<AtomicF32>,
     gamma_articulation: Arc<AtomicF32>,
+    voice_source_alpha: Arc<AtomicF32>,
     latency_quality_q: Arc<AtomicF32>,
     status: Arc<SharedStatus>,
 
@@ -87,6 +88,7 @@ impl TmrvcApp {
         let alpha_timbre = Arc::new(AtomicF32::new(1.0));
         let beta_prosody = Arc::new(AtomicF32::new(0.0));
         let gamma_articulation = Arc::new(AtomicF32::new(0.0));
+        let voice_source_alpha = Arc::new(AtomicF32::new(0.0));
         let latency_quality_q = Arc::new(AtomicF32::new(0.0));
         let status = Arc::new(SharedStatus::new());
         let input_ring = Arc::new(SpscRingBuffer::new(RING_BUFFER_CAPACITY));
@@ -103,6 +105,7 @@ impl TmrvcApp {
             let alpha_timbre = Arc::clone(&alpha_timbre);
             let beta_prosody = Arc::clone(&beta_prosody);
             let gamma_articulation = Arc::clone(&gamma_articulation);
+            let voice_source_alpha = Arc::clone(&voice_source_alpha);
             let latency_quality_q = Arc::clone(&latency_quality_q);
             let status = Arc::clone(&status);
             let input_ring = Arc::clone(&input_ring);
@@ -118,6 +121,7 @@ impl TmrvcApp {
                         alpha_timbre,
                         beta_prosody,
                         gamma_articulation,
+                        voice_source_alpha,
                         latency_quality_q,
                         status,
                         input_ring,
@@ -176,6 +180,7 @@ impl TmrvcApp {
             alpha_timbre,
             beta_prosody,
             gamma_articulation,
+            voice_source_alpha,
             latency_quality_q,
             status,
             input_ring,
@@ -307,6 +312,8 @@ impl eframe::App for TmrvcApp {
                     .store(self.controls.beta_prosody, Ordering::Relaxed);
                 self.gamma_articulation
                     .store(self.controls.gamma_articulation, Ordering::Relaxed);
+                self.voice_source_alpha
+                    .store(self.controls.voice_source_alpha, Ordering::Relaxed);
                 self.latency_quality_q
                     .store(self.controls.latency_quality_q, Ordering::Relaxed);
             }
@@ -836,6 +843,7 @@ fn processor_thread(
     alpha_timbre: Arc<AtomicF32>,
     beta_prosody: Arc<AtomicF32>,
     gamma_articulation: Arc<AtomicF32>,
+    voice_source_alpha: Arc<AtomicF32>,
     latency_quality_q: Arc<AtomicF32>,
     status: Arc<SharedStatus>,
     input_ring: Arc<SpscRingBuffer>,
@@ -895,6 +903,7 @@ fn processor_thread(
                 alpha_timbre: alpha_timbre.load(Ordering::Relaxed),
                 beta_prosody: beta_prosody.load(Ordering::Relaxed),
                 gamma_articulation: gamma_articulation.load(Ordering::Relaxed),
+                voice_source_alpha: voice_source_alpha.load(Ordering::Relaxed),
                 latency_quality_q: latency_quality_q.load(Ordering::Relaxed),
             };
             engine.process_one_frame(&input_buf, &mut output_buf, &frame_params);

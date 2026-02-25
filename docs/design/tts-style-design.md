@@ -73,7 +73,7 @@ L_style = λ_cls * CE(emotion_logits, gt_emotion)
 ### 1.4 スタイルの結合
 
 ```python
-# VC モード (backward compatible)
+# VC モード (legacy checkpoint support removed)
 style_params = cat([acoustic_params[32], zeros[32]])  # [64]
 
 # TTS モード
@@ -133,16 +133,7 @@ output = gamma * x + beta
 W = [W_old[768, 224] | W_new[768, 32]]
 ```
 
-`migrate_film_weights()` で `W_new = 0` に初期化すると:
-
-```
-cond_tts = [cond_vc[224], emotion_style[32]]
-W @ cond_tts = W_old @ cond_vc + W_new @ emotion_style
-             = W_old @ cond_vc + 0
-             = VC 出力と同一
-```
-
-したがって `emotion_style = 0` のとき VC と完全同一出力が保証される。
+旧VC checkpoint (d_cond=224) からの重み移行は行わない。ランタイムは style-conditioned converter (d_cond=256) 前提。
 
 ### 3.2 Fine-tune 時の学習対象
 
@@ -481,7 +472,7 @@ class TTSResponse(BaseModel):
 - [x] StyleEncoder 出力 `[B, 32]` が FiLM 入力の追加次元と一致 (`tts-architecture.md §7`)
 - [x] `style_params[64]` = `acoustic_params[32]` + `emotion_style[32]` (`tts-architecture.md §8`)
 - [x] ContextStylePredictor の出力が emotion_style ベクトルにマッピング可能
-- [x] `.tmrvc_character` フォーマットが `.tmrvc_speaker` (`onnx-contract.md §6`) の上位互換
+- [x] `.tmrvc_character` フォーマットが `.tmrvc_speaker` (`onnx-contract.md §6`) とは別仕様
 - [x] ストリーミング TTS は既存 Converter/Vocoder のフレーム単位処理を利用 (`streaming-design.md §4`)
 - [x] WebSocket プロトコルが VC リアルタイムエンジンと独立 (別ポート/プロセス)
 - [x] Claude API コスト ~$0.001/発話は VTuber 配信で実用的 (1000 発話/配信 → ~$1)

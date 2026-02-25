@@ -75,7 +75,7 @@ class VoiceSourceEstimator(nn.Module):
                         kernel_size=cfg.kernel_size,
                         padding=cfg.kernel_size // 2,
                     ),
-                    nn.LayerNorm([out_ch]),
+                    nn.BatchNorm1d(out_ch),
                     nn.GELU(),
                     nn.Dropout(cfg.dropout),
                 ]

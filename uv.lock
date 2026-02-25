@@ -1889,6 +1889,8 @@ dependencies = [
     { name = "fastapi", marker = "sys_platform == 'win32'" },
     { name = "pydantic", marker = "sys_platform == 'win32'" },
     { name = "tmrvc-core", marker = "sys_platform == 'win32'" },
+    { name = "tmrvc-data", marker = "sys_platform == 'win32'" },
+    { name = "tmrvc-export", marker = "sys_platform == 'win32'" },
     { name = "tmrvc-train", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extra = ["standard"], marker = "sys_platform == 'win32'" },
 ]
@@ -1898,6 +1900,8 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "tmrvc-core", editable = "tmrvc-core" },
+    { name = "tmrvc-data", editable = "tmrvc-data" },
+    { name = "tmrvc-export", editable = "tmrvc-export" },
     { name = "tmrvc-train", editable = "tmrvc-train" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]

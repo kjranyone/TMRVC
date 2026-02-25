@@ -178,11 +178,11 @@ def main(argv: list[str] | None = None) -> None:
     # Merge YAML config with CLI overrides
     file_cfg = _load_config(args.config, args.phase)
 
-    lr = args.lr or file_cfg.get("lr") or _default_lr(args.phase)
-    max_steps = args.max_steps or file_cfg.get("max_steps", 200_000)
-    batch_size = args.batch_size or file_cfg.get("batch_size", 64)
-    save_every = args.save_every or file_cfg.get("save_every", 10_000)
-    checkpoint_dir = args.checkpoint_dir or Path(file_cfg.get("checkpoint_dir", "checkpoints/distill"))
+    lr = args.lr if args.lr is not None else (file_cfg.get("lr") or _default_lr(args.phase))
+    max_steps = args.max_steps if args.max_steps is not None else file_cfg.get("max_steps", 200_000)
+    batch_size = args.batch_size if args.batch_size is not None else file_cfg.get("batch_size", 64)
+    save_every = args.save_every if args.save_every is not None else file_cfg.get("save_every", 10_000)
+    checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir is not None else Path(file_cfg.get("checkpoint_dir", "checkpoints/distill"))
 
     speaker_groups = _parse_speaker_groups(file_cfg)
     device = torch.device(args.device)

@@ -71,7 +71,7 @@ phoneme_ids[B, L]
 
 - G2P は `tmrvc-data/src/tmrvc_data/g2p.py` に実装
 - 音素ボキャブラリ: `PHONE2ID` dict、特殊トークン `<pad>=0, <unk>=1, <bos>=2, <eos>=3, <sil>=4, <breath>=5`
-- 言語 ID: `ja=0, en=1, zh=2, other=3`
+- 言語 ID: `ja=0, en=1, zh=2, ko=3`
 
 ### 3.3 定数 (`configs/constants.yaml`)
 
@@ -203,11 +203,11 @@ mel_ref[B, 80, T]
 | **テキスト指示** | "怒りを抑えて冷たく" | Embedding + SmallTransformer | 3+ |
 | **LLM 出力** | 構造化 JSON | 直接ベクトルマッピング | 4 |
 
-### 7.5 後方互換性
+### 7.5 互換ポリシー
 
-- VC モード: `StyleEncoder.make_vc_style_params(acoustic_params)` → `style[32:64] = 0`
-- FiLM 初期化 (gamma=1, beta=0) により、追加次元がゼロなら恒等変換
-- VC チェックポイントからの移行: `converter_from_vc_checkpoint()` で FiLM 重みをパディング
+- ランタイムは後方互換フォールバックを持たない。
+- Converter は d_cond = d_speaker + n_style_params = 256 のみ許可する。
+- 旧VCチェックポイント (d_cond=224) の自動移行は廃止。
 
 ## 8. Converter FiLM 拡張
 
@@ -218,14 +218,10 @@ mel_ref[B, 80, T]
 # TTS モード: d_cond = d_speaker(192) + n_style_params(64)     = 256
 ```
 
-### 8.2 重み移行
+### 8.2 条件次元ポリシー
 
-`converter_from_vc_checkpoint()` により VC → TTS の重み移行:
-
-1. 新しい ConverterStudent を `n_acoustic_params=64` で構築
-2. input_proj / output_proj はそのままコピー
-3. FiLM 重み: `migrate_film_weights()` で既存 224 列をコピー、新 32 列はゼロ初期化
-4. ゼロ初期化により TTS モードでも VC と同一出力 (emotion_style=0 の場合)
+ランタイムでは converter_from_vc_checkpoint() を使った自動移行は行わない。  
+d_cond=256 の style-conditioned converter のみロード対象とする。
 
 ### 8.3 定数
 
@@ -320,7 +316,7 @@ tmrvc-train/src/tmrvc_train/
         f0_predictor.py         # F0Predictor + length_regulate()
         content_synthesizer.py  # ContentSynthesizer
         style_encoder.py        # StyleEncoder + AudioStyleEncoder
-        converter.py            # + migrate_film_weights(), converter_from_vc_checkpoint()
+        converter.py            # converter modules
     tts_trainer.py              # TTSTrainer + TTSTrainerConfig
 
 tmrvc-core/src/tmrvc_core/
@@ -341,7 +337,7 @@ tests/python/
 - [x] `d_text_encoder=256` = `d_content=256` = ContentSynthesizer 入出力次元 (`constants.yaml`)
 - [x] `n_style_params=64` = `n_acoustic_params(32) + d_style(32)` (`constants.yaml`)
 - [x] Converter FiLM `d_cond` = `d_speaker(192) + n_style_params(64) = 256` (`converter.py`)
-- [x] `migrate_film_weights()` でゼロ初期化 → VC 互換出力を検証済み (`test_tts_models.py`)
+- [x] 旧VC checkpoint (`d_cond=224`) はランタイムで reject し、style-conditioned (`d_cond=256`) のみ許可する。
 - [x] ContentSynthesizer 出力 `[B, 256, T]` = ContentEncoder 出力 `[B, 256, T]` (`model-architecture.md §2`)
 - [x] F0Predictor 出力 `[B, 1, T]` = CREPE/RMVPE F0 フォーマット (`onnx-contract.md §3`)
 - [x] DurationPredictor に LayerNorm を使わない (ストリーミング互換、`MEMORY.md` 制約)

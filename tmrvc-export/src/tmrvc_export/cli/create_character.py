@@ -34,7 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", default="", help="Character name.")
     parser.add_argument("--personality", default="", help="Character personality description.")
     parser.add_argument("--voice-description", default="", help="Voice description.")
-    parser.add_argument("--language", default="ja", choices=["ja", "en", "zh", "other"], help="Language.")
+    parser.add_argument(
+        "--language",
+        default="ja",
+        choices=["ja", "en", "zh", "ko"],
+        help="Language.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 

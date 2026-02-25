@@ -3,7 +3,7 @@
 Kojiro Tanaka — ONNX contract
 Created: 2026-02-16 (Asia/Tokyo)
 
-> **Purpose:** Python (tmrvc-export) と C++ (tmrvc-engine) の間のインターフェース仕様。
+> **Purpose:** Python (tmrvc-export) と Rust (tmrvc-engine-rs) の間のインターフェース仕様。
 > 5つの ONNX モデルの入出力テンソル形状、state 管理、数値パリティ基準を定義する。
 
 ---
@@ -49,32 +49,26 @@ n_lora_layers: 4          # Number of cross-attention layers with LoRA
 | 出力 | パス | 用途 |
 |---|---|---|
 | Python module | `tmrvc-core/src/tmrvc_core/constants.py` | 学習・エクスポート |
-| C++ header | `tmrvc-engine/include/tmrvc/constants.h` | エンジン・プラグイン |
+| Rust constants | `tmrvc-engine-rs/src/constants.rs` | エンジン・VST |
 
-```cpp
+```rust
 // Auto-generated from configs/constants.yaml — DO NOT EDIT
-#pragma once
-
-namespace tmrvc {
-constexpr int kSampleRate       = 24000;
-constexpr int kNFFT             = 1024;
-constexpr int kHopLength        = 240;
-constexpr int kWindowLength     = 960;
-constexpr int kNMels            = 80;
-constexpr int kNFreqBins        = 513;
-constexpr int kDContent         = 256;
-constexpr int kDSpeaker         = 192;
-constexpr int kNIRParams        = 24;
-constexpr int kNVoiceSourceParams = 8;
-constexpr int kNAcousticParams  = 32;
-constexpr int kDConverterHidden = 384;
-constexpr int kDVocoderFeatures = 513;
-constexpr int kStudentSteps     = 1;
-constexpr int kIRUpdateInterval = 10;
-constexpr int kLoraRank         = 4;
-constexpr int kLoraAlpha        = 8;
-constexpr int kNLoraLayers      = 4;
-} // namespace tmrvc
+pub const SAMPLE_RATE: usize = 24000;
+pub const N_FFT: usize = 1024;
+pub const HOP_LENGTH: usize = 240;
+pub const WINDOW_LENGTH: usize = 960;
+pub const N_MELS: usize = 80;
+pub const N_FREQ_BINS: usize = 513;
+pub const D_CONTENT: usize = 256;
+pub const D_SPEAKER: usize = 192;
+pub const N_IR_PARAMS: usize = 24;
+pub const N_VOICE_SOURCE_PARAMS: usize = 8;
+pub const N_ACOUSTIC_PARAMS: usize = 32;
+pub const D_CONVERTER_HIDDEN: usize = 384;
+pub const D_VOCODER_FEATURES: usize = 513;
+pub const IR_UPDATE_INTERVAL: usize = 10;
+pub const LORA_RANK: usize = 4;
+pub const LORA_DELTA_SIZE: usize = 15872;
 ```
 
 ---
@@ -291,7 +285,7 @@ Example: content_encoder
 すべての state tensor は **ゼロ初期化** (silence 入力に対応)。
 
 ```cpp
-// C++ 側の初期化
+// ランタイム側の初期化 (擬似コード)
 memset(contentEncoderState, 0, sizeof(float) * 1 * 256 * 28);
 memset(irEstimatorState, 0, sizeof(float) * 1 * 128 * 6);
 memset(converterState, 0, sizeof(float) * 1 * 384 * 52);
@@ -329,7 +323,7 @@ struct PingPongState {
 
 ## 4. 数値パリティ基準
 
-### 4.1 Python vs C++ パリティ
+### 4.1 Python vs Rust パリティ
 
 | 基準 | 値 | 対象 |
 |---|---|---|
@@ -346,17 +340,17 @@ def verify_parity(model_name: str, test_inputs: dict, rtol=1e-4, atol=1e-5):
     """
     1. PyTorch model でテスト入力を推論
     2. 同じテスト入力を ONNX Runtime (Python) で推論
-    3. 同じテスト入力を C++ engine で推論 (subprocess call)
+    3. 同じテスト入力を Rust engine で推論 (subprocess call)
     4. 3つの出力を比較
     """
     pytorch_out = run_pytorch(model_name, test_inputs)
     onnx_out = run_onnxruntime_python(model_name, test_inputs)
-    cpp_out = run_cpp_engine(model_name, test_inputs)
+    rust_out = run_rust_engine(model_name, test_inputs)
 
     # PyTorch vs ONNX
     assert_close(pytorch_out, onnx_out, atol=atol, rtol=rtol)
-    # ONNX vs C++
-    assert_close(onnx_out, cpp_out, atol=atol, rtol=rtol)
+    # ONNX vs Rust
+    assert_close(onnx_out, rust_out, atol=atol, rtol=rtol)
 ```
 
 ### 4.3 テストケース
@@ -548,7 +542,7 @@ models/
 ### 8.1 概要
 
 ONNX Runtime の IO Binding を使用して、TensorPool の pre-allocated メモリ上で直接推論を行う。
-`CreateTensorWithDataAsOrtValue` で既存バッファを OrtValue としてラップし、コピーを排除。
+（現行 Rust 実装では `ort` crate を介して同等の zero-copy 指向を維持する）。
 
 ### 8.2 呼び出しフロー
 
@@ -586,6 +580,6 @@ contentEncState_.swap();
 - [x] State tensor shapes が各モデルの causal conv 構成と整合
 - [x] constants.yaml の値が streaming-design.md のパラメータと一致
 - [x] lora_delta サイズが model-architecture.md の LoRA 設計と一致
-- [x] IO Binding が cpp-engine-design.md の TensorPool と整合
+- [x] IO Binding 方針が `tmrvc-engine-rs` の TensorPool 実装と整合
 - [x] .tmrvc_speaker format が architecture.md の enrollment フローと整合
 - [x] 量子化対象が実行頻度 (per-frame models) と整合

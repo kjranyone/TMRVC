@@ -14,6 +14,8 @@ from tmrvc_data.g2p import (
     SIL_ID,
     LANG_JA,
     LANG_EN,
+    LANG_ZH,
+    LANG_KO,
 )
 
 
@@ -93,6 +95,28 @@ class TestG2PEnglish:
 
         with pytest.raises(ValueError, match="Unsupported language"):
             text_to_phonemes("test", language="fr")
+
+
+class TestG2PAdditionalLanguages:
+    def test_basic_chinese_branch(self, monkeypatch):
+        import tmrvc_data.g2p as g2p
+
+        monkeypatch.setattr(g2p, "_g2p_chinese", lambda _text: ["n", "i", "h", "ao"])
+        result = g2p.text_to_phonemes("你好", language="zh")
+
+        assert result.language_id == LANG_ZH
+        assert result.phoneme_ids[0].item() == BOS_ID
+        assert result.phoneme_ids[-1].item() == EOS_ID
+
+    def test_basic_korean_branch(self, monkeypatch):
+        import tmrvc_data.g2p as g2p
+
+        monkeypatch.setattr(g2p, "_g2p_korean", lambda _text: ["a", "n", "n", "j", "eo", "ng"])
+        result = g2p.text_to_phonemes("안녕", language="ko")
+
+        assert result.language_id == LANG_KO
+        assert result.phoneme_ids[0].item() == BOS_ID
+        assert result.phoneme_ids[-1].item() == EOS_ID
 
 
 class TestAlignment:

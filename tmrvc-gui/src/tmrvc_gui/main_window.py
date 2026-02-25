@@ -33,7 +33,7 @@ _TABS: list[tuple[str, type[QWidget]]] = [
     ("Realtime Demo", RealtimeDemoPage),
     ("ONNX Export", OnnxExportPage),
     ("TTS", TTSPage),
-    ("Script", ScriptPage),
+    ("Script (Example)", ScriptPage),
 ]
 
 

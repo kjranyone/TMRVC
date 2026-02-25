@@ -121,4 +121,4 @@ phoneme_vocab_size: 200           # Unified IPA phoneme vocabulary
 n_emotion_categories: 12          # happy,sad,angry,fearful,surprised,disgusted,neutral,bored,excited,tender,sarcastic,whisper
 d_f0_predictor: 128               # F0Predictor hidden dimension
 d_content_synthesizer: 256        # ContentSynthesizer hidden dimension (= d_content)
-n_languages: 4                    # ja, en, zh, other
+n_languages: 4                    # ja, en, zh, ko

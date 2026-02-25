@@ -83,7 +83,7 @@ class TTSFeatureSet:
     spk_embed: torch.Tensor  # [192]
     phoneme_ids: torch.Tensor  # [L] — phoneme index sequence
     durations: torch.Tensor  # [L] — frames per phoneme
-    language_id: int = 0  # 0=ja, 1=en, 2=zh, 3=other
+    language_id: int = 0  # 0=ja, 1=en, 2=zh, 3=ko
     utterance_id: str = ""
     speaker_id: str = ""
     n_frames: int = 0

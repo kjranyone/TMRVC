@@ -7,6 +7,12 @@ and VC backend (Converter, Vocoder) to produce audio from text.
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import OrderedDict
+from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -18,12 +24,60 @@ from tmrvc_core.constants import (
     HOP_LENGTH,
     N_FFT,
     N_MELS,
+    N_STYLE_PARAMS,
     SAMPLE_RATE,
     WINDOW_LENGTH,
 )
 from tmrvc_core.dialogue_types import CharacterProfile, DialogueTurn, StyleParams
 
 logger = logging.getLogger(__name__)
+
+# Crossfade/fadeout constants for sentence-level streaming
+CROSSFADE_SAMPLES = 2400   # 100ms @ 24kHz
+FADEOUT_SAMPLES = 1200     # 50ms @ 24kHz
+SENTENCE_PAUSE_SAMPLES = 2880  # 120ms @ 24kHz (natural inter-sentence pause)
+G2P_CACHE_MAX_SIZE = 256
+
+
+@dataclass
+class SynthesisMetrics:
+    """Per-call timing breakdown for synthesis pipeline stages."""
+
+    g2p_ms: float = 0.0
+    text_encoder_ms: float = 0.0
+    duration_predictor_ms: float = 0.0
+    f0_predictor_ms: float = 0.0
+    content_synthesizer_ms: float = 0.0
+    converter_ms: float = 0.0
+    vocoder_ms: float = 0.0
+    istft_ms: float = 0.0
+    total_ms: float = 0.0
+    output_frames: int = 0
+    output_duration_ms: float = 0.0
+    cancelled: bool = False
+
+    @property
+    def rtf(self) -> float:
+        """Real-time factor: total_ms / output_duration_ms. <1 means faster than real-time."""
+        if self.output_duration_ms <= 0:
+            return 0.0
+        return self.total_ms / self.output_duration_ms
+
+
+@dataclass
+class StreamMetrics:
+    """Aggregate metrics for a sentence-streaming call."""
+
+    sentence_count: int = 0
+    first_chunk_ms: float = 0.0
+    total_ms: float = 0.0
+    per_sentence: list[SynthesisMetrics] = field(default_factory=list)
+
+    @property
+    def avg_sentence_ms(self) -> float:
+        if not self.per_sentence:
+            return 0.0
+        return sum(m.total_ms for m in self.per_sentence) / len(self.per_sentence)
 
 
 class TTSEngine:
@@ -48,6 +102,7 @@ class TTSEngine:
         self._models_loaded = False
         self._tts_checkpoint = tts_checkpoint
         self._vc_checkpoint = vc_checkpoint
+        self._warmed_up = False
 
         # Models (lazily loaded)
         self._text_encoder: torch.nn.Module | None = None
@@ -56,6 +111,18 @@ class TTSEngine:
         self._content_synthesizer: torch.nn.Module | None = None
         self._converter: torch.nn.Module | None = None
         self._vocoder: torch.nn.Module | None = None
+
+        # G2P cache for speculative prefetch (LRU-bounded)
+        self._g2p_cache: OrderedDict[tuple[str, str], object] = OrderedDict()
+
+        # Per-instance lookahead pool (1 worker per engine instance)
+        self._lookahead_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tts-lookahead",
+        )
+
+        # Last metrics (accessible after synthesize / synthesize_sentences)
+        self.last_metrics: SynthesisMetrics | None = None
+        self.last_stream_metrics: StreamMetrics | None = None
 
     @property
     def models_loaded(self) -> bool:
@@ -90,20 +157,73 @@ class TTSEngine:
         self._models_loaded = True
         logger.info("TTS engine ready on %s", self.device)
 
+    def warmup(self) -> None:
+        """Run dummy inference to pre-compile JIT kernels.
+
+        Call after load_models() to eliminate first-inference latency spike.
+        """
+        if self._warmed_up or not self._models_loaded:
+            return
+        logger.info("Warming up TTS engine...")
+        t0 = time.perf_counter()
+        dummy_embed = torch.zeros(192, device=self.device)
+        self.synthesize("warmup", "en", dummy_embed, speed=1.0)
+        elapsed = (time.perf_counter() - t0) * 1000
+        self._warmed_up = True
+        logger.info("Warmup complete in %.1fms", elapsed)
+
     def _load_vc_backend(self) -> None:
         """Load Converter and Vocoder from VC checkpoint."""
-        from tmrvc_train.models.converter import ConverterStudent
+        from tmrvc_train.models.converter import (
+            ConverterStudent,
+        )
         from tmrvc_train.models.vocoder import VocoderStudent
 
-        self._converter = ConverterStudent().to(self.device).eval()
+        self._converter = ConverterStudent(
+            n_acoustic_params=N_STYLE_PARAMS,
+        ).to(self.device).eval()
         self._vocoder = VocoderStudent().to(self.device).eval()
 
         ckpt = torch.load(self._vc_checkpoint, map_location=self.device, weights_only=False)
-        if "converter" in ckpt:
-            self._converter.load_state_dict(ckpt["converter"])
+        converter_state = ckpt.get("converter")
+        if converter_state is not None:
+            film_weight = converter_state.get("blocks.0.film.proj.weight")
+            if film_weight is None:
+                raise RuntimeError("Invalid converter state dict: missing blocks.0.film.proj.weight")
+
+            cond_dim = int(film_weight.shape[1])
+            tts_cond_dim = D_SPEAKER + N_STYLE_PARAMS
+
+            if cond_dim != tts_cond_dim:
+                raise RuntimeError(
+                    f"Unsupported converter conditioning size: {cond_dim} "
+                    f"(expected style-conditioned {tts_cond_dim}). "
+                    "Legacy VC converter checkpoints are not supported."
+                )
+            self._converter.load_state_dict(converter_state)
+        else:
+            logger.warning("VC checkpoint has no converter state; using randomly initialized converter.")
+
         if "vocoder" in ckpt:
             self._vocoder.load_state_dict(ckpt["vocoder"])
+        else:
+            logger.warning("VC checkpoint has no vocoder state; using randomly initialized vocoder.")
         logger.info("Loaded VC backend from %s", self._vc_checkpoint)
+
+    def prefetch_g2p(self, text: str, language: str) -> None:
+        """Run G2P for the given text and cache the result.
+
+        Intended for speculative prefetch while previous audio is streaming.
+        Uses LRU eviction when cache exceeds ``G2P_CACHE_MAX_SIZE``.
+        """
+        cache_key = (text, language)
+        if cache_key in self._g2p_cache:
+            self._g2p_cache.move_to_end(cache_key)
+            return
+        from tmrvc_data.g2p import text_to_phonemes
+        self._g2p_cache[cache_key] = text_to_phonemes(text, language=language)
+        while len(self._g2p_cache) > G2P_CACHE_MAX_SIZE:
+            self._g2p_cache.popitem(last=False)  # evict oldest
 
     @torch.no_grad()
     def synthesize(
@@ -113,34 +233,70 @@ class TTSEngine:
         spk_embed: torch.Tensor,
         style: StyleParams | None = None,
         speed: float = 1.0,
-    ) -> tuple[np.ndarray, float]:
+        cancel: threading.Event | None = None,
+    ) -> tuple[np.ndarray, float] | None:
         """Synthesize audio from text.
 
         Args:
             text: Input text.
-            language: Language code ('ja' or 'en').
+            language: Language code ('ja', 'en', 'zh', 'ko').
             spk_embed: ``[192]`` speaker embedding.
             style: Style parameters (None = neutral).
             speed: Speed factor (>1 = faster, <1 = slower).
+            cancel: If set, abort between pipeline stages and return None.
 
         Returns:
-            Tuple of (audio_samples [N], duration_sec).
+            Tuple of (audio_samples [N], duration_sec), or None if cancelled.
         """
         if not self._models_loaded:
             raise RuntimeError("Models not loaded. Call load_models() first.")
 
-        from tmrvc_data.g2p import text_to_phonemes
+        metrics = SynthesisMetrics()
+        t_total = time.perf_counter()
 
-        # G2P
-        g2p_result = text_to_phonemes(text, language=language)
+        from tmrvc_data.g2p import (
+            LANG_EN,
+            LANG_JA,
+            LANG_KO,
+            LANG_ZH,
+            text_to_phonemes,
+        )
+
+        # G2P (use cache if available)
+        t0 = time.perf_counter()
+        cache_key = (text, language)
+        g2p_result = self._g2p_cache.pop(cache_key, None)
+        if g2p_result is None:
+            g2p_result = text_to_phonemes(text, language=language)
         phoneme_ids = g2p_result.phoneme_ids.unsqueeze(0).to(self.device)  # [1, L]
+        metrics.g2p_ms = (time.perf_counter() - t0) * 1000
+
+        if cancel and cancel.is_set():
+            metrics.cancelled = True
+            self.last_metrics = metrics
+            return None
 
         # Language ID
-        lang_id = 0 if language == "ja" else 1
+        lang_id_map = {
+            "ja": LANG_JA,
+            "en": LANG_EN,
+            "zh": LANG_ZH,
+            "ko": LANG_KO,
+        }
+        if language not in lang_id_map:
+            raise ValueError(f"Unsupported language: {language}")
+        lang_id = lang_id_map[language]
         language_ids = torch.tensor([lang_id], dtype=torch.long, device=self.device)
 
         # Text encoding
+        t0 = time.perf_counter()
         text_features = self._text_encoder(phoneme_ids, language_ids)  # [1, 256, L]
+        metrics.text_encoder_ms = (time.perf_counter() - t0) * 1000
+
+        if cancel and cancel.is_set():
+            metrics.cancelled = True
+            self.last_metrics = metrics
+            return None
 
         # Style vector
         if style is None:
@@ -150,38 +306,85 @@ class TTSEngine:
         ).unsqueeze(0)  # [1, 32]
 
         # Duration prediction
+        t0 = time.perf_counter()
         durations = self._duration_predictor(text_features, style_vec)  # [1, L]
         durations = durations / speed
         durations = torch.round(durations).long().clamp(min=1)
+        metrics.duration_predictor_ms = (time.perf_counter() - t0) * 1000
+
+        if cancel and cancel.is_set():
+            metrics.cancelled = True
+            self.last_metrics = metrics
+            return None
 
         # Length regulate (expand phoneme features to frame-level)
         from tmrvc_train.models.f0_predictor import length_regulate
         expanded = length_regulate(text_features, durations.float())  # [1, 256, T]
 
         # F0 prediction
+        t0 = time.perf_counter()
         f0, voiced_prob = self._f0_predictor(expanded, style_vec)  # [1, 1, T]
+        metrics.f0_predictor_ms = (time.perf_counter() - t0) * 1000
+
+        if cancel and cancel.is_set():
+            metrics.cancelled = True
+            self.last_metrics = metrics
+            return None
 
         # Content synthesis
+        t0 = time.perf_counter()
         content = self._content_synthesizer(expanded)  # [1, 256, T]
+        metrics.content_synthesizer_ms = (time.perf_counter() - t0) * 1000
+
+        if cancel and cancel.is_set():
+            metrics.cancelled = True
+            self.last_metrics = metrics
+            return None
 
         T = content.shape[-1]
+        metrics.output_frames = T
         duration_sec = T * HOP_LENGTH / SAMPLE_RATE
+        metrics.output_duration_ms = duration_sec * 1000
 
         # If VC backend loaded, generate audio
         if self._converter is not None and self._vocoder is not None:
             spk = spk_embed.to(self.device).unsqueeze(0)  # [1, 192]
-            # Zero acoustic params for now (TTS mode)
+            # Zero acoustic params for now (TTS mode).
             from tmrvc_train.models.style_encoder import StyleEncoder
             acoustic_params = torch.zeros(1, 32, device=self.device)
             style_params = StyleEncoder.combine_style_params(acoustic_params, style_vec)
 
-            # Converter: content + spk_embed + style_params → STFT features
+            # Converter conditioning can be VC(32) or TTS(64) depending on checkpoint.
+            expected_cond_dim = D_SPEAKER + N_STYLE_PARAMS
+            actual_cond_dim = int(self._converter.blocks[0].film.proj.in_features)
+            if actual_cond_dim != expected_cond_dim:
+                raise RuntimeError(
+                    f"Unexpected converter conditioning width: {actual_cond_dim} "
+                    f"(expected {expected_cond_dim})"
+                )
+
+            if cancel and cancel.is_set():
+                metrics.cancelled = True
+                self.last_metrics = metrics
+                return None
+
+            # Converter: content + spk_embed + cond → STFT features
+            t0 = time.perf_counter()
             pred_features, _ = self._converter(content, spk, style_params)  # [1, 513, T]
+            metrics.converter_ms = (time.perf_counter() - t0) * 1000
+
+            if cancel and cancel.is_set():
+                metrics.cancelled = True
+                self.last_metrics = metrics
+                return None
 
             # Vocoder: STFT features → magnitude + phase
+            t0 = time.perf_counter()
             stft_mag, stft_phase, _ = self._vocoder(pred_features)  # [1, 513, T]
+            metrics.vocoder_ms = (time.perf_counter() - t0) * 1000
 
             # iSTFT reconstruction
+            t0 = time.perf_counter()
             stft_complex = stft_mag * torch.exp(1j * stft_phase)  # [1, 513, T]
             window = torch.hann_window(WINDOW_LENGTH, device=self.device)
             audio = torch.istft(
@@ -193,10 +396,255 @@ class TTSEngine:
                 center=False,
             )  # [1, N_samples]
             audio_np = audio.squeeze(0).cpu().numpy()
+            metrics.istft_ms = (time.perf_counter() - t0) * 1000
         else:
             # No VC backend — return silence placeholder
             n_samples = T * HOP_LENGTH
             audio_np = np.zeros(n_samples, dtype=np.float32)
             logger.warning("No VC backend loaded; returning silence.")
 
+        metrics.total_ms = (time.perf_counter() - t_total) * 1000
+        self.last_metrics = metrics
+
+        logger.debug(
+            "Synthesized %d frames (%.0fms audio) in %.1fms (RTF=%.2f) "
+            "[g2p=%.1f enc=%.1f dur=%.1f f0=%.1f cs=%.1f conv=%.1f voc=%.1f istft=%.1f]",
+            metrics.output_frames, metrics.output_duration_ms, metrics.total_ms,
+            metrics.rtf,
+            metrics.g2p_ms, metrics.text_encoder_ms, metrics.duration_predictor_ms,
+            metrics.f0_predictor_ms, metrics.content_synthesizer_ms,
+            metrics.converter_ms, metrics.vocoder_ms, metrics.istft_ms,
+        )
+
         return audio_np, duration_sec
+
+    def synthesize_sentences(
+        self,
+        text: str,
+        language: str,
+        spk_embed: torch.Tensor,
+        style: StyleParams | None = None,
+        speed: float = 1.0,
+        chunk_duration_ms: int = 100,
+        cancel: threading.Event | None = None,
+        sentence_pause_ms: int = 120,
+        auto_style: bool = True,
+    ) -> Generator[np.ndarray, None, None]:
+        """Sentence-level streaming synthesis with lookahead pipeline.
+
+        Splits text into sentences, synthesizes each independently with
+        1-sentence lookahead (next sentence synthesized while current is
+        being yielded), inserts natural silence, and applies crossfade
+        at boundaries.
+
+        Args:
+            text: Input text.
+            language: Language code.
+            spk_embed: Speaker embedding [192].
+            style: Base style parameters (overridden per-sentence if auto_style=True).
+            speed: Speed factor.
+            chunk_duration_ms: Chunk size in ms for yielded audio.
+            cancel: If set, abort and stop yielding.
+            sentence_pause_ms: Silence between sentences in ms (0 to disable).
+            auto_style: Infer per-sentence style from text content.
+
+        Yields:
+            numpy arrays of shape [chunk_samples] (float32).
+        """
+        from tmrvc_core.text_utils import infer_sentence_style, segment_sentences
+
+        t_stream_start = time.perf_counter()
+        stream_metrics = StreamMetrics()
+
+        sentences = segment_sentences(text, language)
+        stream_metrics.sentence_count = len(sentences)
+        chunk_samples = int(SAMPLE_RATE * chunk_duration_ms / 1000)
+        pause_samples = int(SAMPLE_RATE * sentence_pause_ms / 1000)
+
+        # Determine per-sentence styles
+        if auto_style and style is not None:
+            styles = [infer_sentence_style(s, language, style) for s in sentences]
+        elif auto_style:
+            base = StyleParams.neutral()
+            styles = [infer_sentence_style(s, language, base) for s in sentences]
+        else:
+            styles = [style] * len(sentences)
+
+        prev_tail: np.ndarray | None = None
+        first_chunk_emitted = False
+
+        # Lookahead: submit next sentence synthesis while yielding current.
+        # We use a single-thread executor to avoid GIL contention with
+        # the main synthesis (which also uses this thread).
+        lookahead_future: Future | None = None
+
+        def _synth_sentence(sent: str, sent_style: StyleParams | None) -> tuple[np.ndarray, float] | None:
+            return self.synthesize(sent, language, spk_embed, sent_style, speed, cancel=cancel)
+
+        for sent_idx, sentence in enumerate(sentences):
+            if cancel and cancel.is_set():
+                if lookahead_future is not None:
+                    lookahead_future.cancel()
+                return
+
+            # Get current sentence's audio
+            if lookahead_future is not None:
+                # Wait for lookahead to complete
+                result = lookahead_future.result()
+                lookahead_future = None
+            else:
+                # First sentence (or no lookahead): synthesize synchronously
+                result = _synth_sentence(sentence, styles[sent_idx])
+
+            if result is None:
+                return
+            audio, _ = result
+
+            # Collect metrics
+            if self.last_metrics is not None:
+                stream_metrics.per_sentence.append(self.last_metrics)
+
+            is_last = sent_idx == len(sentences) - 1
+
+            # Launch lookahead for next sentence
+            if not is_last and (cancel is None or not cancel.is_set()):
+                next_idx = sent_idx + 1
+                next_sent = sentences[next_idx]
+                next_style = styles[next_idx]
+                # Prefetch G2P for the next sentence
+                self.prefetch_g2p(next_sent, language)
+                # Submit synthesis to thread pool
+                lookahead_future = self._lookahead_pool.submit(
+                    _synth_sentence, next_sent, next_style,
+                )
+
+            # Apply crossfade or silence gap with previous sentence's tail
+            if prev_tail is not None:
+                if pause_samples > 0:
+                    # With inter-sentence pause: emit prev_tail with fadeout,
+                    # then silence, then let next sentence start fresh.
+                    # Do NOT crossfade audio-through-silence (would create
+                    # an unintended fade-in from silence).
+                    n_fade = min(FADEOUT_SAMPLES, len(prev_tail))
+                    faded_tail = prev_tail.copy()
+                    faded_tail[-n_fade:] *= np.linspace(
+                        1.0, 0.0, n_fade, dtype=np.float32,
+                    )
+                    to_emit = np.concatenate([
+                        faded_tail,
+                        np.zeros(pause_samples, dtype=np.float32),
+                    ])
+                    for start in range(0, len(to_emit), chunk_samples):
+                        if cancel and cancel.is_set():
+                            return
+                        chunk = to_emit[start:start + chunk_samples]
+                        if not first_chunk_emitted:
+                            stream_metrics.first_chunk_ms = (time.perf_counter() - t_stream_start) * 1000
+                            first_chunk_emitted = True
+                        yield chunk
+                    prev_tail = None
+                elif len(audio) >= CROSSFADE_SAMPLES:
+                    # No pause: crossfade adjacent sentences directly
+                    if len(prev_tail) >= CROSSFADE_SAMPLES:
+                        emit_prefix = prev_tail[:-CROSSFADE_SAMPLES]
+                        tail_xfade = prev_tail[-CROSSFADE_SAMPLES:]
+                    else:
+                        emit_prefix = np.array([], dtype=np.float32)
+                        tail_xfade = prev_tail
+
+                    n_xfade = len(tail_xfade)
+                    fade_out = np.linspace(1.0, 0.0, n_xfade, dtype=np.float32)
+                    fade_in = np.linspace(0.0, 1.0, n_xfade, dtype=np.float32)
+                    audio[:n_xfade] = (
+                        tail_xfade * fade_out + audio[:n_xfade] * fade_in
+                    )
+
+                    for start in range(0, len(emit_prefix), chunk_samples):
+                        if cancel and cancel.is_set():
+                            return
+                        chunk = emit_prefix[start:start + chunk_samples]
+                        if not first_chunk_emitted:
+                            stream_metrics.first_chunk_ms = (time.perf_counter() - t_stream_start) * 1000
+                            first_chunk_emitted = True
+                        yield chunk
+                    prev_tail = None
+                else:
+                    # Audio shorter than crossfade window: blend what we can
+                    n = min(len(prev_tail), len(audio))
+                    fade_out = np.linspace(1.0, 0.0, n, dtype=np.float32)
+                    fade_in = np.linspace(0.0, 1.0, n, dtype=np.float32)
+                    audio[:n] = prev_tail[:n] * fade_out + audio[:n] * fade_in
+                    if len(prev_tail) > n:
+                        remainder = prev_tail[n:]
+                        for start in range(0, len(remainder), chunk_samples):
+                            if cancel and cancel.is_set():
+                                return
+                            yield remainder[start:start + chunk_samples]
+                    prev_tail = None
+
+            # Determine tail for next crossfade
+            if is_last:
+                emit = audio
+            else:
+                if len(audio) > CROSSFADE_SAMPLES:
+                    emit = audio[:-CROSSFADE_SAMPLES]
+                    prev_tail = audio[-CROSSFADE_SAMPLES:].copy()
+                else:
+                    prev_tail = audio.copy()
+                    continue
+
+            # Yield in chunks
+            for start in range(0, len(emit), chunk_samples):
+                if cancel and cancel.is_set():
+                    return
+                chunk = emit[start:start + chunk_samples]
+                if not first_chunk_emitted:
+                    stream_metrics.first_chunk_ms = (time.perf_counter() - t_stream_start) * 1000
+                    first_chunk_emitted = True
+                yield chunk
+
+        # Flush any remaining tail
+        if prev_tail is not None:
+            for start in range(0, len(prev_tail), chunk_samples):
+                chunk = prev_tail[start:start + chunk_samples]
+                if not first_chunk_emitted:
+                    stream_metrics.first_chunk_ms = (time.perf_counter() - t_stream_start) * 1000
+                    first_chunk_emitted = True
+                yield chunk
+
+        stream_metrics.total_ms = (time.perf_counter() - t_stream_start) * 1000
+        self.last_stream_metrics = stream_metrics
+
+        logger.debug(
+            "Stream: %d sentences, first_chunk=%.1fms, total=%.1fms, avg_sentence=%.1fms",
+            stream_metrics.sentence_count,
+            stream_metrics.first_chunk_ms,
+            stream_metrics.total_ms,
+            stream_metrics.avg_sentence_ms,
+        )
+
+    def synthesize_chunks(
+        self,
+        text: str,
+        language: str,
+        spk_embed: torch.Tensor,
+        style: StyleParams | None = None,
+        speed: float = 1.0,
+        chunk_duration_ms: int = 100,
+    ) -> Generator[np.ndarray, None, None]:
+        """Synthesize audio and yield fixed-size PCM chunks.
+
+        Runs the full synthesis pipeline, then splits the result into
+        chunks of ``chunk_duration_ms`` milliseconds. The last chunk may
+        be shorter.
+
+        Yields:
+            numpy arrays of shape ``[chunk_samples]`` (float32).
+        """
+        result = self.synthesize(text, language, spk_embed, style, speed)
+        if result is None:
+            return
+        audio, _ = result
+        chunk_samples = int(SAMPLE_RATE * chunk_duration_ms / 1000)
+        for start in range(0, len(audio), chunk_samples):
+            yield audio[start : start + chunk_samples]

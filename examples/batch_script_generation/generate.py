@@ -1,8 +1,12 @@
-"""CLI for batch TTS generation from YAML scripts.
+#!/usr/bin/env python3
+"""Batch TTS generation from YAML scripts.
+
+Standalone example script — reads a YAML script file with character profiles
+and dialogue entries, then generates audio files for each entry.
 
 Usage:
-    tmrvc-generate-script script.yaml --output-dir output/
-    tmrvc-generate-script script.yaml --tts-checkpoint ckpt/tts.pt --vc-checkpoint ckpt/vc.pt
+    python generate.py script.yaml --output-dir output/
+    python generate.py script.yaml --tts-checkpoint ckpt/tts.pt --vc-checkpoint ckpt/vc.pt
 """
 
 from __future__ import annotations

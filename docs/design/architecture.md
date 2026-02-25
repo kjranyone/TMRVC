@@ -36,7 +36,7 @@ Created: 2026-02-16 (Asia/Tokyo)
 信号フロー:
 ```
 DAW Input ──▶ VST3 Plugin ──▶ StreamingEngine ──▶ ONNX Models ──▶ DAW Output
-  (48kHz)     (processBlock)   (C++ library)      (ORT C API)     (48kHz)
+  (48kHz)     (processBlock)   (Rust library)     (ONNX Runtime)  (48kHz)
 ```
 
 ---
@@ -85,38 +85,22 @@ TMRVC/
 │   └── src/tmrvc_export/
 │       ├── export_onnx.py         # PyTorch → ONNX (5 models)
 │       ├── quantize.py            # INT8 dynamic quantization
-│       ├── verify_parity.py       # Python vs C++ numerical parity
+│       ├── verify_parity.py       # Python vs Rust numerical parity
 │       └── benchmark.py           # ONNX Runtime benchmark
 │
-├── tmrvc-engine/                  # C++: ストリーミング推論エンジン (JUCE 非依存)
-│   ├── CMakeLists.txt
-│   ├── include/tmrvc/
-│   │   ├── streaming_engine.h
-│   │   ├── ort_session_bundle.h
-│   │   ├── tensor_pool.h
-│   │   ├── fixed_ring_buffer.h
-│   │   ├── polyphase_resampler.h
-│   │   ├── spsc_queue.h
-│   │   ├── speaker_manager.h
-│   │   ├── cross_fader.h
-│   │   └── constants.h            # auto-generated from YAML
+├── tmrvc-engine-rs/               # Rust: ストリーミング推論エンジン
 │   └── src/
-│       ├── streaming_engine.cpp
-│       ├── ort_session_bundle.cpp
-│       ├── tensor_pool.cpp
-│       ├── fixed_ring_buffer.cpp
-│       ├── polyphase_resampler.cpp
-│       ├── spsc_queue.cpp
-│       ├── speaker_manager.cpp
-│       └── cross_fader.cpp
+│       ├── processor.rs
+│       ├── ort_bundle.rs
+│       ├── tensor_pool.rs
+│       ├── ring_buffer.rs
+│       ├── resampler.rs
+│       └── speaker.rs
 │
-├── tmrvc-plugin/                  # C++: JUCE VST3 プラグイン
-│   ├── CMakeLists.txt
+├── tmrvc-vst/                     # Rust: VST3 プラグイン (nih-plug)
 │   └── src/
-│       ├── TMRVCProcessor.cpp     # PluginProcessor
-│       ├── TMRVCProcessor.h
-│       ├── TMRVCEditor.cpp        # PluginEditor (GUI)
-│       └── TMRVCEditor.h
+│       ├── plugin.rs
+│       └── params.rs
 │
 ├── tmrvc-gui/                     # Python: Research Studio GUI (PySide6)
 │   ├── pyproject.toml
@@ -141,11 +125,10 @@ TMRVC/
 │   └── export.yaml
 │
 ├── scripts/                       # ユーティリティスクリプト
-│   ├── generate_constants.py      # YAML → Python + C++ header
+│   ├── generate_constants.py      # YAML → Python + Rust constants
 │   └── run_benchmark.py
 │
-├── pyproject.toml                 # Workspace root (uv workspace)
-└── CMakeLists.txt                 # Top-level CMake
+└── pyproject.toml                 # Workspace root (uv workspace)
 ```
 
 ---
@@ -157,9 +140,9 @@ TMRVC/
 | **tmrvc-core** | Python | 共有定数 (sample_rate, n_fft, hop_length, dims)、mel 計算、型定義 | なし |
 | **tmrvc-data** | Python | データセット管理、前処理、augmentation (RIR, EQ, noise)、特徴量抽出 (F0, content, speaker) | tmrvc-core |
 | **tmrvc-train** | Python | Teacher/Student モデル定義、学習ループ、損失関数、蒸留、Few-shot adaptation | tmrvc-core, tmrvc-data |
-| **tmrvc-export** | Python | PyTorch → ONNX エクスポート、INT8 量子化、Python↔C++ 数値パリティ検証 | tmrvc-core, tmrvc-train |
-| **tmrvc-engine** | C++ | ストリーミング推論エンジン。ONNX Runtime でモデル実行、Ring Buffer、Resampler、Speaker 管理。**JUCE 非依存** | ONNX Runtime (C API) |
-| **tmrvc-plugin** | C++ | JUCE VST3 ラッパー。DAW 統合 (processBlock, latency reporting, state persistence)、GUI | tmrvc-engine, JUCE |
+| **tmrvc-export** | Python | PyTorch → ONNX エクスポート、INT8 量子化、Python↔Rust 数値パリティ検証 | tmrvc-core, tmrvc-train |
+| **tmrvc-engine-rs** | Rust | ストリーミング推論エンジン。ONNX Runtime でモデル実行、Ring Buffer、Resampler、Speaker 管理 | ONNX Runtime (`ort` crate) |
+| **tmrvc-vst** | Rust | VST3 ラッパー。DAW 統合 (process, latency reporting, state persistence) | tmrvc-engine-rs, nih-plug |
 | **tmrvc-gui** | Python | Research Studio GUI。全ワークフロー統合 (データ準備→学習→蒸留→評価→話者登録→リアルタイムVC→エクスポート)。PySide6 + sounddevice + pyqtgraph | tmrvc-core, tmrvc-data, tmrvc-train, tmrvc-export |
 
 ### モジュール間の依存グラフ
@@ -176,14 +159,14 @@ tmrvc-core ◀─── tmrvc-data ◀─── tmrvc-train
                      │──▶ tmrvc-train
                      └──▶ tmrvc-export
 
-tmrvc-engine ◀─── tmrvc-plugin
-  (C++)            (C++ / JUCE)
+tmrvc-engine-rs ◀─── tmrvc-vst
+     (Rust)            (Rust / nih-plug)
        ▲
        │
-  ONNX Runtime (C API, static link)
+  ONNX Runtime (`ort` crate)
 ```
 
-Python 側と C++ 側は ONNX ファイルと `constants.yaml` (→ 自動生成ヘッダ) でのみ接続される。
+Python 側と Rust 側は ONNX ファイルと `constants.yaml` (→ 自動生成定数) でのみ接続される。
 `tmrvc-gui` は Python 側の統合フロントエンドで、ONNX Runtime Python API 経由でリアルタイム VC も実行可能。
 
 ---
@@ -323,27 +306,26 @@ DAW Audio Out (48kHz)
 
 モノリシックモデルでは、実行頻度の異なる処理を分離できず無駄な計算が発生する。
 
-### 5.2 tmrvc-engine は JUCE 非依存
+### 5.2 tmrvc-engine-rs は UI/Host 非依存
 
-| 判断 | StreamingEngine を JUCE に一切依存しない C++ ライブラリとして設計 |
+| 判断 | StreamingEngine を UI/Host 実装 (VST/Standalone) から分離した Rust crate として設計 |
 |---|---|
 | **根拠** | テスタビリティ、再利用性、ライセンス分離 |
 
 - **テスタビリティ**: DAW なしで単体テスト・ベンチマーク可能
 - **再利用性**: VST3 以外 (standalone CLI, mobile, WebAssembly) にも展開可能
-- **ライセンス分離**: JUCE (GPLv3 / commercial) の影響をエンジンコアに波及させない
-- **ビルド簡素化**: JUCE の複雑なビルドシステムをエンジンから切り離せる
+- **依存分離**: VST ラッパー (nih-plug) と推論エンジンの責務を明確に分離
+- **ビルド簡素化**: エンジン単体を `cargo test`/`cargo bench` で検証可能
 
-### 5.3 ONNX Runtime 静的リンク (ort-builder, C API only)
+### 5.3 ONNX Runtime 利用方針 (Rust `ort` crate)
 
-| 判断 | ONNX Runtime を ort-builder で必要な EP のみ含む静的ライブラリとしてビルドし、C API のみ使用 |
+| 判断 | ONNX Runtime CPU EP を Rust から利用し、推論呼び出しを `tmrvc-engine-rs` に集約 |
 |---|---|
 | **根拠** | バイナリサイズ削減、配布簡素化、ABI 安定性 |
 
-- **ort-builder**: CPU EP のみを含む最小構成でビルド → バイナリサイズ 5-10MB (フル版 50MB+ から大幅削減)
-- **C API only**: C++ API は header-only だが ABI 不安定。C API はバージョン間で安定
-- **静的リンク**: DLL 配布不要、ユーザー環境の依存関係問題を排除
-- **OrtValue direct creation**: `CreateTensorWithDataAsOrtValue` で zero-copy inference
+- **CPU-only 実行**: ライブ用途での安定性を優先
+- **セッション分離**: content/converter/vocoder などを個別セッションで管理
+- **将来拡張性**: 量子化モデル切替や HQ モデル追加をランタイム側で吸収しやすい
 
 ### 5.4 Frame-by-frame causal streaming (chunk-based ではなく)
 
@@ -404,7 +386,7 @@ DAW Audio Out (48kHz)
 | ストリーミング設計 | `docs/design/streaming-design.md` | §4.2 推論時フローの詳細化 |
 | ONNX I/O 仕様 | `docs/design/onnx-contract.md` | §5.1 の 5 モデル I/O 定義、`.tmrvc_speaker` metadata |
 | モデルアーキテクチャ | `docs/design/model-architecture.md` | §4.1 学習時フローの詳細化 |
-| C++ エンジン設計 | `docs/design/cpp-engine-design.md` | §5.2-5.3 の実装詳細 |
+| エンジン設計 (legacy doc 名) | `docs/design/cpp-engine-design.md` | §5.2-5.3 の実装詳細（現行実装は Rust） |
 | Acoustic Condition Pathway | `docs/design/acoustic-condition-pathway.md` | IR + Voice Source 統合条件付け、プリセットブレンド |
 | GUI 設計 | `docs/design/gui-design.md` | Research Studio GUI アプリケーション設計 |
 | Teacher 学習計画 | `docs/design/training-plan.md` | §4.1 学習時フローのコーパス・スケジュール詳細 |

@@ -25,6 +25,7 @@ EMOTION_CATEGORIES: list[str] = [
 ]
 
 EMOTION_TO_ID: dict[str, int] = {e: i for i, e in enumerate(EMOTION_CATEGORIES)}
+SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja", "en", "zh", "ko")
 
 
 @dataclass
@@ -108,6 +109,13 @@ class CharacterProfile:
     default_style: StyleParams = field(default_factory=StyleParams.neutral)
     speaker_file: Path | None = None
     language: str = "ja"
+
+    def __post_init__(self) -> None:
+        if self.language not in SUPPORTED_LANGUAGES:
+            supported = ", ".join(SUPPORTED_LANGUAGES)
+            raise ValueError(
+                f"Unsupported language: {self.language}. Supported languages: {supported}"
+            )
 
 
 @dataclass

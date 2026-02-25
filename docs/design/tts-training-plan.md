@@ -161,8 +161,7 @@ frozen: [vocoder, content_encoder, text_encoder, content_synthesizer]
 ```
 
 - `n_acoustic_params`: 32 → 64 (`n_style_params`) に拡張
-- 既存 VC チェックポイントから `converter_from_vc_checkpoint()` で移行
-- 拡張次元がゼロなら恒等変換 → VC 退行なし
+- [x] 旧VCチェックポイント移行は行わず、style-conditioned checkpointのみを対象とする
 
 ### 4.5 Step 3.4: 統合テスト (1 週間)
 
@@ -245,7 +244,7 @@ frozen: [vocoder, content_encoder, text_encoder, content_synthesizer]
 | ContentSynthesizer が ContentEncoder の分布と合わない | Converter 品質劣化 | alignment loss 重み調整、Teacher end-to-end 学習 |
 | 日本語感情音声データ不足 (JVNV 4h のみ) | 感情制御精度不足 | Expresso cross-lingual transfer + pseudo-label |
 | MFA アラインメント品質 (日本語) | デュレーション予測劣化 | 手動検査 + 低品質除外フィルタ |
-| FiLM 拡張が VC 品質に悪影響 | 既存 VC の退行 | 拡張次元ゼロ初期化、VC/TTS 別チェックポイント |
+| FiLM 拡張が VC 品質に悪影響 | 既存 VC の退行 | style-conditioned converter のみを運用し、旧VC checkpoint は対象外とする |
 | pyopenjtalk ビルド失敗 (Windows, VS 必要) | 日本語 G2P 不可 | pre-built wheel 使用、WSL フォールバック |
 
 ## 11. 整合性チェックリスト
@@ -254,7 +253,7 @@ frozen: [vocoder, content_encoder, text_encoder, content_synthesizer]
 - [x] `train_tts.yaml` の `max_frames: 400` は `CLAUDE.md` のデフォルト設定と一致
 - [x] `batch_size: 32` は B570 VRAM (9.6 GB) 内で動作する推定 (~2.5 GB)
 - [x] Converter 凍結 → `tts_trainer.py` で optimizer に含まない
-- [x] Phase 3 の FiLM 拡張は `converter_from_vc_checkpoint()` で移行 (`converter.py`)
+- [x] 旧VCチェックポイント移行は行わず、style-conditioned checkpointのみを対象とする
 - [x] 全 Phase で `--device xpu` を使用 (`CLAUDE.md` Runtime Device Policy)
 - [x] 学習チェックポイントは `checkpoints/tts/` に保存 (gitignore 対象)
 
