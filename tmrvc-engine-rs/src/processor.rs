@@ -7,6 +7,7 @@ use atomic_float::AtomicF32;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
+use crate::character::CharacterFile;
 use crate::constants::*;
 use crate::dsp;
 use crate::ort_bundle::OrtBundle;
@@ -14,6 +15,7 @@ use crate::ping_pong::PingPongState;
 use crate::speaker::SpeakerFile;
 use crate::style::StyleFile;
 use crate::tensor_pool::TensorPool;
+use crate::tts::{self, Language};
 
 /// Circular buffer for content vectors, used by HQ mode.
 ///
@@ -713,6 +715,138 @@ impl StreamingEngine {
     /// Returns true if the engine is currently in HQ (semi-causal) mode.
     pub fn is_hq_mode(&self) -> bool {
         self.hq_mode
+    }
+
+    /// Returns true if TTS front-end models are loaded.
+    pub fn has_tts(&self) -> bool {
+        self.ort_bundle
+            .as_ref()
+            .map_or(false, |b| b.has_tts())
+    }
+
+    /// Load a .tmrvc_character file (speaker embed + LoRA + voice source + default style + profile).
+    pub fn load_character(&mut self, path: &Path) -> Result<()> {
+        let ch = CharacterFile::load(path)?;
+        self.spk_embed = ch.spk_embed;
+        self.lora_delta = ch.lora_delta;
+        self.voice_source_preset = Some(ch.voice_source_preset);
+        self.speaker_loaded = true;
+        log::info!(
+            "Character '{}' loaded from {:?} (lang={})",
+            ch.profile.name,
+            path,
+            ch.profile.language
+        );
+        Ok(())
+    }
+
+    /// Synthesize audio from phoneme IDs using the TTS front-end + VC streaming backend.
+    ///
+    /// This runs the full TTS pipeline:
+    /// 1. TTS front-end (TextEncoder → DurationPredictor → LengthRegulate → F0/ContentSynth)
+    /// 2. Per-frame Converter + Vocoder + iSTFT + OLA
+    ///
+    /// Returns PCM audio at SAMPLE_RATE (24kHz), mono, f32 samples.
+    ///
+    /// Requires both TTS models and a speaker to be loaded.
+    pub fn synthesize_tts(
+        &mut self,
+        phoneme_ids: &[i64],
+        language: Language,
+        style: &[f32; D_STYLE],
+    ) -> Result<Vec<f32>> {
+        if !self.speaker_loaded {
+            anyhow::bail!("No speaker loaded");
+        }
+        let bundle = self
+            .ort_bundle
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Models not loaded"))?;
+
+        // 1. Run TTS front-end
+        let frontend = tts::run_tts_frontend(bundle, phoneme_ids, language, style)?;
+        let n_frames = frontend.n_frames;
+
+        if n_frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 2. Reset streaming states for clean synthesis
+        self.states.converter.reset();
+        self.states.vocoder.reset();
+
+        // 3. Prepare output buffer
+        let mut audio = Vec::with_capacity(n_frames * HOP_LENGTH);
+        let mut content_frame = vec![0.0f32; D_CONTENT];
+        let mut features = vec![0.0f32; N_FREQ_BINS];
+        let mut conv_state_out = vec![0.0f32; D_CONVERTER_HIDDEN * CONVERTER_STATE_FRAMES];
+        let mut mag = vec![0.0f32; N_FREQ_BINS];
+        let mut phase = vec![0.0f32; N_FREQ_BINS];
+        let mut voc_state_out = vec![0.0f32; D_VOCODER_HIDDEN * VOCODER_STATE_FRAMES];
+        let mut time_signal = vec![0.0f32; WINDOW_LENGTH];
+        let mut ola_buffer = vec![0.0f32; WINDOW_LENGTH];
+        let mut hop_output = [0.0f32; HOP_LENGTH];
+        let mut istft_complex = vec![Complex::new(0.0, 0.0); N_FFT];
+
+        // Use acoustic_params = 0 for TTS (no IR estimation needed)
+        let acoustic_params = [0.0f32; N_ACOUSTIC_PARAMS];
+
+        let bundle = self.ort_bundle.as_mut().unwrap();
+
+        for frame in 0..n_frames {
+            // Extract content and f0 for this frame
+            tts::extract_frame_content(&frontend, frame, &mut content_frame);
+            let _f0_val = tts::extract_frame_f0(&frontend, frame);
+
+            // Converter: content[256] + spk[192] + lora + acoustic[32] + state → features[513]
+            conv_state_out.fill(0.0);
+            bundle.run_converter(
+                &content_frame,
+                &self.spk_embed,
+                &self.lora_delta,
+                &acoustic_params,
+                self.states.converter.input(),
+                &mut features,
+                &mut conv_state_out,
+            )?;
+            self.states
+                .converter
+                .output()
+                .copy_from_slice(&conv_state_out);
+            self.states.converter.swap();
+
+            // Vocoder: features[513] + state → mag[513] + phase[513]
+            mag.fill(0.0);
+            phase.fill(0.0);
+            voc_state_out.fill(0.0);
+            bundle.run_vocoder(
+                &features,
+                self.states.vocoder.input(),
+                &mut mag,
+                &mut phase,
+                &mut voc_state_out,
+            )?;
+            self.states
+                .vocoder
+                .output()
+                .copy_from_slice(&voc_state_out);
+            self.states.vocoder.swap();
+
+            // iSTFT + OLA
+            dsp::istft(
+                &mag,
+                &phase,
+                self.tensor_pool.hann_window(),
+                &mut time_signal,
+                &mut istft_complex,
+                &mut self.fft_planner,
+            );
+
+            dsp::overlap_add(&time_signal, &mut ola_buffer, &mut hop_output);
+            audio.extend_from_slice(&hop_output);
+        }
+
+        Ok(audio)
     }
 
     /// Reset all internal state.

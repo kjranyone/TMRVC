@@ -118,7 +118,21 @@ n_text_encoder_layers: 6          # Transformer encoder layers
 n_text_encoder_heads: 4           # Multi-head attention heads
 text_encoder_ff_dim: 1024         # Feed-forward dimension
 phoneme_vocab_size: 200           # Unified IPA phoneme vocabulary
+tokenizer_vocab_size: 262         # Byte-level tokenizer vocab (6 special + 256 bytes)
 n_emotion_categories: 12          # happy,sad,angry,fearful,surprised,disgusted,neutral,bored,excited,tender,sarcastic,whisper
 d_f0_predictor: 128               # F0Predictor hidden dimension
 d_content_synthesizer: 256        # ContentSynthesizer hidden dimension (= d_content)
 n_languages: 4                    # ja, en, zh, ko
+
+# --- Scene State Latent (SSL) ---
+d_scene_state: 64                 # Scene state latent dimension
+d_history: 128                    # Dialogue history summary dimension
+ssl_n_gru_layers: 1               # GRU layers in state update
+ssl_prosody_stats_dim: 8          # Prosody statistics for L_state_recon (pitch_mean, pitch_std, energy_mean, energy_std, rate, voiced_ratio, pause_ratio, spectral_tilt)
+
+# --- Breath-Pause Event Head (BPEH) ---
+bpeh_d_hidden: 128                # BPEH hidden dimension
+bpeh_n_blocks: 3                  # BPEH conv blocks
+bpeh_breath_threshold_db: -40.0   # Energy threshold for breath candidate detection (dB)
+bpeh_min_pause_ms: 50.0           # Minimum pause duration to label (ms)
+bpeh_min_breath_ms: 80.0          # Minimum breath duration to label (ms)

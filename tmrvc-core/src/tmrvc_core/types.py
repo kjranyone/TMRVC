@@ -91,6 +91,12 @@ class TTSFeatureSet:
     content_dim: int = 768
     text: str = ""
 
+    # BPEH event tensors (frame-level, optional)
+    breath_onsets: torch.Tensor | None = None   # [T] binary
+    breath_durations: torch.Tensor | None = None  # [T] ms
+    breath_intensity: torch.Tensor | None = None  # [T] 0-1
+    pause_durations: torch.Tensor | None = None  # [T] ms
+
 
 @dataclass
 class TTSBatch:
@@ -114,6 +120,12 @@ class TTSBatch:
     content_dim: int = 768
     style: torch.Tensor | None = None  # [B, d_style] optional style vec
 
+    # BPEH event tensors (frame-level, optional)
+    breath_onsets: torch.Tensor | None = None   # [B, T] binary: 1 at breath onset frames
+    breath_durations: torch.Tensor | None = None  # [B, T] ms duration at onset frames, 0 elsewhere
+    breath_intensity: torch.Tensor | None = None  # [B, T] intensity (0-1) at onset frames
+    pause_durations: torch.Tensor | None = None  # [B, T] ms pause duration at onset frames
+
     def to(self, device: torch.device | str) -> TTSBatch:
         """Transfer all tensor fields to device."""
         return TTSBatch(
@@ -130,4 +142,8 @@ class TTSBatch:
             speaker_ids=self.speaker_ids,
             content_dim=self.content_dim,
             style=self.style.to(device) if self.style is not None else None,
+            breath_onsets=self.breath_onsets.to(device) if self.breath_onsets is not None else None,
+            breath_durations=self.breath_durations.to(device) if self.breath_durations is not None else None,
+            breath_intensity=self.breath_intensity.to(device) if self.breath_intensity is not None else None,
+            pause_durations=self.pause_durations.to(device) if self.pause_durations is not None else None,
         )

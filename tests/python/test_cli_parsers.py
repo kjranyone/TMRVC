@@ -82,11 +82,17 @@ class TestPreprocessCLI:
             assert args.dataset == ds
 
     def test_invalid_dataset_rejected(self):
+        """Unknown dataset names are accepted by argparse but rejected by get_adapter()."""
         from tmrvc_data.cli.preprocess import build_parser
+        from tmrvc_data.dataset_adapters import get_adapter
 
         parser = build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["--dataset", "invalid", "--raw-dir", "/r", "--cache-dir", "/c"])
+        # argparse no longer rejects unknown dataset names (choices removed)
+        args = parser.parse_args(["--dataset", "invalid", "--raw-dir", "/r", "--cache-dir", "/c"])
+        assert args.dataset == "invalid"
+        # But get_adapter raises ValueError for unknown datasets
+        with pytest.raises(ValueError, match="Unknown dataset"):
+            get_adapter(args.dataset)
 
     def test_defaults(self):
         from tmrvc_data.cli.preprocess import build_parser
@@ -193,12 +199,14 @@ class TestServeCLI:
             "--host", "0.0.0.0",
             "--port", "9000",
             "--device", "xpu",
+            "--text-frontend", "tokenizer",
             "--reload",
             "--api-key", "test-key",
         ])
         assert args.host == "0.0.0.0"
         assert args.port == 9000
         assert args.device == "xpu"
+        assert args.text_frontend == "tokenizer"
         assert args.reload is True
         assert args.api_key == "test-key"
 
@@ -229,12 +237,14 @@ class TestTrainTTSCLI:
             "--batch-size", "16",
             "--device", "xpu",
             "--max-frames", "500",
+            "--text-frontend", "tokenizer",
             "--wandb",
         ])
         assert args.lr == 5e-5
         assert args.max_steps == 100000
         assert args.batch_size == 16
         assert args.max_frames == 500
+        assert args.text_frontend == "tokenizer"
         assert args.wandb is True
 
     def test_load_config_none(self):

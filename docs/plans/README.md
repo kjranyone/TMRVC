@@ -26,6 +26,7 @@ Created: 2026-02-17
 | 3 | Training Execution | [training-execution.md](training-execution.md) | Pending | Data download | Days (GPU) |
 | 4 | C++ Engine | [cpp-engine.md](cpp-engine.md) | Pending | None (Rust ref exists) | 3-5 sessions |
 | 5 | VST3 Plugin | [vst3-plugin.md](vst3-plugin.md) | Pending | Stream #4 | 2-3 sessions |
+| 6 | Research Novelty Implementation | [research-development-plan-claude-code.md](research-development-plan-claude-code.md) | Pending | Baseline freeze | Multi-week |
 
 ## Dependency Graph
 

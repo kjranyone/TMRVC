@@ -149,6 +149,13 @@ class TestTeacherTrainer:
         trainer2.load_checkpoint(path)
         assert trainer2.global_step == 3
 
+    def test_load_checkpoint_rejects_legacy_format(self, trainer, tmp_path):
+        path = tmp_path / "legacy_teacher.pt"
+        torch.save({"step": 1}, path)
+
+        with pytest.raises(RuntimeError, match="Legacy checkpoints are not supported"):
+            trainer.load_checkpoint(path)
+
 
 class TestTrainTeacherCLI:
     """Tests for CLI argument parsing and config loading."""

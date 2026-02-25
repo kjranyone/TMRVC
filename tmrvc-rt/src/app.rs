@@ -32,6 +32,7 @@ pub enum Command {
     LoadModels(String),
     LoadSpeaker(String),
     LoadStyle(String),
+    LoadCharacter(String),
     Start,
     Stop,
     Quit,
@@ -161,6 +162,9 @@ impl TmrvcApp {
         if !model_panel.style_path.is_empty() {
             let _ = command_tx.send(Command::LoadStyle(model_panel.style_path.clone()));
         }
+        if !model_panel.character_path.is_empty() {
+            let _ = command_tx.send(Command::LoadCharacter(model_panel.character_path.clone()));
+        }
 
         let status_text =
             if !model_panel.onnx_dir.is_empty() || !model_panel.speaker_path.is_empty() {
@@ -217,6 +221,10 @@ impl eframe::App for TmrvcApp {
                 ModelPanelEvent::LoadStyle(path) => {
                     let _ = self.command_tx.send(Command::LoadStyle(path));
                     self.status_text = "Loading style...".to_string();
+                }
+                ModelPanelEvent::LoadCharacter(path) => {
+                    let _ = self.command_tx.send(Command::LoadCharacter(path));
+                    self.status_text = "Loading character...".to_string();
                 }
                 ModelPanelEvent::None => {}
             }
@@ -582,6 +590,9 @@ impl TmrvcApp {
                     if path.ends_with(".tmrvc_style") {
                         self.model_panel.style_path = path;
                         self.status_text = "Style profile loaded".to_string();
+                    } else if path.ends_with(".tmrvc_character") {
+                        self.model_panel.character_path = path;
+                        self.status_text = "Character profile loaded".to_string();
                     } else {
                         self.model_panel.speaker_path = path;
                         self.status_text = "Speaker profile loaded".to_string();
@@ -868,6 +879,10 @@ fn processor_thread(
                 Command::LoadStyle(path) => match engine.load_style(Path::new(&path)) {
                     Ok(()) => log::info!("Style loaded"),
                     Err(e) => log::error!("Failed to load style: {}", e),
+                },
+                Command::LoadCharacter(path) => match engine.load_character(Path::new(&path)) {
+                    Ok(()) => log::info!("Character loaded"),
+                    Err(e) => log::error!("Failed to load character: {}", e),
                 },
                 Command::Start => {
                     eval_logger.reset(&status);

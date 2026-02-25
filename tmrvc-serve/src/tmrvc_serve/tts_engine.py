@@ -14,18 +14,23 @@ from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
 
 from tmrvc_core.constants import (
     D_CONTENT,
+    D_HISTORY,
+    D_SCENE_STATE,
     D_SPEAKER,
     HOP_LENGTH,
     N_FFT,
     N_MELS,
+    PHONEME_VOCAB_SIZE,
     N_STYLE_PARAMS,
     SAMPLE_RATE,
+    TOKENIZER_VOCAB_SIZE,
     WINDOW_LENGTH,
 )
 from tmrvc_core.dialogue_types import CharacterProfile, DialogueTurn, StyleParams
@@ -97,12 +102,20 @@ class TTSEngine:
         tts_checkpoint: Path | str | None = None,
         vc_checkpoint: Path | str | None = None,
         device: str = "cpu",
+        text_frontend: Literal["phoneme", "tokenizer", "auto"] = "tokenizer",
     ) -> None:
         self.device = torch.device(device)
         self._models_loaded = False
         self._tts_checkpoint = tts_checkpoint
         self._vc_checkpoint = vc_checkpoint
         self._warmed_up = False
+        if text_frontend not in {"phoneme", "tokenizer", "auto"}:
+            raise ValueError(
+                f"Unsupported text_frontend: {text_frontend}. "
+                "Expected one of: phoneme, tokenizer, auto."
+            )
+        self._text_frontend: Literal["phoneme", "tokenizer", "auto"] = text_frontend
+        self._text_vocab_size = self._resolve_frontend_vocab_size(text_frontend)
 
         # Models (lazily loaded)
         self._text_encoder: torch.nn.Module | None = None
@@ -111,6 +124,7 @@ class TTSEngine:
         self._content_synthesizer: torch.nn.Module | None = None
         self._converter: torch.nn.Module | None = None
         self._vocoder: torch.nn.Module | None = None
+        self._scene_state_update: torch.nn.Module | None = None
 
         # G2P cache for speculative prefetch (LRU-bounded)
         self._g2p_cache: OrderedDict[tuple[str, str], object] = OrderedDict()
@@ -124,6 +138,14 @@ class TTSEngine:
         self.last_metrics: SynthesisMetrics | None = None
         self.last_stream_metrics: StreamMetrics | None = None
 
+    @staticmethod
+    def _resolve_frontend_vocab_size(frontend: str) -> int:
+        if frontend == "tokenizer":
+            return TOKENIZER_VOCAB_SIZE
+        if frontend == "auto":
+            return max(PHONEME_VOCAB_SIZE, TOKENIZER_VOCAB_SIZE)
+        return PHONEME_VOCAB_SIZE
+
     @property
     def models_loaded(self) -> bool:
         return self._models_loaded
@@ -135,20 +157,82 @@ class TTSEngine:
         from tmrvc_train.models.f0_predictor import F0Predictor
         from tmrvc_train.models.content_synthesizer import ContentSynthesizer
 
-        self._text_encoder = TextEncoder().to(self.device).eval()
+        self._text_encoder = TextEncoder(vocab_size=self._text_vocab_size).to(self.device).eval()
         self._duration_predictor = DurationPredictor().to(self.device).eval()
         self._f0_predictor = F0Predictor().to(self.device).eval()
         self._content_synthesizer = ContentSynthesizer().to(self.device).eval()
 
         if self._tts_checkpoint:
             ckpt = torch.load(self._tts_checkpoint, map_location=self.device, weights_only=False)
-            state = ckpt if isinstance(ckpt, dict) and "text_encoder" not in ckpt else ckpt
-            if "text_encoder" in state:
-                self._text_encoder.load_state_dict(state["text_encoder"])
-                self._duration_predictor.load_state_dict(state["duration_predictor"])
-                self._f0_predictor.load_state_dict(state["f0_predictor"])
-                self._content_synthesizer.load_state_dict(state["content_synthesizer"])
-                logger.info("Loaded TTS models from %s", self._tts_checkpoint)
+            if not isinstance(ckpt, dict):
+                raise RuntimeError("Invalid TTS checkpoint format: expected dict")
+            state = ckpt
+            if "text_encoder" not in state:
+                raise RuntimeError("Invalid TTS checkpoint: missing text_encoder")
+
+            missing = [
+                key for key in ("text_frontend", "text_vocab_size")
+                if key not in state
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Legacy TTS checkpoints are not supported. Missing metadata: "
+                    + ", ".join(missing)
+                )
+
+            ckpt_frontend = str(state["text_frontend"])
+            if ckpt_frontend not in {"phoneme", "tokenizer"}:
+                raise RuntimeError(
+                    f"Unsupported checkpoint text_frontend: {ckpt_frontend}"
+                )
+            ckpt_vocab_size = int(state["text_vocab_size"])
+
+            text_state = state["text_encoder"]
+            embed_weight = text_state.get("phoneme_embed.weight")
+            if embed_weight is None:
+                raise RuntimeError(
+                    "Invalid TTS checkpoint: missing text_encoder phoneme_embed.weight"
+                )
+            if ckpt_vocab_size != int(embed_weight.shape[0]):
+                raise RuntimeError(
+                    "Invalid TTS checkpoint metadata: text_vocab_size does not "
+                    "match text_encoder embedding rows"
+                )
+
+            configured_frontend = getattr(self, "_text_frontend", "tokenizer")
+            if configured_frontend != "auto" and configured_frontend != ckpt_frontend:
+                raise RuntimeError(
+                    f"Checkpoint/frontend mismatch: configured={configured_frontend}, "
+                    f"checkpoint={ckpt_frontend}"
+                )
+
+            self._text_frontend = ckpt_frontend
+            if ckpt_vocab_size != int(self._text_encoder.phoneme_embed.num_embeddings):
+                logger.info(
+                    "Rebuilding TextEncoder vocab size %d -> %d from checkpoint",
+                    int(self._text_encoder.phoneme_embed.num_embeddings),
+                    ckpt_vocab_size,
+                )
+                self._text_encoder = TextEncoder(
+                    vocab_size=ckpt_vocab_size,
+                ).to(self.device).eval()
+            self._text_vocab_size = ckpt_vocab_size
+
+            self._text_encoder.load_state_dict(state["text_encoder"])
+            self._duration_predictor.load_state_dict(state["duration_predictor"])
+            self._f0_predictor.load_state_dict(state["f0_predictor"])
+            self._content_synthesizer.load_state_dict(state["content_synthesizer"])
+
+            if state.get("enable_ssl") and "ssl_state_update" in state:
+                from tmrvc_train.models.scene_state import SceneStateUpdate
+                self._scene_state_update = SceneStateUpdate().to(self.device).eval()
+                self._scene_state_update.load_state_dict(state["ssl_state_update"])
+                logger.info("Loaded SceneStateUpdate from TTS checkpoint")
+
+            logger.info(
+                "Loaded TTS models from %s (frontend=%s, vocab=%d)",
+                self._tts_checkpoint, self._text_frontend, self._text_vocab_size,
+            )
 
         # VC backend (Converter + Vocoder) — load if checkpoint provided
         if self._vc_checkpoint:
@@ -167,10 +251,70 @@ class TTSEngine:
         logger.info("Warming up TTS engine...")
         t0 = time.perf_counter()
         dummy_embed = torch.zeros(192, device=self.device)
-        self.synthesize("warmup", "en", dummy_embed, speed=1.0)
+        try:
+            self.synthesize("warmup", "ja", dummy_embed, speed=1.0)
+        except Exception as e:
+            # Warmup must not block service startup. Runtime inference still
+            # reports backend errors explicitly if they occur.
+            logger.warning("Warmup skipped due to frontend dependency issue: %s", e)
+            return
         elapsed = (time.perf_counter() - t0) * 1000
         self._warmed_up = True
         logger.info("Warmup complete in %.1fms", elapsed)
+
+    @property
+    def scene_state_available(self) -> bool:
+        """Whether scene state tracking is available (SSL model loaded)."""
+        return self._scene_state_update is not None
+
+    def initial_scene_state(self) -> torch.Tensor:
+        """Create zero initial scene state ``[1, D_SCENE_STATE]``."""
+        return torch.zeros(1, D_SCENE_STATE, device=self.device)
+
+    @torch.no_grad()
+    def update_scene_state(
+        self,
+        text: str,
+        language: str,
+        spk_embed: torch.Tensor,
+        z_prev: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute updated scene state after an utterance.
+
+        Runs text frontend + text encoder to get utterance encoding,
+        then applies SceneStateUpdate GRU.
+
+        Args:
+            text: The spoken text.
+            language: Language code.
+            spk_embed: ``[192]`` speaker embedding.
+            z_prev: ``[1, D_SCENE_STATE]`` previous scene state.
+
+        Returns:
+            ``[1, D_SCENE_STATE]`` updated scene state.
+        """
+        if self._scene_state_update is None:
+            return z_prev
+
+        # Compute utterance encoding (mean-pooled text features)
+        cache_key = (text, language)
+        g2p_result = self._g2p_cache.pop(cache_key, None)
+        if g2p_result is None:
+            g2p_result = self._run_text_frontend(text, language=language)
+        input_ids, language_id = self._extract_ids_and_lang(g2p_result, language=language)
+        phoneme_ids = input_ids.unsqueeze(0).to(self.device)
+        language_ids = torch.tensor([language_id], dtype=torch.long, device=self.device)
+        text_features = self._text_encoder(phoneme_ids, language_ids)  # [1, 256, L]
+        u_t = text_features.mean(dim=2)  # [1, 256]
+
+        # Dialogue history summary (zeros — trained without history encoder)
+        h_t = torch.zeros(1, D_HISTORY, device=self.device)
+
+        # Speaker embedding
+        s = spk_embed.to(self.device).unsqueeze(0) if spk_embed.dim() == 1 else spk_embed.to(self.device)
+
+        z_t = self._scene_state_update(z_prev.to(self.device), u_t, h_t, s)
+        return z_t
 
     def _load_vc_backend(self) -> None:
         """Load Converter and Vocoder from VC checkpoint."""
@@ -210,8 +354,55 @@ class TTSEngine:
             logger.warning("VC checkpoint has no vocoder state; using randomly initialized vocoder.")
         logger.info("Loaded VC backend from %s", self._vc_checkpoint)
 
+    def _run_text_frontend(self, text: str, language: str) -> object:
+        """Run configured text frontend and return frontend result object."""
+        frontend = getattr(self, "_text_frontend", "phoneme")
+        text_vocab_size = int(
+            getattr(
+                self,
+                "_text_vocab_size",
+                self._resolve_frontend_vocab_size(frontend),
+            ),
+        )
+
+        if frontend == "tokenizer":
+            from tmrvc_data.text_tokenizer import text_to_tokens
+            return text_to_tokens(text, language=language)
+
+        if frontend == "phoneme":
+            from tmrvc_data.g2p import text_to_phonemes
+            return text_to_phonemes(text, language=language)
+
+        # auto mode: prefer tokenizer when vocab can represent it, else phoneme.
+        if text_vocab_size >= TOKENIZER_VOCAB_SIZE:
+            try:
+                from tmrvc_data.text_tokenizer import text_to_tokens
+                return text_to_tokens(text, language=language)
+            except Exception as e:
+                logger.warning("Tokenizer frontend failed in auto mode, fallback to phoneme: %s", e)
+        from tmrvc_data.g2p import text_to_phonemes
+        return text_to_phonemes(text, language=language)
+
+    @staticmethod
+    def _extract_ids_and_lang(frontend_result: object, language: str) -> tuple[torch.Tensor, int]:
+        """Extract input IDs and language ID from frontend result."""
+        token_ids = getattr(frontend_result, "token_ids", None)
+        phoneme_ids = getattr(frontend_result, "phoneme_ids", None)
+        ids = token_ids if token_ids is not None else phoneme_ids
+        if ids is None:
+            raise RuntimeError("Text frontend result has neither token_ids nor phoneme_ids")
+
+        language_id = getattr(frontend_result, "language_id", None)
+        if language_id is None:
+            # Fallback for custom mocks.
+            lang_id_map = {"ja": 0, "en": 1, "zh": 2, "ko": 3}
+            if language not in lang_id_map:
+                raise ValueError(f"Unsupported language: {language}")
+            language_id = lang_id_map[language]
+        return ids, int(language_id)
+
     def prefetch_g2p(self, text: str, language: str) -> None:
-        """Run G2P for the given text and cache the result.
+        """Run text frontend for the given text and cache the result.
 
         Intended for speculative prefetch while previous audio is streaming.
         Uses LRU eviction when cache exceeds ``G2P_CACHE_MAX_SIZE``.
@@ -220,8 +411,7 @@ class TTSEngine:
         if cache_key in self._g2p_cache:
             self._g2p_cache.move_to_end(cache_key)
             return
-        from tmrvc_data.g2p import text_to_phonemes
-        self._g2p_cache[cache_key] = text_to_phonemes(text, language=language)
+        self._g2p_cache[cache_key] = self._run_text_frontend(text, language=language)
         while len(self._g2p_cache) > G2P_CACHE_MAX_SIZE:
             self._g2p_cache.popitem(last=False)  # evict oldest
 
@@ -254,21 +444,14 @@ class TTSEngine:
         metrics = SynthesisMetrics()
         t_total = time.perf_counter()
 
-        from tmrvc_data.g2p import (
-            LANG_EN,
-            LANG_JA,
-            LANG_KO,
-            LANG_ZH,
-            text_to_phonemes,
-        )
-
         # G2P (use cache if available)
         t0 = time.perf_counter()
         cache_key = (text, language)
         g2p_result = self._g2p_cache.pop(cache_key, None)
         if g2p_result is None:
-            g2p_result = text_to_phonemes(text, language=language)
-        phoneme_ids = g2p_result.phoneme_ids.unsqueeze(0).to(self.device)  # [1, L]
+            g2p_result = self._run_text_frontend(text, language=language)
+        input_ids, language_id = self._extract_ids_and_lang(g2p_result, language=language)
+        phoneme_ids = input_ids.unsqueeze(0).to(self.device)  # [1, L]
         metrics.g2p_ms = (time.perf_counter() - t0) * 1000
 
         if cancel and cancel.is_set():
@@ -277,16 +460,7 @@ class TTSEngine:
             return None
 
         # Language ID
-        lang_id_map = {
-            "ja": LANG_JA,
-            "en": LANG_EN,
-            "zh": LANG_ZH,
-            "ko": LANG_KO,
-        }
-        if language not in lang_id_map:
-            raise ValueError(f"Unsupported language: {language}")
-        lang_id = lang_id_map[language]
-        language_ids = torch.tensor([lang_id], dtype=torch.long, device=self.device)
+        language_ids = torch.tensor([language_id], dtype=torch.long, device=self.device)
 
         # Text encoding
         t0 = time.perf_counter()
@@ -387,13 +561,15 @@ class TTSEngine:
             t0 = time.perf_counter()
             stft_complex = stft_mag * torch.exp(1j * stft_phase)  # [1, 513, T]
             window = torch.hann_window(WINDOW_LENGTH, device=self.device)
+            expected_length = T * HOP_LENGTH
             audio = torch.istft(
                 stft_complex,
                 n_fft=N_FFT,
                 hop_length=HOP_LENGTH,
                 win_length=WINDOW_LENGTH,
                 window=window,
-                center=False,
+                center=True,
+                length=expected_length,
             )  # [1, N_samples]
             audio_np = audio.squeeze(0).cpu().numpy()
             metrics.istft_ms = (time.perf_counter() - t0) * 1000

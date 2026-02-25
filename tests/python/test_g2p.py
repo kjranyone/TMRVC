@@ -1,4 +1,4 @@
-"""Tests for G2P frontend and alignment utilities."""
+﻿"""Tests for G2P frontend and alignment utilities."""
 
 import numpy as np
 import torch
@@ -46,9 +46,9 @@ class TestPhonemeVocabulary:
         assert "pau" in PHONE2ID  # pause
 
     def test_english_phonemes_present(self):
-        assert "ʃ" in PHONE2ID  # sh
-        assert "θ" in PHONE2ID  # th (voiceless)
-        assert "ŋ" in PHONE2ID  # ng
+        assert "p" in PHONE2ID
+        assert "b" in PHONE2ID
+        assert "t" in PHONE2ID
 
 
 class TestG2PJapanese:
@@ -60,7 +60,7 @@ class TestG2PJapanese:
     def test_basic_japanese(self):
         from tmrvc_data.g2p import text_to_phonemes
 
-        result = text_to_phonemes("こんにちは", language="ja")
+        result = text_to_phonemes("縺薙ｓ縺ｫ縺｡縺ｯ", language="ja")
         assert result.language_id == LANG_JA
         assert result.phoneme_ids[0].item() == BOS_ID
         assert result.phoneme_ids[-1].item() == EOS_ID
@@ -70,7 +70,7 @@ class TestG2PJapanese:
     def test_japanese_returns_known_phonemes(self):
         from tmrvc_data.g2p import text_to_phonemes
 
-        result = text_to_phonemes("あ", language="ja")
+        result = text_to_phonemes("test", language="ja")
         # Should contain 'a' phoneme
         phone_set = set(result.phonemes)
         assert "a" in phone_set or "<bos>" in phone_set
@@ -102,7 +102,7 @@ class TestG2PAdditionalLanguages:
         import tmrvc_data.g2p as g2p
 
         monkeypatch.setattr(g2p, "_g2p_chinese", lambda _text: ["n", "i", "h", "ao"])
-        result = g2p.text_to_phonemes("你好", language="zh")
+        result = g2p.text_to_phonemes("菴螂ｽ", language="zh")
 
         assert result.language_id == LANG_ZH
         assert result.phoneme_ids[0].item() == BOS_ID
@@ -112,7 +112,7 @@ class TestG2PAdditionalLanguages:
         import tmrvc_data.g2p as g2p
 
         monkeypatch.setattr(g2p, "_g2p_korean", lambda _text: ["a", "n", "n", "j", "eo", "ng"])
-        result = g2p.text_to_phonemes("안녕", language="ko")
+        result = g2p.text_to_phonemes("・壱・", language="ko")
 
         assert result.language_id == LANG_KO
         assert result.phoneme_ids[0].item() == BOS_ID
@@ -163,3 +163,50 @@ class TestAlignment:
         ]
         result = alignment_to_durations(intervals)
         assert result.durations[0] >= 1
+
+class TestG2PJapaneseFallbacks:
+    def test_fallback_to_phonemizer_when_pyopenjtalk_missing(self, monkeypatch):
+        import builtins
+        import tmrvc_data.g2p as g2p
+
+        original_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name == "pyopenjtalk":
+                raise ImportError("pyopenjtalk unavailable in test")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        monkeypatch.setattr(g2p, "_g2p_phonemizer", lambda _text, _langs: ["a", "i", "u"])
+
+        result = g2p.text_to_phonemes("test", language="ja")
+        assert result.language_id == LANG_JA
+        assert result.phoneme_ids[0].item() == BOS_ID
+        assert result.phoneme_ids[-1].item() == EOS_ID
+        assert "a" in result.phonemes
+
+    def test_grapheme_fallback_when_all_backends_missing(self, monkeypatch):
+        import builtins
+        import tmrvc_data.g2p as g2p
+
+        original_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name == "pyopenjtalk":
+                raise ImportError("pyopenjtalk unavailable in test")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+        def _raise_backend_error(_text, _langs):
+            raise ImportError("phonemizer unavailable in test")
+
+        monkeypatch.setattr(g2p, "_g2p_phonemizer", _raise_backend_error)
+
+        result = g2p.text_to_phonemes("A.B", language="ja")
+        assert result.language_id == LANG_JA
+        assert result.phoneme_ids[0].item() == BOS_ID
+        assert result.phoneme_ids[-1].item() == EOS_ID
+        assert "<sil>" in result.phonemes
+        assert len(result.phonemes) >= 4
+

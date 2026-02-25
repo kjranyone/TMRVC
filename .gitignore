@@ -29,6 +29,7 @@ tmrvc-engine/include/tmrvc/constants.h
 /data/
 /checkpoints/
 /models/
+/eval/
 
 # ============================================================
 # Temporary files

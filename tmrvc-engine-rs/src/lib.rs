@@ -1,3 +1,4 @@
+pub mod character;
 pub mod constants;
 pub mod dsp;
 pub mod mel_thumbnail;
@@ -11,5 +12,6 @@ pub mod speaker;
 pub mod speaker_encoder;
 pub mod style;
 pub mod tensor_pool;
+pub mod tts;
 pub mod voice_profile;
 pub mod wav_reader;

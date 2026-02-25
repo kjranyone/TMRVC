@@ -29,20 +29,11 @@ from tmrvc_core.constants import (
     N_MELS,
     PHONEME_VOCAB_SIZE,
 )
+from tmrvc_export._utils import prepare_output_path
 
 logger = logging.getLogger(__name__)
 
 _OPSET_VERSION = 18
-
-
-def _prepare_output_path(output_path: Path) -> None:
-    """Remove stale ONNX/external-data files before export."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    for p in (output_path, Path(f"{output_path}.data")):
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
 
 
 # --- Wrappers ---
@@ -116,7 +107,7 @@ def export_text_encoder(
 ) -> Path:
     """Export TextEncoder to ONNX (variable-length L)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _TextEncoderWrapper(model).eval()
@@ -145,7 +136,7 @@ def export_duration_predictor(
 ) -> Path:
     """Export DurationPredictor to ONNX (variable-length L)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _DurationPredictorWrapper(model).eval()
@@ -174,7 +165,7 @@ def export_f0_predictor(
 ) -> Path:
     """Export F0Predictor to ONNX (variable-length T)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _F0PredictorWrapper(model).eval()
@@ -204,7 +195,7 @@ def export_content_synthesizer(
 ) -> Path:
     """Export ContentSynthesizer to ONNX (variable-length T)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _ContentSynthesizerWrapper(model).eval()
@@ -292,7 +283,7 @@ def export_style_encoder(
     Input: mel[B, 80, T] → Output: style[B, 32]
     """
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _StyleEncoderWrapper(model).eval()

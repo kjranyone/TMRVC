@@ -28,7 +28,7 @@ class TestGetAdapter:
             get_adapter("nonexistent")
 
     def test_adapter_registry(self):
-        assert set(ADAPTERS.keys()) == {"vctk", "jvs", "libritts_r", "tsukuyomi"}
+        assert set(ADAPTERS.keys()) == {"vctk", "jvs", "libritts_r", "tsukuyomi", "generic"}
 
 
 class TestTsukuyomiAdapter:

@@ -4,7 +4,7 @@
 
 実際にモデルを学習する。Phase 0 (検証) → Phase 1 (Base Teacher) → Phase 2 (IR-robust) → 蒸留。
 
-詳細な学習パラメータは `docs/design/training-plan.md` を参照。
+詳細な学習パラメータは `docs/training/vc-training-plan.md` を参照。
 ここでは実行手順と準備チェックリストに集中する。
 
 ## Prerequisites

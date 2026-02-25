@@ -1,0 +1,40 @@
+﻿title: "放課後のゆりゆり会話"
+situation: "雨上がりの図書室。親友同士の二人が、少しだけ素直になって話す。"
+
+characters:
+  mio:
+    name: "美緒"
+    personality: "明るいけれど、好きな相手には照れが出る。"
+    voice_description: "やわらかく弾む声。"
+    language: "ja"
+  rena:
+    name: "怜奈"
+    personality: "落ち着いて見えるが、実は独占欲が強い。"
+    voice_description: "低めで息混じりの優しい声。"
+    language: "ja"
+
+dialogue:
+  - speaker: mio
+    text: "怜奈、今日も一緒に帰っていい？ その……手、つないでも。"
+    emotion: "tender"
+    speed: 0.96
+
+  - speaker: rena
+    text: "もちろん。むしろ、私のほうが先に言おうとしてた。"
+    emotion: "happy"
+    speed: 0.94
+
+  - speaker: mio
+    text: "えへへ。こうして近くにいると、心臓がちょっと忙しいんだよね。"
+    emotion: "happy"
+    speed: 0.98
+
+  - speaker: rena
+    text: "じゃあ、今日はゆっくり歩こう。美緒の鼓動が落ち着くまで、ずっと隣にいる。"
+    emotion: "tender"
+    speed: 0.92
+
+  - speaker: mio
+    text: "……うん。ありがとう、怜奈。大好き。"
+    emotion: "tender"
+    speed: 0.90

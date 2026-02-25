@@ -59,7 +59,60 @@ class ConverterBlock(nn.Module):
         return x, state_out
 
 
-class ConverterStudent(nn.Module):
+# ---------------------------------------------------------------------------
+# Shared base for ConverterStudent / ConverterStudentGTM / ConverterStudentHQ
+# ---------------------------------------------------------------------------
+
+
+class _ConverterStudentBase(nn.Module):
+    """Shared base: input/output projections, state splitting, init_state."""
+
+    def __init__(
+        self,
+        d_input: int,
+        d_model: int,
+        d_output: int,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Conv1d(d_input, d_model, kernel_size=1),
+            nn.SiLU(),
+        )
+
+        # Output projection → STFT features
+        self.output_proj = nn.Conv1d(d_model, d_output, kernel_size=1)
+
+    def _init_state_accounting(self, expected_total_state: int) -> None:
+        """Compute state sizes from ``self.blocks``. Call after block creation."""
+        self._state_sizes = [self._block_state_size(blk) for blk in self.blocks]
+        self._total_state = sum(self._state_sizes)
+        assert self._total_state == expected_total_state, (
+            f"Expected total state {expected_total_state}, got {self._total_state}"
+        )
+
+    def _block_state_size(self, block: nn.Module) -> int:
+        """State size for a single block. HQ overrides to ``left_context``."""
+        return block.context_size
+
+    def _split_state(self, state: torch.Tensor) -> list[torch.Tensor]:
+        states = []
+        offset = 0
+        for size in self._state_sizes:
+            if size > 0:
+                states.append(state[:, :, offset:offset + size])
+            else:
+                states.append(state[:, :, :0])
+            offset += size
+        return states
+
+    def init_state(self, batch_size: int = 1, device: str = "cpu") -> torch.Tensor:
+        return torch.zeros(batch_size, self.d_model, self._total_state, device=device)
+
+
+class ConverterStudent(_ConverterStudentBase):
     """1-step converter distilled from Teacher U-Net.
 
     8 CausalConvNeXt blocks with FiLM, d=384, k=3, dilation=[1,1,2,2,4,4,6,6].
@@ -79,17 +132,10 @@ class ConverterStudent(nn.Module):
         kernel_size: int = 3,
         dilations: list[int] | None = None,
     ) -> None:
-        super().__init__()
-        self.d_model = d_model
+        super().__init__(d_input, d_model, d_output)
         d_cond = d_speaker + n_acoustic_params  # 192 + 32 = 224
         dilations = dilations or [1, 1, 2, 2, 4, 4, 6, 6]
         assert len(dilations) == n_blocks
-
-        # Input projection
-        self.input_proj = nn.Sequential(
-            nn.Conv1d(d_input, d_model, kernel_size=1),
-            nn.SiLU(),
-        )
 
         # Converter blocks with FiLM
         self.blocks = nn.ModuleList([
@@ -97,15 +143,7 @@ class ConverterStudent(nn.Module):
             for d in dilations
         ])
 
-        # Output projection → STFT features
-        self.output_proj = nn.Conv1d(d_model, d_output, kernel_size=1)
-
-        # Precompute state slicing
-        self._state_sizes = [blk.context_size for blk in self.blocks]
-        self._total_state = sum(self._state_sizes)
-        assert self._total_state == CONVERTER_STATE_FRAMES, (
-            f"Expected total state {CONVERTER_STATE_FRAMES}, got {self._total_state}"
-        )
+        self._init_state_accounting(CONVERTER_STATE_FRAMES)
 
     def forward(
         self,
@@ -146,20 +184,6 @@ class ConverterStudent(nn.Module):
             return x, state_out
         return x, None
 
-    def _split_state(self, state: torch.Tensor) -> list[torch.Tensor]:
-        states = []
-        offset = 0
-        for size in self._state_sizes:
-            if size > 0:
-                states.append(state[:, :, offset:offset + size])
-            else:
-                states.append(state[:, :, :0])
-            offset += size
-        return states
-
-    def init_state(self, batch_size: int = 1, device: str = "cpu") -> torch.Tensor:
-        return torch.zeros(batch_size, self.d_model, self._total_state, device=device)
-
 
 class ConverterBlockGTM(nn.Module):
     """CausalConvNeXtBlock + TimbreCrossAttention(speaker) + FiLM(acoustic)."""
@@ -197,7 +221,7 @@ class ConverterBlockGTM(nn.Module):
         return x, state_out
 
 
-class ConverterStudentGTM(nn.Module):
+class ConverterStudentGTM(_ConverterStudentBase):
     """Converter with Global Timbre Memory (cross-attention on speaker).
 
     Same ONNX I/O contract as ConverterStudent: the GTM expansion happens
@@ -222,19 +246,12 @@ class ConverterStudentGTM(nn.Module):
         gtm_d_entry: int = GTM_D_ENTRY,
         gtm_n_heads: int = GTM_N_HEADS,
     ) -> None:
-        super().__init__()
-        self.d_model = d_model
+        super().__init__(d_input, d_model, d_output)
         dilations = dilations or [1, 1, 2, 2, 4, 4, 6, 6]
         assert len(dilations) == n_blocks
 
         # Global Timbre Memory: spk_embed → memory bank
         self.gtm = GlobalTimbreMemory(d_speaker, gtm_n_entries, gtm_d_entry)
-
-        # Input projection
-        self.input_proj = nn.Sequential(
-            nn.Conv1d(d_input, d_model, kernel_size=1),
-            nn.SiLU(),
-        )
 
         # GTM converter blocks
         self.blocks = nn.ModuleList([
@@ -246,15 +263,7 @@ class ConverterStudentGTM(nn.Module):
             for d in dilations
         ])
 
-        # Output projection
-        self.output_proj = nn.Conv1d(d_model, d_output, kernel_size=1)
-
-        # State size accounting
-        self._state_sizes = [blk.context_size for blk in self.blocks]
-        self._total_state = sum(self._state_sizes)
-        assert self._total_state == CONVERTER_STATE_FRAMES, (
-            f"Expected total state {CONVERTER_STATE_FRAMES}, got {self._total_state}"
-        )
+        self._init_state_accounting(CONVERTER_STATE_FRAMES)
 
     def forward(
         self,
@@ -295,20 +304,6 @@ class ConverterStudentGTM(nn.Module):
             state_out = torch.cat(new_states, dim=-1)
             return x, state_out
         return x, None
-
-    def _split_state(self, state: torch.Tensor) -> list[torch.Tensor]:
-        states = []
-        offset = 0
-        for size in self._state_sizes:
-            if size > 0:
-                states.append(state[:, :, offset:offset + size])
-            else:
-                states.append(state[:, :, :0])
-            offset += size
-        return states
-
-    def init_state(self, batch_size: int = 1, device: str = "cpu") -> torch.Tensor:
-        return torch.zeros(batch_size, self.d_model, self._total_state, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +365,7 @@ class ConverterBlockHQ(nn.Module):
         return x, state_out
 
 
-class ConverterStudentHQ(nn.Module):
+class ConverterStudentHQ(_ConverterStudentBase):
     """Semi-causal converter for HQ mode.
 
     Streaming: T_in = 1 + max_lookahead, T_out = 1.
@@ -396,20 +391,13 @@ class ConverterStudentHQ(nn.Module):
         dilations: list[int] | None = None,
         max_lookahead: int = 6,
     ) -> None:
-        super().__init__()
-        self.d_model = d_model
+        super().__init__(d_input, d_model, d_output)
         self.max_lookahead = max_lookahead
         d_cond = d_speaker + n_acoustic_params  # 224
         dilations = dilations or [1, 1, 2, 2, 4, 4, 6, 6]
         assert len(dilations) == n_blocks
 
         right_ctxs = _compute_right_contexts(dilations, max_lookahead)
-
-        # Input projection (same structure as ConverterStudent)
-        self.input_proj = nn.Sequential(
-            nn.Conv1d(d_input, d_model, kernel_size=1),
-            nn.SiLU(),
-        )
 
         # HQ converter blocks with semi-causal padding
         self.blocks = nn.ModuleList([
@@ -421,15 +409,10 @@ class ConverterStudentHQ(nn.Module):
             for d, rc in zip(dilations, right_ctxs)
         ])
 
-        # Output projection
-        self.output_proj = nn.Conv1d(d_model, d_output, kernel_size=1)
+        self._init_state_accounting(CONVERTER_HQ_STATE_FRAMES)
 
-        # Precompute state slicing (left_context per block)
-        self._state_sizes = [blk.left_context for blk in self.blocks]
-        self._total_state = sum(self._state_sizes)
-        assert self._total_state == CONVERTER_HQ_STATE_FRAMES, (
-            f"Expected total HQ state {CONVERTER_HQ_STATE_FRAMES}, got {self._total_state}"
-        )
+    def _block_state_size(self, block: nn.Module) -> int:
+        return block.left_context
 
     def forward(
         self,
@@ -471,20 +454,6 @@ class ConverterStudentHQ(nn.Module):
             state_out = torch.cat(new_states, dim=-1)
             return x, state_out
         return x, None
-
-    def _split_state(self, state: torch.Tensor) -> list[torch.Tensor]:
-        states = []
-        offset = 0
-        for size in self._state_sizes:
-            if size > 0:
-                states.append(state[:, :, offset:offset + size])
-            else:
-                states.append(state[:, :, :0])
-            offset += size
-        return states
-
-    def init_state(self, batch_size: int = 1, device: str = "cpu") -> torch.Tensor:
-        return torch.zeros(batch_size, self.d_model, self._total_state, device=device)
 
     @classmethod
     def from_causal(cls, causal_model: ConverterStudent) -> ConverterStudentHQ:

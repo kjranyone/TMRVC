@@ -15,7 +15,11 @@ const LORA_INPUT_NAME: &str = "lora_delta";
 /// the .tmrvc_speaker file consumed by `speaker.rs`.
 ///
 /// `converter_hq` is optional - loaded only if `converter_hq.onnx` exists.
+///
+/// TTS front-end models are optional - loaded only when the corresponding
+/// ONNX files are present. They run offline (batch) rather than streaming.
 pub struct OrtBundle {
+    // --- VC streaming models (required) ---
     content_encoder: Session,
     ir_estimator: Session,
     converter: Session,
@@ -23,6 +27,11 @@ pub struct OrtBundle {
     vocoder: Session,
     converter_accepts_lora: bool,
     converter_hq_accepts_lora: bool,
+    // --- TTS front-end models (optional) ---
+    text_encoder: Option<Session>,
+    duration_predictor: Option<Session>,
+    f0_predictor: Option<Session>,
+    content_synthesizer: Option<Session>,
 }
 
 /// Helper to build a session with standard options.
@@ -37,6 +46,23 @@ fn build_session(model_path: impl AsRef<Path>) -> Result<Session> {
 
 fn session_has_input(session: &Session, input_name: &str) -> bool {
     session.inputs().iter().any(|inp| inp.name() == input_name)
+}
+
+fn load_optional(dir: &Path, filename: &str) -> Option<Session> {
+    let path = dir.join(filename);
+    if !path.exists() {
+        return None;
+    }
+    match build_session(&path) {
+        Ok(sess) => {
+            log::info!("Loaded optional model: {}", filename);
+            Some(sess)
+        }
+        Err(e) => {
+            log::warn!("Failed to load optional model {}: {}", filename, e);
+            None
+        }
+    }
 }
 
 impl OrtBundle {
@@ -79,6 +105,20 @@ impl OrtBundle {
             (None, false)
         };
 
+        // Optional TTS front-end models
+        let text_encoder = load_optional(model_dir, "text_encoder.onnx");
+        let duration_predictor = load_optional(model_dir, "duration_predictor.onnx");
+        let f0_predictor = load_optional(model_dir, "f0_predictor.onnx");
+        let content_synthesizer = load_optional(model_dir, "content_synthesizer.onnx");
+
+        let tts_count = [&text_encoder, &duration_predictor, &f0_predictor, &content_synthesizer]
+            .iter()
+            .filter(|s| s.is_some())
+            .count();
+        if tts_count > 0 {
+            log::info!("TTS front-end: {}/4 models loaded", tts_count);
+        }
+
         Ok(Self {
             content_encoder,
             ir_estimator,
@@ -87,6 +127,10 @@ impl OrtBundle {
             vocoder,
             converter_accepts_lora,
             converter_hq_accepts_lora,
+            text_encoder,
+            duration_predictor,
+            f0_predictor,
+            content_synthesizer,
         })
     }
 
@@ -213,6 +257,108 @@ impl OrtBundle {
         state_out.copy_from_slice(state.1);
 
         Ok(())
+    }
+
+    // --- TTS front-end methods ---
+
+    /// Returns true if all 4 TTS front-end models are loaded.
+    pub fn has_tts(&self) -> bool {
+        self.text_encoder.is_some()
+            && self.duration_predictor.is_some()
+            && self.f0_predictor.is_some()
+            && self.content_synthesizer.is_some()
+    }
+
+    /// Run text_encoder: phoneme_ids[1,L] + language_ids[1] → text_features[1,256,L]
+    ///
+    /// Returns a newly allocated Vec<f32> of shape [256 * L].
+    pub fn run_text_encoder(
+        &mut self,
+        phoneme_ids: &[i64],
+        language_id: i64,
+    ) -> Result<Vec<f32>> {
+        let session = self
+            .text_encoder
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("text_encoder not loaded"))?;
+
+        let l = phoneme_ids.len();
+        let lang_ids = [language_id];
+        let outputs = session.run(ort::inputs![
+            "phoneme_ids" => TensorRef::from_array_view(([1usize, l], phoneme_ids))?,
+            "language_ids" => TensorRef::from_array_view(([1usize], &lang_ids[..]))?,
+        ])?;
+
+        let feats = outputs["text_features"].try_extract_tensor::<f32>()?;
+        Ok(feats.1.to_vec())
+    }
+
+    /// Run duration_predictor: text_features[1,256,L] + style[1,32] → durations[1,L]
+    ///
+    /// Returns durations as Vec<f32>.
+    pub fn run_duration_predictor(
+        &mut self,
+        text_features: &[f32],
+        l: usize,
+        style: &[f32],
+    ) -> Result<Vec<f32>> {
+        let session = self
+            .duration_predictor
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("duration_predictor not loaded"))?;
+
+        let outputs = session.run(ort::inputs![
+            "text_features" => TensorRef::from_array_view(([1, D_TEXT_ENCODER, l], text_features))?,
+            "style" => TensorRef::from_array_view(([1usize, D_STYLE], style))?,
+        ])?;
+
+        let durs = outputs["durations"].try_extract_tensor::<f32>()?;
+        Ok(durs.1.to_vec())
+    }
+
+    /// Run f0_predictor: text_features[1,256,T] + style[1,32] → (f0[1,1,T], voiced[1,1,T])
+    ///
+    /// Returns (f0_vec, voiced_vec).
+    pub fn run_f0_predictor(
+        &mut self,
+        text_features: &[f32],
+        t: usize,
+        style: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let session = self
+            .f0_predictor
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("f0_predictor not loaded"))?;
+
+        let outputs = session.run(ort::inputs![
+            "text_features" => TensorRef::from_array_view(([1, D_TEXT_ENCODER, t], text_features))?,
+            "style" => TensorRef::from_array_view(([1usize, D_STYLE], style))?,
+        ])?;
+
+        let f0 = outputs["f0"].try_extract_tensor::<f32>()?;
+        let voiced = outputs["voiced"].try_extract_tensor::<f32>()?;
+        Ok((f0.1.to_vec(), voiced.1.to_vec()))
+    }
+
+    /// Run content_synthesizer: text_features[1,256,T] → content[1,256,T]
+    ///
+    /// Returns content as Vec<f32>.
+    pub fn run_content_synthesizer(
+        &mut self,
+        text_features: &[f32],
+        t: usize,
+    ) -> Result<Vec<f32>> {
+        let session = self
+            .content_synthesizer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("content_synthesizer not loaded"))?;
+
+        let outputs = session.run(ort::inputs![
+            "text_features" => TensorRef::from_array_view(([1, D_TEXT_ENCODER, t], text_features))?,
+        ])?;
+
+        let content = outputs["content"].try_extract_tensor::<f32>()?;
+        Ok(content.1.to_vec())
     }
 
     /// Run vocoder: features[513] + state -> mag[513] + phase[513] + state

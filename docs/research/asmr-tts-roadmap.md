@@ -79,3 +79,7 @@ Created: 2026-02-25 (Asia/Tokyo)
 - A/B preference > 65% against current baseline on blind test.
 - No regression in non-ASMR default preset quality.
 - Streaming latency and glitch rate unchanged in live mode.
+
+## Research Link
+- For publication-oriented novelty work, follow:
+  - `docs/research/research-novelty-plan.md`

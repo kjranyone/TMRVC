@@ -147,6 +147,10 @@ class WSConfigureRequest(BaseModel):
     situation: str | None = None
     style_preset: StylePreset | None = None
     speed: float | None = Field(None, ge=0.5, le=2.0)
+    scene_reset: bool = Field(
+        False,
+        description="Reset scene state to initial (zeroed) state.",
+    )
 
 
 # Server → Client

@@ -36,8 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=["vctk", "jvs", "libritts_r", "tsukuyomi"],
-        help="Dataset name.",
+        help="Dataset name (built-in: vctk, jvs, libritts_r, tsukuyomi, or any name defined in datasets.yaml with a 'type' field).",
     )
     parser.add_argument(
         "--raw-dir",
@@ -120,7 +119,21 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    adapter = get_adapter(args.dataset)
+    # Resolve adapter type from datasets.yaml if the dataset name is not
+    # a built-in adapter key.
+    adapter_type: str | None = None
+    language: str = "en"
+    datasets_yaml = Path("configs/datasets.yaml")
+    if datasets_yaml.exists():
+        import yaml
+
+        with open(datasets_yaml, encoding="utf-8") as _f:
+            _registry = yaml.safe_load(_f) or {}
+        ds_cfg = (_registry.get("datasets") or {}).get(args.dataset) or {}
+        adapter_type = ds_cfg.get("type") if ds_cfg.get("type") != args.dataset else None
+        language = ds_cfg.get("language", "en")
+
+    adapter = get_adapter(args.dataset, adapter_type=adapter_type, language=language)
     cache = FeatureCache(args.cache_dir)
 
     # Collect utterances (needed for subset sampling)

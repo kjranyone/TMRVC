@@ -488,3 +488,9 @@ cargo run -p tmrvc-engine-rs --release --bin offline_convert -- \
 | **α Timbre** | 声色の変換強度 |
 | **Converter** | 話者の声質を変換する ONNX モデル |
 | **IR Estimator** | 音響環境（残響等）を推定する ONNX モデル |
+
+---
+
+## 開発者向け: 学習パイプライン
+
+モデルの学習・蒸留・TTS 拡張については [docs/training/README.md](training/README.md) を参照してください。

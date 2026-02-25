@@ -25,6 +25,7 @@ from tmrvc_core.constants import (
     N_MELS,
     VOCODER_STATE_FRAMES,
 )
+from tmrvc_export._utils import prepare_output_path
 from tmrvc_train.models.content_encoder import ContentEncoderStudent
 from tmrvc_train.models.converter import (
     ConverterStudent,
@@ -42,6 +43,27 @@ _LORA_SCALE = float(LORA_ALPHA) / float(LORA_RANK)
 _FILM_D_IN = D_SPEAKER + N_ACOUSTIC_PARAMS
 _FILM_D_OUT = D_CONVERTER_HIDDEN * 2
 _FILM_LAYER_PARAM_SIZE = _FILM_D_IN * LORA_RANK + LORA_RANK * _FILM_D_OUT
+
+
+def _film_lora_delta(
+    cond: torch.Tensor,
+    lora_delta: torch.Tensor,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Compute LoRA delta for a FiLM layer (shared by Converter and ConverterHQ)."""
+    bsz = cond.shape[0]
+    layer_start = layer_idx * _FILM_LAYER_PARAM_SIZE
+
+    a_start = layer_start
+    a_end = a_start + _FILM_D_IN * LORA_RANK
+    b_end = a_end + LORA_RANK * _FILM_D_OUT
+
+    a = lora_delta[:, a_start:a_end].reshape(bsz, _FILM_D_IN, LORA_RANK)
+    b = lora_delta[:, a_end:b_end].reshape(bsz, LORA_RANK, _FILM_D_OUT)
+
+    low_rank = torch.bmm(cond.unsqueeze(1), a).squeeze(1)
+    delta = torch.bmm(low_rank.unsqueeze(1), b).squeeze(1)
+    return delta * _LORA_SCALE
 
 
 class _ContentEncoderWrapper(torch.nn.Module):
@@ -65,26 +87,6 @@ class _ConverterWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    @staticmethod
-    def _film_lora_delta(
-        cond: torch.Tensor,
-        lora_delta: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        bsz = cond.shape[0]
-        layer_start = layer_idx * _FILM_LAYER_PARAM_SIZE
-
-        a_start = layer_start
-        a_end = a_start + _FILM_D_IN * LORA_RANK
-        b_end = a_end + LORA_RANK * _FILM_D_OUT
-
-        a = lora_delta[:, a_start:a_end].reshape(bsz, _FILM_D_IN, LORA_RANK)
-        b = lora_delta[:, a_end:b_end].reshape(bsz, LORA_RANK, _FILM_D_OUT)
-
-        low_rank = torch.bmm(cond.unsqueeze(1), a).squeeze(1)
-        delta = torch.bmm(low_rank.unsqueeze(1), b).squeeze(1)
-        return delta * _LORA_SCALE
-
     def forward(
         self,
         content: torch.Tensor,
@@ -105,7 +107,7 @@ class _ConverterWrapper(torch.nn.Module):
 
             gamma_beta = block.film.proj(cond)
             if i < N_LORA_LAYERS:
-                gamma_beta = gamma_beta + self._film_lora_delta(cond, lora_delta, i)
+                gamma_beta = gamma_beta + _film_lora_delta(cond, lora_delta, i)
 
             gamma, beta = gamma_beta.chunk(2, dim=-1)
             x = gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
@@ -207,26 +209,6 @@ class _ConverterHQWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    @staticmethod
-    def _film_lora_delta(
-        cond: torch.Tensor,
-        lora_delta: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        bsz = cond.shape[0]
-        layer_start = layer_idx * _FILM_LAYER_PARAM_SIZE
-
-        a_start = layer_start
-        a_end = a_start + _FILM_D_IN * LORA_RANK
-        b_end = a_end + LORA_RANK * _FILM_D_OUT
-
-        a = lora_delta[:, a_start:a_end].reshape(bsz, _FILM_D_IN, LORA_RANK)
-        b = lora_delta[:, a_end:b_end].reshape(bsz, LORA_RANK, _FILM_D_OUT)
-
-        low_rank = torch.bmm(cond.unsqueeze(1), a).squeeze(1)
-        delta = torch.bmm(low_rank.unsqueeze(1), b).squeeze(1)
-        return delta * _LORA_SCALE
-
     def forward(
         self,
         content: torch.Tensor,
@@ -247,7 +229,7 @@ class _ConverterHQWrapper(torch.nn.Module):
 
             gamma_beta = block.film.proj(cond)
             if i < N_LORA_LAYERS:
-                gamma_beta = gamma_beta + self._film_lora_delta(cond, lora_delta, i)
+                gamma_beta = gamma_beta + _film_lora_delta(cond, lora_delta, i)
 
             gamma, beta = gamma_beta.chunk(2, dim=-1)
             x = gamma.unsqueeze(-1) * x + beta.unsqueeze(-1)
@@ -258,21 +240,12 @@ class _ConverterHQWrapper(torch.nn.Module):
         return pred_features, state_out
 
 
-def _prepare_output_path(output_path: Path) -> None:
-    """Remove stale ONNX/external-data files before export."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    for p in (output_path, Path(f"{output_path}.data")):
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
-
 def export_content_encoder(
     model: ContentEncoderStudent, output_path: str | Path,
 ) -> Path:
     """Export content encoder to ONNX (streaming mode, T=1)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _ContentEncoderWrapper(model).eval()
@@ -298,7 +271,7 @@ def export_converter(
 ) -> Path:
     """Export converter to ONNX (streaming mode, T=1) with LoRA input."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     if isinstance(model, ConverterStudentGTM):
@@ -330,7 +303,7 @@ def export_converter_hq(
 ) -> Path:
     """Export HQ converter to ONNX (streaming mode, T_in=1+L, T_out=1)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _ConverterHQWrapper(model).eval()
@@ -358,7 +331,7 @@ def export_vocoder(
 ) -> Path:
     """Export vocoder to ONNX (streaming mode, T=1)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _VocoderWrapper(model).eval()
@@ -383,7 +356,7 @@ def export_ir_estimator(
 ) -> Path:
     """Export IR estimator to ONNX (chunk mode, N=10)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     wrapper = _IREstimatorWrapper(model).eval()
@@ -408,7 +381,7 @@ def export_speaker_encoder(
 ) -> Path:
     """Export speaker encoder to ONNX (offline, variable-length input)."""
     output_path = Path(output_path)
-    _prepare_output_path(output_path)
+    prepare_output_path(output_path)
     model.eval()
 
     # T_ref is variable (3-15 seconds, 300-1500 frames)

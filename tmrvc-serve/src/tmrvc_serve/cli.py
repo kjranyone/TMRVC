@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Torch device (default: cpu).",
     )
     parser.add_argument(
+        "--text-frontend",
+        choices=["phoneme", "tokenizer", "auto"],
+        default="tokenizer",
+        help="Text frontend mode (default: tokenizer).",
+    )
+    parser.add_argument(
         "--api-key",
         default=None,
         help="Anthropic API key for context prediction (default: $ANTHROPIC_API_KEY).",
@@ -83,6 +89,7 @@ def main(argv: list[str] | None = None) -> None:
         vc_checkpoint=args.vc_checkpoint,
         device=args.device,
         api_key=api_key,
+        text_frontend=args.text_frontend,
     )
 
     import uvicorn

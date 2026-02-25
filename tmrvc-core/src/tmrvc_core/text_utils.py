@@ -250,3 +250,300 @@ def infer_sentence_style(
         pitch_range=pitch_range,
         reasoning=f"auto-inferred from: {sentence[:30]}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Inline stage-direction analysis
+# ---------------------------------------------------------------------------
+
+_STAGE_BLOCK_PATTERN = re.compile(
+    r"\[[^\[\]\n]{1,160}\]"
+    r"|\([^\(\)\n]{1,160}\)"
+    r"|（[^（）\n]{1,160}）"
+    r"|【[^【】\n]{1,160}】"
+    r"|<[^<>\n]{1,160}>"
+    r"|＜[^＜＞\n]{1,160}＞"
+)
+
+_NON_SPOKEN_CHARS = set(
+    " \t\r\n"
+    + ".,!?;:。！？、…"
+    + "\"'`"
+    + "「」『』（）()[]【】<>＜＞"
+)
+
+
+@dataclass(frozen=True)
+class InlineStageAnalysis:
+    """Inline stage-direction parse result for acting-aware TTS."""
+
+    spoken_text: str
+    stage_directions: list[str]
+    style_overlay: object | None
+    speed_scale: float = 1.0
+    sentence_pause_ms_delta: int = 0
+    leading_silence_ms: int = 0
+    trailing_silence_ms: int = 0
+
+
+@dataclass(frozen=True)
+class _StageCueRule:
+    tag: str
+    keywords: tuple[str, ...]
+    emotion: str | None = None
+    delta_valence: float = 0.0
+    delta_arousal: float = 0.0
+    delta_energy: float = 0.0
+    delta_speech_rate: float = 0.0
+    delta_pitch_range: float = 0.0
+    speed_scale: float = 1.0
+    pause_ms: int = 0
+    priority: float = 0.0
+
+
+_STAGE_CUE_RULES: tuple[_StageCueRule, ...] = (
+    _StageCueRule(
+        tag="whisper",
+        keywords=("whisper", "囁", "ささや", "속삭", "低声", "耳元"),
+        emotion="whisper",
+        delta_valence=0.1,
+        delta_arousal=-0.25,
+        delta_energy=-0.45,
+        delta_speech_rate=-0.20,
+        delta_pitch_range=-0.10,
+        speed_scale=0.88,
+        pause_ms=120,
+        priority=0.9,
+    ),
+    _StageCueRule(
+        tag="long_breath",
+        keywords=(
+            "long breath", "deep breath", "long inhale", "long exhale",
+            "深呼吸", "長い息", "긴 숨", "长呼吸",
+        ),
+        delta_arousal=-0.20,
+        delta_energy=-0.30,
+        delta_speech_rate=-0.25,
+        speed_scale=0.82,
+        pause_ms=260,
+        priority=0.7,
+    ),
+    _StageCueRule(
+        tag="breath",
+        keywords=("breath", "inhale", "exhale", "息", "吐息", "呼吸", "숨", "气息"),
+        delta_arousal=-0.10,
+        delta_energy=-0.18,
+        delta_speech_rate=-0.12,
+        speed_scale=0.93,
+        pause_ms=120,
+        priority=0.5,
+    ),
+    _StageCueRule(
+        tag="breathy_acting",
+        keywords=("moan", "呻吟", "喘ぎ", "신음"),
+        emotion="tender",
+        delta_valence=0.05,
+        delta_arousal=0.12,
+        delta_energy=-0.10,
+        delta_speech_rate=-0.15,
+        speed_scale=0.90,
+        pause_ms=80,
+        priority=0.85,
+    ),
+    _StageCueRule(
+        tag="pause",
+        keywords=("pause", "silence", "間", "沈黙", "停顿", "정적"),
+        delta_speech_rate=-0.12,
+        speed_scale=0.92,
+        pause_ms=180,
+        priority=0.6,
+    ),
+    _StageCueRule(
+        tag="tremble",
+        keywords=("tremble", "shiver", "震", "ふる", "떨", "颤"),
+        emotion="fearful",
+        delta_valence=-0.10,
+        delta_arousal=0.18,
+        delta_energy=-0.05,
+        delta_pitch_range=0.22,
+        speed_scale=0.96,
+        pause_ms=40,
+        priority=0.8,
+    ),
+    _StageCueRule(
+        tag="cry",
+        keywords=("cry", "sob", "涙", "泣", "울", "哭"),
+        emotion="sad",
+        delta_valence=-0.40,
+        delta_arousal=-0.08,
+        delta_energy=-0.22,
+        delta_speech_rate=-0.12,
+        speed_scale=0.90,
+        pause_ms=100,
+        priority=0.85,
+    ),
+    _StageCueRule(
+        tag="shout",
+        keywords=("shout", "yell", "叫", "大声", "怒鳴", "소리치", "喊"),
+        emotion="excited",
+        delta_valence=-0.05,
+        delta_arousal=0.45,
+        delta_energy=0.42,
+        delta_speech_rate=0.12,
+        delta_pitch_range=0.18,
+        speed_scale=1.10,
+        pause_ms=0,
+        priority=0.9,
+    ),
+)
+
+
+def _clamp_stage(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _has_spoken_content(fragment: str) -> bool:
+    for ch in fragment:
+        if ch in _NON_SPOKEN_CHARS:
+            continue
+        return True
+    return False
+
+
+def _extract_stage_blocks(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Extract inline stage blocks and return (spoken_text, [(direction, location)])."""
+    blocks: list[tuple[str, str]] = []
+    spoken_parts: list[str] = []
+    cursor = 0
+
+    for match in _STAGE_BLOCK_PATTERN.finditer(text):
+        spoken_parts.append(text[cursor:match.start()])
+        cursor = match.end()
+
+        block = match.group(0)
+        direction = block[1:-1].strip()
+        if not direction:
+            continue
+
+        before_has = _has_spoken_content(text[:match.start()])
+        after_has = _has_spoken_content(text[match.end():])
+        if not before_has and after_has:
+            location = "prefix"
+        elif before_has and not after_has:
+            location = "suffix"
+        elif before_has and after_has:
+            location = "middle"
+        else:
+            location = "standalone"
+        blocks.append((direction, location))
+
+    spoken_parts.append(text[cursor:])
+    spoken_text = re.sub(r"\s+", " ", "".join(spoken_parts)).strip()
+    return spoken_text, blocks
+
+
+def _rule_matches(direction: str, rule: _StageCueRule) -> bool:
+    lower = direction.lower()
+    for keyword in rule.keywords:
+        if keyword.isascii():
+            if keyword.lower() in lower:
+                return True
+        elif keyword in direction:
+            return True
+    return False
+
+
+def analyze_inline_stage_directions(
+    text: str,
+    language: str = "ja",
+) -> InlineStageAnalysis:
+    """Parse inline stage directions and derive acting control signals.
+
+    Supported direction blocks:
+    - ``(...)`` / ``（...）``
+    - ``[...]`` / ``【...】``
+    - ``<...>`` / ``＜...＞``
+    """
+    from tmrvc_core.dialogue_types import StyleParams
+
+    _ = language  # reserved for future language-specific weighting
+    spoken_text, blocks = _extract_stage_blocks(text)
+    stage_texts = [direction for direction, _loc in blocks]
+
+    if not blocks:
+        clean = text.strip()
+        return InlineStageAnalysis(
+            spoken_text=clean if clean else text,
+            stage_directions=[],
+            style_overlay=None,
+        )
+
+    emotion = "neutral"
+    emotion_priority = 0.0
+    valence = 0.0
+    arousal = 0.0
+    energy = 0.0
+    speech_rate = 0.0
+    pitch_range = 0.0
+    speed_scale = 1.0
+    sentence_pause_ms_delta = 0
+    leading_silence_ms = 0
+    trailing_silence_ms = 0
+    tags: list[str] = []
+
+    for direction, location in blocks:
+        for rule in _STAGE_CUE_RULES:
+            if not _rule_matches(direction, rule):
+                continue
+
+            if rule.emotion is not None and rule.priority >= emotion_priority:
+                emotion = rule.emotion
+                emotion_priority = rule.priority
+
+            valence += rule.delta_valence
+            arousal += rule.delta_arousal
+            energy += rule.delta_energy
+            speech_rate += rule.delta_speech_rate
+            pitch_range += rule.delta_pitch_range
+            speed_scale *= rule.speed_scale
+
+            if rule.pause_ms > 0:
+                if location == "prefix":
+                    leading_silence_ms += rule.pause_ms
+                elif location == "suffix":
+                    trailing_silence_ms += rule.pause_ms
+                else:
+                    sentence_pause_ms_delta += rule.pause_ms
+
+            if rule.tag not in tags:
+                tags.append(rule.tag)
+
+    if not tags:
+        fallback_text = spoken_text if spoken_text else text.strip()
+        return InlineStageAnalysis(
+            spoken_text=fallback_text if fallback_text else text,
+            stage_directions=stage_texts,
+            style_overlay=None,
+        )
+
+    style_overlay = StyleParams(
+        emotion=emotion,
+        valence=_clamp_stage(valence, -1.0, 1.0),
+        arousal=_clamp_stage(arousal, -1.0, 1.0),
+        dominance=0.0,
+        speech_rate=_clamp_stage(speech_rate, -1.0, 1.0),
+        energy=_clamp_stage(energy, -1.0, 1.0),
+        pitch_range=_clamp_stage(pitch_range, -1.0, 1.0),
+        reasoning=f"inline_stage:{','.join(tags)}",
+    )
+
+    fallback_text = spoken_text if spoken_text else text.strip()
+    return InlineStageAnalysis(
+        spoken_text=fallback_text if fallback_text else text,
+        stage_directions=stage_texts,
+        style_overlay=style_overlay,
+        speed_scale=_clamp_stage(speed_scale, 0.75, 1.25),
+        sentence_pause_ms_delta=int(_clamp_stage(float(sentence_pause_ms_delta), -120.0, 600.0)),
+        leading_silence_ms=int(_clamp_stage(float(leading_silence_ms), 0.0, 1600.0)),
+        trailing_silence_ms=int(_clamp_stage(float(trailing_silence_ms), 0.0, 1600.0)),
+    )

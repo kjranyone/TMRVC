@@ -1,0 +1,80 @@
+# B2 — Baseline + BPEH (Breath-Pause Event Head)
+#
+# Ablation variant: adds BPEH on top of B0 baseline.
+# BPEH predicts breath onsets, durations, intensity, and pause durations.
+#
+# Usage:
+#   uv run python scripts/eval_research_baseline.py --config configs/research/b2.yaml --seed 42
+
+variant: b2
+description: "B0 + BPEH: explicit breath/pause event prediction."
+
+# --- Model ---
+model:
+  type: teacher_unet
+  d_content: 768
+  d_speaker: 192
+  n_acoustic_params: 32
+  ssl_enabled: false
+  bpeh_enabled: true
+
+# --- BPEH ---
+bpeh:
+  d_hidden: 128
+  n_blocks: 3
+  breath_threshold_db: -40.0
+  min_pause_ms: 50.0
+  min_breath_ms: 80.0
+
+# --- Training ---
+training:
+  batch_size: 64
+  max_frames: 400
+  lr: 1.0e-4
+  warmup_steps: 5000
+  max_steps: 200000
+  grad_clip: 1.0
+
+# --- Loss weights ---
+loss_weights:
+  lambda_duration: 1.0
+  lambda_f0: 0.5
+  lambda_content: 1.0
+  lambda_voiced: 0.2
+  lambda_onset: 0.5
+  lambda_dur: 0.3
+  lambda_amp: 0.2
+
+# --- Sampling ---
+sampling:
+  steps: 32
+  sway_coefficient: 1.0
+  cfg_scale: 1.0
+
+# --- Test split (same as B0) ---
+test_split:
+  datasets: [vctk, jvs]
+  speakers:
+    - vctk_p225
+    - vctk_p226
+    - vctk_p227
+    - vctk_p228
+    - jvs_jvs001
+    - jvs_jvs002
+    - jvs_jvs003
+    - jvs_jvs004
+  max_utterances_per_speaker: 10
+
+# --- Metrics ---
+metrics:
+  - mel_mse
+  - secs
+  - f0_correlation
+  - utmos_proxy
+  - breath_event_f1
+
+# --- Output ---
+output:
+  format: json
+  save_mel: false
+  save_audio: true

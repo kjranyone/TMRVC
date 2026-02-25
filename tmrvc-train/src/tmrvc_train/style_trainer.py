@@ -25,29 +25,26 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
+from tmrvc_train.base_trainer import BaseTrainer, BaseTrainerConfig
 from tmrvc_train.models.style_encoder import StyleEncoder
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class StyleTrainerConfig:
+class StyleTrainerConfig(BaseTrainerConfig):
     lr: float = 5e-4
     warmup_steps: int = 2000
     max_steps: int = 50_000
     save_every: int = 5_000
-    log_every: int = 100
     checkpoint_dir: str = "checkpoints/style"
-    grad_clip: float = 1.0
 
     lambda_emotion: float = 1.0
     lambda_vad: float = 0.5
     lambda_prosody: float = 0.3
 
-    use_wandb: bool = False
 
-
-class StyleTrainer:
+class StyleTrainer(BaseTrainer):
     """Training loop for StyleEncoder (Phase 3a).
 
     Trains the audio-based style encoder with auxiliary classification
@@ -70,25 +67,24 @@ class StyleTrainer:
         lr_scheduler: LambdaLR | None = None,
         device: torch.device | str = "cpu",
     ) -> None:
+        super().__init__(optimizer, dataloader, config, lr_scheduler)
         self.model = model
-        self.optimizer = optimizer
-        self.dataloader = dataloader
-        self.config = config
-        self.lr_scheduler = lr_scheduler
         self.device = torch.device(device)
-        self.global_step = 0
 
-        self.checkpoint_dir = Path(config.checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    @property
+    def _wandb_project(self) -> str:
+        return "style"
 
-        self._wandb = None
-        if config.use_wandb:
-            try:
-                import wandb
-                wandb.init(project="tmrvc-style", config=vars(config))
-                self._wandb = wandb
-            except ImportError:
-                logger.warning("wandb not available, skipping")
+    @property
+    def _wandb_prefix(self) -> str:
+        return "style"
+
+    @property
+    def _increment_step_in_train_step(self) -> bool:
+        return True
+
+    def _pre_train_setup(self) -> None:
+        self.model.train()
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         """Execute a single training step.
@@ -124,13 +120,7 @@ class StyleTrainer:
             total = total + self.config.lambda_prosody * prosody_loss
             losses["prosody"] = prosody_loss.item()
 
-        self.optimizer.zero_grad()
-        total.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        self.optimizer.step()
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+        self._backward_step(total, self.model.parameters())
 
         self.global_step += 1
         losses["total"] = total.item()
@@ -143,44 +133,24 @@ class StyleTrainer:
 
         return losses
 
-    def train_iter(self) -> Iterator[tuple[int, dict[str, float]]]:
-        """Generator-based training loop.
+    def _log_step(self, losses: dict[str, float]) -> None:
+        lr = self.optimizer.param_groups[0]["lr"]
+        parts = [f"Step {self.global_step}"]
+        parts.append(f"total={losses['total']:.4f}")
+        parts.append(f"emotion={losses['emotion']:.4f}")
+        if "vad" in losses:
+            parts.append(f"vad={losses['vad']:.4f}")
+        if "prosody" in losses:
+            parts.append(f"prosody={losses['prosody']:.4f}")
+        parts.append(f"acc={losses['accuracy']:.2%}")
+        parts.append(f"lr={lr:.2e}")
+        logger.info(" | ".join(parts))
 
-        Yields:
-            Tuples of (step_number, losses_dict).
-        """
-        self.model.train()
-
-        while self.global_step < self.config.max_steps:
-            for batch in self.dataloader:
-                if self.global_step >= self.config.max_steps:
-                    break
-
-                losses = self.train_step(batch)
-
-                if self.global_step % self.config.log_every == 0:
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    parts = [f"Step {self.global_step}"]
-                    parts.append(f"total={losses['total']:.4f}")
-                    parts.append(f"emotion={losses['emotion']:.4f}")
-                    if "vad" in losses:
-                        parts.append(f"vad={losses['vad']:.4f}")
-                    if "prosody" in losses:
-                        parts.append(f"prosody={losses['prosody']:.4f}")
-                    parts.append(f"acc={losses['accuracy']:.2%}")
-                    parts.append(f"lr={lr:.2e}")
-                    logger.info(" | ".join(parts))
-
-                    if self._wandb is not None:
-                        self._wandb.log(
-                            {f"style/{k}": v for k, v in losses.items()},
-                            step=self.global_step,
-                        )
-
-                if self.global_step % self.config.save_every == 0:
-                    self.save_checkpoint()
-
-                yield self.global_step, losses
+        if self._wandb is not None:
+            self._wandb.log(
+                {f"style/{k}": v for k, v in losses.items()},
+                step=self.global_step,
+            )
 
     def save_checkpoint(self, path: Path | None = None) -> Path:
         if path is None:

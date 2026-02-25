@@ -260,7 +260,7 @@ def train_emotion_classifier(
         raise ValueError(f"No emotion data found for datasets={datasets}")
 
     dataloader = create_emotion_dataloader(
-        cache, datasets=datasets, split="train",
+        cache_dir, datasets=datasets, split="train",
         batch_size=batch_size, max_frames=max_frames,
     )
 

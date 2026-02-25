@@ -5,6 +5,8 @@ Frame-by-frame causal streaming アーキテクチャ（10ms hop 単位）で処
 
 ## Features
 
+- **Design Motto**: キャラ演技は本体、few-shotは仕上げ。
+
 - **低レイテンシ**: 10ms hop × causal 処理で ~25ms (nominal)
 - **CPU-only**: ONNX Runtime CPU EP のみ。GPU 不要
 - **IR-aware**: 入力音声の残響・マイク特性を推定し、話者変換と環境特性を分離
@@ -63,6 +65,7 @@ TMRVC/
 │
 ├── tmrvc-train/          # [Python] モデル定義・学習・蒸留
 ├── tmrvc-export/         # [Python] ONNX エクスポート・量子化
+├── tmrvc-serve/          # [Python] FastAPI サーバー (WebSocket TTS)
 │
 ├── tests/                # Python テスト
 └── scripts/              # generate_constants.py 等
@@ -103,6 +106,40 @@ cargo build -p tmrvc-vst --release
 
 詳細は [DEVELOPMENT.md](DEVELOPMENT.md) を参照。
 
+## CLI Commands
+
+### Python (tmrvc-xxx)
+
+| Command | Package | Description |
+|---------|---------|-------------|
+| `tmrvc-train-teacher` | tmrvc-train | Teacher モデル学習 (diffusion U-Net) |
+| `tmrvc-train-tts` | tmrvc-train | TTS モデル学習 |
+| `tmrvc-train-style` | tmrvc-train | スタイル埋め込みモデル学習 |
+| `tmrvc-distill` | tmrvc-train | Teacher → Student 蒸留 |
+| `tmrvc-finetune` | tmrvc-train | Few-shot fine-tuning |
+| `tmrvc-export` | tmrvc-export | ONNX エクスポート・量子化 |
+| `tmrvc-create-character` | tmrvc-export | `.tmrvc_speaker` / `.tmrvc_style` ファイル作成 |
+| `tmrvc-serve` | tmrvc-serve | FastAPI サーバー (WebSocket TTS) |
+| `tmrvc-gui` | tmrvc-gui | PySide6 開発用 GUI |
+
+```bash
+# 使用例
+uv run tmrvc-train-teacher --cache-dir data/cache --phase 0 --device xpu
+uv run tmrvc-distill --teacher-ckpt checkpoints/teacher.pt --phase A --device xpu
+uv run tmrvc-export --checkpoint checkpoints/distill/best.pt --output-dir models/fp32
+uv run tmrvc-create-character --audio voice.wav --output character.tmrvc_speaker
+uv run tmrvc-serve --port 8000
+uv run tmrvc-gui
+```
+
+### Rust
+
+| Package | Type | Description |
+|---------|------|-------------|
+| `tmrvc-engine-rs` | library | ストリーミング推論エンジン (ONNX + NAM) |
+| `tmrvc-rt` | binary | スタンドアロン GUI (egui + cpal) |
+| `tmrvc-vst` | VST3 | DAW 用プラグイン (nih-plug) |
+
 ## Design Documents
 
 | File | Content |
@@ -112,8 +149,8 @@ cargo build -p tmrvc-vst --release
 | [`onnx-contract.md`](docs/design/onnx-contract.md) | 5 モデルの I/O テンソル仕様、State tensor、`.tmrvc_speaker` フォーマット |
 | [`model-architecture.md`](docs/design/model-architecture.md) | 各モデルの詳細設計 |
 | [`cpp-engine-design.md`](docs/design/cpp-engine-design.md) | C++ エンジン・TensorPool・VST3 統合 |
-| [`training-plan.md`](docs/design/training-plan.md) | Teacher 学習計画、コーパス構成、蒸留接続 |
 | [`gui-design.md`](docs/design/gui-design.md) | GUI 設計 |
+| [`training/README.md`](docs/training/README.md) | 学習パイプライン統合ガイド (VC/TTS/Style) |
 
 ## License
 

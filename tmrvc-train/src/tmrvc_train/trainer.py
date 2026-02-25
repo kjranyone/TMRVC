@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from tmrvc_core.constants import IR_UPDATE_INTERVAL, N_IR_PARAMS
 from tmrvc_core.types import TrainingBatch
+from tmrvc_train.base_trainer import BaseTrainer, BaseTrainerConfig
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.losses import FlowMatchingLoss, MultiResolutionSTFTLoss, SpeakerConsistencyLoss
 from tmrvc_train.models.teacher_unet import TeacherUNet
@@ -22,28 +23,22 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TrainerConfig:
+class TrainerConfig(BaseTrainerConfig):
     """Configuration for teacher training."""
 
     phase: str = "0"  # "0", "1a", "1b", "2", "reflow"
     lr: float = 2e-4
     warmup_steps: int = 0
-    max_steps: int = 100_000
-    save_every: int = 10_000
-    log_every: int = 100
-    checkpoint_dir: str = "checkpoints"
     lambda_stft: float = 0.5
     lambda_spk: float = 0.3
     lambda_ir: float = 0.1
     lambda_voice: float = 0.2
-    grad_clip: float = 1.0
-    use_wandb: bool = False
     use_ot_cfm: bool = False
     p_uncond: float = 0.0  # Probability of dropping conditioning (CFG-free training)
     voice_source_checkpoint: str | None = None
 
 
-class TeacherTrainer:
+class TeacherTrainer(BaseTrainer):
     """Training loop for Teacher U-Net across multiple phases.
 
     Phase 0:  50K-100K steps, lr=2e-4, L_flow only.
@@ -63,13 +58,9 @@ class TeacherTrainer:
         voice_source_loss: nn.Module | None = None,
         lr_scheduler: LambdaLR | None = None,
     ) -> None:
+        super().__init__(optimizer, dataloader, config, lr_scheduler)
         self.teacher = teacher
         self.scheduler = scheduler
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.dataloader = dataloader
-        self.config = config
-        self.global_step = 0
 
         self.flow_loss = FlowMatchingLoss()
         self.stft_loss = MultiResolutionSTFTLoss()
@@ -79,32 +70,36 @@ class TeacherTrainer:
         self.ir_estimator = ir_estimator
         self.voice_source_loss = voice_source_loss
 
-        self.checkpoint_dir = Path(config.checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    @property
+    def _wandb_project(self) -> str:
+        return "teacher"
 
-        # WandB integration (optional)
-        self._wandb = None
-        if config.use_wandb:
-            try:
-                import wandb
+    def _init_wandb(self) -> None:
+        try:
+            import wandb
 
-                wandb.init(
-                    project="tmrvc-teacher",
-                    config={
-                        "phase": config.phase,
-                        "lr": config.lr,
-                        "max_steps": config.max_steps,
-                        "lambda_stft": config.lambda_stft,
-                        "lambda_spk": config.lambda_spk,
-                        "lambda_ir": config.lambda_ir,
-                        "grad_clip": config.grad_clip,
-                    },
-                    resume="allow",
-                )
-                self._wandb = wandb
-                logger.info("WandB logging enabled (project=tmrvc-teacher)")
-            except ImportError:
-                logger.warning("wandb not installed, skipping WandB logging")
+            wandb.init(
+                project="tmrvc-teacher",
+                config={
+                    "phase": self.config.phase,
+                    "lr": self.config.lr,
+                    "max_steps": self.config.max_steps,
+                    "lambda_stft": self.config.lambda_stft,
+                    "lambda_spk": self.config.lambda_spk,
+                    "lambda_ir": self.config.lambda_ir,
+                    "grad_clip": self.config.grad_clip,
+                },
+                resume="allow",
+            )
+            self._wandb = wandb
+            logger.info("WandB logging enabled (project=tmrvc-teacher)")
+        except ImportError:
+            logger.warning("wandb not installed, skipping WandB logging")
+
+    def _format_log(self, losses: dict[str, float]) -> str:
+        loss_str = ", ".join(f"{k}={v:.4f}" for k, v in losses.items())
+        cur_lr = self.optimizer.param_groups[0]["lr"]
+        return f"{loss_str} (lr={cur_lr:.2e})"
 
     def train_step(self, batch: TrainingBatch) -> dict[str, float]:
         """Execute a single training step.
@@ -209,51 +204,9 @@ class TeacherTrainer:
         losses["total"] = loss_total.item()
 
         # Backward
-        self.optimizer.zero_grad()
-        loss_total.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.teacher.parameters(), self.config.grad_clip)
-        self.optimizer.step()
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+        self._backward_step(loss_total, self.teacher.parameters())
 
         return losses
-
-    def train_iter(self):
-        """Iterate over training steps, yielding ``(step, losses)`` each step.
-
-        This generator is designed for GUI integration, allowing the
-        caller to inspect metrics and check cancellation between steps.
-
-        Yields:
-            Tuple of ``(global_step, losses_dict)``.
-        """
-        while self.global_step < self.config.max_steps:
-            for batch in self.dataloader:
-                if self.global_step >= self.config.max_steps:
-                    return
-
-                losses = self.train_step(batch)
-                self.global_step += 1
-
-                if self.global_step % self.config.log_every == 0:
-                    loss_str = ", ".join(f"{k}={v:.4f}" for k, v in losses.items())
-                    cur_lr = self.optimizer.param_groups[0]["lr"]
-                    logger.info("Step %d: %s (lr=%.2e)", self.global_step, loss_str, cur_lr)
-
-                    if self._wandb is not None:
-                        self._wandb.log(losses, step=self.global_step)
-
-                if self.global_step % self.config.save_every == 0:
-                    self.save_checkpoint()
-
-                yield self.global_step, losses
-
-    def train_epoch(self) -> None:
-        """Train for one full epoch over the dataloader."""
-        for _step, _losses in self.train_iter():
-            if self.global_step >= self.config.max_steps:
-                break
 
     def save_checkpoint(self, path: str | None = None) -> Path:
         """Save model checkpoint."""
@@ -277,48 +230,63 @@ class TeacherTrainer:
     def load_checkpoint(self, path: str | Path) -> None:
         """Load model checkpoint."""
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        if "model_state_dict" not in ckpt:
+            raise RuntimeError(
+                f"Unsupported checkpoint format: {path} "
+                "(missing 'model_state_dict'). Legacy checkpoints are not supported."
+            )
+        if "optimizer_state_dict" not in ckpt:
+            raise RuntimeError(
+                f"Unsupported checkpoint format: {path} "
+                "(missing 'optimizer_state_dict'). Legacy checkpoints are not supported."
+            )
+        if "step" not in ckpt or not isinstance(ckpt["step"], int):
+            raise RuntimeError(
+                f"Unsupported checkpoint metadata: {path} "
+                "(missing/invalid 'step')."
+            )
+
         state_dict = ckpt["model_state_dict"]
-        # Migrate old key names: film_ir → film_acoustic
-        keys_to_rename = [
-            (k, k.replace("film_ir.", "film_acoustic."))
-            for k in list(state_dict.keys())
-            if "film_ir." in k
-        ]
-        for old_key, new_key in keys_to_rename:
-            state_dict[new_key] = state_dict.pop(old_key)
-            logger.info("Migrated checkpoint key: %s → %s", old_key, new_key)
-        # Pad film_acoustic weights if n_ir_params (24) → n_acoustic_params (32)
         model_sd = self.teacher.state_dict()
-        shapes_changed = False
-        for key in list(state_dict.keys()):
-            if key in model_sd and state_dict[key].shape != model_sd[key].shape:
-                old_shape = state_dict[key].shape
-                new_shape = model_sd[key].shape
-                new_tensor = torch.zeros(new_shape, dtype=state_dict[key].dtype)
-                slices = tuple(slice(0, min(o, n)) for o, n in zip(old_shape, new_shape))
-                new_tensor[slices] = state_dict[key][slices]
-                state_dict[key] = new_tensor
-                shapes_changed = True
-                logger.info("Padded %s: %s → %s", key, old_shape, new_shape)
-        self.teacher.load_state_dict(state_dict)
-        if shapes_changed:
-            logger.warning("Shape changes detected — optimizer state reset")
-        else:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+        missing_keys = sorted(set(model_sd) - set(state_dict))
+        unexpected_keys = sorted(set(state_dict) - set(model_sd))
+        shape_mismatches = [
+            (k, tuple(state_dict[k].shape), tuple(model_sd[k].shape))
+            for k in model_sd.keys() & state_dict.keys()
+            if state_dict[k].shape != model_sd[k].shape
+        ]
+        if missing_keys or unexpected_keys or shape_mismatches:
+            details: list[str] = []
+            if missing_keys:
+                details.append(f"missing={missing_keys[:5]}")
+            if unexpected_keys:
+                details.append(f"unexpected={unexpected_keys[:5]}")
+            if shape_mismatches:
+                k, got, expected = shape_mismatches[0]
+                details.append(f"shape_mismatch={k}: {got} != {expected}")
+            raise RuntimeError(
+                "Checkpoint is incompatible with current TeacherUNet and was rejected. "
+                + "; ".join(details)
+            )
+
+        self.teacher.load_state_dict(state_dict, strict=True)
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.global_step = ckpt["step"]
-        # Restore LR scheduler state if available
-        if self.lr_scheduler is not None and "lr_scheduler_state_dict" in ckpt:
+
+        # Restore LR scheduler state.
+        if self.lr_scheduler is not None:
+            if "lr_scheduler_state_dict" not in ckpt:
+                raise RuntimeError(
+                    f"Checkpoint {path} is missing 'lr_scheduler_state_dict'. "
+                    "Legacy checkpoints are not supported."
+                )
             self.lr_scheduler.load_state_dict(ckpt["lr_scheduler_state_dict"])
             logger.info("Restored LR scheduler state")
-        elif self.lr_scheduler is not None:
-            # Checkpoint predates scheduler — fast-forward to current step
-            for _ in range(self.global_step):
-                self.lr_scheduler.step()
-            logger.info("LR scheduler fast-forwarded to step %d", self.global_step)
         logger.info("Loaded checkpoint from %s (step %d)", path, self.global_step)
 
 
-class ReflowTrainer:
+class ReflowTrainer(BaseTrainer):
     """Re-train Teacher on straightened ODE trajectories (Reflow / VoiceFlow).
 
     Uses pre-generated (noise, clean) pairs from :func:`generate_reflow_pairs`
@@ -334,17 +302,11 @@ class ReflowTrainer:
         dataloader: DataLoader,
         config: TrainerConfig,
     ) -> None:
+        super().__init__(optimizer, dataloader, config)
         self.teacher = teacher
         self.scheduler = scheduler
-        self.optimizer = optimizer
-        self.dataloader = dataloader
-        self.config = config
-        self.global_step = 0
 
         self.flow_loss = FlowMatchingLoss()
-
-        self.checkpoint_dir = Path(config.checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def train_step(
         self,
@@ -406,32 +368,12 @@ class ReflowTrainer:
         losses = {"flow": loss.item(), "total": loss.item()}
 
         # Backward
-        self.optimizer.zero_grad()
-        loss.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.teacher.parameters(), self.config.grad_clip)
-        self.optimizer.step()
+        self._backward_step(loss, self.teacher.parameters())
 
         return losses
 
-    def train_iter(self):
-        """Iterate over training steps, yielding ``(step, losses)`` each step."""
-        while self.global_step < self.config.max_steps:
-            for batch in self.dataloader:
-                if self.global_step >= self.config.max_steps:
-                    return
-
-                losses = self.train_step(batch)
-                self.global_step += 1
-
-                if self.global_step % self.config.log_every == 0:
-                    loss_str = ", ".join(f"{k}={v:.4f}" for k, v in losses.items())
-                    logger.info("Reflow step %d: %s", self.global_step, loss_str)
-
-                if self.global_step % self.config.save_every == 0:
-                    self.save_checkpoint()
-
-                yield self.global_step, losses
+    def _log_step(self, losses: dict[str, float]) -> None:
+        logger.info("Reflow step %d: %s", self.global_step, self._format_log(losses))
 
     def save_checkpoint(self, path: str | None = None) -> Path:
         """Save model checkpoint."""
@@ -451,3 +393,11 @@ class ReflowTrainer:
         )
         logger.info("Saved reflow checkpoint to %s", ckpt_path)
         return ckpt_path
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Load model checkpoint."""
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        self.teacher.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.global_step = ckpt["step"]
+        logger.info("Loaded reflow checkpoint from %s (step %d)", path, self.global_step)

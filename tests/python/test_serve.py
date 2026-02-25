@@ -1174,3 +1174,379 @@ class TestDialogueStyleHelpers:
         assert style is not None
         assert style.valence == pytest.approx(0.35, abs=1e-5)
         assert "hint_soft" in style.reasoning
+
+class TestTTSEngineTextFrontend:
+    def test_tokenizer_frontend_uses_token_ids_and_language_id(self, monkeypatch):
+        import torch
+        import tmrvc_data.text_tokenizer as tok_mod
+        from tmrvc_core.constants import D_CONTENT, D_TEXT_ENCODER
+        from tmrvc_serve.tts_engine import TTSEngine
+
+        class DummyTextEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.last_input_ids = None
+                self.last_language_ids = None
+
+            def forward(self, input_ids, language_ids):
+                self.last_input_ids = input_ids.detach().clone()
+                self.last_language_ids = language_ids.detach().clone()
+                B, L = input_ids.shape
+                return torch.zeros(B, D_TEXT_ENCODER, L)
+
+        class DummyDurationPredictor(torch.nn.Module):
+            def forward(self, text_features, style):
+                B, _, L = text_features.shape
+                return torch.ones(B, L)
+
+        class DummyF0Predictor(torch.nn.Module):
+            def forward(self, expanded, style):
+                B, _, T = expanded.shape
+                return torch.zeros(B, 1, T), torch.zeros(B, 1, T)
+
+        class DummyContentSynthesizer(torch.nn.Module):
+            def forward(self, expanded):
+                B, _, T = expanded.shape
+                return torch.zeros(B, D_CONTENT, T)
+
+        class _FakeTokenResult:
+            def __init__(self):
+                self.token_ids = torch.tensor([2, 7, 8, 3], dtype=torch.long)
+                self.language_id = 2
+
+        monkeypatch.setattr(tok_mod, "text_to_tokens", lambda text, language: _FakeTokenResult())
+
+        engine = TTSEngine(text_frontend="tokenizer")
+        engine._models_loaded = True
+        engine._text_encoder = DummyTextEncoder()
+        engine._duration_predictor = DummyDurationPredictor()
+        engine._f0_predictor = DummyF0Predictor()
+        engine._content_synthesizer = DummyContentSynthesizer()
+        engine._converter = None
+        engine._vocoder = None
+
+        _audio, _duration = engine.synthesize(
+            text="ignored",
+            language="zh",
+            spk_embed=torch.zeros(192),
+        )
+
+        assert engine._text_encoder.last_input_ids.shape == (1, 4)
+        assert int(engine._text_encoder.last_input_ids[0, 0].item()) == 2
+        assert int(engine._text_encoder.last_language_ids.item()) == 2
+
+
+class TestWSConfigureSceneReset:
+    def test_scene_reset_default_false(self):
+        msg = WSConfigureRequest()
+        assert msg.scene_reset is False
+
+    def test_scene_reset_true(self):
+        msg = WSConfigureRequest(scene_reset=True)
+        assert msg.scene_reset is True
+
+    def test_scene_reset_with_other_fields(self):
+        msg = WSConfigureRequest(
+            character_id="sakura",
+            scene_reset=True,
+            speed=1.2,
+        )
+        assert msg.scene_reset is True
+        assert msg.character_id == "sakura"
+
+
+class TestSceneStateEngine:
+    def test_scene_state_not_available_by_default(self):
+        from tmrvc_serve.tts_engine import TTSEngine
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine._scene_state_update = None
+        assert engine.scene_state_available is False
+
+    def test_scene_state_available_when_loaded(self):
+        import torch
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_train.models.scene_state import SceneStateUpdate
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine._scene_state_update = SceneStateUpdate()
+        assert engine.scene_state_available is True
+
+    def test_initial_scene_state_shape(self):
+        import torch
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_core.constants import D_SCENE_STATE
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine.device = torch.device("cpu")
+        z = engine.initial_scene_state()
+        assert z.shape == (1, D_SCENE_STATE)
+        assert z.abs().sum().item() == 0.0
+
+    def test_update_scene_state_without_model_returns_prev(self):
+        import torch
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_core.constants import D_SCENE_STATE
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine._scene_state_update = None
+        engine.device = torch.device("cpu")
+
+        z_prev = torch.randn(1, D_SCENE_STATE)
+        z_t = engine.update_scene_state("test", "ja", torch.zeros(192), z_prev)
+        assert torch.allclose(z_t, z_prev)
+
+    def test_update_scene_state_evolves_state(self, monkeypatch):
+        import torch
+        from collections import OrderedDict
+        from tmrvc_core.constants import D_SCENE_STATE, D_TEXT_ENCODER
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_train.models.scene_state import SceneStateUpdate
+
+        class DummyTextEncoder(torch.nn.Module):
+            def forward(self, phoneme_ids, language_ids):
+                B, L = phoneme_ids.shape
+                return torch.randn(B, D_TEXT_ENCODER, L)
+
+        class _FakeG2PResult:
+            phoneme_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+
+        import tmrvc_data.g2p as g2p_mod
+        original = g2p_mod.text_to_phonemes
+        monkeypatch.setattr(g2p_mod, "text_to_phonemes", lambda *a, **kw: _FakeG2PResult())
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine.device = torch.device("cpu")
+        engine._g2p_cache = OrderedDict()
+        engine._text_frontend = "phoneme"
+        engine._text_vocab_size = 200
+        engine._text_encoder = DummyTextEncoder()
+        engine._scene_state_update = SceneStateUpdate().eval()
+
+        z_prev = torch.zeros(1, D_SCENE_STATE)
+        z_t = engine.update_scene_state("テスト", "ja", torch.zeros(192), z_prev)
+        assert z_t.shape == (1, D_SCENE_STATE)
+        # State should have changed from zeros
+        assert z_t.abs().sum().item() > 0.0
+
+    def test_multi_turn_state_evolves(self, monkeypatch):
+        """Multiple update calls should produce different states."""
+        import torch
+        from collections import OrderedDict
+        from tmrvc_core.constants import D_SCENE_STATE, D_TEXT_ENCODER
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_train.models.scene_state import SceneStateUpdate
+
+        class DummyTextEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._call_count = 0
+
+            def forward(self, phoneme_ids, language_ids):
+                self._call_count += 1
+                B, L = phoneme_ids.shape
+                # Return different features each call
+                return torch.randn(B, D_TEXT_ENCODER, L) * self._call_count
+
+        class _FakeG2PResult:
+            phoneme_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+
+        import tmrvc_data.g2p as g2p_mod
+        monkeypatch.setattr(g2p_mod, "text_to_phonemes", lambda *a, **kw: _FakeG2PResult())
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine.device = torch.device("cpu")
+        engine._g2p_cache = OrderedDict()
+        engine._text_frontend = "phoneme"
+        engine._text_vocab_size = 200
+        engine._text_encoder = DummyTextEncoder()
+        engine._scene_state_update = SceneStateUpdate().eval()
+
+        z_0 = torch.zeros(1, D_SCENE_STATE)
+        z_1 = engine.update_scene_state("Turn 1", "ja", torch.zeros(192), z_0)
+        z_2 = engine.update_scene_state("Turn 2", "ja", torch.zeros(192), z_1)
+        z_3 = engine.update_scene_state("Turn 3", "ja", torch.zeros(192), z_2)
+
+        # Each state should differ
+        assert not torch.allclose(z_1, z_0)
+        assert not torch.allclose(z_2, z_1)
+        assert not torch.allclose(z_3, z_2)
+
+    def test_scene_state_reset(self, monkeypatch):
+        """Resetting to initial state gives zeros regardless of history."""
+        import torch
+        from collections import OrderedDict
+        from tmrvc_core.constants import D_SCENE_STATE, D_TEXT_ENCODER
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_train.models.scene_state import SceneStateUpdate
+
+        class DummyTextEncoder(torch.nn.Module):
+            def forward(self, phoneme_ids, language_ids):
+                B, L = phoneme_ids.shape
+                return torch.randn(B, D_TEXT_ENCODER, L)
+
+        class _FakeG2PResult:
+            phoneme_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+
+        import tmrvc_data.g2p as g2p_mod
+        monkeypatch.setattr(g2p_mod, "text_to_phonemes", lambda *a, **kw: _FakeG2PResult())
+
+        engine = TTSEngine.__new__(TTSEngine)
+        engine.device = torch.device("cpu")
+        engine._g2p_cache = OrderedDict()
+        engine._text_frontend = "phoneme"
+        engine._text_vocab_size = 200
+        engine._text_encoder = DummyTextEncoder()
+        engine._scene_state_update = SceneStateUpdate().eval()
+
+        z_0 = engine.initial_scene_state()
+        z_1 = engine.update_scene_state("話した", "ja", torch.zeros(192), z_0)
+        assert z_1.abs().sum().item() > 0.0
+
+        # Reset
+        z_reset = engine.initial_scene_state()
+        assert z_reset.abs().sum().item() == 0.0
+        assert z_reset.shape == (1, D_SCENE_STATE)
+
+    def test_load_ssl_from_checkpoint(self, tmp_path):
+        """SceneStateUpdate is loaded from TTS checkpoint when enable_ssl=True."""
+        import torch
+        from tmrvc_core.constants import TOKENIZER_VOCAB_SIZE
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_train.models.text_encoder import TextEncoder
+        from tmrvc_train.models.duration_predictor import DurationPredictor
+        from tmrvc_train.models.f0_predictor import F0Predictor
+        from tmrvc_train.models.content_synthesizer import ContentSynthesizer
+        from tmrvc_train.models.scene_state import SceneStateUpdate
+
+        ckpt_path = tmp_path / "tts_with_ssl.pt"
+        ckpt = {
+            "text_frontend": "tokenizer",
+            "text_vocab_size": TOKENIZER_VOCAB_SIZE,
+            "text_encoder": TextEncoder(vocab_size=TOKENIZER_VOCAB_SIZE).state_dict(),
+            "duration_predictor": DurationPredictor().state_dict(),
+            "f0_predictor": F0Predictor().state_dict(),
+            "content_synthesizer": ContentSynthesizer().state_dict(),
+            "enable_ssl": True,
+            "ssl_state_update": SceneStateUpdate().state_dict(),
+        }
+        torch.save(ckpt, ckpt_path)
+
+        engine = TTSEngine(tts_checkpoint=ckpt_path)
+        engine.load_models()
+
+        assert engine.scene_state_available is True
+        assert engine._scene_state_update is not None
+
+    def test_no_ssl_in_checkpoint(self, tmp_path):
+        """No SceneStateUpdate when checkpoint lacks SSL."""
+        import torch
+        from tmrvc_core.constants import TOKENIZER_VOCAB_SIZE
+        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_train.models.text_encoder import TextEncoder
+        from tmrvc_train.models.duration_predictor import DurationPredictor
+        from tmrvc_train.models.f0_predictor import F0Predictor
+        from tmrvc_train.models.content_synthesizer import ContentSynthesizer
+
+        ckpt_path = tmp_path / "tts_no_ssl.pt"
+        ckpt = {
+            "text_frontend": "tokenizer",
+            "text_vocab_size": TOKENIZER_VOCAB_SIZE,
+            "text_encoder": TextEncoder(vocab_size=TOKENIZER_VOCAB_SIZE).state_dict(),
+            "duration_predictor": DurationPredictor().state_dict(),
+            "f0_predictor": F0Predictor().state_dict(),
+            "content_synthesizer": ContentSynthesizer().state_dict(),
+        }
+        torch.save(ckpt, ckpt_path)
+
+        engine = TTSEngine(tts_checkpoint=ckpt_path)
+        engine.load_models()
+
+        assert engine.scene_state_available is False
+
+
+class TestInlineStageOverlay:
+    """Tests for _apply_inline_stage_overlay (additive blend of delta-based overlay)."""
+
+    @pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
+    def test_additive_blend_preserves_unaffected_params(self):
+        """Parameters NOT modified by stage rules must stay unchanged."""
+        from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_serve.app import _apply_inline_stage_overlay
+
+        base = StyleParams(
+            emotion="happy", valence=0.5, arousal=0.3,
+            dominance=0.4, speech_rate=0.2, energy=0.1, pitch_range=0.3,
+        )
+        # Overlay with all-zero deltas (no rule matched any parameter)
+        overlay = StyleParams(emotion="neutral", valence=0.0, arousal=0.0,
+                              dominance=0.0, speech_rate=0.0, energy=0.0,
+                              pitch_range=0.0)
+        result = _apply_inline_stage_overlay(base, overlay)
+        assert result is not None
+        # All numerical params should stay exactly the same
+        assert result.valence == pytest.approx(base.valence, abs=1e-6)
+        assert result.arousal == pytest.approx(base.arousal, abs=1e-6)
+        assert result.dominance == pytest.approx(base.dominance, abs=1e-6)
+        assert result.speech_rate == pytest.approx(base.speech_rate, abs=1e-6)
+        assert result.energy == pytest.approx(base.energy, abs=1e-6)
+        assert result.pitch_range == pytest.approx(base.pitch_range, abs=1e-6)
+
+    @pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
+    def test_additive_blend_applies_delta(self):
+        """A delta of -0.45 energy (whisper) is added, not interpolated."""
+        from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_serve.app import _apply_inline_stage_overlay, _INLINE_STAGE_BLEND_WEIGHT
+
+        base = StyleParams(emotion="neutral", energy=0.3)
+        overlay = StyleParams(emotion="whisper", energy=-0.45)
+        result = _apply_inline_stage_overlay(base, overlay)
+        assert result is not None
+        # additive: 0.3 + (-0.45 * 0.60) = 0.03
+        expected = 0.3 + (-0.45 * _INLINE_STAGE_BLEND_WEIGHT)
+        assert result.energy == pytest.approx(expected, abs=1e-5)
+
+    @pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
+    def test_inline_stage_emotion_overrides_non_neutral(self):
+        """[whisper] overrides keyword-inferred 'happy' emotion."""
+        from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_serve.app import _apply_inline_stage_overlay
+
+        base = StyleParams(emotion="happy", valence=0.5)
+        overlay = StyleParams(emotion="whisper", energy=-0.45)
+        result = _apply_inline_stage_overlay(base, overlay)
+        assert result is not None
+        assert result.emotion == "whisper"
+
+    @pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
+    def test_inline_stage_neutral_overlay_keeps_base_emotion(self):
+        """If no stage rule matched emotion, overlay.emotion='neutral' → keep base."""
+        from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_serve.app import _apply_inline_stage_overlay
+
+        base = StyleParams(emotion="sad", valence=-0.3)
+        overlay = StyleParams(emotion="neutral", speech_rate=-0.2)
+        result = _apply_inline_stage_overlay(base, overlay)
+        assert result is not None
+        assert result.emotion == "sad"
+
+    @pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
+    def test_no_overlay_returns_base(self):
+        from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_serve.app import _apply_inline_stage_overlay
+
+        base = StyleParams(emotion="happy", valence=0.5)
+        result = _apply_inline_stage_overlay(base, None)
+        assert result is base
+
+    @pytest.mark.skipif(not _has_fastapi(), reason="fastapi not installed")
+    def test_base_none_with_overlay(self):
+        from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_serve.app import _apply_inline_stage_overlay, _INLINE_STAGE_BLEND_WEIGHT
+
+        overlay = StyleParams(emotion="whisper", energy=-0.45, arousal=-0.25)
+        result = _apply_inline_stage_overlay(None, overlay)
+        assert result is not None
+        assert result.emotion == "whisper"
+        assert result.energy == pytest.approx(-0.45 * _INLINE_STAGE_BLEND_WEIGHT, abs=1e-5)
+        assert result.arousal == pytest.approx(-0.25 * _INLINE_STAGE_BLEND_WEIGHT, abs=1e-5)

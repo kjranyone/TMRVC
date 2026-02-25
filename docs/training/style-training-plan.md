@@ -481,8 +481,8 @@ class TTSResponse(BaseModel):
 
 **関連資料:**
 
-- `docs/design/tts-architecture.md` — TTS モジュール構成・テンソル仕様
-- `docs/design/tts-training-plan.md` — TTS 学習ロードマップ
+- `docs/training/tts-training-plan.md` — TTS 学習計画 + アーキテクチャ仕様
+- `docs/training/vc-training-plan.md` — VC Teacher + 蒸留 学習計画
 - `docs/design/acoustic-condition-pathway.md` — IR→Acoustic Pathway (style_params の前半 32d)
 - `docs/design/onnx-contract.md` — `.tmrvc_speaker` フォーマット
 - `docs/design/streaming-design.md` — ストリーミングパイプライン

@@ -181,3 +181,77 @@ class TestInferSentenceStyleEnglish:
         # "furious" has priority 0.6+0.5=1.1, "happy" has 0.3+0.5=0.8
         result = infer_sentence_style("I am furious but happy", "en", self._neutral())
         assert result.emotion == "angry"
+
+
+# ---------------------------------------------------------------------------
+# analyze_inline_stage_directions tests
+# ---------------------------------------------------------------------------
+
+from tmrvc_core.text_utils import analyze_inline_stage_directions
+
+
+class TestAnalyzeInlineStageDirections:
+    def test_no_stage_directions(self):
+        result = analyze_inline_stage_directions("普通のテキスト", "ja")
+        assert result.spoken_text == "普通のテキスト"
+        assert result.stage_directions == []
+        assert result.style_overlay is None
+        assert result.speed_scale == 1.0
+
+    def test_whisper_direction_extracts_spoken_text(self):
+        result = analyze_inline_stage_directions("[whisper] Hello there.", "en")
+        assert result.spoken_text == "Hello there."
+        assert "whisper" in result.stage_directions
+
+    def test_whisper_sets_emotion_and_energy(self):
+        from tmrvc_core.dialogue_types import StyleParams
+        result = analyze_inline_stage_directions("（囁き声で）こんにちは", "ja")
+        assert result.style_overlay is not None
+        assert isinstance(result.style_overlay, StyleParams)
+        assert result.style_overlay.emotion == "whisper"
+        assert result.style_overlay.energy < 0
+
+    def test_shout_increases_energy(self):
+        from tmrvc_core.dialogue_types import StyleParams
+        result = analyze_inline_stage_directions("[shout] Get out!", "en")
+        assert result.style_overlay is not None
+        assert isinstance(result.style_overlay, StyleParams)
+        assert result.style_overlay.energy > 0
+        assert result.style_overlay.arousal > 0
+
+    def test_multiple_brackets_formats(self):
+        """Parentheses, brackets, and angle brackets are all recognized."""
+        for text in [
+            "(whisper) hello",
+            "（囁き声）hello",
+            "[whisper] hello",
+            "【囁き】hello",
+            "<whisper> hello",
+            "＜ささやき＞hello",
+        ]:
+            result = analyze_inline_stage_directions(text, "ja")
+            assert len(result.stage_directions) >= 1, f"Failed for: {text}"
+
+    def test_prefix_direction_adds_leading_silence(self):
+        result = analyze_inline_stage_directions("(pause) それでは始めましょう", "ja")
+        assert result.leading_silence_ms > 0
+
+    def test_suffix_direction_adds_trailing_silence(self):
+        result = analyze_inline_stage_directions("さようなら (長い息)", "ja")
+        # "長い息" matches "長い息" keyword in long_breath rule
+        assert result.trailing_silence_ms > 0
+
+    def test_speed_scale_clamped(self):
+        result = analyze_inline_stage_directions(
+            "[whisper][breath][pause] test", "en"
+        )
+        # Multiple rules compound the speed_scale multiplicatively
+        assert 0.75 <= result.speed_scale <= 1.25
+
+    def test_overlay_values_are_deltas_from_zero(self):
+        """Overlay dominance should be 0 since no rule modifies it."""
+        from tmrvc_core.dialogue_types import StyleParams
+        result = analyze_inline_stage_directions("[whisper] test", "en")
+        assert result.style_overlay is not None
+        assert isinstance(result.style_overlay, StyleParams)
+        assert result.style_overlay.dominance == 0.0

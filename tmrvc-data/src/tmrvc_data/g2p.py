@@ -1,8 +1,11 @@
 """Grapheme-to-phoneme frontend for Japanese, English, Chinese, and Korean.
 
 Converts text to a unified IPA-based phoneme sequence with language ID.
-Japanese uses pyopenjtalk.
-English/Chinese/Korean use phonemizer (espeak-ng backend).
+
+Backend policy:
+- Japanese: prefer ``pyopenjtalk`` -> fallback ``phonemizer`` (espeak ja) ->
+  final grapheme fallback (degraded quality, no hard failure).
+- English/Chinese/Korean: use ``phonemizer`` (espeak backend).
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from dataclasses import dataclass
 import torch
 
 logger = logging.getLogger(__name__)
+
+_PAUSE_CHARS = set(" \t\r\n、。，．,.!?！？…・「」『』（）()[]{}<>")
 
 # --- Unified phoneme vocabulary ---
 # Based on IPA with pause/breath tokens.  Index 0 = <pad>, 1 = <unk>.
@@ -108,35 +113,49 @@ class G2PResult:
 
 
 def _g2p_japanese(text: str) -> list[str]:
-    """Convert Japanese text to phoneme list using pyopenjtalk."""
+    """Convert Japanese text to phoneme list.
+
+    Preference order:
+    1) pyopenjtalk fullcontext
+    2) phonemizer espeak ja backend
+    3) grapheme fallback (degraded, but avoids runtime crash)
+    """
     try:
         import pyopenjtalk
     except ImportError:
-        raise ImportError(
-            "pyopenjtalk is required for Japanese G2P. "
-            "Install with: pip install pyopenjtalk"
-        )
+        logger.info("pyopenjtalk is unavailable; trying phonemizer fallback for Japanese")
+    else:
+        try:
+            labels = pyopenjtalk.extract_fullcontext(text)
+            phonemes: list[str] = []
+            for label in labels:
+                # Extract phoneme from fullcontext label
+                # Format: p1^p2-p3+p4=p5/.../...
+                match = re.match(r"[^-]*-([^+]+)\+", label)
+                if match:
+                    phone = match.group(1)
+                    if phone == "xx":
+                        continue
+                    if phone == "pau":
+                        phonemes.append("pau")
+                    elif phone == "cl":
+                        phonemes.append("cl")
+                    else:
+                        phonemes.append(phone)
+            if phonemes:
+                return phonemes
+            logger.warning("pyopenjtalk produced no phonemes; trying phonemizer fallback")
+        except Exception as e:  # pragma: no cover - backend-dependent
+            logger.warning("pyopenjtalk failed; trying phonemizer fallback: %s", e)
 
-    # Get fullcontext labels
-    labels = pyopenjtalk.extract_fullcontext(text)
-    phonemes: list[str] = []
+    try:
+        phonemes = _g2p_phonemizer(text, ["ja", "ja-jp"])
+        if phonemes:
+            return phonemes
+    except Exception as e:  # pragma: no cover - backend-dependent
+        logger.warning("phonemizer Japanese fallback failed; using grapheme fallback: %s", e)
 
-    for label in labels:
-        # Extract phoneme from fullcontext label
-        # Format: p1^p2-p3+p4=p5/.../...
-        match = re.match(r"[^-]*-([^+]+)\+", label)
-        if match:
-            phone = match.group(1)
-            if phone == "xx":
-                continue
-            if phone == "pau":
-                phonemes.append("pau")
-            elif phone == "cl":
-                phonemes.append("cl")
-            else:
-                phonemes.append(phone)
-
-    return phonemes
+    return _g2p_grapheme_fallback(text)
 
 
 def _g2p_phonemizer(text: str, language_options: list[str]) -> list[str]:
@@ -149,7 +168,7 @@ def _g2p_phonemizer(text: str, language_options: list[str]) -> list[str]:
         from phonemizer.separator import Separator
     except ImportError:
         raise ImportError(
-            "phonemizer is required for non-Japanese G2P. "
+            "phonemizer is required for this G2P backend. "
             "Install with: pip install phonemizer"
         )
 
@@ -176,6 +195,37 @@ def _g2p_phonemizer(text: str, language_options: list[str]) -> list[str]:
             f"phonemizer failed for languages={language_options}: {last_error}"
         )
     return []
+
+
+def _g2p_grapheme_fallback(text: str) -> list[str]:
+    """Best-effort fallback when no G2P backend is available.
+
+    This preserves runtime availability at reduced quality.
+    """
+    if not text:
+        return ["<sil>"]
+
+    phones: list[str] = []
+    for ch in text:
+        if ch in _PAUSE_CHARS:
+            phones.append("<sil>")
+            continue
+        lo = ch.lower()
+        if lo in PHONE2ID:
+            phones.append(lo)
+        elif ch in PHONE2ID:
+            phones.append(ch)
+        else:
+            # Use a stable known phoneme instead of <unk>-only collapse.
+            phones.append("a")
+
+    # Collapse duplicate silences to keep durations reasonable.
+    dedup: list[str] = []
+    for p in phones:
+        if p == "<sil>" and dedup and dedup[-1] == "<sil>":
+            continue
+        dedup.append(p)
+    return dedup if dedup else ["<sil>"]
 
 
 def _g2p_english(text: str) -> list[str]:

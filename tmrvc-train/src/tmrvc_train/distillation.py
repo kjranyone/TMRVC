@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from tmrvc_core.audio import create_mel_filterbank
 from tmrvc_core.constants import IR_UPDATE_INTERVAL, N_IR_PARAMS, N_ACOUSTIC_PARAMS
 from tmrvc_core.types import TrainingBatch
+from tmrvc_train.base_trainer import BaseTrainer, BaseTrainerConfig
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.losses import (
     DMD2Loss,
@@ -41,21 +42,17 @@ VQ_COMMITMENT_LAMBDA = 0.25
 
 
 @dataclass
-class DistillationConfig:
+class DistillationConfig(BaseTrainerConfig):
     """Configuration for distillation training."""
 
-    phase: str = "A"  # "A", "B", "B2", "C"
-    lr: float = 1e-4
+    phase: str = "A"  # "A", "B", "B2", "C", "LCD"
     max_steps: int = 200_000
     teacher_steps: int = 20
-    save_every: int = 10_000
-    log_every: int = 100
     checkpoint_dir: str = "checkpoints/distill"
     lambda_stft: float = 0.5
     lambda_spk: float = 0.3
     lambda_ir: float = 0.1
     lambda_voice: float = 0.2  # Voice source external distillation weight
-    grad_clip: float = 1.0
     # Phase B2 (DMD2) settings
     disc_lr: float = 2e-4
     disc_update_ratio: int = 2
@@ -64,9 +61,14 @@ class DistillationConfig:
     lambda_sv: float = 0.5
     # Voice source external distillation
     voice_source_checkpoint: str | None = None
+    # LCD (Latency-Conditioned Distillation) settings
+    enable_lcd: bool = False
+    lambda_latency: float = 0.2
+    lambda_mono: float = 0.2
+    mono_margin: float = 0.05
 
 
-class DistillationTrainer:
+class DistillationTrainer(BaseTrainer):
     """Distill Teacher U-Net into Student models.
 
     Phase A: ODE Trajectory Pre-training.
@@ -92,6 +94,7 @@ class DistillationTrainer:
         disc_optimizer: torch.optim.Optimizer | None = None,
         speaker_encoder: nn.Module | None = None,
     ) -> None:
+        super().__init__(optimizer, dataloader, config)
         self.teacher = teacher
         self.teacher.eval()
         for p in self.teacher.parameters():
@@ -102,10 +105,6 @@ class DistillationTrainer:
         self.vocoder = vocoder
         self.ir_estimator = ir_estimator
         self.scheduler = scheduler
-        self.optimizer = optimizer
-        self.dataloader = dataloader
-        self.config = config
-        self.global_step = 0
 
         self.flow_loss = FlowMatchingLoss()
         self.stft_loss = MultiResolutionSTFTLoss()
@@ -127,11 +126,24 @@ class DistillationTrainer:
         # Mel filterbank for converting STFT features to mel
         self.mel_basis = create_mel_filterbank()  # [80, 513]
 
-        self.checkpoint_dir = Path(config.checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
         # Voice source statistics tracker
         self.voice_source_tracker = VoiceSourceStatsTracker()
+
+        # LCD (Latency-Conditioned Distillation)
+        self.lcd_conditioner = None
+        self.lcd_latency_loss = None
+        self.lcd_mono_loss = None
+        if config.enable_lcd:
+            from tmrvc_train.lcd import (
+                LatencyConditioner,
+                LatencyLoss,
+                MonotonicityLoss,
+            )
+            device = next(self.converter.parameters()).device
+            self.lcd_conditioner = LatencyConditioner(d_output=N_ACOUSTIC_PARAMS).to(device)
+            self.lcd_latency_loss = LatencyLoss()
+            self.lcd_mono_loss = MonotonicityLoss(margin=config.mono_margin)
+            logger.info("LCD enabled: LatencyConditioner + LatencyLoss + MonotonicityLoss")
 
         # Voice source external distillation (Phase 2)
         self.voice_source_teacher: VoiceSourceEstimator | None = None
@@ -150,6 +162,23 @@ class DistillationTrainer:
                 logger.info(
                     f"Voice source external distillation enabled (λ={config.lambda_voice})"
                 )
+
+    def _pre_train_setup(self) -> None:
+        self.content_encoder.train()
+        self.converter.train()
+        self.vocoder.train()
+        self.ir_estimator.train()
+        if self.lcd_conditioner is not None:
+            self.lcd_conditioner.train()
+
+    def _student_params(self) -> list[nn.Parameter]:
+        """Return all student model parameters for gradient clipping."""
+        return (
+            list(self.content_encoder.parameters())
+            + list(self.converter.parameters())
+            + list(self.vocoder.parameters())
+            + list(self.ir_estimator.parameters())
+        )
 
     def _vq_step(self, device: torch.device) -> torch.Tensor:
         """Run VQ EMA update and return commitment loss (0 if VQ disabled)."""
@@ -291,17 +320,7 @@ class DistillationTrainer:
         if vq_loss.item() > 0:
             losses["vq"] = vq_loss.item()
 
-        self.optimizer.zero_grad()
-        loss_total.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                list(self.content_encoder.parameters())
-                + list(self.converter.parameters())
-                + list(self.vocoder.parameters())
-                + list(self.ir_estimator.parameters()),
-                self.config.grad_clip,
-            )
-        self.optimizer.step()
+        self._backward_step(loss_total, self._student_params())
 
         return losses
 
@@ -386,17 +405,7 @@ class DistillationTrainer:
         if vq_loss.item() > 0:
             losses["vq"] = vq_loss.item()
 
-        self.optimizer.zero_grad()
-        loss_total.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                list(self.content_encoder.parameters())
-                + list(self.converter.parameters())
-                + list(self.vocoder.parameters())
-                + list(self.ir_estimator.parameters()),
-                self.config.grad_clip,
-            )
-        self.optimizer.step()
+        self._backward_step(loss_total, self._student_params())
 
         return losses
 
@@ -489,17 +498,7 @@ class DistillationTrainer:
         if vq_loss.item() > 0:
             losses["vq"] = vq_loss.item()
 
-        self.optimizer.zero_grad()
-        loss_total.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                list(self.content_encoder.parameters())
-                + list(self.converter.parameters())
-                + list(self.vocoder.parameters())
-                + list(self.ir_estimator.parameters()),
-                self.config.grad_clip,
-            )
-        self.optimizer.step()
+        self._backward_step(loss_total, self._student_params())
 
         return losses
 
@@ -554,17 +553,111 @@ class DistillationTrainer:
         if vq_loss.item() > 0:
             losses["vq"] = vq_loss.item()
 
-        self.optimizer.zero_grad()
-        loss_total.backward()
-        if self.config.grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                list(self.content_encoder.parameters())
-                + list(self.converter.parameters())
-                + list(self.vocoder.parameters())
-                + list(self.ir_estimator.parameters()),
-                self.config.grad_clip,
+        self._backward_step(loss_total, self._student_params())
+
+        return losses
+
+    def train_step_phase_lcd(self, batch: TrainingBatch) -> dict[str, float]:
+        """Phase LCD: Latency-Conditioned Distillation.
+
+        Samples latency budget ``q ~ U[0,1]`` per batch element.
+        Student learns to match teacher output while respecting latency budget.
+        Additional losses enforce quality/latency monotonicity.
+        """
+        assert self.lcd_conditioner is not None, "LCD phase requires enable_lcd=True"
+        device = next(self.converter.parameters()).device
+
+        mel_target = batch.mel_target.to(device)
+        content_teacher = batch.content.to(device)
+        f0 = batch.f0.to(device)
+        spk_embed = batch.spk_embed.to(device)
+        B = mel_target.shape[0]
+
+        # Sample q ~ U[0,1] per batch element
+        q = torch.rand(B, device=device)
+
+        # Teacher generates target mel (q-independent)
+        with torch.no_grad():
+            teacher_mel = self.scheduler.sample(
+                self.teacher,
+                shape=mel_target.shape,
+                steps=self.config.teacher_steps,
+                device=str(device),
+                content=content_teacher,
+                f0=f0,
+                spk_embed=spk_embed,
             )
-        self.optimizer.step()
+
+        # Student forward with q conditioning
+        content_student = self.content_encoder(mel_target, f0)[0]
+        vq_loss = self._vq_step(device)
+
+        T = mel_target.shape[-1]
+        if T >= IR_UPDATE_INTERVAL:
+            mel_chunk = mel_target[:, :, :IR_UPDATE_INTERVAL]
+        else:
+            mel_chunk = nn.functional.pad(mel_target, (0, IR_UPDATE_INTERVAL - T))
+        acoustic_params = self.ir_estimator(mel_chunk)[0]
+
+        # Modulate acoustic params with q embedding
+        q_embed = self.lcd_conditioner(q)  # [B, 32]
+        acoustic_params_lcd = acoustic_params + q_embed
+
+        pred_features = self.converter(content_student, spk_embed, acoustic_params_lcd)[0]
+        pred_mel = self._pred_to_mel(pred_features)
+        if pred_mel.shape[-1] != mel_target.shape[-1]:
+            pred_mel = nn.functional.interpolate(
+                pred_mel, size=mel_target.shape[-1], mode="linear", align_corners=False,
+            )
+
+        # Distillation loss: L1 against teacher mel
+        if teacher_mel.shape[-1] != pred_mel.shape[-1]:
+            teacher_mel = nn.functional.interpolate(
+                teacher_mel, size=pred_mel.shape[-1], mode="linear", align_corners=False,
+            )
+        loss_distill = nn.functional.l1_loss(pred_mel, teacher_mel)
+
+        # L_latency: activation norm as computational cost proxy
+        activation_norm = pred_features.norm(dim=1).mean(dim=-1)  # [B]
+        loss_latency = self.lcd_latency_loss(q, activation_norm)
+
+        # L_mono: quality monotonicity check
+        # Compare quality between pairs with different q values
+        quality = -nn.functional.mse_loss(
+            pred_mel, teacher_mel, reduction="none",
+        ).mean(dim=(1, 2))  # [B] (negative MSE = higher is better)
+
+        # Sort by q to create adjacent pairs for monotonicity check
+        q_sorted, sort_idx = q.sort()
+        quality_sorted = quality[sort_idx]
+        if B >= 2:
+            # Low-q (more latency) should have higher quality
+            quality_high_lat = quality_sorted[:-1]  # lower q = more latency
+            quality_low_lat = quality_sorted[1:]     # higher q = less latency
+            loss_mono = self.lcd_mono_loss(quality_low_lat, quality_high_lat)
+        else:
+            loss_mono = torch.tensor(0.0, device=device)
+
+        loss_total = (
+            loss_distill
+            + self.config.lambda_latency * loss_latency
+            + self.config.lambda_mono * loss_mono
+            + VQ_COMMITMENT_LAMBDA * vq_loss
+        )
+
+        losses = {
+            "distill": loss_distill.item(),
+            "latency": loss_latency.item(),
+            "mono": loss_mono.item(),
+            "total": loss_total.item(),
+        }
+        if vq_loss.item() > 0:
+            losses["vq"] = vq_loss.item()
+
+        params = self._student_params()
+        if self.lcd_conditioner is not None:
+            params += list(self.lcd_conditioner.parameters())
+        self._backward_step(loss_total, params)
 
         return losses
 
@@ -575,41 +668,9 @@ class DistillationTrainer:
             return self.train_step_phase_b2(batch)
         if self.config.phase == "C":
             return self.train_step_phase_c(batch)
+        if self.config.phase == "LCD":
+            return self.train_step_phase_lcd(batch)
         return self.train_step_phase_b(batch)
-
-    def train_iter(self):
-        """Iterate over training steps, yielding ``(step, losses)`` each step.
-
-        Yields:
-            Tuple of ``(global_step, losses_dict)``.
-        """
-        self.content_encoder.train()
-        self.converter.train()
-        self.vocoder.train()
-        self.ir_estimator.train()
-
-        while self.global_step < self.config.max_steps:
-            for batch in self.dataloader:
-                if self.global_step >= self.config.max_steps:
-                    return
-
-                losses = self.train_step(batch)
-                self.global_step += 1
-
-                if self.global_step % self.config.log_every == 0:
-                    loss_str = ", ".join(f"{k}={v:.4f}" for k, v in losses.items())
-                    logger.info("Step %d: %s", self.global_step, loss_str)
-
-                if self.global_step % self.config.save_every == 0:
-                    self.save_checkpoint()
-
-                yield self.global_step, losses
-
-    def train_epoch(self) -> None:
-        """Train for one full epoch over the dataloader."""
-        for _step, _losses in self.train_iter():
-            if self.global_step >= self.config.max_steps:
-                break
 
     def save_checkpoint(self, path: str | None = None) -> Path:
         if path is None:
@@ -630,6 +691,8 @@ class DistillationTrainer:
             ckpt_data["discriminator"] = self.discriminator.state_dict()
         if self.disc_optimizer is not None:
             ckpt_data["disc_optimizer"] = self.disc_optimizer.state_dict()
+        if self.lcd_conditioner is not None:
+            ckpt_data["lcd_conditioner"] = self.lcd_conditioner.state_dict()
 
         torch.save(ckpt_data, ckpt_path)
         logger.info("Saved checkpoint to %s", ckpt_path)
@@ -651,6 +714,8 @@ class DistillationTrainer:
             self.discriminator.load_state_dict(ckpt["discriminator"])
         if self.disc_optimizer is not None:
             self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
+        if self.lcd_conditioner is not None and "lcd_conditioner" in ckpt:
+            self.lcd_conditioner.load_state_dict(ckpt["lcd_conditioner"])
         self.global_step = ckpt["step"]
         logger.info(
             "Loaded distillation checkpoint from %s (step %d)", path, self.global_step

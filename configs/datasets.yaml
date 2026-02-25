@@ -9,20 +9,28 @@ split: train
 
 datasets:
   tsukuyomi:
+    type: tsukuyomi
     enabled: true
+    language: ja
     # Keep training data inside this repository.
     raw_dir: data/raw/tsukuyomi/corpus1
 
   vctk:
+    type: vctk
     enabled: false
+    language: en
     raw_dir: data/raw/VCTK-Corpus
 
   jvs:
+    type: jvs
     enabled: false
+    language: ja
     raw_dir: data/raw/jvs_corpus
 
   libritts_r:
+    type: libritts_r
     enabled: false
+    language: en
     raw_dir: data/raw/libritts_r
 
   # --- TTS Datasets ---
@@ -74,3 +82,13 @@ datasets:
     language: en
     speakers: 24
     hours: 2
+
+  # --- User-defined (generic adapter) ---
+  # Uncomment and edit to add custom voice data.
+  # Directory structure: raw_dir/speaker_A/*.wav, raw_dir/speaker_B/*.wav
+  #
+  # my_custom_voices:
+  #   type: generic
+  #   raw_dir: data/raw/my_voices
+  #   language: ja
+  #   enabled: true

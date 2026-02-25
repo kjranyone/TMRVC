@@ -21,6 +21,8 @@ from tmrvc_gui.pages.evaluation import EvaluationPage
 from tmrvc_gui.pages.onnx_export import OnnxExportPage
 from tmrvc_gui.pages.realtime_demo import RealtimeDemoPage
 from tmrvc_gui.pages.script import ScriptPage
+from tmrvc_gui.pages.server import ServerPage
+from tmrvc_gui.pages.style_editor import StyleEditorPage
 from tmrvc_gui.pages.teacher_train import TeacherTrainPage
 from tmrvc_gui.pages.tts import TTSPage
 
@@ -34,6 +36,8 @@ _TABS: list[tuple[str, type[QWidget]]] = [
     ("ONNX Export", OnnxExportPage),
     ("TTS", TTSPage),
     ("Script (Example)", ScriptPage),
+    ("Style Editor", StyleEditorPage),
+    ("TTS Server", ServerPage),
 ]
 
 

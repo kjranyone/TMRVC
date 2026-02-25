@@ -389,10 +389,10 @@ DAW Audio Out (48kHz)
 | エンジン設計 (legacy doc 名) | `docs/design/cpp-engine-design.md` | §5.2-5.3 の実装詳細（現行実装は Rust） |
 | Acoustic Condition Pathway | `docs/design/acoustic-condition-pathway.md` | IR + Voice Source 統合条件付け、プリセットブレンド |
 | GUI 設計 | `docs/design/gui-design.md` | Research Studio GUI アプリケーション設計 |
-| Teacher 学習計画 | `docs/design/training-plan.md` | §4.1 学習時フローのコーパス・スケジュール詳細 |
-| TTS アーキテクチャ | `docs/design/tts-architecture.md` | TTS モジュール構成、VC 流用設計、テンソル仕様 |
-| TTS 学習計画 | `docs/design/tts-training-plan.md` | Phase 2-5 ロードマップ、データセット、リソース見積もり |
-| TTS スタイル・文脈統合 | `docs/design/tts-style-design.md` | StyleEncoder、LLM 統合、VTuber 配信設計 |
+| VC 学習計画 | `docs/training/vc-training-plan.md` | Teacher 学習 + 蒸留のコーパス・スケジュール詳細 |
+| TTS 学習計画 + アーキテクチャ | `docs/training/tts-training-plan.md` | TTS Phase 2-5 ロードマップ、モジュール構成、テンソル仕様 |
+| Style・文脈統合 | `docs/training/style-training-plan.md` | StyleEncoder、LLM 統合、VTuber 配信設計 |
+| 学習パイプライン統合ガイド | `docs/training/README.md` | 全学習パスの依存グラフ + CLI リファレンス |
 | 先行研究・コンセプト | `docs/reference/concept.md` | IR-aware 設計の根拠 |
 | 参考: 旧システム設計 | `docs/reference/system_design.md` | 品質目標・蒸留手法・データセット計画の参考 |
 

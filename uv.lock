@@ -1867,6 +1867,7 @@ dependencies = [
     { name = "tmrvc-core", marker = "sys_platform == 'win32'" },
     { name = "tmrvc-data", marker = "sys_platform == 'win32'" },
     { name = "tmrvc-export", marker = "sys_platform == 'win32'" },
+    { name = "tmrvc-serve", marker = "sys_platform == 'win32'" },
 ]
 
 [package.metadata]
@@ -1879,6 +1880,7 @@ requires-dist = [
     { name = "tmrvc-core", editable = "tmrvc-core" },
     { name = "tmrvc-data", editable = "tmrvc-data" },
     { name = "tmrvc-export", editable = "tmrvc-export" },
+    { name = "tmrvc-serve", editable = "tmrvc-serve" },
 ]
 
 [[package]]

@@ -19,14 +19,15 @@ from torch.utils.data import DataLoader, Dataset
 from tmrvc_core.constants import DEFAULT_BATCH_SIZE, N_MELS
 from tmrvc_core.types import TTSBatch, TTSFeatureSet
 from tmrvc_data.cache import FeatureCache
+from tmrvc_data.events import events_to_tensors, load_events
 
 
 class TTSDataset(Dataset):
     """Lazy-loading TTS dataset backed by :class:`FeatureCache`.
 
     Expects additional files in each utterance directory:
-    - ``phoneme_ids.npy``: ``[L]`` int64 phoneme index sequence
-    - ``durations.npy``: ``[L]`` int64 frames per phoneme
+    - ``phoneme_ids.npy`` or ``token_ids.npy``: ``[L]`` int64 text unit IDs
+    - ``durations.npy``: ``[L]`` int64 frames per text unit
 
     These are produced by ``scripts/run_forced_alignment.py``.
     """
@@ -37,11 +38,17 @@ class TTSDataset(Dataset):
         dataset: str | list[str],
         split: str = "train",
         max_frames: int = 0,
+        frontend: str = "auto",
     ) -> None:
         self.cache = cache
         self.datasets = [dataset] if isinstance(dataset, str) else list(dataset)
         self.split = split
         self.max_frames = max_frames
+        if frontend not in {"phoneme", "tokenizer", "auto"}:
+            raise ValueError(
+                f"Unsupported frontend: {frontend}. Expected one of phoneme/tokenizer/auto."
+            )
+        self.frontend = frontend
 
         # Collect entries that have TTS alignment data
         self.entries: list[dict[str, str]] = []
@@ -50,9 +57,24 @@ class TTSDataset(Dataset):
                 utt_dir = cache._utt_dir(
                     ds_name, split, entry["speaker_id"], entry["utterance_id"],
                 )
-                if (utt_dir / "phoneme_ids.npy").exists() and (utt_dir / "durations.npy").exists():
+                id_file = self._resolve_id_file(utt_dir)
+                if id_file is not None and (utt_dir / "durations.npy").exists():
                     entry["dataset"] = ds_name
                     self.entries.append(entry)
+
+    def _resolve_id_file(self, utt_dir: Path) -> Path | None:
+        token_path = utt_dir / "token_ids.npy"
+        phone_path = utt_dir / "phoneme_ids.npy"
+        if self.frontend == "tokenizer":
+            return token_path if token_path.exists() else None
+        if self.frontend == "phoneme":
+            return phone_path if phone_path.exists() else None
+        # auto: prefer tokenizer path for new E2E pipeline.
+        if token_path.exists():
+            return token_path
+        if phone_path.exists():
+            return phone_path
+        return None
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -75,7 +97,10 @@ class TTSDataset(Dataset):
         )
 
         # Load TTS alignment data
-        phoneme_ids = np.load(utt_dir / "phoneme_ids.npy")
+        id_file = self._resolve_id_file(utt_dir)
+        if id_file is None:
+            raise FileNotFoundError(f"No text unit ID file found in {utt_dir}")
+        text_ids = np.load(id_file)
         durations = np.load(utt_dir / "durations.npy")
 
         # Load language_id from meta if present
@@ -90,20 +115,28 @@ class TTSDataset(Dataset):
         if actual_frames < total_dur:
             durations = _adjust_durations(durations, actual_frames)
 
+        # Load BPEH events if available
+        events = load_events(utt_dir)
+        event_tensors = events_to_tensors(events, actual_frames) if events else None
+
         return TTSFeatureSet(
             mel=features.mel,
             content=features.content,
             f0=features.f0,
             spk_embed=features.spk_embed,
-            phoneme_ids=torch.from_numpy(phoneme_ids.copy()).long(),
+            phoneme_ids=torch.from_numpy(text_ids.copy()).long(),
             durations=torch.from_numpy(durations.copy()).float(),
             language_id=language_id,
             utterance_id=features.utterance_id,
             speaker_id=features.speaker_id,
             n_frames=actual_frames,
-            n_phonemes=len(phoneme_ids),
+            n_phonemes=len(text_ids),
             content_dim=features.content_dim,
             text=text,
+            breath_onsets=event_tensors["breath_onsets"] if event_tensors else None,
+            breath_durations=event_tensors["breath_durations"] if event_tensors else None,
+            breath_intensity=event_tensors["breath_intensity"] if event_tensors else None,
+            pause_durations=event_tensors["pause_durations"] if event_tensors else None,
         )
 
 
@@ -175,6 +208,34 @@ def tts_collate_fn(
         [f.n_phonemes for f in batch], dtype=torch.long,
     )
 
+    # BPEH event tensors (collate if any item has them)
+    has_events = any(f.breath_onsets is not None for f in batch)
+    breath_onsets = None
+    breath_durations = None
+    breath_intensity = None
+    pause_durations = None
+    if has_events:
+        breath_onsets = torch.stack([
+            _crop_or_pad(f.breath_onsets.unsqueeze(0), target_t).squeeze(0)
+            if f.breath_onsets is not None else torch.zeros(target_t)
+            for f in batch
+        ])
+        breath_durations = torch.stack([
+            _crop_or_pad(f.breath_durations.unsqueeze(0), target_t).squeeze(0)
+            if f.breath_durations is not None else torch.zeros(target_t)
+            for f in batch
+        ])
+        breath_intensity = torch.stack([
+            _crop_or_pad(f.breath_intensity.unsqueeze(0), target_t).squeeze(0)
+            if f.breath_intensity is not None else torch.zeros(target_t)
+            for f in batch
+        ])
+        pause_durations = torch.stack([
+            _crop_or_pad(f.pause_durations.unsqueeze(0), target_t).squeeze(0)
+            if f.pause_durations is not None else torch.zeros(target_t)
+            for f in batch
+        ])
+
     return TTSBatch(
         phoneme_ids=torch.stack(phone_ids_list),
         durations=torch.stack(dur_list),
@@ -188,6 +249,10 @@ def tts_collate_fn(
         utterance_ids=[f.utterance_id for f in batch],
         speaker_ids=[f.speaker_id for f in batch],
         content_dim=batch[0].content_dim,
+        breath_onsets=breath_onsets,
+        breath_durations=breath_durations,
+        breath_intensity=breath_intensity,
+        pause_durations=pause_durations,
     )
 
 
@@ -198,6 +263,7 @@ def create_tts_dataloader(
     batch_size: int = 32,
     num_workers: int = 0,
     max_frames: int = 400,
+    frontend: str = "auto",
 ) -> DataLoader:
     """Create a DataLoader for TTS training.
 
@@ -218,6 +284,7 @@ def create_tts_dataloader(
         dataset=dataset,
         split=split,
         max_frames=max_frames,
+        frontend=frontend,
     )
 
     collate = partial(tts_collate_fn, max_frames=max_frames)

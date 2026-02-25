@@ -112,7 +112,21 @@ N_TEXT_ENCODER_LAYERS: int = _cfg["n_text_encoder_layers"]
 N_TEXT_ENCODER_HEADS: int = _cfg["n_text_encoder_heads"]
 TEXT_ENCODER_FF_DIM: int = _cfg["text_encoder_ff_dim"]
 PHONEME_VOCAB_SIZE: int = _cfg["phoneme_vocab_size"]
+TOKENIZER_VOCAB_SIZE: int = _cfg["tokenizer_vocab_size"]
 N_EMOTION_CATEGORIES: int = _cfg["n_emotion_categories"]
 D_F0_PREDICTOR: int = _cfg["d_f0_predictor"]
 D_CONTENT_SYNTHESIZER: int = _cfg["d_content_synthesizer"]
 N_LANGUAGES: int = _cfg["n_languages"]
+
+# --- Scene State Latent (SSL) ---
+D_SCENE_STATE: int = _cfg["d_scene_state"]
+D_HISTORY: int = _cfg["d_history"]
+SSL_N_GRU_LAYERS: int = _cfg["ssl_n_gru_layers"]
+SSL_PROSODY_STATS_DIM: int = _cfg["ssl_prosody_stats_dim"]
+
+# --- Breath-Pause Event Head (BPEH) ---
+BPEH_D_HIDDEN: int = _cfg["bpeh_d_hidden"]
+BPEH_N_BLOCKS: int = _cfg["bpeh_n_blocks"]
+BPEH_BREATH_THRESHOLD_DB: float = _cfg["bpeh_breath_threshold_db"]
+BPEH_MIN_PAUSE_MS: float = _cfg["bpeh_min_pause_ms"]
+BPEH_MIN_BREATH_MS: float = _cfg["bpeh_min_breath_ms"]

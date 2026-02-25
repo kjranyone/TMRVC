@@ -217,7 +217,7 @@ VST3/CLAP プラグイン化は薄いラッパー追加のみで実現可能。
 | `docs/design/streaming-design.md` | レイテンシバジェット, causal STFT, OLA |
 | `docs/design/cpp-engine-design.md` | TensorPool layout, SPSC Queue protocol |
 | `docs/design/model-architecture.md` | 各モデルの層構成, パラメータ数 |
-| `docs/design/training-plan.md` | コーパス構成, 学習フェーズ |
+| `docs/training/README.md` | 学習パイプライン統合ガイド (VC/TTS/Style) |
 
 ## Structured Training Data Pipeline
 

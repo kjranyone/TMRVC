@@ -247,19 +247,113 @@ class TsukuyomiAdapter(DatasetAdapter):
             )
 
 
+class GenericAdapter(DatasetAdapter):
+    """Generic adapter: auto-detect speaker_id/**.wav structure.
+
+    Expected layout::
+
+        root/
+        +-- speaker_A/
+        |   +-- 001.wav
+        |   +-- 002.wav
+        +-- speaker_B/
+            +-- 001.wav
+
+    Single-speaker (flat)::
+
+        root/
+        +-- 001.wav
+        +-- 002.wav
+
+    speaker_id = directory name (or dataset name for flat layout).
+    """
+
+    name = "generic"
+    _AUDIO_EXTS = {".wav", ".flac", ".ogg"}
+
+    def __init__(self, dataset_name: str = "generic", language: str = "en") -> None:
+        self._dataset_name = dataset_name
+        self._language = language
+
+    @staticmethod
+    def _sanitize(value: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z_\-]+", "_", value).strip("_")
+        return cleaned or "unknown"
+
+    def iter_utterances(
+        self, root: Path, split: str = "train"
+    ) -> Iterator[Utterance]:
+        if not root.exists():
+            raise FileNotFoundError(f"Root directory not found: {root}")
+
+        audio_files = sorted(
+            p for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in self._AUDIO_EXTS
+        )
+        if not audio_files:
+            raise FileNotFoundError(
+                f"No audio files found under {root} (expected: {sorted(self._AUDIO_EXTS)})"
+            )
+
+        prefix = self._sanitize(self._dataset_name)
+
+        for wav_path in audio_files:
+            rel = wav_path.relative_to(root)
+            rel_no_ext = rel.with_suffix("")
+
+            # Use top-level folder as speaker id when available
+            speaker_raw = rel.parts[0] if len(rel.parts) > 1 else prefix
+            speaker_id = f"{prefix}_{self._sanitize(speaker_raw)}"
+
+            utt_raw = "_".join(rel_no_ext.parts)
+            utt_id = f"{prefix}_{self._sanitize(utt_raw)}"
+
+            import soundfile as sf
+
+            info = sf.info(str(wav_path))
+            yield Utterance(
+                utterance_id=utt_id,
+                speaker_id=speaker_id,
+                dataset=self._dataset_name,
+                audio_path=wav_path,
+                duration_sec=info.duration,
+                sample_rate=info.samplerate,
+                language=self._language,
+            )
+
+
 ADAPTERS: dict[str, type[DatasetAdapter]] = {
     "vctk": VCTKAdapter,
     "jvs": JVSAdapter,
     "libritts_r": LibriTTSRAdapter,
     "tsukuyomi": TsukuyomiAdapter,
+    "generic": GenericAdapter,
 }
 
 
-def get_adapter(dataset_name: str) -> DatasetAdapter:
-    """Get a dataset adapter by name."""
-    cls = ADAPTERS.get(dataset_name)
+def get_adapter(
+    dataset_name: str,
+    *,
+    adapter_type: str | None = None,
+    language: str = "en",
+) -> DatasetAdapter:
+    """Get a dataset adapter by name or explicit type.
+
+    Args:
+        dataset_name: Name of the dataset (used as key in ADAPTERS if
+            *adapter_type* is not given).
+        adapter_type: Explicit adapter type override.  When provided,
+            ``"generic"`` creates a :class:`GenericAdapter` with
+            *dataset_name* and *language*.
+        language: Language hint passed to GenericAdapter (ignored for
+            built-in adapters).
+    """
+    type_key = adapter_type or dataset_name
+    cls = ADAPTERS.get(type_key)
     if cls is None:
         raise ValueError(
-            f"Unknown dataset: {dataset_name!r}. Available: {list(ADAPTERS)}"
+            f"Unknown dataset/type: {type_key!r}. Available: {list(ADAPTERS)}"
         )
+    if cls is GenericAdapter:
+        return GenericAdapter(dataset_name=dataset_name, language=language)
     return cls()

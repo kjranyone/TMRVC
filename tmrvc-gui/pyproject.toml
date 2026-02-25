@@ -13,6 +13,7 @@ dependencies = [
     "tmrvc-core",
     "tmrvc-data",
     "tmrvc-export",
+    "tmrvc-serve",
 ]
 
 [project.scripts]
@@ -26,6 +27,7 @@ build-backend = "hatchling.build"
 tmrvc-core = { workspace = true }
 tmrvc-data = { workspace = true }
 tmrvc-export = { workspace = true }
+tmrvc-serve = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tmrvc_gui"]

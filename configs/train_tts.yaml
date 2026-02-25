@@ -4,6 +4,7 @@
 
 batch_size: 32
 max_frames: 400
+text_frontend: tokenizer
 lr: 1.0e-4
 warmup_steps: 5000
 max_steps: 200000

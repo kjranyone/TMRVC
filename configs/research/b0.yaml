@@ -1,0 +1,55 @@
+# B0 — Baseline (no SSL, no BPEH, no LCD)
+#
+# Frozen config for ablation. Do NOT edit after baseline freeze.
+# Any change must create a new variant (b0v2, etc.).
+#
+# Usage:
+#   uv run python scripts/eval_research_baseline.py --config configs/research/b0.yaml --seed 42
+
+variant: b0
+description: "Baseline VC: TeacherUNet flow matching, no research extensions."
+
+# --- Model ---
+model:
+  type: teacher_unet
+  d_content: 768         # ContentVec (WavLM)
+  d_speaker: 192         # ECAPA-TDNN
+  n_acoustic_params: 32  # IR(24) + voice_source(8)
+  # No SSL, BPEH, or LCD modules
+
+# --- Sampling ---
+sampling:
+  steps: 32              # Euler ODE steps
+  sway_coefficient: 1.0  # Sway sampling (F5-TTS style)
+  cfg_scale: 1.0         # No CFG (single pass)
+
+# --- Test split ---
+# Fixed speaker/utterance set for reproducible evaluation.
+# Speakers chosen to cover: male/female, en/ja, different accent groups.
+test_split:
+  datasets: [vctk, jvs]
+  # VCTK: 4 speakers (2M/2F, diverse accents)
+  # JVS: 4 speakers (2M/2F)
+  speakers:
+    - vctk_p225    # F, Southern English
+    - vctk_p226    # M, Surrey
+    - vctk_p227    # M, Cumbria
+    - vctk_p228    # F, Southern English
+    - jvs_jvs001   # F
+    - jvs_jvs002   # M
+    - jvs_jvs003   # F
+    - jvs_jvs004   # M
+  max_utterances_per_speaker: 10  # First 10 utterances per speaker
+
+# --- Metrics ---
+metrics:
+  - mel_mse          # MSE between predicted and GT mel
+  - secs             # Speaker Embedding Cosine Similarity
+  - f0_correlation   # Pearson correlation on voiced frames
+  - utmos_proxy      # Mel-distance proxy for MOS (0-5)
+
+# --- Output ---
+output:
+  format: json       # Per-utterance + aggregate
+  save_mel: false    # Don't save predicted mels (space)
+  save_audio: true   # Save Griffin-Lim reconstructed audio

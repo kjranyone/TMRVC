@@ -2,25 +2,27 @@ use std::path::PathBuf;
 
 use egui::Ui;
 
-/// Model / Speaker / Style selection state.
+/// Model / Speaker / Style / Character selection state.
 pub struct ModelPanelState {
     pub onnx_dir: String,
     pub speaker_path: String,
     pub style_path: String,
+    pub character_path: String,
 }
 
 impl ModelPanelState {
     pub fn new() -> Self {
-        let (onnx_dir, speaker_path, style_path) = detect_default_model_paths();
+        let (onnx_dir, speaker_path, style_path, character_path) = detect_default_model_paths();
         Self {
             onnx_dir,
             speaker_path,
             style_path,
+            character_path,
         }
     }
 }
 
-fn detect_default_model_paths() -> (String, String, String) {
+fn detect_default_model_paths() -> (String, String, String, String) {
     let onnx_from_env = std::env::var("TMRVC_ONNX_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -28,6 +30,9 @@ fn detect_default_model_paths() -> (String, String, String) {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let style_from_env = std::env::var("TMRVC_STYLE_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let character_from_env = std::env::var("TMRVC_CHARACTER_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty());
 
@@ -76,7 +81,23 @@ fn detect_default_model_paths() -> (String, String, String) {
         String::new()
     });
 
-    (onnx_dir, speaker_path, style_path)
+    let character_path = character_from_env.unwrap_or_else(|| {
+        let candidates = [
+            ["models", "demo_character.tmrvc_character"],
+            ["models", "test_character.tmrvc_character"],
+        ];
+        for root in &roots {
+            for parts in candidates {
+                let p = root.join(parts[0]).join(parts[1]);
+                if p.is_file() {
+                    return p.display().to_string();
+                }
+            }
+        }
+        String::new()
+    });
+
+    (onnx_dir, speaker_path, style_path, character_path)
 }
 
 fn candidate_roots() -> Vec<PathBuf> {
@@ -93,12 +114,13 @@ fn candidate_roots() -> Vec<PathBuf> {
     out
 }
 
-/// Model load/speaker load/style load events.
+/// Model load/speaker load/style load/character load events.
 pub enum ModelPanelEvent {
     None,
     LoadModels(String),
     LoadSpeaker(String),
     LoadStyle(String),
+    LoadCharacter(String),
 }
 
 /// Draw the model/speaker/style selection panel.
@@ -170,6 +192,28 @@ pub fn draw_model_panel(ui: &mut Ui, state: &mut ModelPanelState) -> ModelPanelE
                     let p = path.display().to_string();
                     state.style_path = p.clone();
                     event = ModelPanelEvent::LoadStyle(p);
+                }
+            }
+        });
+
+        // Character file (TTS)
+        ui.horizontal(|ui| {
+            ui.label("Character:");
+            let display = if state.character_path.is_empty() {
+                "(optional, TTS)"
+            } else {
+                &state.character_path
+            };
+            ui.add(egui::Label::new(display).truncate());
+            if ui.button("Browse...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select character file")
+                    .add_filter("TMRVC Character", &["tmrvc_character"])
+                    .pick_file()
+                {
+                    let p = path.display().to_string();
+                    state.character_path = p.clone();
+                    event = ModelPanelEvent::LoadCharacter(p);
                 }
             }
         });

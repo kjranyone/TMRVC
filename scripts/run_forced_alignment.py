@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run forced alignment on cached datasets and save phoneme_ids/durations.
+"""Run forced alignment on cached datasets and save text unit IDs/durations.
 
 Processes each utterance in the feature cache:
 1. Loads text from meta.json
 2. Converts text → phonemes via G2P
-3. Saves phoneme_ids.npy and durations.npy alongside existing features
+3. Saves phoneme_ids.npy or token_ids.npy and durations.npy alongside existing features
 
 For datasets without MFA alignment, uses a heuristic equal-duration split.
 For datasets with MFA TextGrid files, loads actual alignments.
@@ -51,8 +51,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--language",
         required=True,
-        choices=["ja", "en"],
-        help="Language for G2P.",
+        choices=["ja", "en", "zh", "ko"],
+        help="Language for text frontend.",
+    )
+    parser.add_argument(
+        "--frontend",
+        choices=["phoneme", "tokenizer"],
+        default="tokenizer",
+        help="Text frontend mode (default: tokenizer).",
     )
     parser.add_argument(
         "--textgrid-dir",
@@ -113,7 +119,7 @@ def process_utterance_g2p(
     if n_frames <= 0:
         return False
 
-    from tmrvc_data.g2p import text_to_phonemes, LANG_JA, LANG_EN
+    from tmrvc_data.g2p import text_to_phonemes
 
     result = text_to_phonemes(text, language=language)
     phoneme_ids = result.phoneme_ids.numpy()
@@ -124,6 +130,54 @@ def process_utterance_g2p(
 
     # Update meta with language_id
     meta["language_id"] = result.language_id
+    meta["text_frontend"] = "phoneme"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+    return True
+
+
+def process_utterance_tokenizer(
+    utt_dir: Path,
+    language: str,
+    overwrite: bool = False,
+) -> bool:
+    """Process a single utterance with tokenizer frontend.
+
+    Saves ``token_ids.npy`` and heuristic ``durations.npy``.
+    """
+    token_path = utt_dir / "token_ids.npy"
+    dur_path = utt_dir / "durations.npy"
+
+    if token_path.exists() and dur_path.exists() and not overwrite:
+        return False
+
+    meta_path = utt_dir / "meta.json"
+    if not meta_path.exists():
+        return False
+
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+
+    text = meta.get("text", "")
+    if not text:
+        return False
+
+    n_frames = meta.get("n_frames", 0)
+    if n_frames <= 0:
+        return False
+
+    from tmrvc_data.text_tokenizer import text_to_tokens
+
+    result = text_to_tokens(text, language=language)
+    token_ids = result.token_ids.numpy()
+    durations = _equal_duration_split(len(token_ids), n_frames)
+
+    np.save(token_path, token_ids)
+    np.save(dur_path, durations)
+
+    meta["language_id"] = result.language_id
+    meta["text_frontend"] = "tokenizer"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f)
 
@@ -159,7 +213,7 @@ def process_utterance_textgrid(
     n_frames = meta.get("n_frames", 0)
 
     from tmrvc_data.alignment import load_textgrid_durations
-    from tmrvc_data.g2p import BOS_ID, EOS_ID, PHONE2ID, UNK_ID, LANG_JA, LANG_EN
+    from tmrvc_data.g2p import BOS_ID, EOS_ID, PHONE2ID, UNK_ID
 
     alignment = load_textgrid_durations(textgrid_path, total_frames=n_frames)
 
@@ -180,8 +234,10 @@ def process_utterance_textgrid(
     np.save(dur_path, durations)
 
     # Update meta
-    lang_id = LANG_JA if language == "ja" else LANG_EN
+    lang_map = {"ja": 0, "en": 1, "zh": 2, "ko": 3}
+    lang_id = lang_map.get(language, 0)
     meta["language_id"] = lang_id
+    meta["text_frontend"] = "phoneme"
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f)
 
@@ -216,7 +272,9 @@ def main() -> None:
             args.dataset, args.split, entry["speaker_id"], entry["utterance_id"],
         )
 
-        if args.textgrid_dir:
+        if args.frontend == "tokenizer":
+            ok = process_utterance_tokenizer(utt_dir, args.language, args.overwrite)
+        elif args.textgrid_dir:
             # Try to find matching TextGrid
             tg_path = args.textgrid_dir / entry["speaker_id"] / f"{entry['utterance_id']}.TextGrid"
             if not tg_path.exists():

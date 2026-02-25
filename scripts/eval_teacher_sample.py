@@ -138,25 +138,43 @@ def main():
     logger.info("Loading checkpoint: %s", args.checkpoint)
     teacher = TeacherUNet(d_content=D_CONTENT_VEC).to(device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    if "model_state_dict" not in ckpt:
+        raise RuntimeError(
+            f"Unsupported checkpoint format: {args.checkpoint} "
+            "(missing 'model_state_dict'). Legacy checkpoints are not supported."
+        )
     state_dict = ckpt["model_state_dict"]
-    # Migrate old keys
-    for k in list(state_dict.keys()):
-        if "film_ir." in k:
-            state_dict[k.replace("film_ir.", "film_acoustic.")] = state_dict.pop(k)
-    # Pad shapes
     model_sd = teacher.state_dict()
-    for key in list(state_dict.keys()):
-        if key in model_sd and state_dict[key].shape != model_sd[key].shape:
-            new_tensor = torch.zeros(model_sd[key].shape, dtype=state_dict[key].dtype)
-            slices = tuple(
-                slice(0, min(o, n))
-                for o, n in zip(state_dict[key].shape, model_sd[key].shape)
-            )
-            new_tensor[slices] = state_dict[key][slices]
-            state_dict[key] = new_tensor
-    teacher.load_state_dict(state_dict)
+
+    missing_keys = sorted(set(model_sd) - set(state_dict))
+    unexpected_keys = sorted(set(state_dict) - set(model_sd))
+    shape_mismatches = [
+        (k, tuple(state_dict[k].shape), tuple(model_sd[k].shape))
+        for k in model_sd.keys() & state_dict.keys()
+        if state_dict[k].shape != model_sd[k].shape
+    ]
+    if missing_keys or unexpected_keys or shape_mismatches:
+        details: list[str] = []
+        if missing_keys:
+            details.append(f"missing={missing_keys[:5]}")
+        if unexpected_keys:
+            details.append(f"unexpected={unexpected_keys[:5]}")
+        if shape_mismatches:
+            k, got, expected = shape_mismatches[0]
+            details.append(f"shape_mismatch={k}: {got} != {expected}")
+        raise RuntimeError(
+            "Checkpoint is incompatible with current TeacherUNet and was rejected. "
+            + "; ".join(details)
+        )
+
+    teacher.load_state_dict(state_dict, strict=True)
     teacher.eval()
-    step = ckpt["step"]
+    step = ckpt.get("step")
+    if not isinstance(step, int):
+        raise RuntimeError(
+            f"Unsupported checkpoint metadata: {args.checkpoint} "
+            "(missing/invalid 'step')."
+        )
     logger.info("Model loaded (step %d, %.1fM params)", step, sum(p.numel() for p in teacher.parameters()) / 1e6)
 
     scheduler = FlowMatchingScheduler()
