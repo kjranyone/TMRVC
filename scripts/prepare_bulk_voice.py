@@ -74,6 +74,37 @@ def scan_audio_files(root: Path) -> dict[str, list[Path]]:
     return dict(speakers)
 
 
+def scan_audio_files_with_map(root: Path, speaker_map_path: Path) -> dict[str, list[Path]]:
+    """Group audio files using a speaker_map.json from cluster_speakers.py.
+
+    Files mapped to ``"spk_noise"`` are excluded.
+    """
+    with open(speaker_map_path, encoding="utf-8") as f:
+        data = json.load(f)
+    mapping = data["mapping"]
+
+    speakers: dict[str, list[Path]] = defaultdict(list)
+    missing = 0
+    for filename, speaker_id in mapping.items():
+        if speaker_id == "spk_noise":
+            continue
+        audio_path = root / filename
+        if not audio_path.exists():
+            missing += 1
+            continue
+        speakers[speaker_id].append(audio_path)
+
+    if missing > 0:
+        logger.warning("Speaker map: %d files not found in %s", missing, root)
+    logger.info(
+        "Speaker map: %d speakers, %d files (excluded %d noise)",
+        len(speakers),
+        sum(len(v) for v in speakers.values()),
+        sum(1 for v in mapping.values() if v == "spk_noise"),
+    )
+    return dict(speakers)
+
+
 def check_audio(path: Path) -> dict:
     """Check audio file quality. Returns info dict with 'ok' flag."""
     info: dict = {"path": str(path), "ok": False, "reason": ""}
@@ -184,6 +215,10 @@ def main() -> None:
     parser.add_argument("--whisper-model", default="large-v3", help="Whisper model name.")
     parser.add_argument("--language", default="ja", help="Language for transcription.")
     parser.add_argument("--device", default="cuda", help="Device for Whisper.")
+    parser.add_argument(
+        "--speaker-map", type=Path, default=None,
+        help="Path to _speaker_map.json from cluster_speakers.py (for flat directories).",
+    )
     parser.add_argument("--min-duration", type=float, default=MIN_DURATION_SEC)
     parser.add_argument("--max-duration", type=float, default=MAX_DURATION_SEC)
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -203,7 +238,10 @@ def main() -> None:
 
     # Scan
     logger.info("Scanning %s ...", args.input)
-    speakers = scan_audio_files(args.input)
+    if args.speaker_map:
+        speakers = scan_audio_files_with_map(args.input, args.speaker_map)
+    else:
+        speakers = scan_audio_files(args.input)
     total_files = sum(len(v) for v in speakers.values())
     logger.info("Found %d speakers, %d files", len(speakers), total_files)
 

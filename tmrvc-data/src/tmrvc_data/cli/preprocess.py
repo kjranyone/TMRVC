@@ -123,6 +123,7 @@ def main(argv: list[str] | None = None) -> None:
     # a built-in adapter key.
     adapter_type: str | None = None
     language: str = "en"
+    speaker_map_path: str | None = None
     datasets_yaml = Path("configs/datasets.yaml")
     if datasets_yaml.exists():
         import yaml
@@ -132,8 +133,14 @@ def main(argv: list[str] | None = None) -> None:
         ds_cfg = (_registry.get("datasets") or {}).get(args.dataset) or {}
         adapter_type = ds_cfg.get("type") if ds_cfg.get("type") != args.dataset else None
         language = ds_cfg.get("language", "en")
+        speaker_map_path = ds_cfg.get("speaker_map")
 
-    adapter = get_adapter(args.dataset, adapter_type=adapter_type, language=language)
+    adapter = get_adapter(
+        args.dataset,
+        adapter_type=adapter_type,
+        language=language,
+        speaker_map_path=speaker_map_path,
+    )
     cache = FeatureCache(args.cache_dir)
 
     # Collect utterances (needed for subset sampling)
