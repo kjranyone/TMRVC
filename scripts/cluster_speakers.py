@@ -127,10 +127,16 @@ def cluster_embeddings(
         len(names), method, min_cluster_size, min_samples,
     )
 
+    # L2-normalize before clustering — speaker embeddings are already L2-normed,
+    # so euclidean distance on normalized vectors ∝ cosine distance.
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    matrix = matrix / norms
+
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-        metric="cosine",
+        metric="euclidean",
     )
     labels = clusterer.fit_predict(matrix)
 

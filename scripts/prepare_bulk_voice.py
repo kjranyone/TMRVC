@@ -34,8 +34,12 @@ Usage::
     # Filter + compress to FLAC (for server transfer)
     python scripts/prepare_bulk_voice.py --input data/raw/eroge_all --output data/raw/eroge_clean --flac
 
-    # Auto-transcribe with Whisper (requires whisper)
+    # Auto-transcribe with faster-whisper (requires: uv sync --extra asr)
     python scripts/prepare_bulk_voice.py --input data/raw/eroge_all --output data/raw/eroge_clean --transcribe
+
+    # Flat directory with speaker map from cluster_speakers.py
+    python scripts/prepare_bulk_voice.py --input data/raw/voices --output data/raw/voices_clean \
+        --speaker-map data/raw/voices/_speaker_map.json
 """
 
 from __future__ import annotations
@@ -53,11 +57,13 @@ import soundfile as sf
 
 logger = logging.getLogger(__name__)
 
-# --- Filtering thresholds ---
-MIN_DURATION_SEC = 1.0
-MAX_DURATION_SEC = 30.0
-MIN_RMS = 0.005  # below this = near-silence
-MAX_RMS = 0.99  # above this = clipping
+# --- Filtering thresholds (defaults, overridable via CLI) ---
+_FILTER_CFG = {
+    "min_duration": 1.0,
+    "max_duration": 30.0,
+    "min_rms": 0.005,  # below this = near-silence
+    "max_rms": 0.99,   # above this = clipping
+}
 AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3"}
 
 
@@ -107,6 +113,11 @@ def scan_audio_files_with_map(root: Path, speaker_map_path: Path) -> dict[str, l
 
 def check_audio(path: Path) -> dict:
     """Check audio file quality. Returns info dict with 'ok' flag."""
+    min_dur = _FILTER_CFG["min_duration"]
+    max_dur = _FILTER_CFG["max_duration"]
+    min_rms = _FILTER_CFG["min_rms"]
+    max_rms = _FILTER_CFG["max_rms"]
+
     info: dict = {"path": str(path), "ok": False, "reason": ""}
     try:
         data, sr = sf.read(path, dtype="float32")
@@ -122,11 +133,11 @@ def check_audio(path: Path) -> dict:
     info["sample_rate"] = sr
     info["samples"] = len(data)
 
-    if duration < MIN_DURATION_SEC:
-        info["reason"] = f"too_short ({duration:.1f}s < {MIN_DURATION_SEC}s)"
+    if duration < min_dur:
+        info["reason"] = f"too_short ({duration:.1f}s < {min_dur}s)"
         return info
-    if duration > MAX_DURATION_SEC:
-        info["reason"] = f"too_long ({duration:.1f}s > {MAX_DURATION_SEC}s)"
+    if duration > max_dur:
+        info["reason"] = f"too_long ({duration:.1f}s > {max_dur}s)"
         return info
 
     rms = float(np.sqrt(np.mean(data**2)))
@@ -134,10 +145,10 @@ def check_audio(path: Path) -> dict:
     info["rms"] = round(rms, 4)
     info["peak"] = round(peak, 4)
 
-    if rms < MIN_RMS:
+    if rms < min_rms:
         info["reason"] = f"near_silence (rms={rms:.4f})"
         return info
-    if peak > MAX_RMS:
+    if peak > max_rms:
         info["reason"] = f"clipping (peak={peak:.4f})"
         return info
 
@@ -163,27 +174,28 @@ def transcribe_whisper(
     output_path: Path,
     model_name: str = "large-v3",
     language: str = "ja",
-    device: str = "cuda",
+    device: str = "cpu",
 ) -> dict[str, str]:
-    """Transcribe audio files using Whisper."""
+    """Transcribe audio files using faster-whisper."""
     try:
-        import whisper
+        from faster_whisper import WhisperModel
     except ImportError:
-        logger.error("whisper not installed. Run: pip install openai-whisper")
+        logger.error(
+            "faster-whisper not installed. Run: uv sync --extra asr"
+        )
         return {}
 
-    logger.info("Loading Whisper model '%s'...", model_name)
-    model = whisper.load_model(model_name, device=device)
+    logger.info("Loading faster-whisper model '%s' on %s...", model_name, device)
+    compute_type = "int8" if device == "cpu" else "float16"
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
     transcripts: dict[str, str] = {}
     for i, path in enumerate(audio_paths):
         if (i + 1) % 100 == 0:
             logger.info("  Transcribing %d/%d...", i + 1, len(audio_paths))
         try:
-            result = model.transcribe(
-                str(path), language=language, fp16=(device != "cpu")
-            )
-            text = result["text"].strip()
+            segments, _ = model.transcribe(str(path), language=language)
+            text = "".join(seg.text for seg in segments).strip()
             if text:
                 transcripts[path.stem] = text
         except Exception as e:
@@ -219,8 +231,8 @@ def main() -> None:
         "--speaker-map", type=Path, default=None,
         help="Path to _speaker_map.json from cluster_speakers.py (for flat directories).",
     )
-    parser.add_argument("--min-duration", type=float, default=MIN_DURATION_SEC)
-    parser.add_argument("--max-duration", type=float, default=MAX_DURATION_SEC)
+    parser.add_argument("--min-duration", type=float, default=_FILTER_CFG["min_duration"])
+    parser.add_argument("--max-duration", type=float, default=_FILTER_CFG["max_duration"])
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -229,9 +241,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    global MIN_DURATION_SEC, MAX_DURATION_SEC
-    MIN_DURATION_SEC = args.min_duration
-    MAX_DURATION_SEC = args.max_duration
+    _FILTER_CFG["min_duration"] = args.min_duration
+    _FILTER_CFG["max_duration"] = args.max_duration
 
     if not args.report and args.output is None:
         parser.error("--output is required unless --report is used")
@@ -305,10 +316,15 @@ def main() -> None:
     logger.info("")
     logger.info("Copying %d files to %s ...", total_kept, args.output)
     copied = 0
+    use_speaker_map = args.speaker_map is not None
     for spk, files in sorted(kept_paths.items()):
         for src in files:
-            rel = src.relative_to(args.input)
-            dst = args.output / rel
+            if use_speaker_map:
+                # speaker-map: flat files → output/{spk}/{filename}
+                dst = args.output / spk / src.name
+            else:
+                rel = src.relative_to(args.input)
+                dst = args.output / rel
             copy_or_convert(src, dst, to_flac=args.flac)
             copied += 1
             if copied % 1000 == 0:
@@ -319,12 +335,15 @@ def main() -> None:
     # Transcribe
     if args.transcribe:
         logger.info("")
-        logger.info("=== Whisper Transcription ===")
+        logger.info("=== Whisper Transcription (faster-whisper) ===")
         for spk, files in sorted(kept_paths.items()):
             output_files = []
             for src in files:
-                rel = src.relative_to(args.input)
-                dst = args.output / rel
+                if use_speaker_map:
+                    dst = args.output / spk / src.name
+                else:
+                    rel = src.relative_to(args.input)
+                    dst = args.output / rel
                 if args.flac:
                     dst = dst.with_suffix(".flac")
                 output_files.append(dst)
