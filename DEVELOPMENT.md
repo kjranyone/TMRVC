@@ -48,7 +48,11 @@ cargo --version
 
 ```bash
 # 依存関係のインストール (仮想環境自動作成)
-uv sync
+# CUDA環境
+uv sync --extra-index-url https://download.pytorch.org/whl/cu128
+
+# XPU環境 (Intel Arc)
+uv sync --extra-index-url https://download.pytorch.org/whl/xpu
 
 # 特定パッケージのみ
 uv sync --package tmrvc-core
@@ -227,7 +231,8 @@ Use a registry file instead of searching for datasets manually.
 2. Run deterministic preprocessing:
 
 ```bash
-uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu --skip-existing
+# --device は環境に合わせて cuda/xpu を指定
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device cuda --skip-existing
 ```
 
 3. Check generated cache manifests:
@@ -236,5 +241,5 @@ uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --devic
 Example for Tsukuyomi only:
 
 ```bash
-uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --datasets tsukuyomi --device xpu --skip-existing
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --datasets tsukuyomi --device cuda --skip-existing
 ```

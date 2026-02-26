@@ -43,11 +43,10 @@ VQ_COMMITMENT_LAMBDA = 0.25
 
 @dataclass
 class DistillationConfig(BaseTrainerConfig):
-    """Configuration for distillation training."""
-
-    phase: str = "A"  # "A", "B", "B2", "C", "LCD"
-    max_steps: int = 200_000
+    phase: str = "A"
     teacher_steps: int = 20
+    save_every: int = 10_000
+    log_every: int = 100
     checkpoint_dir: str = "checkpoints/distill"
     lambda_stft: float = 0.5
     lambda_spk: float = 0.3
@@ -93,6 +92,7 @@ class DistillationTrainer(BaseTrainer):
         discriminator: MelDiscriminator | None = None,
         disc_optimizer: torch.optim.Optimizer | None = None,
         speaker_encoder: nn.Module | None = None,
+        use_amp: bool = True,
     ) -> None:
         super().__init__(optimizer, dataloader, config)
         self.teacher = teacher
@@ -105,6 +105,8 @@ class DistillationTrainer(BaseTrainer):
         self.vocoder = vocoder
         self.ir_estimator = ir_estimator
         self.scheduler = scheduler
+        self.use_amp = use_amp
+        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         self.flow_loss = FlowMatchingLoss()
         self.stft_loss = MultiResolutionSTFTLoss()
@@ -139,11 +141,16 @@ class DistillationTrainer(BaseTrainer):
                 LatencyLoss,
                 MonotonicityLoss,
             )
+
             device = next(self.converter.parameters()).device
-            self.lcd_conditioner = LatencyConditioner(d_output=N_ACOUSTIC_PARAMS).to(device)
+            self.lcd_conditioner = LatencyConditioner(d_output=N_ACOUSTIC_PARAMS).to(
+                device
+            )
             self.lcd_latency_loss = LatencyLoss()
             self.lcd_mono_loss = MonotonicityLoss(margin=config.mono_margin)
-            logger.info("LCD enabled: LatencyConditioner + LatencyLoss + MonotonicityLoss")
+            logger.info(
+                "LCD enabled: LatencyConditioner + LatencyLoss + MonotonicityLoss"
+            )
 
         # Voice source external distillation (Phase 2)
         self.voice_source_teacher: VoiceSourceEstimator | None = None
@@ -185,10 +192,23 @@ class DistillationTrainer(BaseTrainer):
         if self.content_encoder.vq is not None:
             self.content_encoder.update_vq_ema()
             return getattr(
-                self.content_encoder, "_vq_commitment_loss",
+                self.content_encoder,
+                "_vq_commitment_loss",
                 torch.tensor(0.0, device=device),
             )
         return torch.tensor(0.0, device=device)
+
+    def _backward_step_amp(self, loss: torch.Tensor, params) -> None:
+        """Backward pass with AMP support."""
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        if self.config.grad_clip > 0:
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(params, self.config.grad_clip)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
     def _pred_to_mel(self, pred_features: torch.Tensor) -> torch.Tensor:
         """Convert converter output to log-mel via vocoder + mel filterbank.
@@ -218,98 +238,94 @@ class DistillationTrainer(BaseTrainer):
         f0 = batch.f0.to(device)
         spk_embed = batch.spk_embed.to(device)
 
-        # Teacher generates target mel via multi-step ODE
         with torch.no_grad():
-            teacher_mel = self.scheduler.sample(
-                self.teacher,
-                shape=mel_target.shape,
-                steps=self.config.teacher_steps,
-                device=str(device),
-                content=content_teacher,
-                f0=f0,
-                spk_embed=spk_embed,
-            )
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                teacher_mel = self.scheduler.sample(
+                    self.teacher,
+                    shape=mel_target.shape,
+                    steps=self.config.teacher_steps,
+                    device=str(device),
+                    content=content_teacher,
+                    f0=f0,
+                    spk_embed=spk_embed,
+                )
 
-        # Student: content encoder → IR estimator → converter
-        content_student = self.content_encoder(
-            mel_target,
-            f0,
-        )[0]  # [B, 256, T]
-
-        # IR Estimator: predict acoustic params from mel chunks
-        # Use chunks of IR_UPDATE_INTERVAL frames, pad if needed
-        T = mel_target.shape[-1]
-        if T >= IR_UPDATE_INTERVAL:
-            mel_chunk = mel_target[:, :, :IR_UPDATE_INTERVAL]
-        else:
-            mel_chunk = torch.nn.functional.pad(
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
+            content_student = self.content_encoder(
                 mel_target,
-                (0, IR_UPDATE_INTERVAL - T),
+                f0,
+            )[0]
+
+            T = mel_target.shape[-1]
+            if T >= IR_UPDATE_INTERVAL:
+                mel_chunk = mel_target[:, :, :IR_UPDATE_INTERVAL]
+            else:
+                mel_chunk = torch.nn.functional.pad(
+                    mel_target,
+                    (0, IR_UPDATE_INTERVAL - T),
+                )
+            acoustic_params_pred = self.ir_estimator(mel_chunk)[0]
+
+            vq_loss = self._vq_step(device)
+
+            if batch.speaker_ids:
+                self.voice_source_tracker.update(
+                    acoustic_params_pred, batch.speaker_ids
+                )
+
+            pred_features = self.converter(
+                content_student,
+                spk_embed,
+                acoustic_params_pred,
+            )[0]
+
+            pred_mel = self._pred_to_mel(pred_features)
+
+            if pred_mel.shape[-1] != mel_target.shape[-1]:
+                pred_mel = torch.nn.functional.interpolate(
+                    pred_mel,
+                    size=mel_target.shape[-1],
+                    mode="linear",
+                    align_corners=False,
+                )
+
+            if teacher_mel.shape[-1] != pred_mel.shape[-1]:
+                teacher_mel = torch.nn.functional.interpolate(
+                    teacher_mel,
+                    size=pred_mel.shape[-1],
+                    mode="linear",
+                    align_corners=False,
+                )
+            loss_mel = nn.functional.l1_loss(pred_mel, teacher_mel)
+
+            ir_target = torch.zeros_like(acoustic_params_pred[:, :N_IR_PARAMS])
+            loss_ir = torch.nn.functional.mse_loss(
+                acoustic_params_pred[:, :N_IR_PARAMS],
+                ir_target,
             )
-        acoustic_params_pred = self.ir_estimator(mel_chunk)[0]  # [B, 32]
 
-        # VQ EMA update + commitment loss
-        vq_loss = self._vq_step(device)
+            voice_source = acoustic_params_pred[:, N_IR_PARAMS:]
+            if self.voice_source_loss is not None:
+                if (
+                    self.voice_source_teacher is not None
+                    and not self._voice_source_on_device
+                ):
+                    self.voice_source_teacher.to(device)
+                    self._voice_source_on_device = True
+                loss_voice = self.voice_source_loss(mel_target, voice_source)
+            else:
+                loss_voice = torch.nn.functional.mse_loss(
+                    voice_source,
+                    torch.zeros_like(voice_source),
+                )
+                loss_voice = self.config.lambda_voice * loss_voice
 
-        # Track voice source statistics
-        if batch.speaker_ids:
-            self.voice_source_tracker.update(acoustic_params_pred, batch.speaker_ids)
-
-        pred_features = self.converter(
-            content_student,
-            spk_embed,
-            acoustic_params_pred,
-        )[0]  # [B, 513, T]
-
-        # Convert to proper mel via vocoder + mel filterbank
-        pred_mel = self._pred_to_mel(pred_features)  # [B, 80, T]
-
-        # Ensure time dimensions match
-        if pred_mel.shape[-1] != mel_target.shape[-1]:
-            pred_mel = torch.nn.functional.interpolate(
-                pred_mel,
-                size=mel_target.shape[-1],
-                mode="linear",
-                align_corners=False,
+            loss_total = (
+                loss_mel
+                + self.config.lambda_ir * loss_ir
+                + loss_voice
+                + VQ_COMMITMENT_LAMBDA * vq_loss
             )
-
-        # Loss: L1 against teacher-generated mel (not GT mel)
-        if teacher_mel.shape[-1] != pred_mel.shape[-1]:
-            teacher_mel = torch.nn.functional.interpolate(
-                teacher_mel,
-                size=pred_mel.shape[-1],
-                mode="linear",
-                align_corners=False,
-            )
-        loss_mel = nn.functional.l1_loss(pred_mel, teacher_mel)
-
-        # IR params regression loss: zero-room target for env params (0-23)
-        ir_target = torch.zeros_like(acoustic_params_pred[:, :N_IR_PARAMS])
-        loss_ir = torch.nn.functional.mse_loss(
-            acoustic_params_pred[:, :N_IR_PARAMS],
-            ir_target,
-        )
-
-        # Voice source params (24-31): external distillation or zero regularization
-        voice_source = acoustic_params_pred[:, N_IR_PARAMS:]
-        if self.voice_source_loss is not None:
-            # External distillation from pretrained estimator
-            if self.voice_source_teacher is not None and not self._voice_source_on_device:
-                self.voice_source_teacher.to(device)
-                self._voice_source_on_device = True
-            loss_voice = self.voice_source_loss(mel_target, voice_source)
-        else:
-            # Zero regularization (Phase A default)
-            loss_voice = torch.nn.functional.mse_loss(
-                voice_source,
-                torch.zeros_like(voice_source),
-            )
-            loss_voice = self.config.lambda_voice * loss_voice
-
-        loss_total = (
-            loss_mel + self.config.lambda_ir * loss_ir + loss_voice
-            + VQ_COMMITMENT_LAMBDA * vq_loss
-        )
 
         losses = {
             "mel": loss_mel.item(),
@@ -320,7 +336,7 @@ class DistillationTrainer(BaseTrainer):
         if vq_loss.item() > 0:
             losses["vq"] = vq_loss.item()
 
-        self._backward_step(loss_total, self._student_params())
+        self._backward_step_amp(loss_total, self._student_params())
 
         return losses
 
@@ -377,13 +393,23 @@ class DistillationTrainer(BaseTrainer):
         x_t_real = (1 - t_expanded) * mel_target + t_expanded * noise
         with torch.no_grad():
             v_real = self.teacher(
-                x_t_real, t, content_teacher, f0, spk_embed, acoustic_params,
+                x_t_real,
+                t,
+                content_teacher,
+                f0,
+                spk_embed,
+                acoustic_params,
             )
 
         # Student output ODE interpolation at same timestep
         x_t_fake = (1 - t_expanded) * pred_mel_proxy + t_expanded * noise
         v_fake = self.teacher(
-            x_t_fake, t, content_teacher, f0, spk_embed, acoustic_params,
+            x_t_fake,
+            t,
+            content_teacher,
+            f0,
+            spk_embed,
+            acoustic_params,
         )
 
         loss_dmd = ((v_fake - v_real) ** 2).mean()
@@ -394,7 +420,8 @@ class DistillationTrainer(BaseTrainer):
         loss_spk = self.spk_loss(pred_mean, target_mean)
 
         loss_total = (
-            loss_dmd + self.config.lambda_spk * loss_spk
+            loss_dmd
+            + self.config.lambda_spk * loss_spk
             + VQ_COMMITMENT_LAMBDA * vq_loss
         )
         losses = {
@@ -453,7 +480,8 @@ class DistillationTrainer(BaseTrainer):
         # --- Single student forward (reused for disc and gen) ---
         pred_features, acoustic_params, _ = self._student_forward(batch)
         vq_loss = getattr(
-            self.content_encoder, "_vq_commitment_loss",
+            self.content_encoder,
+            "_vq_commitment_loss",
             torch.tensor(0.0, device=device),
         )
         pred_mel = self._pred_to_mel(pred_features)
@@ -485,10 +513,7 @@ class DistillationTrainer(BaseTrainer):
             logits_fake_for_gen,
         )
 
-        loss_total = (
-            self.config.lambda_gan * loss_gen
-            + VQ_COMMITMENT_LAMBDA * vq_loss
-        )
+        loss_total = self.config.lambda_gan * loss_gen + VQ_COMMITMENT_LAMBDA * vq_loss
 
         losses = {
             "gen": loss_gen.item(),
@@ -513,7 +538,8 @@ class DistillationTrainer(BaseTrainer):
 
         pred_features, _, _ = self._student_forward(batch)
         vq_loss = getattr(
-            self.content_encoder, "_vq_commitment_loss",
+            self.content_encoder,
+            "_vq_commitment_loss",
             torch.tensor(0.0, device=device),
         )
         pred_mel = self._pred_to_mel(pred_features)  # [B, 80, T]
@@ -541,7 +567,8 @@ class DistillationTrainer(BaseTrainer):
             loss_sv = self.sv_loss(pred_mean, target_mean)
 
         loss_total = (
-            self.config.lambda_stft * loss_stft + self.config.lambda_sv * loss_sv
+            self.config.lambda_stft * loss_stft
+            + self.config.lambda_sv * loss_sv
             + VQ_COMMITMENT_LAMBDA * vq_loss
         )
 
@@ -603,17 +630,25 @@ class DistillationTrainer(BaseTrainer):
         q_embed = self.lcd_conditioner(q)  # [B, 32]
         acoustic_params_lcd = acoustic_params + q_embed
 
-        pred_features = self.converter(content_student, spk_embed, acoustic_params_lcd)[0]
+        pred_features = self.converter(content_student, spk_embed, acoustic_params_lcd)[
+            0
+        ]
         pred_mel = self._pred_to_mel(pred_features)
         if pred_mel.shape[-1] != mel_target.shape[-1]:
             pred_mel = nn.functional.interpolate(
-                pred_mel, size=mel_target.shape[-1], mode="linear", align_corners=False,
+                pred_mel,
+                size=mel_target.shape[-1],
+                mode="linear",
+                align_corners=False,
             )
 
         # Distillation loss: L1 against teacher mel
         if teacher_mel.shape[-1] != pred_mel.shape[-1]:
             teacher_mel = nn.functional.interpolate(
-                teacher_mel, size=pred_mel.shape[-1], mode="linear", align_corners=False,
+                teacher_mel,
+                size=pred_mel.shape[-1],
+                mode="linear",
+                align_corners=False,
             )
         loss_distill = nn.functional.l1_loss(pred_mel, teacher_mel)
 
@@ -624,7 +659,9 @@ class DistillationTrainer(BaseTrainer):
         # L_mono: quality monotonicity check
         # Compare quality between pairs with different q values
         quality = -nn.functional.mse_loss(
-            pred_mel, teacher_mel, reduction="none",
+            pred_mel,
+            teacher_mel,
+            reduction="none",
         ).mean(dim=(1, 2))  # [B] (negative MSE = higher is better)
 
         # Sort by q to create adjacent pairs for monotonicity check
@@ -633,7 +670,7 @@ class DistillationTrainer(BaseTrainer):
         if B >= 2:
             # Low-q (more latency) should have higher quality
             quality_high_lat = quality_sorted[:-1]  # lower q = more latency
-            quality_low_lat = quality_sorted[1:]     # higher q = less latency
+            quality_low_lat = quality_sorted[1:]  # higher q = less latency
             loss_mono = self.lcd_mono_loss(quality_low_lat, quality_high_lat)
         else:
             loss_mono = torch.tensor(0.0, device=device)
@@ -710,9 +747,9 @@ class DistillationTrainer(BaseTrainer):
         self.vocoder.load_state_dict(ckpt["vocoder"])
         self.ir_estimator.load_state_dict(ckpt["ir_estimator"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
-        if self.discriminator is not None:
+        if self.discriminator is not None and "discriminator" in ckpt:
             self.discriminator.load_state_dict(ckpt["discriminator"])
-        if self.disc_optimizer is not None:
+        if self.disc_optimizer is not None and "disc_optimizer" in ckpt:
             self.disc_optimizer.load_state_dict(ckpt["disc_optimizer"])
         if self.lcd_conditioner is not None and "lcd_conditioner" in ckpt:
             self.lcd_conditioner.load_state_dict(ckpt["lcd_conditioner"])

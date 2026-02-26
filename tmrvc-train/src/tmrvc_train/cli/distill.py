@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 
 import torch
+import torch.backends.cudnn as cudnn
 
 from tmrvc_train.diffusion import FlowMatchingScheduler
 from tmrvc_train.distillation import DistillationConfig, DistillationTrainer
@@ -114,9 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Prevents XPU kernel recompilation. Set to 0 to disable.",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Verbose logging.",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable automatic mixed precision.",
     )
     return parser
 
@@ -153,7 +160,12 @@ def _parse_speaker_groups(cfg: dict) -> list | None:
                 weight=int(entry.get("weight", 1)),
             )
         )
-        logger.info("Speaker group '%s': speakers=%s, weight=%d", name, groups[-1].speakers, groups[-1].weight)
+        logger.info(
+            "Speaker group '%s': speakers=%s, weight=%d",
+            name,
+            groups[-1].speakers,
+            groups[-1].weight,
+        )
     return groups
 
 
@@ -178,14 +190,38 @@ def main(argv: list[str] | None = None) -> None:
     # Merge YAML config with CLI overrides
     file_cfg = _load_config(args.config, args.phase)
 
-    lr = args.lr if args.lr is not None else (file_cfg.get("lr") or _default_lr(args.phase))
-    max_steps = args.max_steps if args.max_steps is not None else file_cfg.get("max_steps", 200_000)
-    batch_size = args.batch_size if args.batch_size is not None else file_cfg.get("batch_size", 64)
-    save_every = args.save_every if args.save_every is not None else file_cfg.get("save_every", 10_000)
-    checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir is not None else Path(file_cfg.get("checkpoint_dir", "checkpoints/distill"))
+    lr = (
+        args.lr
+        if args.lr is not None
+        else (file_cfg.get("lr") or _default_lr(args.phase))
+    )
+    max_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else file_cfg.get("max_steps", 200_000)
+    )
+    batch_size = (
+        args.batch_size
+        if args.batch_size is not None
+        else file_cfg.get("batch_size", 64)
+    )
+    save_every = (
+        args.save_every
+        if args.save_every is not None
+        else file_cfg.get("save_every", 10_000)
+    )
+    checkpoint_dir = (
+        args.checkpoint_dir
+        if args.checkpoint_dir is not None
+        else Path(file_cfg.get("checkpoint_dir", "checkpoints/distill"))
+    )
 
     speaker_groups = _parse_speaker_groups(file_cfg)
     device = torch.device(args.device)
+
+    # Enable cudnn benchmark for faster training
+    if device.type == "cuda":
+        cudnn.benchmark = True
 
     # Load teacher — infer d_content from checkpoint
     ckpt = torch.load(args.teacher_ckpt, map_location=device, weights_only=False)
@@ -218,15 +254,21 @@ def main(argv: list[str] | None = None) -> None:
         from tmrvc_data.augmentation import Augmenter, AugmentationConfig
 
         rir_dirs = file_cfg.get("rir_dirs", [])
-        augmenter = Augmenter(AugmentationConfig(
-            rir_dirs=[Path(d) for d in rir_dirs],
-        ))
+        augmenter = Augmenter(
+            AugmentationConfig(
+                rir_dirs=[Path(d) for d in rir_dirs],
+            )
+        )
         logger.info("Augmentation enabled (rir_dirs=%s)", rir_dirs)
 
     # Dataloader
     from tmrvc_data.dataset import create_dataloader
 
-    max_frames = args.max_frames if args.max_frames is not None else file_cfg.get("max_frames", 400)
+    max_frames = (
+        args.max_frames
+        if args.max_frames is not None
+        else file_cfg.get("max_frames", 400)
+    )
 
     dataloader = create_dataloader(
         cache_dir=args.cache_dir,
@@ -260,7 +302,9 @@ def main(argv: list[str] | None = None) -> None:
 
         discriminator = MelDiscriminator().to(device)
         disc_optimizer = torch.optim.AdamW(
-            discriminator.parameters(), lr=config.disc_lr, weight_decay=0.01,
+            discriminator.parameters(),
+            lr=config.disc_lr,
+            weight_decay=0.01,
         )
         if args.resume:
             ckpt_data = torch.load(args.resume, map_location=device, weights_only=False)
@@ -283,11 +327,19 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Speaker encoder loaded for Phase C SV loss")
 
     trainer = DistillationTrainer(
-        teacher, content_encoder, converter, vocoder, ir_estimator,
-        scheduler, optimizer, dataloader, config,
+        teacher,
+        content_encoder,
+        converter,
+        vocoder,
+        ir_estimator,
+        scheduler,
+        optimizer,
+        dataloader,
+        config,
         discriminator=discriminator,
         disc_optimizer=disc_optimizer,
         speaker_encoder=speaker_encoder,
+        use_amp=not args.no_amp and device.type == "cuda",
     )
 
     if args.resume:
@@ -295,7 +347,9 @@ def main(argv: list[str] | None = None) -> None:
 
     logger.info(
         "Starting distillation phase %s (lr=%.2e, max_steps=%d)",
-        args.phase, lr, max_steps,
+        args.phase,
+        lr,
+        max_steps,
     )
 
     while trainer.global_step < max_steps:

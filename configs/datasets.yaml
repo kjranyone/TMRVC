@@ -2,28 +2,27 @@
 # Update `raw_dir` to your actual storage location and toggle `enabled`.
 #
 # Usage:
-#   uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu
+#   uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device cuda
 
 cache_dir: data/cache
 split: train
 
 datasets:
+  vctk:
+    type: vctk
+    enabled: true
+    language: en
+    raw_dir: data/raw
+
   tsukuyomi:
     type: tsukuyomi
     enabled: true
     language: ja
-    # Keep training data inside this repository.
     raw_dir: data/raw/tsukuyomi/corpus1
-
-  vctk:
-    type: vctk
-    enabled: false
-    language: en
-    raw_dir: data/raw/VCTK-Corpus
 
   jvs:
     type: jvs
-    enabled: false
+    enabled: true
     language: ja
     raw_dir: data/raw/jvs_corpus
 

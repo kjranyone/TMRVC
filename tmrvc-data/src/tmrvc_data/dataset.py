@@ -107,9 +107,7 @@ class TMRVCDataset(Dataset):
 
             # F0 perturbation on feature level (semitone shift)
             if random.random() < self.augmenter.config.f0_perturbation_prob:
-                shift = random.uniform(
-                    *self.augmenter.config.f0_shift_semitones_range
-                )
+                shift = random.uniform(*self.augmenter.config.f0_shift_semitones_range)
                 f0_shifted = features.f0.clone()
                 voiced = f0_shifted > 0
                 f0_shifted[voiced] = f0_shifted[voiced] * (2.0 ** (shift / 12.0))
@@ -135,7 +133,8 @@ class TMRVCDataset(Dataset):
                     aug_mel = aug_mel[..., :T]
                 elif aug_mel.shape[-1] < T:
                     aug_mel = torch.nn.functional.pad(
-                        aug_mel, (0, T - aug_mel.shape[-1]),
+                        aug_mel,
+                        (0, T - aug_mel.shape[-1]),
                     )
                 features = FeatureSet(
                     mel=aug_mel.squeeze(0) if aug_mel.dim() == 3 else aug_mel,
@@ -155,9 +154,7 @@ class TMRVCDataset(Dataset):
             and len(self._all_speakers) > 1
         ):
             # Pick a different speaker
-            other_speakers = [
-                s for s in self._all_speakers if s != entry["speaker_id"]
-            ]
+            other_speakers = [s for s in self._all_speakers if s != entry["speaker_id"]]
             if other_speakers:
                 other_sid = random.choice(other_speakers)
                 other_idx = random.choice(self._speaker_to_indices[other_sid])
@@ -242,7 +239,8 @@ def collate_fn(
     f0_list = [_crop_or_pad(f.f0, target_t) for f in batch]
     mel_list = [_crop_or_pad(f.mel, target_t) for f in batch]
     lengths = torch.tensor(
-        [min(f.n_frames, target_t) for f in batch], dtype=torch.long,
+        [min(f.n_frames, target_t) for f in batch],
+        dtype=torch.long,
     )
 
     def _pad_time(tensors: list[torch.Tensor], max_len: int) -> torch.Tensor:
@@ -250,18 +248,16 @@ def collate_fn(
         for t in tensors:
             pad_len = max_len - t.shape[-1]
             if pad_len > 0:
-                padded.append(
-                    torch.nn.functional.pad(t, (0, pad_len), value=0.0)
-                )
+                padded.append(torch.nn.functional.pad(t, (0, pad_len), value=0.0))
             else:
                 padded.append(t)
         return torch.stack(padded)
 
     return TrainingBatch(
-        content=_pad_time(content_list, target_t),      # [B, D, T]
-        f0=_pad_time(f0_list, target_t),                 # [B, 1, T]
+        content=_pad_time(content_list, target_t),  # [B, D, T]
+        f0=_pad_time(f0_list, target_t),  # [B, 1, T]
         spk_embed=torch.stack([f.spk_embed for f in batch]),  # [B, 192]
-        mel_target=_pad_time(mel_list, target_t),        # [B, 80, T]
+        mel_target=_pad_time(mel_list, target_t),  # [B, 80, T]
         lengths=lengths,
         utterance_ids=[f.utterance_id for f in batch],
         speaker_ids=[f.speaker_id for f in batch],
@@ -273,13 +269,14 @@ def create_dataloader(
     dataset: str | list[str],
     split: str = "train",
     batch_size: int = DEFAULT_BATCH_SIZE,
-    num_workers: int = 4,
+    num_workers: int = 8,
     cross_speaker_prob: float = CROSS_SPEAKER_PROB,
     balanced_sampling: bool = True,
     subset: float = 1.0,
     speaker_groups: list[SpeakerGroupConfig] | None = None,
     augmenter: Augmenter | None = None,
     max_frames: int = 0,
+    prefetch_factor: int = 4,
 ) -> DataLoader:
     """Create a DataLoader with balanced speaker sampling.
 
@@ -320,7 +317,8 @@ def create_dataloader(
     if balanced_sampling and len(ds) > 0:
         speaker_ids = [e["speaker_id"] for e in ds.entries]
         sampler = BalancedSpeakerSampler(
-            speaker_ids, speaker_groups=speaker_groups,
+            speaker_ids,
+            speaker_groups=speaker_groups,
         )
         shuffle = False  # sampler handles ordering
 
@@ -337,4 +335,6 @@ def create_dataloader(
         collate_fn=collate,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )

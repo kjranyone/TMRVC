@@ -87,7 +87,12 @@ d_speaker: 192        n_ir_params: 24            d_converter_hidden: 384
 
 ```bash
 # uv がインストール済みであること
-uv sync
+# CUDA環境
+uv sync --extra-index-url https://download.pytorch.org/whl/cu128
+
+# XPU環境 (Intel Arc)
+uv sync --extra-index-url https://download.pytorch.org/whl/xpu
+
 uv run pytest tests/python/
 ```
 
@@ -123,9 +128,9 @@ cargo build -p tmrvc-vst --release
 | `tmrvc-gui` | tmrvc-gui | PySide6 開発用 GUI |
 
 ```bash
-# 使用例
-uv run tmrvc-train-teacher --cache-dir data/cache --phase 0 --device xpu
-uv run tmrvc-distill --teacher-ckpt checkpoints/teacher.pt --phase A --device xpu
+# 使用例 (--device は環境に合わせて cuda/xpu を指定)
+uv run tmrvc-train-teacher --cache-dir data/cache --phase 0 --device cuda
+uv run tmrvc-distill --teacher-ckpt checkpoints/teacher.pt --phase A --device cuda
 uv run tmrvc-export --checkpoint checkpoints/distill/best.pt --output-dir models/fp32
 uv run tmrvc-create-character --audio voice.wav --output character.tmrvc_speaker
 uv run tmrvc-serve --port 8000
@@ -161,5 +166,6 @@ MIT
 Configure dataset locations in `configs/datasets.yaml`, then run:
 
 ```bash
-uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device xpu --skip-existing
+# --device は環境に合わせて cuda/xpu を指定
+uv run python scripts/prepare_datasets.py --config configs/datasets.yaml --device cuda --skip-existing
 ```
