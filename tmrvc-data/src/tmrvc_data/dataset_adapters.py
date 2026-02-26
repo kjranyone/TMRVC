@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -271,9 +272,19 @@ class GenericAdapter(DatasetAdapter):
     name = "generic"
     _AUDIO_EXTS = {".wav", ".flac", ".ogg"}
 
-    def __init__(self, dataset_name: str = "generic", language: str = "en") -> None:
+    def __init__(
+        self,
+        dataset_name: str = "generic",
+        language: str = "en",
+        speaker_map_path: str | Path | None = None,
+    ) -> None:
         self._dataset_name = dataset_name
         self._language = language
+        self._speaker_map: dict[str, str] | None = None
+        if speaker_map_path is not None:
+            with open(speaker_map_path, encoding="utf-8") as f:
+                data = json.load(f)
+            self._speaker_map = data["mapping"]
 
     @staticmethod
     def _sanitize(value: str) -> str:
@@ -301,9 +312,17 @@ class GenericAdapter(DatasetAdapter):
             rel = wav_path.relative_to(root)
             rel_no_ext = rel.with_suffix("")
 
-            # Use top-level folder as speaker id when available
-            speaker_raw = rel.parts[0] if len(rel.parts) > 1 else prefix
-            speaker_id = f"{prefix}_{self._sanitize(speaker_raw)}"
+            # Speaker map overrides folder-based speaker detection
+            if self._speaker_map is not None:
+                filename = rel.parts[-1]  # just the filename
+                spk_label = self._speaker_map.get(filename)
+                if spk_label is None or spk_label == "spk_noise":
+                    continue
+                speaker_id = f"{prefix}_{self._sanitize(spk_label)}"
+            else:
+                # Use top-level folder as speaker id when available
+                speaker_raw = rel.parts[0] if len(rel.parts) > 1 else prefix
+                speaker_id = f"{prefix}_{self._sanitize(speaker_raw)}"
 
             utt_raw = "_".join(rel_no_ext.parts)
             utt_id = f"{prefix}_{self._sanitize(utt_raw)}"
@@ -336,6 +355,7 @@ def get_adapter(
     *,
     adapter_type: str | None = None,
     language: str = "en",
+    speaker_map_path: str | Path | None = None,
 ) -> DatasetAdapter:
     """Get a dataset adapter by name or explicit type.
 
@@ -347,6 +367,8 @@ def get_adapter(
             *dataset_name* and *language*.
         language: Language hint passed to GenericAdapter (ignored for
             built-in adapters).
+        speaker_map_path: Path to ``_speaker_map.json`` from
+            ``cluster_speakers.py``.  Only used by :class:`GenericAdapter`.
     """
     type_key = adapter_type or dataset_name
     cls = ADAPTERS.get(type_key)
@@ -355,5 +377,9 @@ def get_adapter(
             f"Unknown dataset/type: {type_key!r}. Available: {list(ADAPTERS)}"
         )
     if cls is GenericAdapter:
-        return GenericAdapter(dataset_name=dataset_name, language=language)
+        return GenericAdapter(
+            dataset_name=dataset_name,
+            language=language,
+            speaker_map_path=speaker_map_path,
+        )
     return cls()

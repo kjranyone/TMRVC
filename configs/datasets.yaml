@@ -82,6 +82,16 @@ datasets:
     speakers: 24
     hours: 2
 
+  # --- Bulk voice data (flat directory, clustered by speaker) ---
+  galge:
+    type: generic
+    enabled: false
+    language: ja
+    raw_dir: data/raw/galge_clean
+    # For flat input with speaker clustering:
+    # raw_dir: data/raw/galge_voices
+    # speaker_map: data/raw/galge_voices/_speaker_map.json
+
   # --- User-defined (generic adapter) ---
   # Uncomment and edit to add custom voice data.
   # Directory structure: raw_dir/speaker_A/*.wav, raw_dir/speaker_B/*.wav

@@ -9,6 +9,7 @@ import pytest
 
 from tmrvc_data.dataset_adapters import (
     ADAPTERS,
+    GenericAdapter,
     JVSAdapter,
     LibriTTSRAdapter,
     TsukuyomiAdapter,
@@ -182,3 +183,91 @@ class TestLibriTTSRAdapter:
         adapter = LibriTTSRAdapter()
         utts = list(adapter.iter_utterances(tmp_path, split="train"))
         assert len(utts) == 0
+
+
+class TestGenericAdapter:
+    def test_flat_layout(self, tmp_path):
+        """Test flat layout: root/*.wav with no speaker folders."""
+        import json
+        import numpy as np
+        import soundfile as sf
+
+        for name in ["utt001.wav", "utt002.wav", "utt003.wav"]:
+            sf.write(str(tmp_path / name), np.zeros(2400, dtype=np.float32), 24000)
+
+        adapter = GenericAdapter(dataset_name="mydata", language="ja")
+        utts = list(adapter.iter_utterances(tmp_path))
+        assert len(utts) == 3
+        assert all(u.dataset == "mydata" for u in utts)
+        assert all(u.language == "ja" for u in utts)
+
+    def test_speaker_map(self, tmp_path):
+        """Test GenericAdapter with speaker_map.json."""
+        import json
+        import numpy as np
+        import soundfile as sf
+
+        # Create flat audio files
+        for name in ["a01.wav", "a02.wav", "b01.wav", "noise01.wav"]:
+            sf.write(str(tmp_path / name), np.zeros(2400, dtype=np.float32), 24000)
+
+        # Create speaker map
+        speaker_map = {
+            "version": 1,
+            "method": "hdbscan",
+            "n_speakers": 2,
+            "n_noise": 1,
+            "mapping": {
+                "a01.wav": "spk_0001",
+                "a02.wav": "spk_0001",
+                "b01.wav": "spk_0002",
+                "noise01.wav": "spk_noise",
+            },
+        }
+        map_path = tmp_path / "_speaker_map.json"
+        map_path.write_text(json.dumps(speaker_map), encoding="utf-8")
+
+        adapter = GenericAdapter(
+            dataset_name="test", language="ja", speaker_map_path=map_path,
+        )
+        utts = list(adapter.iter_utterances(tmp_path))
+
+        # noise01.wav should be excluded
+        assert len(utts) == 3
+        names = {u.utterance_id for u in utts}
+        assert any("a01" in n for n in names)
+        assert any("b01" in n for n in names)
+        assert not any("noise01" in n for n in names)
+
+        # Check speaker ids are properly mapped
+        spk_ids = {u.utterance_id: u.speaker_id for u in utts}
+        a01_utt = [u for u in utts if "a01" in u.utterance_id][0]
+        a02_utt = [u for u in utts if "a02" in u.utterance_id][0]
+        b01_utt = [u for u in utts if "b01" in u.utterance_id][0]
+        assert a01_utt.speaker_id == a02_utt.speaker_id  # same speaker
+        assert a01_utt.speaker_id != b01_utt.speaker_id  # different speaker
+
+    def test_speaker_map_via_get_adapter(self, tmp_path):
+        """Test that get_adapter passes speaker_map_path to GenericAdapter."""
+        import json
+        import numpy as np
+        import soundfile as sf
+
+        sf.write(str(tmp_path / "x.wav"), np.zeros(2400, dtype=np.float32), 24000)
+
+        speaker_map = {
+            "version": 1, "method": "hdbscan", "n_speakers": 1, "n_noise": 0,
+            "mapping": {"x.wav": "spk_0001"},
+        }
+        map_path = tmp_path / "_speaker_map.json"
+        map_path.write_text(json.dumps(speaker_map), encoding="utf-8")
+
+        adapter = get_adapter(
+            "myds", adapter_type="generic", language="ja",
+            speaker_map_path=map_path,
+        )
+        assert isinstance(adapter, GenericAdapter)
+        assert adapter._speaker_map is not None
+        utts = list(adapter.iter_utterances(tmp_path))
+        assert len(utts) == 1
+        assert "spk_0001" in utts[0].speaker_id

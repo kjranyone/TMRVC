@@ -19,6 +19,13 @@ tts = [
     "pyopenjtalk>=0.3",
     "phonemizer>=3.2",
 ]
+cluster = [
+    "hdbscan>=0.8.38",
+    "scikit-learn>=1.4",
+]
+asr = [
+    "faster-whisper>=1.0",
+]
 
 [project.scripts]
 tmrvc-preprocess = "tmrvc_data.cli.preprocess:main"
