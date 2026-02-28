@@ -136,3 +136,13 @@ bpeh_n_blocks: 3                  # BPEH conv blocks
 bpeh_breath_threshold_db: -40.0   # Energy threshold for breath candidate detection (dB)
 bpeh_min_pause_ms: 50.0           # Minimum pause duration to label (ms)
 bpeh_min_breath_ms: 80.0          # Minimum breath duration to label (ms)
+
+# --- UCLM (Unified Codec Language Model) ---
+n_codebooks: 8                    # EnCodec codebook count
+vocab_size: 1024                  # EnCodec codebook vocabulary size
+d_model: 256                      # UCLM model dimension
+d_voice_state: 8                  # Voice state parameter count
+uclm_n_heads: 8                   # UCLM attention heads
+uclm_n_layers: 12                 # UCLM transformer layers
+uclm_dropout: 0.1                 # UCLM dropout rate
+uclm_max_seq_len: 2000            # Maximum sequence length

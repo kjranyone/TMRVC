@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use tmrvc_engine_rs::constants::{HOP_LENGTH, SAMPLE_RATE};
-use tmrvc_engine_rs::processor::{FrameParams, StreamingEngine};
+use tmrvc_engine_rs::constants::{FRAME_SIZE, SAMPLE_RATE};
+use tmrvc_engine_rs::processor::Processor;
 use tmrvc_engine_rs::resampler::PolyphaseResampler;
 use tmrvc_engine_rs::wav_reader::read_wav;
 
@@ -16,6 +16,12 @@ fn parse_arg(args: &[String], key: &str) -> Option<String> {
 fn parse_arg_f32(args: &[String], key: &str, default: f32) -> f32 {
     parse_arg(args, key)
         .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_arg_usize(args: &[String], key: &str, default: usize) -> usize {
+    parse_arg(args, key)
+        .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(default)
 }
 
@@ -66,7 +72,10 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 || parse_arg(&args, "--input").is_none() || parse_arg(&args, "--output").is_none() {
         eprintln!(
-            "Usage: cargo run -p tmrvc-engine-rs --bin offline_convert -- \\\n+  --input <in.wav> --output <out.wav> [--model-dir models/fp32] [--speaker models/test_speaker.tmrvc_speaker] \\\n+  [--dry-wet 0.85] [--output-gain 0.7] [--alpha-timbre 1.0] [--latency-q 1.0]"
+            "Usage: cargo run -p tmrvc-engine-rs --bin offline_convert -- \\\n\
+             --input <in.wav> --output <out.wav> [--model-dir models/fp32] \\\n\
+             [--speaker models/test_speaker.tmrvc_speaker] \\\n\
+             [--temperature 1.0] [--top-k 50]"
         );
         std::process::exit(2);
     }
@@ -77,54 +86,51 @@ fn main() -> Result<()> {
     let speaker_path = PathBuf::from(
         parse_arg(&args, "--speaker").unwrap_or_else(|| "models/test_speaker.tmrvc_speaker".to_string()),
     );
-    let dry_wet = parse_arg_f32(&args, "--dry-wet", 0.85).clamp(0.0, 1.0);
-    let output_gain = parse_arg_f32(&args, "--output-gain", 0.7).max(0.0);
-    let alpha_timbre = parse_arg_f32(&args, "--alpha-timbre", 1.0).clamp(0.0, 1.0);
-    let latency_q = parse_arg_f32(&args, "--latency-q", 1.0).clamp(0.0, 1.0);
+    let temperature = parse_arg_f32(&args, "--temperature", 1.0).max(0.01);
+    let top_k = parse_arg_usize(&args, "--top-k", 50).max(1);
 
     let (raw, sr) = read_wav(&input_path)
         .with_context(|| format!("failed to read input wav: {}", input_path.display()))?;
     let input_24k = maybe_resample_to_24k(&raw, sr);
 
-    let mut engine = StreamingEngine::new(None);
-    engine
-        .load_models(&model_dir)
+    let mut processor = Processor::new(&model_dir)
         .with_context(|| format!("failed to load models: {}", model_dir.display()))?;
-    engine
+    processor
         .load_speaker(&speaker_path)
         .with_context(|| format!("failed to load speaker: {}", speaker_path.display()))?;
+    processor.set_sampling_params(temperature, top_k);
+    processor.start();
 
-    let params = FrameParams {
-        dry_wet,
-        output_gain,
-        alpha_timbre,
-        beta_prosody: 0.0,
-        gamma_articulation: 0.0,
-        latency_quality_q: latency_q,
-        voice_source_alpha: 0.0,
-    };
+    let mut out = Vec::with_capacity(input_24k.len() + FRAME_SIZE);
+    let mut frame_in = [0.0f32; FRAME_SIZE];
+    let mut frame_out = [0.0f32; FRAME_SIZE];
 
-    let mut out = Vec::with_capacity(input_24k.len() + HOP_LENGTH);
-    let mut frame_in = [0.0f32; HOP_LENGTH];
-    let mut frame_out = [0.0f32; HOP_LENGTH];
-
-    for chunk in input_24k.chunks(HOP_LENGTH) {
+    for chunk in input_24k.chunks(FRAME_SIZE) {
         frame_in.fill(0.0);
         frame_in[..chunk.len()].copy_from_slice(chunk);
-        engine.process_one_frame(&frame_in, &mut frame_out, &params);
+        processor.process_frame(&frame_in, &mut frame_out)
+            .context("frame processing failed")?;
         out.extend_from_slice(&frame_out[..chunk.len()]);
     }
 
     let norm_scale = normalize_peak(&mut out, 0.95);
     write_wav_24k(&output_path, &out)?;
+    
+    let timing = processor.timing();
     println!(
-        "done: {} ({} samples @24kHz, norm_scale={:.4}, dry_wet={:.2}, gain={:.2}, q={:.2})",
+        "done: {} ({} samples @24kHz, norm_scale={:.4}, temp={:.2}, top_k={})",
         output_path.display(),
         out.len(),
         norm_scale,
-        dry_wet,
-        output_gain,
-        latency_q
+        temperature,
+        top_k
+    );
+    println!(
+        "timing: avg={:.2}us, max={:.2}us, frames={}, overruns={}",
+        timing.avg_frame_us.load(std::sync::atomic::Ordering::SeqCst),
+        timing.max_frame_us.load(std::sync::atomic::Ordering::SeqCst),
+        timing.frame_count.load(std::sync::atomic::Ordering::SeqCst),
+        timing.overrun_count.load(std::sync::atomic::Ordering::SeqCst),
     );
     Ok(())
 }

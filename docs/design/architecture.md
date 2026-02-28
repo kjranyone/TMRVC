@@ -2,13 +2,14 @@
 
 Kojiro Tanaka — architecture design
 Created: 2026-02-16 (Asia/Tokyo)
+Updated: 2026-02-28 — UCLM パラダイムに統合
 
-> **Goal:** End-to-end 50ms 以下 (DAW バッファ込み)、CPU-only リアルタイム Voice Conversion。
-> Frame-by-frame causal streaming アーキテクチャ。
+> **Goal:** End-to-end 50ms 以下 (DAW バッファ込み)、CPU-only リアルタイム Voice Conversion + TTS。
+> **Current Paradigm:** UCLM (Unified Codec Language Model) — 単一モデルで TTS と VC を統合。
 
 ---
 
-## 1. システム概要図
+## 1. システム概要
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -19,13 +20,11 @@ Created: 2026-02-16 (Asia/Tokyo)
 │                │  ┌───────────────────────────┐  │                    │
 │                │  │    StreamingEngine         │  │                    │
 │                │  │  ┌─────────────────────┐  │  │                    │
-│                │  │  │   ONNX Models (×5)  │  │  │                    │
+│                │  │  │  UCLM (ONNX)       │  │  │                    │
 │                │  │  │  ┌───────────────┐  │  │  │                    │
-│                │  │  │  │content_encoder│  │  │  │                    │
-│                │  │  │  │ir_estimator   │  │  │  │                    │
-│                │  │  │  │speaker_encoder│  │  │  │                    │
-│                │  │  │  │converter      │  │  │  │                    │
-│                │  │  │  │vocoder        │  │  │  │                    │
+│                │  │  │  │CodecEncoder   │  │  │  │                    │
+│                │  │  │  │UCLM Core      │  │  │  │                    │
+│                │  │  │  │CodecDecoder   │  │  │  │                    │
 │                │  │  │  └───────────────┘  │  │  │                    │
 │                │  │  └─────────────────────┘  │  │                    │
 │                │  └───────────────────────────┘  │                    │
@@ -33,387 +32,234 @@ Created: 2026-02-16 (Asia/Tokyo)
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-信号フロー:
-```
-DAW Input ──▶ VST3 Plugin ──▶ StreamingEngine ──▶ ONNX Models ──▶ DAW Output
-  (48kHz)     (processBlock)   (Rust library)     (ONNX Runtime)  (48kHz)
-```
-
 ---
 
-## 2. Monorepo ディレクトリ構成
+## 2. パラダイムの歴史
+
+TMRVC は 3 つの設計パラダイムを経て、現在は **UCLM** に統合されている。
+
+### 2.1 パラダイム比較
+
+| パラダイム | モデル数 | TTS | VC | 設計資料 |
+|---|---|---|---|---|
+| **Teacher-Student** | 5+ | ✗ | ✓ | (旧設計、非公開) |
+| **Codec-Latent** | 3 | ✗ | ✓ | `codec-latent-design.md` |
+| **UCLM** | 2 | ✓ | ✓ | `unified-codec-lm.md` |
+
+### 2.2 各パラダイムの概要
+
+#### Teacher-Student (Phase 0-1)
 
 ```
-TMRVC/
-├── docs/                          # 設計資料 (本ファイル群)
-│
-├── tmrvc-core/                    # Python: 共有定数・ユーティリティ
-│   ├── pyproject.toml
-│   └── src/tmrvc_core/
-│       ├── constants.py           # sample_rate, n_fft, hop_length, etc.
-│       ├── audio.py               # mel, STFT, resampling
-│       └── types.py               # shared type definitions
-│
-├── tmrvc-data/                    # Python: データ前処理パイプライン
-│   ├── pyproject.toml
-│   └── src/tmrvc_data/
-│       ├── dataset.py             # Dataset / DataLoader
-│       ├── augmentation.py        # RIR convolution, EQ, noise
-│       ├── features.py            # F0, content embedding extraction
-│       └── speaker.py             # speaker embedding extraction
-│
-├── tmrvc-train/                   # Python: モデル定義・学習ループ
-│   ├── pyproject.toml
-│   └── src/tmrvc_train/
-│       ├── models/
-│       │   ├── content_encoder.py
-│       │   ├── converter.py       # Teacher (U-Net) + Student (causal CNN)
-│       │   ├── vocoder.py         # iSTFT vocoder
-│       │   ├── ir_estimator.py
-│       │   ├── speaker_encoder.py
-│       │   └── lora.py            # LoRA adapter
-│       ├── losses/
-│       │   ├── stft_loss.py       # Multi-res STFT loss
-│       │   ├── distill_loss.py    # DMD / trajectory matching
-│       │   └── speaker_loss.py    # ECAPA cosine similarity
-│       ├── train_teacher.py
-│       ├── train_student.py       # Distillation
-│       └── train_fewshot.py       # Few-shot adaptation
-│
-├── tmrvc-export/                  # Python: ONNX エクスポート・検証
-│   ├── pyproject.toml
-│   └── src/tmrvc_export/
-│       ├── export_onnx.py         # PyTorch → ONNX (5 models)
-│       ├── quantize.py            # INT8 dynamic quantization
-│       ├── verify_parity.py       # Python vs Rust numerical parity
-│       └── benchmark.py           # ONNX Runtime benchmark
-│
-├── tmrvc-engine-rs/               # Rust: ストリーミング推論エンジン
-│   └── src/
-│       ├── processor.rs
-│       ├── ort_bundle.rs
-│       ├── tensor_pool.rs
-│       ├── ring_buffer.rs
-│       ├── resampler.rs
-│       └── speaker.rs
-│
-├── tmrvc-vst/                     # Rust: VST3 プラグイン (nih-plug)
-│   └── src/
-│       ├── plugin.rs
-│       └── params.rs
-│
-├── tmrvc-gui/                     # Python: Research Studio GUI (PySide6)
-│   ├── pyproject.toml
-│   └── src/tmrvc_gui/
-│       ├── __main__.py            # Entry point (uv run tmrvc-gui)
-│       ├── app.py                 # QApplication setup
-│       ├── main_window.py         # Sidebar + QStackedWidget + StatusBar
-│       ├── pages/                 # 7 workflow screens
-│       ├── workers/               # Background jobs + AudioEngine
-│       ├── widgets/               # Reusable UI components
-│       ├── models/                # ProjectState, ConfigManager
-│       └── resources/             # style.qss
-│
-├── tests/                         # 統合テスト
-│   ├── python/
-│   └── cpp/
-│
-├── configs/                       # 学習・エクスポート設定
-│   ├── constants.yaml             # 共有定数 (YAML source of truth)
-│   ├── train_teacher.yaml
-│   ├── train_student.yaml
-│   └── export.yaml
-│
-├── scripts/                       # ユーティリティスクリプト
-│   ├── generate_constants.py      # YAML → Python + Rust constants
-│   └── run_benchmark.py
-│
-└── pyproject.toml                 # Workspace root (uv workspace)
+Source Audio → ContentEncoder → Content → Converter → Vocoder → Target Audio
+                                       ↑
+                                 SpeakerEmbed + AcousticParams
 ```
 
----
+- **特長:** 従来の VC パイプライン
+- **課題:** パイプライン複雑、TTS 非対応
 
-## 3. モジュール責務表
-
-| モジュール | 言語 | 責務 | 依存先 |
-|---|---|---|---|
-| **tmrvc-core** | Python | 共有定数 (sample_rate, n_fft, hop_length, dims)、mel 計算、型定義 | なし |
-| **tmrvc-data** | Python | データセット管理、前処理、augmentation (RIR, EQ, noise)、特徴量抽出 (F0, content, speaker) | tmrvc-core |
-| **tmrvc-train** | Python | Teacher/Student モデル定義、学習ループ、損失関数、蒸留、Few-shot adaptation | tmrvc-core, tmrvc-data |
-| **tmrvc-export** | Python | PyTorch → ONNX エクスポート、INT8 量子化、Python↔Rust 数値パリティ検証 | tmrvc-core, tmrvc-train |
-| **tmrvc-engine-rs** | Rust | ストリーミング推論エンジン。ONNX Runtime でモデル実行、Ring Buffer、Resampler、Speaker 管理 | ONNX Runtime (`ort` crate) |
-| **tmrvc-vst** | Rust | VST3 ラッパー。DAW 統合 (process, latency reporting, state persistence) | tmrvc-engine-rs, nih-plug |
-| **tmrvc-gui** | Python | Research Studio GUI。全ワークフロー統合 (データ準備→学習→蒸留→評価→話者登録→リアルタイムVC→エクスポート)。PySide6 + sounddevice + pyqtgraph | tmrvc-core, tmrvc-data, tmrvc-train, tmrvc-export |
-
-### モジュール間の依存グラフ
+#### Codec-Latent (Phase 2)
 
 ```
-tmrvc-core ◀─── tmrvc-data ◀─── tmrvc-train
-     ▲               ▲               │
-     │               │               ▼
-     └──────── tmrvc-export ◀────────┘
-                     ▲
-                     │
-               tmrvc-gui (Python GUI, PySide6)
-                     │──▶ tmrvc-data
-                     │──▶ tmrvc-train
-                     └──▶ tmrvc-export
-
-tmrvc-engine-rs ◀─── tmrvc-vst
-     (Rust)            (Rust / nih-plug)
-       ▲
-       │
-  ONNX Runtime (`ort` crate)
+Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → Decoder → Audio
 ```
 
-Python 側と Rust 側は ONNX ファイルと `constants.yaml` (→ 自動生成定数) でのみ接続される。
-`tmrvc-gui` は Python 側の統合フロントエンドで、ONNX Runtime Python API 経由でリアルタイム VC も実行可能。
+- **特長:** トークン予測による VC
+- **課題:** TTS 非対応、学習複雑
 
----
-
-## 4. データフロー図
-
-### 4.1 学習時フロー (Teacher → Student 蒸留 → Few-shot)
+#### UCLM (Current)
 
 ```
-                        ┌─────── Training Pipeline ───────┐
-                        │                                  │
-  Audio Dataset         │   Phase 1: Teacher Training      │
-  (VCTK, LibriTTS-R,   │   ─────────────────────────      │
-   JVS + RIR augment)  │                                  │
-        │               │   HuBERT ──▶ content (768d)     │
-        ▼               │   RMVPE  ──▶ f0                 │
-  ┌──────────┐          │   ECAPA  ──▶ spk_embed (192d)   │
-  │ tmrvc-   │          │   IR est ──▶ ir_params (24d)    │
-  │   data   │──────────▶                                  │
-  └──────────┘          │   U-Net (v-prediction, non-causal)
-                        │   + multi-res STFT loss          │
-                        │              │                   │
-                        │              ▼                   │
-                        │   Teacher checkpoint             │
-                        │              │                   │
-                        │   Phase 2: Student Distillation  │
-                        │   ────────────────────────────   │
-                        │                                  │
-                        │   Teacher (multi-step) generates │
-                        │   reference mel/features         │
-                        │              │                   │
-                        │              ▼                   │
-                        │   Student (causal CNN, 1-step):  │
-                        │     content_encoder (mel→256d)   │
-                        │     converter (1-step denoiser)  │
-                        │     vocoder (iSTFT)              │
-                        │              │                   │
-                        │   Losses:                        │
-                        │     Phase A: ODE trajectory      │
-                        │     Phase B: DMD                 │
-                        │              │                   │
-                        │              ▼                   │
-                        │   Student checkpoint             │
-                        │              │                   │
-                        │   Phase 3: Few-shot Adaptation   │
-                        │   ───────────────────────────    │
-                        │                                  │
-                        │   Target speaker audio (3-20 utt)│
-                        │   → ECAPA → spk_embed (192d)    │
-                        │   → LoRA delta (cross-attn K/V)  │
-                        │                                  │
-                        │   Update: spk_embed + LoRA only  │
-                        │   Freeze: content_enc, vocoder,  │
-                        │           IR pathway             │
-                        │              │                   │
-                        │              ▼                   │
-                        │   .tmrvc_speaker file            │
-                        │   (spk_embed + LoRA delta)       │
-                        └──────────────────────────────────┘
-```
-
-### 4.2 推論時フロー (Streaming VC)
-
-```
-DAW Audio In (48kHz)
-      │
-      ▼
-┌─ StreamingEngine ──────────────────────────────────────────────┐
-│                                                                 │
-│  Downsample (48kHz → 24kHz, polyphase)                         │
-│      │                                                          │
-│      ▼                                                          │
-│  Input Ring Buffer                                              │
-│      │ accumulate ≥ hop_length (240 samples = 10ms)             │
-│      ▼                                                          │
-│  Causal STFT + Mel (per frame)                                  │
-│      │                                                          │
-│      ├──▶ content_encoder.onnx  ──▶ content[1,256,1]           │
-│      │      (per-frame, ~0.3ms)     + state update              │
-│      │                                                          │
-│      ├──▶ ir_estimator.onnx     ──▶ ir_params[1,24]  ← cached │
-│      │      (every ~10 frames, ~0.5ms amortized)                │
-│      │                                                          │
-│      │   speaker_encoder output: pre-loaded from                │
-│      │      .tmrvc_speaker file (spk_embed + LoRA delta         │
-│      │      + voice_source_preset)                              │
-│      │                                                          │
-│      ├──▶ Voice Source Blend (if preset loaded):               │
-│      │      acoustic_params[24..31] = lerp(estimated, preset, α)│
-│      │      (RT-safe: stack copy + 8 mul-add, zero alloc)       │
-│      │                                                          │
-│      ▼                                                          │
-│  converter.onnx (1-step)                                        │
-│      content + spk_embed + acoustic_params → pred_features      │
-│      (per-frame, ~2ms)                                          │
-│      │                                                          │
-│      ▼                                                          │
-│  vocoder.onnx                                                   │
-│      pred_features → STFT mag + phase                           │
-│      (per-frame, ~1ms)                                          │
-│      │                                                          │
-│      ▼                                                          │
-│  iSTFT + Overlap-Add                                            │
-│      │                                                          │
-│      ▼                                                          │
-│  Output Ring Buffer                                             │
-│      │                                                          │
-│  Upsample (24kHz → 48kHz, polyphase)                           │
-│      │                                                          │
-│  Dry/Wet Mix + Gain                                             │
-│                                                                 │
+┌─────────────────────────────────────────────────────────────────┐
+│                      UCLM (Unified Codec LM)                     │
+│                                                                  │
+│  TTS Mode:  text + voice_state + speaker → CodecLM → Audio      │
+│  VC Mode:   source_tokens + speaker + voice_state → Audio       │
+│                                                                  │
+│  Components:                                                     │
+│    - EnCodec (Encoder + Decoder)                                │
+│    - UCLM Core (Transformer)                                    │
+│    - VoiceStateEncoder                                          │
+│    - SpeakerEncoder                                              │
 └─────────────────────────────────────────────────────────────────┘
-      │
-      ▼
-DAW Audio Out (48kHz)
+```
+
+- **特長:** TTS + VC 統合、パイプライン簡素化
+- **状態:** 現在実装中
+
+---
+
+## 3. 現在のアーキテクチャ (UCLM)
+
+### 3.1 モデル構成
+
+| モデル | 入力 | 出力 | 用途 |
+|---|---|---|---|
+| **EnCodec** | waveform | tokens [n_cb, T] | 符号化/復号 |
+| **UCLM Core** | (text \| source_tokens) + voice_state + spk_embed | tokens | トークン生成 |
+| **VoiceStateEncoder** | voice_state [T, 8] | features [T, d] | 条件付け |
+| **SpeakerEncoder** | audio | embed [192] | 話者埋め込み |
+
+### 3.2 フレームレート
+
+| コンポーネント | サンプルレート | フレームレート |
+|---|---|---|
+| DAW Audio | 48kHz | — |
+| 内部 Audio | 24kHz | — |
+| Mel / Voice State | 24kHz | 100 fps (10ms) |
+| EnCodec Tokens | 24kHz | 75 fps (~13.3ms) |
+
+### 3.3 推論フロー (VC Mode)
+
+```
+1. DAW Audio (48kHz) → Resample → 24kHz
+2. 24kHz Audio → EnCodec Encoder → tokens [8, T]
+3. tokens + spk_embed + voice_state → UCLM Core → target_tokens
+4. target_tokens → EnCodec Decoder → 24kHz Audio
+5. 24kHz Audio → Resample → 48kHz → DAW Output
+```
+
+### 3.4 推論フロー (TTS Mode)
+
+```
+1. Text → TextEncoder → text_features
+2. text_features + voice_state + spk_embed → UCLM Core → tokens
+3. tokens → EnCodec Decoder → 24kHz Audio
 ```
 
 ---
 
-## 5. 主要アーキテクチャ判断と根拠
+## 4. 共通コンポーネント
 
-### 5.1 5 分割 ONNX モデル
+### 4.1 SpeakerEncoder
 
-| 判断 | 5つの独立した ONNX モデルとしてエクスポート |
-|---|---|
-| **根拠** | 各モデルの実行頻度が異なるため、個別に管理することで計算量を最小化できる |
+- **アーキテクチャ:** ECAPA-TDNN
+- **出力:** 192 次元埋め込み
+- **学習:** 事前学習済み (VoxCeleb)
+- **ファイル:** `.tmrvc_speaker`
 
-実行頻度の違い:
+### 4.2 Voice State Parameters
 
-| モデル | 実行頻度 | 理由 |
-|---|---|---|
-| speaker_encoder | Offline (enrollment 時のみ) | 話者登録は一度だけ。推論時はキャッシュ参照 |
-| ir_estimator | ~100ms ごと (every ~10 frames) | 室内音響は緩やかに変化。amortized 実行で十分 |
-| content_encoder | Per-frame (10ms ごと) | 音声内容はフレームごとに変化 |
-| converter | Per-frame (10ms ごと) | content→target features 変換 |
-| vocoder | Per-frame (10ms ごと) | features→waveform 変換 |
+| Index | Name | Range | Description |
+|---|---|---|---|
+| 0 | breathiness | [0, 1] | 気息成分 |
+| 1 | tension | [0, 1] | 声帯緊張 |
+| 2 | arousal | [0, 1] | 感情覚醒度 |
+| 3 | valence | [-1, 1] | 感情価 |
+| 4 | roughness | [0, 1] | 声の粗さ |
+| 5 | voicing | [0, 1] | 有声/無声 |
+| 6 | energy | [0, 1] | エネルギー |
+| 7 | rate | [0.5, 2.0] | 話速 |
 
-モノリシックモデルでは、実行頻度の異なる処理を分離できず無駄な計算が発生する。
+### 4.3 EnCodec
 
-### 5.2 tmrvc-engine-rs は UI/Host 非依存
-
-| 判断 | StreamingEngine を UI/Host 実装 (VST/Standalone) から分離した Rust crate として設計 |
-|---|---|
-| **根拠** | テスタビリティ、再利用性、ライセンス分離 |
-
-- **テスタビリティ**: DAW なしで単体テスト・ベンチマーク可能
-- **再利用性**: VST3 以外 (standalone CLI, mobile, WebAssembly) にも展開可能
-- **依存分離**: VST ラッパー (nih-plug) と推論エンジンの責務を明確に分離
-- **ビルド簡素化**: エンジン単体を `cargo test`/`cargo bench` で検証可能
-
-### 5.3 ONNX Runtime 利用方針 (Rust `ort` crate)
-
-| 判断 | ONNX Runtime CPU EP を Rust から利用し、推論呼び出しを `tmrvc-engine-rs` に集約 |
-|---|---|
-| **根拠** | バイナリサイズ削減、配布簡素化、ABI 安定性 |
-
-- **CPU-only 実行**: ライブ用途での安定性を優先
-- **セッション分離**: content/converter/vocoder などを個別セッションで管理
-- **将来拡張性**: 量子化モデル切替や HQ モデル追加をランタイム側で吸収しやすい
-
-### 5.4 Frame-by-frame causal streaming (chunk-based ではなく)
-
-| 判断 | 1 hop (10ms) 単位の frame-by-frame 処理。50ms chunk-based ではない |
-|---|---|
-| **根拠** | レイテンシ最小化、パイプラインの柔軟性 |
-
-- **chunk-based** (旧設計 system_design.md): 50ms 分 (5 frames) を溜めて一括処理 → algorithmic latency = 50ms
-- **frame-by-frame** (本設計): 10ms 分 (1 frame) が溜まるたびに即座に処理 → algorithmic latency = 10ms
-- 10ms の処理時間で推論が完了すれば、DAW buffer latency + 10ms で出力可能
-- 先行研究 LLVC は frame-by-frame で <20ms@16kHz を実証済み
-
-### 5.5 iSTFT-based vocoder (Vocos 系)
-
-| 判断 | WaveForm domain ではなく STFT domain で予測し iSTFT で波形復元 |
-|---|---|
-| **根拠** | フレーム単位処理との親和性、計算量削減 |
-
-- **従来の waveform vocoder** (HiFi-GAN): hop_length 分のサンプルを直接生成 → 計算量大
-- **iSTFT vocoder** (Vocos): STFT magnitude + phase を予測 → iSTFT で波形復元
-  - フレーム単位の予測と自然に整合
-  - overlap-add でフレーム間の連続性を保証
-  - 計算量は waveform vocoder の 1/3-1/5
-  - Vocos は HiFi-GAN と同等品質を報告 (Kim et al., 2024)
-
-### 5.6 Speaker enrollment = embed + LoRA delta (事前計算、推論時はキャッシュ参照)
-
-| 判断 | 話者登録時に spk_embed と LoRA delta を事前計算し `.tmrvc_speaker` ファイルに保存。推論時はロードのみ |
-|---|---|
-| **根拠** | 推論時の計算量ゼロ、Hot-swap 可能 |
-
-- speaker_encoder (ECAPA-TDNN, ~5-10M params) は推論パイプラインから完全に除外
-- `.tmrvc_speaker` ファイル (~100-500KB) にはバイナリ形式で格納:
-  - `spk_embed[192]` (float32)
-  - `lora_delta` (LoRA weights for cross-attn K/V)
-  - metadata JSON: `voice_source_preset[8]` (optional) — 声質パラメータのプリセット値
-- Worker thread でロード → double-buffered slot に書き込み → atomic swap
-- Audio thread は常にキャッシュされた embed/LoRA/voice_source_preset を参照するだけ
-
-### 5.7 内部サンプルレート: 24kHz
-
-| 判断 | モデル内部は 24kHz で処理。DAW の 44.1/48kHz とはリサンプルで接続 |
-|---|---|
-| **根拠** | 計算量削減、先行研究との整合、品質とのトレードオフ |
-
-- 24kHz で 12kHz まで表現可能 (音声帯域には十分)
-- 48kHz 処理と比べて hop あたりのサンプル数が半分 → STFT/iSTFT の計算量半減
-- 48kHz↔24kHz は整数比 (2:1) のため polyphase resampler が効率的
-- LLVC, StreamVC 等の先行研究も 16-24kHz 内部処理を採用
+- **モデル:** `facebook/encodec_24khz`
+- **Codebooks:** 8
+- **Vocabulary:** 1024
+- **Bandwidth:** 6 kbps
 
 ---
 
-## 6. 設計資料間のクロスリファレンス
+## 5. データパイプライン
 
-| 資料 | ファイル | 主な関連 |
-|---|---|---|
-| 本資料 (アーキテクチャ) | `docs/design/architecture.md` | 全体の統合ビュー |
-| ストリーミング設計 | `docs/design/streaming-design.md` | §4.2 推論時フローの詳細化 |
-| ONNX I/O 仕様 | `docs/design/onnx-contract.md` | §5.1 の 5 モデル I/O 定義、`.tmrvc_speaker` metadata |
-| モデルアーキテクチャ | `docs/design/model-architecture.md` | §4.1 学習時フローの詳細化 |
-| エンジン設計 (legacy doc 名) | `docs/design/cpp-engine-design.md` | §5.2-5.3 の実装詳細（現行実装は Rust） |
-| Acoustic Condition Pathway | `docs/design/acoustic-condition-pathway.md` | IR + Voice Source 統合条件付け、プリセットブレンド |
-| GUI 設計 | `docs/design/gui-design.md` | Research Studio GUI アプリケーション設計 |
-| VC 学習計画 | `docs/training/vc-training-plan.md` | Teacher 学習 + 蒸留のコーパス・スケジュール詳細 |
-| TTS 学習計画 + アーキテクチャ | `docs/training/tts-training-plan.md` | TTS Phase 2-5 ロードマップ、モジュール構成、テンソル仕様 |
-| Style・文脈統合 | `docs/training/style-training-plan.md` | StyleEncoder、LLM 統合、VTuber 配信設計 |
-| 学習パイプライン統合ガイド | `docs/training/README.md` | 全学習パスの依存グラフ + CLI リファレンス |
-| 先行研究・コンセプト | `docs/reference/concept.md` | IR-aware 設計の根拠 |
-| 参考: 旧システム設計 | `docs/reference/system_design.md` | 品質目標・蒸留手法・データセット計画の参考 |
+```
+Raw Audio (data/raw/)
+    │
+    ├──▶ prepare_dataset.py
+    │      ├── Normalize (24kHz, loudness)
+    │      ├── Annotate (Whisper, emotion)
+    │      ├── Extract (mel, f0, spk_embed)
+    │      └── Save (data/cache/)
+    │
+    ├──▶ add_codec_to_cache.py
+    │      ├── EnCodec → codec_tokens
+    │      └── VoiceStateEstimator → voice_state
+    │
+    └──▶ UCLMDataset
+           └── DataLoader → Training
+```
 
 ---
 
-## 7. 追加設計判断 (2026-02-17)
+## 6. 学習パイプライン
 
-### 7.1 Latency-Quality Spectrum を正式採用
+### 6.1 Phase 構成
 
-| 判断 | 推論品質とレイテンシを単一ノブで連続可変にする (`q in [0,1]`) |
+| Phase | データ | モデル | 目標 |
+|---|---|---|---|
+| **A** | LibriTTS-R | UCLM (TTS only) | 基本 TTS |
+| **B** | VCTK + JVS | UCLM (TTS + VC) | VC 統合 |
+| **C** | moe_multispeaker | UCLM | 多話者・感情 |
+| **D** | Expresso + Custom | UCLM | NV・濡れ場 |
+
+### 6.2 CLI
+
+```bash
+# データ前処理
+uv run python scripts/parallel_prepare.py \
+    --input data/moe_multispeaker_voices \
+    --name moe_multispeaker \
+    --n-jobs 4
+
+# codec_tokens 追加
+uv run python scripts/add_codec_to_cache.py --speaker moe_spk_01 --device cuda
+
+# UCLM 学習
+uv run tmrvc-train-uclm \
+    --cache-dir data/cache \
+    --datasets vctk,moe_multispeaker \
+    --device cuda
+```
+
+---
+
+## 7. 用語集
+
+| 用語 | 定義 |
 |---|---|
-| **根拠** | 用途ごとに最適点が異なるため。ライブ用途は低遅延、制作用途はイントネーション/活舌の品質を優先する。 |
+| **UCLM** | Unified Codec Language Model。TTS/VC 統合モデル |
+| **Codec-Latent** | EnCodec トークンを潜在表現として扱うパラダイム |
+| **Voice State** | breathiness, tension 等 8 次元の音響パラメータ |
+| **NV** | Non-Verbal Vocalization（笑い、泣き、息 etc.） |
+| **StreamingEngine** | Rust によるリアルタイム推論エンジン |
+| **.tmrvc_speaker** | 話者埋め込みファイル形式 |
 
-採用方針:
+---
 
-- `q` に応じて `lookahead_hops`, `F0 window`, `IR update interval`, `model profile` を連動
-- レイテンシ報告は `20ms + lookahead_hops * 10ms`
-- プロファイル遷移は 100ms クロスフェードで無破綻切替
-- 過負荷時は adaptive に `q` を自動降格
+## 8. 設計資料一覧
 
-参照:
+### Current (有効)
 
-- `docs/design/streaming-design.md` の `## 12. Latency-Quality Spectrum Control`
-- `docs/design/gui-design.md` の `## 12. Latency-Quality Spectrum UI`
+| ファイル | 内容 |
+|---|---|
+| `unified-codec-lm.md` | UCLM アーキテクチャ詳細 |
+| `uclm-implementation-roadmap.md` | 実装ロードマップ |
+| `streaming-design.md` | ストリーミング設計 |
+| `dataset-preparation-flow.md` | データ準備フロー |
+
+### Archive (参考)
+
+| ファイル | 内容 | 状態 |
+|---|---|---|
+| `expressive-tts-design-VSF.md` | Voice Source Flow (パイプライン案) | 古い |
+| `unified-generator-tts-UCG.md` | UCG (初期案) | 古い |
+| `codec-latent-design.md` | Codec-Latent (Mamba案) | 参考 |
+
+### Legacy (更新予定)
+
+| ファイル | 状態 |
+|---|---|
+| `model-architecture.md` | UCLM に更新必要 |
+| `acoustic-condition-pathway.md` | 参考資料 (UCLM では使用しない) |
+| `onnx-contract.md` | UCLM ONNX 仕様に更新必要 |
+| `cpp-engine-design.md` | Rust エンジン設計 (有効) |
+
+---
+
+## 9. Consistency Checklist
+
+- [ ] UCLM のフレームレート: EnCodec 75fps vs Voice State 100fps → リサンプリング済み
+- [ ] constants.yaml に UCLM 定数追加済み
+- [ ] Rust エンジンは UCLM 対応予定
+- [ ] ONNX エクスポート未実装

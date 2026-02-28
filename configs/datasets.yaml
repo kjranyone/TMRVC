@@ -10,19 +10,19 @@ split: train
 datasets:
   vctk:
     type: vctk
-    enabled: true
+    enabled: false
     language: en
     raw_dir: data/raw
 
   tsukuyomi:
     type: tsukuyomi
-    enabled: true
+    enabled: false
     language: ja
     raw_dir: data/raw/tsukuyomi/corpus1
 
   jvs:
     type: jvs
-    enabled: true
+    enabled: false
     language: ja
     raw_dir: data/raw/jvs_corpus
 
@@ -93,11 +93,8 @@ datasets:
     # speaker_map: data/raw/galge_voices/_speaker_map.json
 
   # --- User-defined (generic adapter) ---
-  # Uncomment and edit to add custom voice data.
-  # Directory structure: raw_dir/speaker_A/*.wav, raw_dir/speaker_B/*.wav
-  #
-  # my_custom_voices:
-  #   type: generic
-  #   raw_dir: data/raw/my_voices
-  #   language: ja
-  #   enabled: true
+  custom_speaker:
+    type: generic
+    raw_dir: data/wav
+    language: ja
+    enabled: true

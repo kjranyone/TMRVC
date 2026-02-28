@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "TMRVC — IR-aware Real-time Voice Conversion"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "transformers>=5.2.0",
+]
 
 [tool.uv.workspace]
 members = ["tmrvc-core", "tmrvc-data", "tmrvc-gui", "tmrvc-train", "tmrvc-export", "tmrvc-serve"]

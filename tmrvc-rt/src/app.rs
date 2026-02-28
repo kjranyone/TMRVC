@@ -905,13 +905,13 @@ fn processor_thread(
             }
         }
 
-        if running && input_ring.available() >= HOP_LENGTH {
-            // Read one hop from input ring
-            let mut input_buf = [0.0f32; HOP_LENGTH];
+        if running && input_ring.available() >= FRAME_SIZE {
+            // Read one frame from input ring
+            let mut input_buf = [0.0f32; FRAME_SIZE];
             input_ring.read(&mut input_buf);
 
             // Process one frame
-            let mut output_buf = [0.0f32; HOP_LENGTH];
+            let mut output_buf = [0.0f32; FRAME_SIZE];
             let frame_params = FrameParams {
                 dry_wet: dry_wet.load(Ordering::Relaxed),
                 output_gain: output_gain.load(Ordering::Relaxed),

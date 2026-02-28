@@ -179,16 +179,21 @@ pub fn create_voice_profile(
         source_audio_files,
         source_sample_count: total_samples,
         training_mode: "embedding".to_string(),
+        adaptation_level: String::new(),
         checkpoint_name: String::new(),
         voice_source_preset: None,
         voice_source_param_names: Vec::new(),
+        style_embed: None,
+        reference_tokens: None,
     };
 
     // Save
     progress_fn(ProfileProgress::Saving);
     let speaker_file = SpeakerFile {
         spk_embed,
-        lora_delta,
+        style_embed: None,
+        reference_tokens: None,
+        lora_delta: Some(lora_delta),
         metadata,
     };
     speaker_file.save(output_path)?;

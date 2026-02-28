@@ -14,6 +14,9 @@ SAMPLE_RATE: int = _cfg["sample_rate"]
 N_FFT: int = _cfg["n_fft"]
 HOP_LENGTH: int = _cfg["hop_length"]
 WINDOW_LENGTH: int = _cfg["window_length"]
+FRAME_SIZE: int = (
+    HOP_LENGTH  # 240 samples = 10ms @ 24kHz (for codec-latent: 480 = 20ms)
+)
 N_MELS: int = _cfg["n_mels"]
 MEL_FMIN: float = _cfg["mel_fmin"]
 MEL_FMAX: float = _cfg["mel_fmax"]
@@ -130,3 +133,13 @@ BPEH_N_BLOCKS: int = _cfg["bpeh_n_blocks"]
 BPEH_BREATH_THRESHOLD_DB: float = _cfg["bpeh_breath_threshold_db"]
 BPEH_MIN_PAUSE_MS: float = _cfg["bpeh_min_pause_ms"]
 BPEH_MIN_BREATH_MS: float = _cfg["bpeh_min_breath_ms"]
+
+# --- UCLM (Unified Codec Language Model) ---
+N_CODEBOOKS: int = _cfg["n_codebooks"]
+VOCAB_SIZE: int = _cfg["vocab_size"]
+D_MODEL: int = _cfg["d_model"]
+D_VOICE_STATE: int = _cfg["d_voice_state"]
+UCLM_N_HEADS: int = _cfg["uclm_n_heads"]
+UCLM_N_LAYERS: int = _cfg["uclm_n_layers"]
+UCLM_DROPOUT: float = _cfg["uclm_dropout"]
+UCLM_MAX_SEQ_LEN: int = _cfg["uclm_max_seq_len"]

@@ -122,10 +122,22 @@ class ServerPage(QWidget):
         param_row = QHBoxLayout()
         param_row.addWidget(QLabel("Emotion:"))
         self._test_emotion = QComboBox()
-        self._test_emotion.addItems([
-            "neutral", "happy", "sad", "angry", "fearful", "surprised",
-            "disgusted", "bored", "excited", "tender", "sarcastic", "whisper",
-        ])
+        self._test_emotion.addItems(
+            [
+                "neutral",
+                "happy",
+                "sad",
+                "angry",
+                "fearful",
+                "surprised",
+                "disgusted",
+                "bored",
+                "excited",
+                "tender",
+                "sarcastic",
+                "whisper",
+            ]
+        )
         param_row.addWidget(self._test_emotion)
         param_row.addWidget(QLabel("Endpoint:"))
         self._test_endpoint = QComboBox()
@@ -191,11 +203,17 @@ class ServerPage(QWidget):
             return
 
         cmd = [
-            sys.executable, "-m", "tmrvc_serve",
-            "--tts-checkpoint", tts_ckpt,
-            "--host", self._host_edit.text(),
-            "--port", str(self._port_spin.value()),
-            "--device", self._device_combo.currentText(),
+            sys.executable,
+            "-m",
+            "tmrvc_serve",
+            "--tts-checkpoint",
+            tts_ckpt,
+            "--host",
+            self._host_edit.text(),
+            "--port",
+            str(self._port_spin.value()),
+            "--device",
+            self._device_combo.currentText(),
         ]
         vc_ckpt = self._vc_ckpt.text().strip()
         if vc_ckpt:
@@ -221,7 +239,8 @@ class ServerPage(QWidget):
 
         # Read output in background thread
         self._reader_thread = threading.Thread(
-            target=self._read_output, daemon=True,
+            target=self._read_output,
+            daemon=True,
         )
         self._reader_thread.start()
 
@@ -274,12 +293,15 @@ class ServerPage(QWidget):
                 self._response_log.setText(body)
             elif endpoint == "/tts":
                 url = f"{base_url}/tts"
-                payload = json.dumps({
-                    "text": self._test_text.text(),
-                    "emotion": self._test_emotion.currentText(),
-                }).encode("utf-8")
+                payload = json.dumps(
+                    {
+                        "text": self._test_text.text(),
+                        "emotion": self._test_emotion.currentText(),
+                    }
+                ).encode("utf-8")
                 req = urllib.request.Request(
-                    url, data=payload,
+                    url,
+                    data=payload,
                     headers={"Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -290,7 +312,9 @@ class ServerPage(QWidget):
                     f"Audio: {len(body.get('audio_base64', ''))} chars (base64)"
                 )
             else:
-                self._response_log.setText(f"Streaming endpoint not supported in GUI test")
+                self._response_log.setText(
+                    f"Streaming endpoint not supported in GUI test"
+                )
         except Exception as e:
             self._response_log.setText(f"Error: {e}")
 
@@ -299,6 +323,7 @@ class ServerPage(QWidget):
         port = self._port_spin.value()
         try:
             import urllib.request
+
             url = f"http://{host}:{port}/characters"
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -309,11 +334,57 @@ class ServerPage(QWidget):
 
     def _on_register_character(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Character or Speaker File", "",
+            self,
+            "Select Character or Speaker File",
+            "",
             "Character/Speaker Files (*.tmrvc_character *.tmrvc_speaker);;All Files (*)",
         )
         if not path:
             return
+
+        from pathlib import Path as PPath
+        import urllib.request
+
+        file_path = PPath(path)
+        file_name = file_path.stem
         self._append_log(f"Register character from: {path}")
-        # Registration would be done via POST /characters API
-        self._response_log.setText(f"TODO: POST /characters with file: {path}")
+
+        host = self._host_edit.text()
+        port = self._port_spin.value()
+
+        try:
+            payload = json.dumps(
+                {
+                    "id": file_name,
+                    "name": file_name,
+                    "personality": "",
+                    "voice_description": "",
+                    "language": "ja",
+                    "speaker_file": str(file_path),
+                }
+            ).encode("utf-8")
+
+            url = f"http://{host}:{port}/characters"
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+
+            self._response_log.setText(
+                f"Character registered:\n{json.dumps(body, indent=2, ensure_ascii=False)}"
+            )
+            self._append_log(f"Character '{file_name}' registered successfully")
+
+            self._on_refresh_characters()
+
+        except Exception as e:
+            import urllib.error
+
+            if isinstance(e, urllib.error.HTTPError):
+                error_body = e.read().decode("utf-8") if e.fp else str(e)
+                self._response_log.setText(f"HTTP Error {e.code}: {error_body}")
+            else:
+                self._response_log.setText(f"Error: {e}")

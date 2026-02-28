@@ -14,7 +14,7 @@ dependencies = [
 
 [project.scripts]
 tmrvc-export = "tmrvc_export.cli.export:main"
-tmrvc-create-character = "tmrvc_export.cli.create_character:main"
+tmrvc-enroll = "tmrvc_export.cli.enroll:main"
 
 [build-system]
 requires = ["hatchling"]

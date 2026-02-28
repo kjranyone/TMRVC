@@ -1,23 +1,24 @@
 [project]
 name = "tmrvc-train"
-version = "0.1.0"
-description = "TMRVC train: model definitions, training, distillation"
+version = "0.2.0"
+description = "TMRVC train: Codec-Latent pipeline training"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "tmrvc-core",
     "tmrvc-data",
     "torch>=2.2",
+    "torchaudio>=2.2",
     "wandb>=0.16",
     "accelerate>=0.25",
 ]
 
 [project.scripts]
-tmrvc-train-teacher = "tmrvc_train.cli.train_teacher:main"
+tmrvc-train-codec = "tmrvc_train.cli.train_codec:main"
+tmrvc-train-token = "tmrvc_train.cli.train_token:main"
 tmrvc-train-tts = "tmrvc_train.cli.train_tts:main"
 tmrvc-train-style = "tmrvc_train.cli.train_style:main"
-tmrvc-distill = "tmrvc_train.cli.distill:main"
-tmrvc-finetune = "tmrvc_train.cli.finetune:main"
+tmrvc-train-uclm = "tmrvc_train.cli.train_uclm:main"
 
 [build-system]
 requires = ["hatchling"]

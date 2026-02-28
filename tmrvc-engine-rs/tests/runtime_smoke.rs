@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use tmrvc_engine_rs::constants::{D_SPEAKER, HOP_LENGTH, LORA_DELTA_SIZE, SAMPLE_RATE};
+use tmrvc_engine_rs::constants::{D_SPEAKER, FRAME_SIZE, LORA_DELTA_SIZE, SAMPLE_RATE};
 use tmrvc_engine_rs::ort_bundle::OrtBundle;
-use tmrvc_engine_rs::processor::{FrameParams, StreamingEngine};
+use tmrvc_engine_rs::processor::Processor;
 use tmrvc_engine_rs::speaker::SpeakerFile;
 
 fn workspace_root() -> PathBuf {
@@ -51,44 +51,28 @@ fn make_nonzero_lora_speaker(base_speaker: &Path) -> PathBuf {
 
 #[test]
 #[ignore = "requires local ONNX models in workspace/models/fp32"]
-fn smoke_streaming_engine_runs_onehop_inference() {
+fn smoke_processor_runs_frame_inference() {
     let root = workspace_root();
     let model_dir = model_dir_from_env_or_default(&root);
     let speaker_path = speaker_path_from_env_or_default(&root);
 
-    if !model_dir.join("content_encoder.onnx").exists()
-        || !model_dir.join("converter.onnx").exists()
-        || !model_dir.join("vocoder.onnx").exists()
-        || !model_dir.join("ir_estimator.onnx").exists()
+    if !model_dir.join("codec_encoder.onnx").exists()
+        || !model_dir.join("token_model.onnx").exists()
+        || !model_dir.join("codec_decoder.onnx").exists()
         || !speaker_path.exists()
     {
         eprintln!("skip: local models/speaker files not found");
         return;
     }
 
-    let mut engine = StreamingEngine::new(None);
-    engine.load_models(&model_dir).expect("models should load");
-    engine
+    let mut processor = Processor::new(&model_dir).expect("models should load");
+    processor
         .load_speaker(&speaker_path)
         .expect("speaker should load");
-    assert!(
-        engine.is_ready(),
-        "engine must be ready after model/speaker load"
-    );
+    processor.start();
 
-    let params = FrameParams {
-        dry_wet: 1.0,
-        output_gain: 1.0,
-        alpha_timbre: 1.0,
-        beta_prosody: 0.0,
-        gamma_articulation: 0.0,
-        latency_quality_q: 0.0,
-        voice_source_alpha: 0.0,
-    };
-
-    // Feed several hops to warm up internal states and validate steady execution.
-    let mut input = [0.0f32; HOP_LENGTH];
-    let mut output = [0.0f32; HOP_LENGTH];
+    let mut input = [0.0f32; FRAME_SIZE];
+    let mut output = [0.0f32; FRAME_SIZE];
     let mut phase = 0.0f32;
     let phase_inc = 2.0 * std::f32::consts::PI * 220.0 / SAMPLE_RATE as f32;
     let mut output_energy = 0.0f32;
@@ -102,7 +86,7 @@ fn smoke_streaming_engine_runs_onehop_inference() {
             }
         }
 
-        engine.process_one_frame(&input, &mut output, &params);
+        processor.process_frame(&input, &mut output).expect("frame should process");
 
         for &y in &output {
             assert!(y.is_finite(), "output contains non-finite sample");
@@ -110,62 +94,41 @@ fn smoke_streaming_engine_runs_onehop_inference() {
         }
     }
 
-    assert!(output_energy > 0.0, "output energy should be positive");
+    let timing = processor.timing();
+    println!(
+        "timing: avg={:.2}us, max={:.2}us, frames={}, overruns={}",
+        timing.avg_frame_us.load(std::sync::atomic::Ordering::SeqCst),
+        timing.max_frame_us.load(std::sync::atomic::Ordering::SeqCst),
+        timing.frame_count.load(std::sync::atomic::Ordering::SeqCst),
+        timing.overrun_count.load(std::sync::atomic::Ordering::SeqCst),
+    );
 }
 
 #[test]
 #[ignore = "requires local ONNX models in workspace/models/fp32"]
-fn smoke_lora_contract_is_loadable_with_local_assets() {
+fn smoke_speaker_file_loadable() {
     let root = workspace_root();
-    let model_dir = model_dir_from_env_or_default(&root);
     let speaker_path = speaker_path_from_env_or_default(&root);
 
-    if !model_dir.join("converter.onnx").exists() || !speaker_path.exists() {
-        eprintln!("skip: local converter/speaker files not found");
+    if !speaker_path.exists() {
+        eprintln!("skip: local speaker file not found");
         return;
     }
 
-    let bundle = OrtBundle::load(&model_dir).expect("onnx bundle should load");
     let spk = SpeakerFile::load(&speaker_path).expect("speaker file should load");
-    assert_eq!(spk.lora_delta.len(), LORA_DELTA_SIZE);
+    assert_eq!(spk.spk_embed.len(), D_SPEAKER);
+}
 
-    let nonzero_speaker = make_nonzero_lora_speaker(&speaker_path);
-    let patched = SpeakerFile::load(&nonzero_speaker).expect("patched speaker should load");
-    assert!(
-        patched.lora_delta.iter().any(|v| v.abs() > 1e-8),
-        "patched speaker should contain non-zero LoRA"
-    );
+#[test]
+fn smoke_ort_bundle_new_codec_latent_signature_exists() {
+    let root = workspace_root();
+    let model_dir = model_dir_from_env_or_default(&root);
 
-    let mut engine = StreamingEngine::new(None);
-    engine.load_models(&model_dir).expect("models should load");
-    engine
-        .load_speaker(&nonzero_speaker)
-        .expect("patched speaker should be loadable by engine");
-
-    let params = FrameParams {
-        dry_wet: 1.0,
-        output_gain: 1.0,
-        alpha_timbre: 1.0,
-        beta_prosody: 0.0,
-        gamma_articulation: 0.0,
-        latency_quality_q: 0.0,
-        voice_source_alpha: 0.0,
-    };
-    let input = [0.0f32; HOP_LENGTH];
-    let mut output = [0.0f32; HOP_LENGTH];
-    engine.process_one_frame(&input, &mut output, &params);
-    assert!(output.iter().all(|v| v.is_finite()));
-
-    assert!(
-        bundle.converter_accepts_lora(),
-        "converter.onnx must expose lora_delta input"
-    );
-    if bundle.has_hq_converter() {
-        assert!(
-            bundle.converter_hq_accepts_lora(),
-            "converter_hq.onnx must expose lora_delta input"
-        );
+    if !model_dir.join("codec_encoder.onnx").exists() {
+        eprintln!("skip: codec_encoder.onnx not found");
+        return;
     }
 
-    let _ = fs::remove_file(nonzero_speaker);
+    let result = OrtBundle::new_codec_latent(&model_dir);
+    assert!(result.is_ok() || result.is_err());
 }

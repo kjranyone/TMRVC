@@ -1,12 +1,18 @@
-""".tmrvc_speaker v2 binary file format: create and load speaker profiles."""
+""".tmrvc_speaker v3 binary file format: create and load speaker profiles.
+
+v3 format supports hierarchical adaptation:
+- Light: spk_embed only
+- Standard: + style_embed + reference_tokens
+- Full: + lora_delta
+"""
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -16,25 +22,14 @@ from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE
 logger = logging.getLogger(__name__)
 
 MAGIC = b"TMSP"
-VERSION = 2
+VERSION = 3
 
-# v2 binary layout:
-#   Magic: 4 bytes "TMSP"
-#   Version: uint32_le = 2
-#   spk_embed_size: uint32_le = 192
-#   lora_delta_size: uint32_le = 24576
-#   metadata_size: uint32_le (JSON UTF-8 byte count)
-#   thumbnail_size: uint32_le (PNG byte count, 0 = none)
-#   spk_embed: float32[192] = 768 bytes
-#   lora_delta: float32[24576] = 98304 bytes
-#   metadata_json: UTF-8 JSON (variable)
-#   thumbnail_png: PNG bytes (variable)
-#   checksum: SHA-256 = 32 bytes
+D_STYLE = 128
 
-HEADER_SIZE = 24  # magic(4) + version(4) + spk_size(4) + lora_size(4) + meta_size(4) + thumb_size(4)
-SPK_EMBED_BYTES = D_SPEAKER * 4
-LORA_DELTA_BYTES = LORA_DELTA_SIZE * 4
-CHECKSUM_SIZE = 32
+# Flags
+FLAG_HAS_STYLE = 1 << 0
+FLAG_HAS_REF_TOKENS = 1 << 1
+FLAG_HAS_LORA = 1 << 2
 
 # Default metadata template
 _DEFAULT_METADATA = {
@@ -48,56 +43,116 @@ _DEFAULT_METADATA = {
     "source_audio_files": [],
     "source_sample_count": 0,
     "training_mode": "embedding",
+    "adaptation_level": "light",
     "checkpoint_name": "",
     "voice_source_preset": None,
     "voice_source_param_names": [],
 }
 
 
+@dataclass
+class SpeakerFile:
+    """Speaker file v3 data container."""
+
+    spk_embed: np.ndarray  # [192]
+    style_embed: np.ndarray | None = None  # [128]
+    reference_tokens: np.ndarray | None = None  # [T, 4]
+    lora_delta: np.ndarray | None = None  # [15872]
+    metadata: dict | None = None
+
+    @property
+    def adaptation_level(self) -> str:
+        """Determine adaptation level from loaded data."""
+        if self.lora_delta is not None:
+            return "full"
+        if self.style_embed is not None or self.reference_tokens is not None:
+            return "standard"
+        return "light"
+
+
 def write_speaker_file(
     output_path: str | Path,
     spk_embed: np.ndarray,
-    lora_delta: np.ndarray,
+    style_embed: np.ndarray | None = None,
+    reference_tokens: np.ndarray | None = None,
+    lora_delta: np.ndarray | None = None,
     metadata: dict | None = None,
-    thumbnail_png: bytes | None = None,
 ) -> Path:
-    """Write a .tmrvc_speaker v2 binary file.
+    """Write a .tmrvc_speaker v3 binary file.
 
     Args:
         output_path: Output file path.
-        spk_embed: Speaker embedding array, shape ``(192,)``, float32.
-        lora_delta: LoRA delta array, shape ``(24576,)``, float32.
-        metadata: Optional metadata dict. Missing keys use defaults.
-        thumbnail_png: Optional PNG thumbnail bytes. ``None`` means no thumbnail.
+        spk_embed: Speaker embedding array, shape ``(192,)``, float32. (required)
+        style_embed: Style embedding array, shape ``(128,)``, float32. (optional)
+        reference_tokens: Reference codec tokens, shape ``(T, 4)``, int32. (optional)
+        lora_delta: LoRA delta array, shape ``(15872,)``, float32. (optional)
+        metadata: Optional metadata dict.
 
     Returns:
         Path to the written file.
     """
     output_path = Path(output_path)
 
-    assert spk_embed.shape == (D_SPEAKER,), f"Expected ({D_SPEAKER},), got {spk_embed.shape}"
-    assert lora_delta.shape == (LORA_DELTA_SIZE,), f"Expected ({LORA_DELTA_SIZE},), got {lora_delta.shape}"
+    assert spk_embed.shape == (D_SPEAKER,), (
+        f"Expected ({D_SPEAKER},), got {spk_embed.shape}"
+    )
     assert spk_embed.dtype == np.float32
-    assert lora_delta.dtype == np.float32
 
-    # Build metadata JSON
+    flags = 0
+    if style_embed is not None:
+        assert style_embed.shape == (D_STYLE,), (
+            f"Expected ({D_STYLE},), got {style_embed.shape}"
+        )
+        assert style_embed.dtype == np.float32
+        flags |= FLAG_HAS_STYLE
+    if reference_tokens is not None:
+        assert reference_tokens.ndim == 2 and reference_tokens.shape[1] == 4
+        assert reference_tokens.dtype == np.int32
+        flags |= FLAG_HAS_REF_TOKENS
+    if lora_delta is not None:
+        assert lora_delta.shape == (LORA_DELTA_SIZE,), (
+            f"Expected ({LORA_DELTA_SIZE},), got {lora_delta.shape}"
+        )
+        assert lora_delta.dtype == np.float32
+        flags |= FLAG_HAS_LORA
+
+    # Build metadata
     meta = {**_DEFAULT_METADATA, **(metadata or {})}
-    # Encode thumbnail as base64 in metadata (not in binary thumbnail section)
-    if thumbnail_png:
-        meta["thumbnail_b64"] = base64.b64encode(thumbnail_png).decode("ascii")
+    if "adaptation_level" not in meta:
+        if flags & FLAG_HAS_LORA:
+            meta["adaptation_level"] = "full"
+        elif flags & (FLAG_HAS_STYLE | FLAG_HAS_REF_TOKENS):
+            meta["adaptation_level"] = "standard"
+        else:
+            meta["adaptation_level"] = "light"
 
     metadata_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
 
-    # Build data (without checksum)
+    # Build header (32 bytes)
     data = bytearray()
     data += MAGIC
-    data += struct.pack("<I", VERSION)
-    data += struct.pack("<I", D_SPEAKER)
-    data += struct.pack("<I", LORA_DELTA_SIZE)
-    data += struct.pack("<I", len(metadata_bytes))
-    data += struct.pack("<I", 0)  # thumbnail_size = 0 (stored as base64 in metadata)
+    data += struct.pack("<I", VERSION)  # version
+    data += struct.pack("<I", flags)  # flags
+    data += struct.pack("<I", D_SPEAKER)  # spk_embed_size
+    data += struct.pack(
+        "<I", D_STYLE if style_embed is not None else 0
+    )  # style_embed_size
+    data += struct.pack(
+        "<I", len(reference_tokens) if reference_tokens is not None else 0
+    )  # ref_tokens_frames
+    data += struct.pack(
+        "<I", LORA_DELTA_SIZE if lora_delta is not None else 0
+    )  # lora_size
+    data += struct.pack("<I", len(metadata_bytes))  # metadata_size
+
+    # Build data section
     data += spk_embed.tobytes()
-    data += lora_delta.tobytes()
+    if style_embed is not None:
+        data += style_embed.tobytes()
+    if reference_tokens is not None:
+        data += reference_tokens.tobytes()
+    if lora_delta is not None:
+        data += lora_delta.tobytes()
     data += metadata_bytes
 
     # Compute SHA-256 checksum
@@ -105,36 +160,29 @@ def write_speaker_file(
     data += checksum
 
     output_path.write_bytes(bytes(data))
-    logger.info("Wrote speaker file to %s (%d bytes)", output_path, len(data))
+    logger.info(
+        "Wrote speaker file v3 to %s (%d bytes, level=%s)",
+        output_path,
+        len(data),
+        meta["adaptation_level"],
+    )
     return output_path
 
 
-def read_speaker_file(
-    path: str | Path,
-) -> tuple[np.ndarray, np.ndarray, dict, bytes]:
-    """Read and validate a .tmrvc_speaker v2 binary file.
+def read_speaker_file(path: str | Path) -> SpeakerFile:
+    """Read and validate a .tmrvc_speaker v3 binary file.
 
     Args:
         path: Path to the speaker file.
 
     Returns:
-        Tuple of ``(spk_embed, lora_delta, metadata_dict, thumbnail_bytes)``.
-        ``spk_embed`` is shape ``(192,)`` float32,
-        ``lora_delta`` is shape ``(24576,)`` float32,
-        ``metadata_dict`` is a dict,
-        ``thumbnail_bytes`` is raw PNG bytes (empty if no thumbnail).
+        SpeakerFile data container.
 
     Raises:
         ValueError: If the file is invalid or corrupted.
     """
     path = Path(path)
     data = path.read_bytes()
-
-    min_size = HEADER_SIZE + SPK_EMBED_BYTES + LORA_DELTA_BYTES + CHECKSUM_SIZE
-    if len(data) < min_size:
-        raise ValueError(
-            f"Invalid file size: expected at least {min_size}, got {len(data)}"
-        )
 
     # Validate magic
     magic = data[:4]
@@ -144,63 +192,73 @@ def read_speaker_file(
     # Validate version
     version = struct.unpack("<I", data[4:8])[0]
     if version != VERSION:
-        raise ValueError(f"Unsupported version: {version}")
+        raise ValueError(f"Unsupported version: {version}, expected v3")
 
-    # Validate sizes
-    spk_size = struct.unpack("<I", data[8:12])[0]
-    lora_size = struct.unpack("<I", data[12:16])[0]
+    # Parse header
+    flags = struct.unpack("<I", data[8:12])[0]
+    spk_size = struct.unpack("<I", data[12:16])[0]
+    style_size = struct.unpack("<I", data[16:20])[0]
+    ref_frames = struct.unpack("<I", data[20:24])[0]
+    lora_size = struct.unpack("<I", data[24:28])[0]
+    metadata_size = struct.unpack("<I", data[28:32])[0]
+
+    HEADER_SIZE = 32
+
+    # Verify spk_embed size
     if spk_size != D_SPEAKER:
-        raise ValueError(f"Invalid spk_embed_size: expected {D_SPEAKER}, got {spk_size}")
-    if lora_size != LORA_DELTA_SIZE:
-        raise ValueError(f"Invalid lora_delta_size: expected {LORA_DELTA_SIZE}, got {lora_size}")
-
-    # Variable-length sizes
-    metadata_size = struct.unpack("<I", data[16:20])[0]
-    thumbnail_size = struct.unpack("<I", data[20:24])[0]
-
-    # Verify total size
-    expected_size = (
-        HEADER_SIZE + SPK_EMBED_BYTES + LORA_DELTA_BYTES
-        + metadata_size + thumbnail_size + CHECKSUM_SIZE
-    )
-    if len(data) != expected_size:
         raise ValueError(
-            f"File size mismatch: expected {expected_size}, got {len(data)}"
+            f"Invalid spk_embed_size: expected {D_SPEAKER}, got {spk_size}"
         )
 
-    # Validate checksum
-    payload = data[:-CHECKSUM_SIZE]
-    stored_checksum = data[-CHECKSUM_SIZE:]
-    computed_checksum = hashlib.sha256(payload).digest()
-    if stored_checksum != computed_checksum:
+    # Verify checksum
+    checksum = data[-32:]
+    payload = data[:-32]
+    if hashlib.sha256(payload).digest() != checksum:
         raise ValueError("Checksum mismatch: file is corrupted")
 
-    # Extract arrays
-    spk_offset = HEADER_SIZE
+    offset = HEADER_SIZE
+
+    # Extract spk_embed
     spk_embed = np.frombuffer(
-        data[spk_offset:spk_offset + SPK_EMBED_BYTES], dtype=np.float32,
+        data[offset : offset + spk_size * 4], dtype=np.float32
     ).copy()
+    offset += spk_size * 4
 
-    lora_offset = spk_offset + SPK_EMBED_BYTES
-    lora_delta = np.frombuffer(
-        data[lora_offset:lora_offset + LORA_DELTA_BYTES], dtype=np.float32,
-    ).copy()
+    # Extract style_embed (optional)
+    style_embed = None
+    if flags & FLAG_HAS_STYLE:
+        style_embed = np.frombuffer(
+            data[offset : offset + style_size * 4], dtype=np.float32
+        ).copy()
+        offset += style_size * 4
 
-    # Extract metadata JSON
-    meta_offset = lora_offset + LORA_DELTA_BYTES
-    if metadata_size > 0:
-        metadata_dict = json.loads(data[meta_offset:meta_offset + metadata_size])
-    else:
-        metadata_dict = dict(_DEFAULT_METADATA)
+    # Extract reference_tokens (optional)
+    reference_tokens = None
+    if flags & FLAG_HAS_REF_TOKENS:
+        reference_tokens = (
+            np.frombuffer(data[offset : offset + ref_frames * 4 * 4], dtype=np.int32)
+            .copy()
+            .reshape(ref_frames, 4)
+        )
+        offset += ref_frames * 4 * 4
 
-    # Decode thumbnail from metadata base64 (preferred) or legacy raw section
-    thumbnail_b64 = metadata_dict.get("thumbnail_b64", "")
-    if thumbnail_b64:
-        thumbnail_bytes = base64.b64decode(thumbnail_b64)
-    elif thumbnail_size > 0:
-        thumb_offset = meta_offset + metadata_size
-        thumbnail_bytes = bytes(data[thumb_offset:thumb_offset + thumbnail_size])
-    else:
-        thumbnail_bytes = b""
+    # Extract lora_delta (optional)
+    lora_delta = None
+    if flags & FLAG_HAS_LORA:
+        lora_delta = np.frombuffer(
+            data[offset : offset + lora_size * 4], dtype=np.float32
+        ).copy()
+        offset += lora_size * 4
 
-    return spk_embed, lora_delta, metadata_dict, thumbnail_bytes
+    # Extract metadata
+    metadata_dict = (
+        json.loads(data[offset : offset + metadata_size]) if metadata_size > 0 else {}
+    )
+
+    return SpeakerFile(
+        spk_embed=spk_embed,
+        style_embed=style_embed,
+        reference_tokens=reference_tokens,
+        lora_delta=lora_delta,
+        metadata=metadata_dict,
+    )

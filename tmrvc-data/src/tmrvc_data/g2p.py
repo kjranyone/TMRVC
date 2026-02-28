@@ -28,55 +28,184 @@ _SPECIAL = ["<pad>", "<unk>", "<bos>", "<eos>", "<sil>", "<breath>"]
 # Japanese phonemes (pyopenjtalk fullcontext → phoneme)
 _JA_VOWELS = ["a", "i", "u", "e", "o"]
 _JA_CONSONANTS = [
-    "k", "s", "t", "n", "h", "m", "y", "r", "w", "g", "z", "d", "b", "p",
-    "ky", "sy", "ty", "ny", "hy", "my", "ry", "gy", "zy", "dy", "by", "py",
-    "ts", "ch", "sh", "f", "j", "v",
+    "k",
+    "s",
+    "t",
+    "n",
+    "h",
+    "m",
+    "y",
+    "r",
+    "w",
+    "g",
+    "z",
+    "d",
+    "b",
+    "p",
+    "ky",
+    "sy",
+    "ty",
+    "ny",
+    "hy",
+    "my",
+    "ry",
+    "gy",
+    "zy",
+    "dy",
+    "by",
+    "py",
+    "ts",
+    "ch",
+    "sh",
+    "f",
+    "j",
+    "v",
 ]
 _JA_SPECIAL = ["N", "cl", "pau"]  # moraic nasal, geminate, pause
 
 # English phonemes (ARPAbet-style via espeak / CMU)
 _EN_VOWELS = [
-    "iː", "ɪ", "eɪ", "ɛ", "æ", "ɑː", "ɒ", "ɔː", "oʊ", "ʊ", "uː",
-    "ʌ", "ə", "ɜː", "aɪ", "aʊ", "ɔɪ",
+    "iː",
+    "ɪ",
+    "eɪ",
+    "ɛ",
+    "æ",
+    "ɑː",
+    "ɒ",
+    "ɔː",
+    "oʊ",
+    "ʊ",
+    "uː",
+    "ʌ",
+    "ə",
+    "ɜː",
+    "aɪ",
+    "aʊ",
+    "ɔɪ",
 ]
 _EN_CONSONANTS = [
-    "p", "b", "t", "d", "k", "g", "f", "v", "θ", "ð", "s", "z",
-    "ʃ", "ʒ", "h", "m", "n", "ŋ", "l", "r", "w", "j",
-    "tʃ", "dʒ",
+    "p",
+    "b",
+    "t",
+    "d",
+    "k",
+    "g",
+    "f",
+    "v",
+    "θ",
+    "ð",
+    "s",
+    "z",
+    "ʃ",
+    "ʒ",
+    "h",
+    "m",
+    "n",
+    "ŋ",
+    "l",
+    "r",
+    "w",
+    "j",
+    "tʃ",
+    "dʒ",
 ]
 
 # Mandarin Chinese IPA (common subset used by espeak outputs)
 _ZH_VOWELS = [
-    "a", "ɑ", "e", "ə", "ɤ", "i", "u", "y", "o", "ɚ",
+    "a",
+    "ɑ",
+    "e",
+    "ə",
+    "ɤ",
+    "i",
+    "u",
+    "y",
+    "o",
+    "ɚ",
 ]
 _ZH_CONSONANTS = [
-    "p", "pʰ", "t", "tʰ", "k", "kʰ", "m", "n", "ŋ", "f",
-    "s", "ʂ", "ɕ", "ʐ", "ɻ", "l", "tɕ", "tɕʰ", "ts", "tsʰ", "ʈʂ", "ʈʂʰ",
+    "p",
+    "pʰ",
+    "t",
+    "tʰ",
+    "k",
+    "kʰ",
+    "m",
+    "n",
+    "ŋ",
+    "f",
+    "s",
+    "ʂ",
+    "ɕ",
+    "ʐ",
+    "ɻ",
+    "l",
+    "tɕ",
+    "tɕʰ",
+    "ts",
+    "tsʰ",
+    "ʈʂ",
+    "ʈʂʰ",
 ]
 _ZH_TONES = ["˥", "˦", "˧", "˨", "˩", "1", "2", "3", "4", "5"]
 
 # Korean IPA (common subset used by espeak outputs)
 _KO_VOWELS = [
-    "a", "e", "i", "o", "u", "ɯ", "ʌ", "ɛ", "ø", "y", "ɐ",
+    "a",
+    "e",
+    "i",
+    "o",
+    "u",
+    "ɯ",
+    "ʌ",
+    "ɛ",
+    "ø",
+    "y",
+    "ɐ",
 ]
 _KO_CONSONANTS = [
-    "p", "pʰ", "p͈", "t", "tʰ", "t͈", "k", "kʰ", "k͈",
-    "s", "s͈", "h", "m", "n", "ŋ", "l", "ɾ", "tɕ", "tɕʰ", "tɕ͈", "j", "w",
+    "p",
+    "pʰ",
+    "p͈",
+    "t",
+    "tʰ",
+    "t͈",
+    "k",
+    "kʰ",
+    "k͈",
+    "s",
+    "s͈",
+    "h",
+    "m",
+    "n",
+    "ŋ",
+    "l",
+    "ɾ",
+    "tɕ",
+    "tɕʰ",
+    "tɕ͈",
+    "j",
+    "w",
 ]
 
 # Shared suprasegmentals
 _PROSODY = ["ˈ", "ˌ", "ː", "̃"]
 
 # Build full vocabulary
-_ALL_PHONES = (
-    _SPECIAL
-    + sorted(set(
-        _JA_VOWELS + _JA_CONSONANTS + _JA_SPECIAL
-        + _EN_VOWELS + _EN_CONSONANTS
-        + _ZH_VOWELS + _ZH_CONSONANTS + _ZH_TONES
-        + _KO_VOWELS + _KO_CONSONANTS
+_ALL_PHONES = _SPECIAL + sorted(
+    set(
+        _JA_VOWELS
+        + _JA_CONSONANTS
+        + _JA_SPECIAL
+        + _EN_VOWELS
+        + _EN_CONSONANTS
+        + _ZH_VOWELS
+        + _ZH_CONSONANTS
+        + _ZH_TONES
+        + _KO_VOWELS
+        + _KO_CONSONANTS
         + _PROSODY
-    ))
+    )
 )
 
 # Deduplicate while preserving order
@@ -123,7 +252,9 @@ def _g2p_japanese(text: str) -> list[str]:
     try:
         import pyopenjtalk
     except ImportError:
-        logger.info("pyopenjtalk is unavailable; trying phonemizer fallback for Japanese")
+        logger.info(
+            "pyopenjtalk is unavailable; trying phonemizer fallback for Japanese"
+        )
     else:
         try:
             labels = pyopenjtalk.extract_fullcontext(text)
@@ -144,7 +275,9 @@ def _g2p_japanese(text: str) -> list[str]:
                         phonemes.append(phone)
             if phonemes:
                 return phonemes
-            logger.warning("pyopenjtalk produced no phonemes; trying phonemizer fallback")
+            logger.warning(
+                "pyopenjtalk produced no phonemes; trying phonemizer fallback"
+            )
         except Exception as e:  # pragma: no cover - backend-dependent
             logger.warning("pyopenjtalk failed; trying phonemizer fallback: %s", e)
 
@@ -153,7 +286,9 @@ def _g2p_japanese(text: str) -> list[str]:
         if phonemes:
             return phonemes
     except Exception as e:  # pragma: no cover - backend-dependent
-        logger.warning("phonemizer Japanese fallback failed; using grapheme fallback: %s", e)
+        logger.warning(
+            "phonemizer Japanese fallback failed; using grapheme fallback: %s", e
+        )
 
     return _g2p_grapheme_fallback(text)
 
@@ -230,7 +365,11 @@ def _g2p_grapheme_fallback(text: str) -> list[str]:
 
 def _g2p_english(text: str) -> list[str]:
     """Convert English text to phoneme list using phonemizer."""
-    return _g2p_phonemizer(text, ["en-us", "en"])
+    try:
+        return _g2p_phonemizer(text, ["en-us", "en"])
+    except (ImportError, RuntimeError) as e:
+        logger.warning("phonemizer failed for English, using grapheme fallback: %s", e)
+        return _g2p_grapheme_fallback(text)
 
 
 def _g2p_chinese(text: str) -> list[str]:

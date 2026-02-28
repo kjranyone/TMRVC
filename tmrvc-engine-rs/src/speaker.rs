@@ -11,12 +11,18 @@ use sha2::{Digest, Sha256};
 use crate::constants::*;
 
 const MAGIC: &[u8; 4] = b"TMSP";
-const VERSION: u32 = 2;
-// 4 (magic) + 4 (version) + 4 (embed_size) + 4 (lora_size) + 4 (metadata_size) + 4 (thumbnail_size)
-const HEADER_SIZE: usize = 24;
-const CHECKSUM_SIZE: usize = 32; // SHA-256
+const VERSION: u32 = 3;
+const HEADER_SIZE: usize = 32;
+const CHECKSUM_SIZE: usize = 32;
 
-/// Metadata embedded in a .tmrvc_speaker v2 file.
+// Flags
+const FLAG_HAS_STYLE: u32 = 1 << 0;
+const FLAG_HAS_REF_TOKENS: u32 = 1 << 1;
+const FLAG_HAS_LORA: u32 = 1 << 2;
+
+const D_STYLE: usize = 128;
+
+/// Metadata embedded in a .tmrvc_speaker file.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct SpeakerMetadata {
     pub profile_name: String,
@@ -32,21 +38,41 @@ pub struct SpeakerMetadata {
     pub source_audio_files: Vec<String>,
     pub source_sample_count: u64,
     pub training_mode: String,
+    #[serde(default)]
+    pub adaptation_level: String,
     pub checkpoint_name: String,
     #[serde(default)]
     pub voice_source_preset: Option<Vec<f32>>,
     #[serde(default)]
     pub voice_source_param_names: Vec<String>,
+    #[serde(default)]
+    pub style_embed: Option<Vec<f32>>,
+    #[serde(default)]
+    pub reference_tokens: Option<Vec<i32>>,
+    #[serde(default = "default_f0_mean")]
+    pub f0_mean: f32,
 }
 
-/// Parsed .tmrvc_speaker v2 file.
+fn default_f0_mean() -> f32 {
+    220.0
+}
+
+/// Parsed .tmrvc_speaker v3 file.
 pub struct SpeakerFile {
     pub spk_embed: [f32; D_SPEAKER],
-    pub lora_delta: Vec<f32>,
+    pub f0_mean: f32,
+    pub style_embed: Option<Vec<f32>>,
+    pub reference_tokens: Option<Vec<i32>>,
+    pub lora_delta: Option<Vec<f32>>,
     pub metadata: SpeakerMetadata,
 }
 
 impl SpeakerFile {
+    /// Get lora_delta, defaulting to zeros if not present.
+    pub fn lora_delta_or_zeros(&self) -> Vec<f32> {
+        self.lora_delta.clone().unwrap_or_else(|| vec![0.0f32; LORA_DELTA_SIZE])
+    }
+
     /// Extract voice source preset as a fixed-size array, if present in metadata.
     pub fn voice_source_preset(&self) -> Option<[f32; N_VOICE_SOURCE_PARAMS]> {
         let vec = self.metadata.voice_source_preset.as_ref()?;
@@ -58,12 +84,12 @@ impl SpeakerFile {
         Some(arr)
     }
 
-    /// Load and validate a .tmrvc_speaker v2 file.
+    /// Load and validate a .tmrvc_speaker v3 file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read(path).context("Failed to read speaker file")?;
 
-        // Minimum size: header + embed + lora + checksum (no metadata/thumbnail)
-        let min_size = HEADER_SIZE + D_SPEAKER * 4 + LORA_DELTA_SIZE * 4 + CHECKSUM_SIZE;
+        // Minimum size: header + spk_embed + f0_mean + checksum
+        let min_size = HEADER_SIZE + D_SPEAKER * 4 + 4 + CHECKSUM_SIZE;
         if data.len() < min_size {
             bail!(
                 "Speaker file too small: expected at least {} bytes, got {}",
@@ -83,57 +109,36 @@ impl SpeakerFile {
             bail!("Unsupported version: {} (expected {})", version, VERSION);
         }
 
-        // Embed size
-        let embed_size =
-            u32::from_le_bytes(data[8..12].try_into().expect("embed_size field is 4 bytes"))
-                as usize;
-        if embed_size != D_SPEAKER {
-            bail!(
-                "Speaker embed size mismatch: expected {}, got {}",
-                D_SPEAKER,
-                embed_size
-            );
+        // Parse v3 header
+        let flags = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let spk_embed_size = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        let style_embed_size = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let ref_tokens_frames = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+        let lora_size = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+        let metadata_size = u32::from_le_bytes(data[28..32].try_into().unwrap()) as usize;
+
+        if spk_embed_size != D_SPEAKER {
+            bail!("Speaker embed size mismatch: expected {}, got {}", D_SPEAKER, spk_embed_size);
         }
 
-        // Lora size
-        let lora_size =
-            u32::from_le_bytes(data[12..16].try_into().expect("lora_size field is 4 bytes"))
-                as usize;
-        if lora_size != LORA_DELTA_SIZE {
-            bail!(
-                "LoRA delta size mismatch: expected {}, got {}",
-                LORA_DELTA_SIZE,
-                lora_size
-            );
+        // Calculate expected size
+        let mut expected_size = HEADER_SIZE;
+        expected_size += D_SPEAKER * 4; // spk_embed
+        expected_size += 4; // f0_mean
+        if flags & FLAG_HAS_STYLE != 0 {
+            expected_size += D_STYLE * 4;
         }
+        if flags & FLAG_HAS_REF_TOKENS != 0 {
+            expected_size += ref_tokens_frames * 4 * 4; // [T, 4] int32
+        }
+        if flags & FLAG_HAS_LORA != 0 {
+            expected_size += lora_size * 4;
+        }
+        expected_size += metadata_size;
+        expected_size += CHECKSUM_SIZE;
 
-        // Metadata size
-        let metadata_size = u32::from_le_bytes(
-            data[16..20]
-                .try_into()
-                .expect("metadata_size field is 4 bytes"),
-        ) as usize;
-
-        // Thumbnail size
-        let thumbnail_size = u32::from_le_bytes(
-            data[20..24]
-                .try_into()
-                .expect("thumbnail_size field is 4 bytes"),
-        ) as usize;
-
-        // Verify total size
-        let expected_size = HEADER_SIZE
-            + D_SPEAKER * 4
-            + LORA_DELTA_SIZE * 4
-            + metadata_size
-            + thumbnail_size
-            + CHECKSUM_SIZE;
         if data.len() != expected_size {
-            bail!(
-                "Speaker file size mismatch: expected {} bytes, got {}",
-                expected_size,
-                data.len()
-            );
+            bail!("Speaker file size mismatch: expected {} bytes, got {}", expected_size, data.len());
         }
 
         // SHA-256 verification
@@ -144,88 +149,150 @@ impl SpeakerFile {
             bail!("SHA-256 checksum mismatch");
         }
 
+        let mut offset = HEADER_SIZE;
+
         // Parse spk_embed
         let mut spk_embed = [0.0f32; D_SPEAKER];
-        let embed_bytes = &data[HEADER_SIZE..HEADER_SIZE + D_SPEAKER * 4];
-        for (i, chunk) in embed_bytes.chunks_exact(4).enumerate() {
-            spk_embed[i] = f32::from_le_bytes(chunk.try_into().expect("embed chunk is 4 bytes"));
+        for (i, chunk) in data[offset..offset + D_SPEAKER * 4].chunks_exact(4).enumerate() {
+            spk_embed[i] = f32::from_le_bytes(chunk.try_into().unwrap());
         }
+        offset += D_SPEAKER * 4;
 
-        // Parse lora_delta
-        let lora_offset = HEADER_SIZE + D_SPEAKER * 4;
-        let lora_bytes = &data[lora_offset..lora_offset + LORA_DELTA_SIZE * 4];
-        let mut lora_delta = vec![0.0f32; LORA_DELTA_SIZE];
-        for (i, chunk) in lora_bytes.chunks_exact(4).enumerate() {
-            lora_delta[i] = f32::from_le_bytes(chunk.try_into().expect("lora chunk is 4 bytes"));
-        }
+        // Parse f0_mean (4 bytes after spk_embed)
+        let f0_mean = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let f0_mean = if f0_mean > 0.0 { f0_mean } else { default_f0_mean() };
+        offset += 4;
+
+        // Parse style_embed (optional)
+        let style_embed = if flags & FLAG_HAS_STYLE != 0 {
+            let mut se = vec![0.0f32; D_STYLE];
+            for (i, chunk) in data[offset..offset + D_STYLE * 4].chunks_exact(4).enumerate() {
+                se[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            offset += D_STYLE * 4;
+            Some(se)
+        } else {
+            None
+        };
+
+        // Parse reference_tokens (optional)
+        let reference_tokens = if flags & FLAG_HAS_REF_TOKENS != 0 && ref_tokens_frames > 0 {
+            let bytes_len = ref_tokens_frames * 4 * 4;
+            let mut rt = vec![0i32; ref_tokens_frames * 4];
+            for (i, chunk) in data[offset..offset + bytes_len].chunks_exact(4).enumerate() {
+                rt[i] = i32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            offset += bytes_len;
+            Some(rt)
+        } else {
+            None
+        };
+
+        // Parse lora_delta (optional)
+        let lora_delta = if flags & FLAG_HAS_LORA != 0 && lora_size > 0 {
+            let mut ld = vec![0.0f32; lora_size];
+            for (i, chunk) in data[offset..offset + lora_size * 4].chunks_exact(4).enumerate() {
+                ld[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            offset += lora_size * 4;
+            Some(ld)
+        } else {
+            None
+        };
 
         // Parse metadata JSON
-        let meta_offset = lora_offset + LORA_DELTA_SIZE * 4;
         let metadata = if metadata_size > 0 {
-            let meta_bytes = &data[meta_offset..meta_offset + metadata_size];
-            serde_json::from_slice(meta_bytes).context("Failed to parse metadata JSON")?
+            serde_json::from_slice(&data[offset..offset + metadata_size])
+                .context("Failed to parse metadata JSON")?
         } else {
             SpeakerMetadata::default()
         };
 
-        // Skip legacy raw thumbnail section (thumbnail is in metadata.thumbnail_b64)
-        // thumbnail_size bytes are accounted for in total size validation above
+        // Use metadata.f0_mean if available, otherwise use binary f0_mean
+        let f0_mean = if metadata.f0_mean > 0.0 { metadata.f0_mean } else { f0_mean };
 
         Ok(Self {
             spk_embed,
+            f0_mean,
+            style_embed,
+            reference_tokens,
             lora_delta,
             metadata,
         })
     }
 
-    /// Save a .tmrvc_speaker v2 file.
-    ///
-    /// Layout: MAGIC(4) + VERSION(4) + embed_size(4) + lora_size(4)
-    ///       + metadata_size(4) + thumbnail_size(4)
-    ///       + spk_embed(D_SPEAKER*4) + lora_delta(LORA_DELTA_SIZE*4)
-    ///       + metadata_json(variable) + thumbnail_png(variable)
-    ///       + SHA-256(32)
+    /// Save as .tmrvc_speaker v3 file.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let metadata_json =
-            serde_json::to_vec(&self.metadata).context("Failed to serialize metadata")?;
+        let metadata_json = serde_json::to_vec(&self.metadata).context("Failed to serialize metadata")?;
         let metadata_size = metadata_json.len();
-        let thumbnail_size: usize = 0; // thumbnail stored as base64 in metadata JSON
 
-        let payload_size =
-            HEADER_SIZE + D_SPEAKER * 4 + LORA_DELTA_SIZE * 4 + metadata_size + thumbnail_size;
-        let mut buf = Vec::with_capacity(payload_size + CHECKSUM_SIZE);
+        // Calculate flags and sizes
+        let mut flags: u32 = 0;
+        if self.style_embed.is_some() {
+            flags |= FLAG_HAS_STYLE;
+        }
+        if self.reference_tokens.is_some() {
+            flags |= FLAG_HAS_REF_TOKENS;
+        }
+        if self.lora_delta.is_some() {
+            flags |= FLAG_HAS_LORA;
+        }
 
-        // Header
+        let style_embed_size = if self.style_embed.is_some() { D_STYLE as u32 } else { 0 };
+        let ref_tokens_frames = self.reference_tokens.as_ref().map(|t| (t.len() / 4) as u32).unwrap_or(0);
+        let lora_size = self.lora_delta.as_ref().map(|l| l.len() as u32).unwrap_or(0);
+
+        // Build payload
+        let mut buf = Vec::new();
+
+        // Header (32 bytes)
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&flags.to_le_bytes());
         buf.extend_from_slice(&(D_SPEAKER as u32).to_le_bytes());
-        buf.extend_from_slice(&(LORA_DELTA_SIZE as u32).to_le_bytes());
+        buf.extend_from_slice(&style_embed_size.to_le_bytes());
+        buf.extend_from_slice(&ref_tokens_frames.to_le_bytes());
+        buf.extend_from_slice(&lora_size.to_le_bytes());
         buf.extend_from_slice(&(metadata_size as u32).to_le_bytes());
-        buf.extend_from_slice(&(thumbnail_size as u32).to_le_bytes());
 
         // spk_embed
         for &v in &self.spk_embed {
             buf.extend_from_slice(&v.to_le_bytes());
         }
 
+        // f0_mean
+        buf.extend_from_slice(&self.f0_mean.to_le_bytes());
+
+        // style_embed
+        if let Some(ref se) = self.style_embed {
+            for &v in se {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        // reference_tokens
+        if let Some(ref rt) = self.reference_tokens {
+            for &v in rt {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
         // lora_delta
-        assert_eq!(self.lora_delta.len(), LORA_DELTA_SIZE);
-        for &v in &self.lora_delta {
-            buf.extend_from_slice(&v.to_le_bytes());
+        if let Some(ref ld) = self.lora_delta {
+            for &v in ld {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
         }
 
         // metadata JSON
         buf.extend_from_slice(&metadata_json);
-
-        // thumbnail_size = 0: no raw thumbnail section (stored as base64 in metadata)
 
         // SHA-256
         let hash = Sha256::digest(&buf);
         buf.extend_from_slice(&hash);
 
         let mut file = fs::File::create(path).context("Failed to create speaker file")?;
-        file.write_all(&buf)
-            .context("Failed to write speaker file")?;
+        file.write_all(&buf).context("Failed to write speaker file")?;
 
         Ok(())
     }
@@ -234,58 +301,94 @@ impl SpeakerFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64;
-    use std::io::Write;
 
     fn default_metadata() -> SpeakerMetadata {
         SpeakerMetadata::default()
     }
 
     #[test]
-    fn save_load_roundtrip() {
+    fn save_load_roundtrip_light() {
         let mut spk_embed = [0.0f32; D_SPEAKER];
         for (i, v) in spk_embed.iter_mut().enumerate() {
             *v = (i as f32) * 0.01;
         }
-        let mut lora_delta = vec![0.0f32; LORA_DELTA_SIZE];
-        lora_delta[0] = 1.23;
-        lora_delta[LORA_DELTA_SIZE - 1] = -4.56;
 
         let original = SpeakerFile {
             spk_embed,
-            lora_delta,
+            f0_mean: 220.0,
+            style_embed: None,
+            reference_tokens: None,
+            lora_delta: None,
             metadata: default_metadata(),
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v2_roundtrip.tmrvc_speaker");
+        let path = dir.join("test_v3_light.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
         assert_eq!(original.spk_embed, loaded.spk_embed);
-        assert_eq!(original.lora_delta, loaded.lora_delta);
+        assert!((loaded.f0_mean - 220.0).abs() < 0.1);
+        assert!(loaded.style_embed.is_none());
+        assert!(loaded.reference_tokens.is_none());
+        assert!(loaded.lora_delta.is_none());
 
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn save_load_zero_lora() {
+    fn save_load_roundtrip_standard() {
         let spk_embed = [0.5f32; D_SPEAKER];
-        let lora_delta = vec![0.0f32; LORA_DELTA_SIZE];
+        let style_embed = Some(vec![0.3f32; D_STYLE]);
+        let reference_tokens = Some(vec![100i32, 200, 300, 400, 101, 201, 301, 401]); // 2 frames
 
         let original = SpeakerFile {
             spk_embed,
+            f0_mean: 180.0,
+            style_embed,
+            reference_tokens,
+            lora_delta: None,
+            metadata: default_metadata(),
+        };
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_v3_standard.tmrvc_speaker");
+        original.save(&path).expect("save failed");
+
+        let loaded = SpeakerFile::load(&path).expect("load failed");
+        assert_eq!(original.spk_embed, loaded.spk_embed);
+        assert!((loaded.f0_mean - 180.0).abs() < 0.1);
+        assert_eq!(original.style_embed, loaded.style_embed);
+        assert_eq!(original.reference_tokens, loaded.reference_tokens);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_load_roundtrip_full() {
+        let spk_embed = [0.1f32; D_SPEAKER];
+        let style_embed = Some(vec![0.2f32; D_STYLE]);
+        let reference_tokens = Some(vec![1i32, 2, 3, 4]);
+        let lora_delta = Some(vec![0.3f32; LORA_DELTA_SIZE]);
+
+        let original = SpeakerFile {
+            spk_embed,
+            f0_mean: 250.0,
+            style_embed,
+            reference_tokens,
             lora_delta,
             metadata: default_metadata(),
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v2_zero_lora.tmrvc_speaker");
+        let path = dir.join("test_v3_full.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
-        assert!(loaded.lora_delta.iter().all(|&v| v == 0.0));
-        assert_eq!(original.spk_embed, loaded.spk_embed);
+        assert_eq!(loaded.style_embed.as_ref().map(|s| s.len()), Some(D_STYLE));
+        assert_eq!(loaded.reference_tokens.as_ref().map(|r| r.len()), Some(4));
+        assert_eq!(loaded.lora_delta.as_ref().map(|l| l.len()), Some(LORA_DELTA_SIZE));
+        assert!((loaded.f0_mean - 250.0).abs() < 0.1);
 
         let _ = fs::remove_file(&path);
     }
@@ -294,113 +397,37 @@ mod tests {
     fn load_detects_corruption() {
         let spk = SpeakerFile {
             spk_embed: [1.0; D_SPEAKER],
-            lora_delta: vec![0.0; LORA_DELTA_SIZE],
+            f0_mean: 220.0,
+            style_embed: None,
+            reference_tokens: None,
+            lora_delta: None,
             metadata: default_metadata(),
         };
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v2_corrupt.tmrvc_speaker");
+        let path = dir.join("test_v3_corrupt.tmrvc_speaker");
         spk.save(&path).expect("save failed");
 
-        // Corrupt one byte in the embed region
+        // Corrupt one byte
         let mut data = fs::read(&path).unwrap();
-        let mid = HEADER_SIZE + 100; // well inside spk_embed
-        data[mid] ^= 0xFF;
-        let mut f = fs::File::create(&path).unwrap();
-        f.write_all(&data).unwrap();
-        drop(f);
+        data[HEADER_SIZE + 100] ^= 0xFF;
+        fs::write(&path, &data).unwrap();
 
         assert!(SpeakerFile::load(&path).is_err());
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn metadata_roundtrip() {
-        let metadata = SpeakerMetadata {
-            profile_name: "Test Speaker".to_string(),
-            author_name: "Test Author".to_string(),
-            co_author_name: "Co-Author".to_string(),
-            licence_url: "https://example.com/licence".to_string(),
-            thumbnail_b64: "dGVzdA==".to_string(), // base64("test")
-            created_at: "2026-02-18T12:00:00Z".to_string(),
-            description: "A test voice profile".to_string(),
-            source_audio_files: vec!["ref1.wav".to_string(), "ref2.wav".to_string()],
-            source_sample_count: 480000,
-            training_mode: "embedding".to_string(),
-            checkpoint_name: "".to_string(),
-            voice_source_preset: None,
-            voice_source_param_names: Vec::new(),
+    fn lora_delta_or_zeros() {
+        let sf = SpeakerFile {
+            spk_embed: [0.0; D_SPEAKER],
+            f0_mean: 220.0,
+            style_embed: None,
+            reference_tokens: None,
+            lora_delta: None,
+            metadata: default_metadata(),
         };
-
-        let original = SpeakerFile {
-            spk_embed: [0.1; D_SPEAKER],
-            lora_delta: vec![0.0; LORA_DELTA_SIZE],
-            metadata: metadata.clone(),
-        };
-
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_v2_metadata.tmrvc_speaker");
-        original.save(&path).expect("save failed");
-
-        let loaded = SpeakerFile::load(&path).expect("load failed");
-        assert_eq!(loaded.metadata, metadata);
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn thumbnail_b64_roundtrip() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-
-        // Fake PNG data
-        let thumbnail_bytes = vec![
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5,
-        ];
-        let b64 = STANDARD.encode(&thumbnail_bytes);
-
-        let original = SpeakerFile {
-            spk_embed: [0.2; D_SPEAKER],
-            lora_delta: vec![0.0; LORA_DELTA_SIZE],
-            metadata: SpeakerMetadata {
-                profile_name: "Thumb Test".to_string(),
-                thumbnail_b64: b64.clone(),
-                ..Default::default()
-            },
-        };
-
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_v2_thumbnail_b64.tmrvc_speaker");
-        original.save(&path).expect("save failed");
-
-        let loaded = SpeakerFile::load(&path).expect("load failed");
-        assert_eq!(loaded.metadata.thumbnail_b64, b64);
-        assert_eq!(loaded.metadata.profile_name, "Thumb Test");
-
-        // Verify base64 decodes back to original bytes
-        let decoded = STANDARD.decode(&loaded.metadata.thumbnail_b64).unwrap();
-        assert_eq!(decoded, thumbnail_bytes);
-
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn empty_thumbnail_b64() {
-        let original = SpeakerFile {
-            spk_embed: [0.3; D_SPEAKER],
-            lora_delta: vec![0.0; LORA_DELTA_SIZE],
-            metadata: SpeakerMetadata {
-                profile_name: "No Thumb".to_string(),
-                ..Default::default()
-            },
-        };
-
-        let dir = std::env::temp_dir();
-        let path = dir.join("test_v2_no_thumb_b64.tmrvc_speaker");
-        original.save(&path).expect("save failed");
-
-        let loaded = SpeakerFile::load(&path).expect("load failed");
-        assert!(loaded.metadata.thumbnail_b64.is_empty());
-        assert_eq!(loaded.metadata.profile_name, "No Thumb");
-
-        let _ = fs::remove_file(&path);
+        let zeros = sf.lora_delta_or_zeros();
+        assert_eq!(zeros.len(), LORA_DELTA_SIZE);
+        assert!(zeros.iter().all(|&v| v == 0.0));
     }
 }

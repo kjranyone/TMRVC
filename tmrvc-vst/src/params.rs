@@ -11,42 +11,30 @@ pub struct TmrvcParams {
     #[id = "output_gain"]
     pub output_gain: FloatParam,
 
-    #[id = "alpha_timbre"]
-    pub alpha_timbre: FloatParam,
+    #[id = "pitch_shift"]
+    pub pitch_shift: FloatParam,
 
-    #[id = "beta_prosody"]
-    pub beta_prosody: FloatParam,
+    #[id = "formant_shift"]
+    pub formant_shift: FloatParam,
 
-    #[id = "gamma_articulation"]
-    pub gamma_articulation: FloatParam,
-
-    #[id = "voice_source_alpha"]
-    pub voice_source_alpha: FloatParam,
-
-    /// Latency-Quality trade-off: 0.0 = Live (low latency), 1.0 = Quality (HQ mode).
     #[id = "latency_quality"]
     pub latency_quality_q: FloatParam,
 
-    /// Path to ONNX model directory, persisted in DAW project state.
     #[persist = "models_dir"]
     pub models_dir: Mutex<String>,
 
-    /// Path to .tmrvc_speaker file, persisted in DAW project state.
     #[persist = "speaker_path"]
     pub speaker_path: Mutex<String>,
 
-    /// Path to .tmrvc_style file, persisted in DAW project state.
     #[persist = "style_path"]
     pub style_path: Mutex<String>,
 
-    // --- NAM (Neural Amp Modeler) ---
     #[id = "nam_enabled"]
     pub nam_enabled: BoolParam,
 
     #[id = "nam_mix"]
     pub nam_mix: FloatParam,
 
-    /// Path to .nam profile file, persisted in DAW project state.
     #[persist = "nam_profile_path"]
     pub nam_profile_path: Mutex<String>,
 }
@@ -74,45 +62,25 @@ impl Default for TmrvcParams {
             .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
 
-            alpha_timbre: FloatParam::new(
-                "Timbre Strength",
-                1.0,
-                FloatRange::Linear { min: 0.0, max: 1.0 },
-            )
-            .with_smoother(SmoothingStyle::Linear(20.0))
-            .with_unit("%")
-            .with_value_to_string(formatters::v2s_f32_percentage(1))
-            .with_string_to_value(formatters::s2v_f32_percentage()),
-
-            beta_prosody: FloatParam::new(
-                "Prosody Strength",
+            // Pitch shift: F0-conditioned token model (singing VC support)
+            // Range: -24 to +24 semitones
+            pitch_shift: FloatParam::new(
+                "Pitch Shift",
                 0.0,
-                FloatRange::Linear { min: 0.0, max: 1.0 },
+                FloatRange::Linear { min: -24.0, max: 24.0 },
             )
-            .with_smoother(SmoothingStyle::Linear(20.0))
-            .with_unit("%")
-            .with_value_to_string(formatters::v2s_f32_percentage(1))
-            .with_string_to_value(formatters::s2v_f32_percentage()),
+            .with_smoother(SmoothingStyle::Linear(50.0))
+            .with_unit(" st")
+            .with_value_to_string(Arc::new(|v| format!("{:+.1}", v))),
 
-            gamma_articulation: FloatParam::new(
-                "Articulation",
+            // Formant shift: Not yet implemented (requires vocoder-based method)
+            formant_shift: FloatParam::new(
+                "Formant Shift",
                 0.0,
-                FloatRange::Linear { min: 0.0, max: 1.0 },
+                FloatRange::Linear { min: 0.0, max: 0.0 },  // Disabled for now
             )
-            .with_smoother(SmoothingStyle::Linear(20.0))
-            .with_unit("%")
-            .with_value_to_string(formatters::v2s_f32_percentage(1))
-            .with_string_to_value(formatters::s2v_f32_percentage()),
-
-            voice_source_alpha: FloatParam::new(
-                "Voice Source",
-                0.0,
-                FloatRange::Linear { min: 0.0, max: 1.0 },
-            )
-            .with_smoother(SmoothingStyle::Linear(20.0))
-            .with_unit("%")
-            .with_value_to_string(formatters::v2s_f32_percentage(1))
-            .with_string_to_value(formatters::s2v_f32_percentage()),
+            .with_smoother(SmoothingStyle::Linear(50.0))
+            .with_value_to_string(Arc::new(|_| "N/A".to_string())),
 
             latency_quality_q: FloatParam::new(
                 "Latency-Quality",
