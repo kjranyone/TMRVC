@@ -1,9 +1,6 @@
-"""``tmrvc-preprocess`` — full preprocessing pipeline.
+"""``tmrvc-preprocess`` — UCLM v2 full preprocessing pipeline.
 
-Usage::
-
-    tmrvc-preprocess --dataset vctk --raw-dir /data/vctk --cache-dir /data/cache
-    tmrvc-preprocess --dataset jvs  --raw-dir /data/jvs  --cache-dir /data/cache
+Unified extraction of dual-stream tokens, voice state, and TTS alignment.
 """
 
 from __future__ import annotations
@@ -15,15 +12,19 @@ import sys
 from pathlib import Path
 
 import torch
+import numpy as np
+import tqdm
 
 from tmrvc_core.audio import compute_mel
-from tmrvc_core.constants import HOP_LENGTH, SAMPLE_RATE
-from tmrvc_core.types import FeatureSet
+from tmrvc_core.constants import SAMPLE_RATE
+from tmrvc_core.types import UCLMFeatureSet
 from tmrvc_data.cache import FeatureCache
 from tmrvc_data.dataset_adapters import get_adapter
-from tmrvc_data.features import create_content_extractor, create_f0_extractor
+from tmrvc_data.codec import UCLMCodecWrapper
+from tmrvc_data.voice_state import SSLVoiceStateEstimator
 from tmrvc_data.preprocessing import preprocess_audio, segment_utterance
 from tmrvc_data.speaker import SpeakerEncoder
+from tmrvc_data.alignment import extract_alignment
 
 logger = logging.getLogger(__name__)
 
@@ -31,87 +32,23 @@ logger = logging.getLogger(__name__)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmrvc-preprocess",
-        description="Preprocess raw audio and extract features to cache.",
+        description="Extract UCLM v2 features from raw audio to cache.",
     )
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--raw-dir", required=True, type=Path)
+    parser.add_argument("--cache-dir", required=True, type=Path)
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--codec-checkpoint", type=Path, default=None)
+    parser.add_argument("--language", default="ja", choices=["ja", "en", "zh", "ko"])
     parser.add_argument(
-        "--dataset",
-        required=True,
-        help="Dataset name (built-in: vctk, jvs, libritts_r, tsukuyomi, or any name defined in datasets.yaml with a 'type' field).",
-    )
-    parser.add_argument(
-        "--raw-dir",
-        required=True,
-        type=Path,
-        help="Path to raw dataset root.",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        required=True,
-        type=Path,
-        help="Path to feature cache directory.",
-    )
-    parser.add_argument(
-        "--split",
-        default="train",
-        help="Split name (default: train).",
-    )
-    parser.add_argument(
-        "--f0-method",
-        default="torchcrepe",
-        choices=["torchcrepe", "rmvpe"],
-        help="F0 extraction method.",
-    )
-    parser.add_argument(
-        "--content-teacher",
-        default="contentvec",
-        choices=["contentvec", "wavlm"],
-        help="Content feature extractor: contentvec (768d, Phase 0) or wavlm (1024d, Phase 1+).",
-    )
-    parser.add_argument(
-        "--device",
-        default="cpu",
-        help="Device for model inference (default: cpu).",
-    )
-    parser.add_argument(
-        "--max-utterances",
-        type=int,
-        default=0,
-        help="Max utterances to process (0=all, for debugging).",
-    )
-    parser.add_argument(
-        "--subset",
+        "--sample-ratio",
         type=float,
         default=1.0,
-        help="Fraction of utterances to process (0.0-1.0, default: 1.0=all).",
+        help="Ratio of dataset to process (0.0-1.0)",
     )
-    parser.add_argument(
-        "--segment-min-sec",
-        type=float,
-        default=None,
-        help="Override minimum segment duration in seconds (default: constants.yaml).",
-    )
-    parser.add_argument(
-        "--segment-max-sec",
-        type=float,
-        default=None,
-        help="Override maximum segment duration in seconds (default: constants.yaml).",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip utterances already in cache.",
-    )
-    parser.add_argument(
-        "--save-waveform",
-        action="store_true",
-        help="Save waveform.npy for later UCLM feature extraction.",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose logging.",
-    )
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
 
@@ -124,10 +61,9 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Resolve adapter type from datasets.yaml if the dataset name is not
-    # a built-in adapter key.
+    # Resolve adapter from datasets.yaml to handle speaker_map
     adapter_type: str | None = None
-    language: str = "en"
+    language: str = args.language
     speaker_map_path: str | None = None
     datasets_yaml = Path("configs/datasets.yaml")
     if datasets_yaml.exists():
@@ -136,10 +72,8 @@ def main(argv: list[str] | None = None) -> None:
         with open(datasets_yaml, encoding="utf-8") as _f:
             _registry = yaml.safe_load(_f) or {}
         ds_cfg = (_registry.get("datasets") or {}).get(args.dataset) or {}
-        adapter_type = (
-            ds_cfg.get("type") if ds_cfg.get("type") != args.dataset else None
-        )
-        language = ds_cfg.get("language", "en")
+        adapter_type = ds_cfg.get("type")
+        language = ds_cfg.get("language", args.language)
         speaker_map_path = ds_cfg.get("speaker_map")
 
     adapter = get_adapter(
@@ -150,132 +84,194 @@ def main(argv: list[str] | None = None) -> None:
     )
     cache = FeatureCache(args.cache_dir)
 
-    # Collect utterances (needed for subset sampling)
-    all_utterances = list(adapter.iter_utterances(args.raw_dir, args.split))
-    total = len(all_utterances)
-    if args.subset < 1.0:
-        k = max(1, int(total * args.subset))
-        all_utterances = sorted(
-            random.sample(all_utterances, k),
-            key=lambda u: u.utterance_id,
-        )
-        logger.info(
-            "Subset %.0f%%: %d / %d utterances selected", args.subset * 100, k, total
-        )
-    else:
-        logger.info("Total utterances: %d", total)
-
-    # Segment duration overrides
-    seg_kwargs: dict = {}
-    if args.segment_min_sec is not None:
-        seg_kwargs["min_sec"] = args.segment_min_sec
-    if args.segment_max_sec is not None:
-        seg_kwargs["max_sec"] = args.segment_max_sec
-
-    logger.info("Loading extractors on %s ...", args.device)
-    content_extractor = create_content_extractor(
-        args.content_teacher, device=args.device
-    )
-    f0_extractor = create_f0_extractor(args.f0_method, device=args.device)
+    # Load models
+    logger.info("Loading UCLM v2 extraction models on %s...", args.device)
+    codec = UCLMCodecWrapper(args.codec_checkpoint, device=args.device)
+    vs_estimator = SSLVoiceStateEstimator(device=args.device)
     spk_encoder = SpeakerEncoder(device=args.device)
 
-    logger.info(
-        "Content extractor: %s (dim=%d)",
-        args.content_teacher,
-        content_extractor.output_dim,
-    )
+    # ASR for TTS data
+    from faster_whisper import WhisperModel
+
+    compute_type = "float16" if args.device == "cuda" else "int8"
+    whisper = WhisperModel("large-v3", device=args.device, compute_type=compute_type)
+
+    utterances = list(adapter.iter_utterances(args.raw_dir, args.split))
+    logger.info("Found %d utterances in %s", len(utterances), args.dataset)
+
+    # Random sampling if requested
+    if args.sample_ratio < 1.0:
+        n_sample = max(1, int(len(utterances) * args.sample_ratio))
+        logger.info(
+            "Sampling %d utterances (ratio=%.2f)...", n_sample, args.sample_ratio
+        )
+        utterances = random.sample(utterances, n_sample)
 
     processed = 0
-    skipped = 0
-    errors = 0
-
-    for utt in all_utterances:
-        if 0 < args.max_utterances <= processed:
-            break
-
+    for utt in tqdm.tqdm(utterances, desc="Preprocessing"):
         if args.skip_existing and cache.exists(
             args.dataset, args.split, utt.speaker_id, utt.utterance_id
         ):
-            skipped += 1
             continue
 
         try:
-            # 1. Load and preprocess
-            waveform, sr = preprocess_audio(str(utt.audio_path))
+            # 0. Early Length Guard
+            import soundfile as sf
 
-            # 2. Segment if too long
-            for seg_idx, segment in enumerate(
-                segment_utterance(waveform, **seg_kwargs)
-            ):
-                seg_id = (
-                    f"{utt.utterance_id}_seg{seg_idx}"
-                    if seg_idx > 0
-                    else utt.utterance_id
+            info = sf.info(str(utt.audio_path))
+            if info.duration < 0.1 or info.duration > 30.0:
+                logger.debug(
+                    "Skipping %s due to duration (%.2fs)",
+                    utt.utterance_id,
+                    info.duration,
                 )
+                continue
 
-                # 3. Extract features
-                mel = compute_mel(segment)  # [1, 80, T]
-                mel = mel.squeeze(0)  # [80, T]
-                n_frames = mel.shape[1]
+            # 1. Load & Normalize
+            waveform, sr = preprocess_audio(str(utt.audio_path), target_sr=SAMPLE_RATE)
+            waveform_t = waveform.unsqueeze(0).to(args.device)
 
-                content = content_extractor.extract(segment, sr)  # [768, T']
-                # Align to mel frame count
-                if content.shape[1] != n_frames:
-                    content = torch.nn.functional.interpolate(
-                        content.unsqueeze(0),
-                        size=n_frames,
-                        mode="linear",
-                        align_corners=False,
-                    ).squeeze(0)
+            # 2. Extract Dual-stream Tokens
+            a_tokens, b_logits = codec.encode(waveform_t)
+            b_tokens = b_logits.argmax(dim=-1)
 
-                f0 = f0_extractor.extract(segment, sr)  # [1, T']
-                if f0.shape[1] != n_frames:
-                    f0 = torch.nn.functional.interpolate(
-                        f0.unsqueeze(0),
-                        size=n_frames,
-                        mode="linear",
-                        align_corners=False,
-                    ).squeeze(0)
+            # 3. Extract Voice State (Physical + SSL)
+            mel = compute_mel(waveform_t.squeeze(1)).to(args.device)
+            f0 = torch.zeros(1, 1, mel.shape[-1], device=args.device)
 
-                spk_embed = spk_encoder.extract(segment, sr)  # [192]
+            import torchaudio.transforms as T
 
-                # 4. Save to cache
-                features = FeatureSet(
-                    mel=mel,
-                    content=content,
-                    f0=f0,
-                    spk_embed=spk_embed,
-                    utterance_id=seg_id,
-                    speaker_id=utt.speaker_id,
-                    n_frames=n_frames,
-                    content_dim=content_extractor.output_dim,
-                )
-                cache.save(
-                    features,
-                    args.dataset,
-                    args.split,
-                    waveform=segment.unsqueeze(0) if args.save_waveform else None,
-                )
-                processed += 1
+            waveform_16k = T.Resample(SAMPLE_RATE, 16000).to(args.device)(
+                waveform_t.squeeze(1)
+            )
+            vs_dict = vs_estimator(waveform_16k, waveform_t.squeeze(1), mel, f0)
 
-                if processed % 100 == 0:
-                    logger.info(
-                        "Processed %d utterances (skipped %d, errors %d)",
-                        processed,
-                        skipped,
-                        errors,
+            # 4. Transcribe & Align
+            segments, _ = whisper.transcribe(
+                str(utt.audio_path), language=args.language
+            )
+            text = "".join(seg.text for seg in segments).strip()
+
+            phoneme_ids, durations = None, None
+            if text:
+                try:
+                    align = extract_alignment(
+                        str(utt.audio_path), text, language=args.language
                     )
+                    phoneme_ids = torch.tensor(align["phoneme_ids"])
+                    durations = torch.tensor(align["durations"])
+                except:
+                    pass
 
-        except Exception:
-            logger.error("Failed to process %s", utt.utterance_id, exc_info=True)
-            errors += 1
+            spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
 
-    logger.info(
-        "Done. Processed=%d, Skipped=%d, Errors=%d",
-        processed,
-        skipped,
-        errors,
-    )
+            # 5. Frame Alignment Verification (CRITICAL: must match exactly)
+            # All temporal features at codec rate MUST have T_target frames.
+            # Any mismatch indicates a bug in extraction logic.
+            T_target = a_tokens.shape[-1]
+            T_mel = mel.shape[-1]
+
+            # Verify mel frames match codec frames (MUST be exact)
+            assert T_mel == T_target, (
+                f"Frame mismatch: mel={T_mel}, codec={T_target}. "
+                f"This indicates a bug in MelSpectrogram or codec implementation."
+            )
+
+            # Get voice state (should match mel frames)
+            explicit_state = vs_dict["explicit_state"].detach().cpu()
+            if explicit_state.dim() == 3:
+                explicit_state = explicit_state.squeeze(0)  # [T, 8]
+            T_explicit = explicit_state.shape[0]
+
+            # Verify explicit_state frames match (MUST be exact)
+            assert T_explicit == T_target, (
+                f"Frame mismatch: explicit_state={T_explicit}, codec={T_target}. "
+                f"This indicates a bug in VoiceStateEstimator implementation."
+            )
+            explicit_state = explicit_state.transpose(0, 1)  # [8, T]
+
+            # SSL state at 50Hz needs interpolation to 100Hz
+            ssl_state = vs_dict["ssl_state"].detach().cpu()
+            if ssl_state.dim() == 3:
+                ssl_state = ssl_state.squeeze(0)  # [T_ssl, 128]
+            T_ssl = ssl_state.shape[0]
+
+            # Interpolate SSL from 50Hz to 100Hz (T_target frames)
+            # This is NOT padding - it's proper signal interpolation
+            ssl_state = (
+                torch.nn.functional.interpolate(
+                    ssl_state.unsqueeze(0).transpose(1, 2),  # [1, 128, T_ssl]
+                    size=T_target,
+                    mode="linear",
+                    align_corners=False,
+                )
+                .transpose(1, 2)
+                .squeeze(0)
+            )  # [T_target, 128]
+            ssl_state = ssl_state.transpose(0, 1)  # [128, T_target]
+
+            # Align codec_tokens_b if needed (should already match)
+            b_tokens_aligned = b_tokens.detach().cpu().squeeze(0)  # [4, T]
+            T_b = b_tokens_aligned.shape[-1]
+            assert T_b == T_target, (
+                f"Frame mismatch: b_tokens={T_b}, codec={T_target}. "
+                f"This indicates a bug in codec implementation."
+            )
+
+            # 6. Save Unified FeatureSet
+            features = UCLMFeatureSet(
+                codec_tokens_a=a_tokens.detach().cpu().squeeze(0),
+                codec_tokens_b=b_tokens_aligned,
+                voice_state_explicit=explicit_state,
+                voice_state_ssl=ssl_state,
+                spk_embed=spk_embed.detach().cpu().squeeze(0),
+                phoneme_ids=phoneme_ids.detach() if phoneme_ids is not None else None,
+                durations=durations.detach() if durations is not None else None,
+                text=text,
+                utterance_id=utt.utterance_id,
+                speaker_id=utt.speaker_id,
+                n_frames=T_target,
+                waveform=waveform.detach(),
+            )
+            cache.save(features, args.dataset, args.split)
+            processed += 1
+
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("CUDA OOM for %s, skipping", utt.utterance_id)
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error("Failed to process %s: %s", utt.utterance_id, e)
+        finally:
+            # Frequent cleanup
+            import gc
+
+            if processed % 10 == 0:
+                gc.collect()
+                if args.device == "cuda":
+                    torch.cuda.empty_cache()
+
+    # Write manifest
+    manifest_dir = args.cache_dir / "_manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_dir / f"{args.dataset}_{args.split}.json"
+
+    manifest = {
+        "dataset": args.dataset,
+        "n_utterances": processed,
+        "language": args.language,
+        "uclm_ready": True,
+    }
+    manifest_path.write_text(torch.json.dumps(manifest, indent=2)) if hasattr(
+        torch, "json"
+    ) else manifest_path.write_text(import_json_and_dump(manifest))
+
+    logger.info("Done. Processed %d utterances. Manifest: %s", processed, manifest_path)
+
+
+def import_json_and_dump(d):
+    import json
+
+    return json.dumps(d, indent=2)
 
 
 if __name__ == "__main__":

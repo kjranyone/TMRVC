@@ -59,3 +59,47 @@ TMRVC/
 1. **Dual-Stream Token Sync**: Acoustic (`A_t`) と Control (`B_t`) は常に同期して予測されなければならない。
 2. **10ms Causal Core**: 未来の情報を参照する非因果的（Non-causal）な処理は一切禁止。
 3. **Physical-First Control**: 演技制御は 8次元の物理パラメータ（息漏れ等）を優先し、抽象的なラベルに頼らない。
+4. **Scientific Rigor & Zero Compromise**: 論文実装という観点から、緻密さと数学的整合性を最優先する。場当たり的なコード置換、テンソル形状の不一致を誤魔化すための不自然なパディング、あるいは失敗したテストの放置は「悪（Evil）」と定義し、厳禁とする。すべての変更は全スタック層（Core, Train, Serve, GUI, Export）において論理的に整合し、常に厳格な数学的パリティテストによって実証されなければならない。
+
+## Resolved Issues (2026-03-01)
+
+### Issue A: Frame Alignment (FIXED - Root Cause)
+- **Problem**: `mel=99 frames`, `codec=100 frames` - 1フレームズレ
+- **Root Cause**: `MelSpectrogram.pad_length = window_length - hop_length` (720) was incorrect
+- **Solution**: `pad_length = 784` for exact `T = ceil(N / hop_length)` alignment
+- **Files**:
+  - `tmrvc-core/src/tmrvc_core/audio.py`: Fixed padding calculation
+  - `tmrvc-data/src/tmrvc_data/cli/preprocess.py`: Replaced zero-padding with assert validation
+  - `tests/data/test_frame_alignment.py`: NEW - 14 tests for frame alignment parity
+- **Verification**: All 14 frame alignment tests pass
+
+### Issue B: Constants Management (FIXED)
+- **Problem**: `constants.py` hardcoded, diverged from YAML
+- **Solution**: YAML is single source of truth, auto-generate Python/Rust
+- **Files**:
+  - `configs/constants.yaml`: Complete constant definitions
+  - `scripts/codegen/generate_constants.py`: Auto-generation
+  - `tmrvc-core/_generated_constants.py`: Auto-generated (DO NOT EDIT)
+  - `tmrvc-core/constants.py`: Re-exports + minimal compat aliases
+  - `tmrvc-engine-rs/constants.rs`: Auto-generated
+- **Verification**: Python ↔ Rust constant values match exactly
+
+### Issue E: Single Source of Truth for f0_mean (FIXED)
+- **Problem**: f0_mean stored in both binary section and metadata JSON
+- **Solution**: Binary section is the single source of truth
+- **Files**:
+  - `tmrvc-export/speaker_file.py`: Removed f0_mean from metadata
+  - `tmrvc-engine-rs/speaker.rs`: Binary f0_mean takes precedence
+- **Verification**: Python/Rust roundtrip tests pass
+
+## Remaining Issues
+
+### Issue C: Streaming Numerical Parity
+- **Status**: 未検証
+- **Problem**: CausalConv1d batch vs streaming processing numerical drift
+- **Location**: `tmrvc-engine-rs/src/ort_bundle.rs`
+- **Action Required**: Write parity test comparing batch vs frame-by-frame inference
+
+### Issue D: GUI/CLI Implementation
+- **Status**: 部分実装
+- **Problem**: `tmrvc-train-codec` collate_fn not verified

@@ -23,9 +23,8 @@ import numpy as np
 import torch
 
 from tmrvc_core.constants import (
-    D_CONTENT,
+    D_MODEL,
     D_STYLE,
-    D_TEXT_ENCODER,
     N_MELS,
     PHONEME_VOCAB_SIZE,
 )
@@ -103,7 +102,8 @@ class _ContentSynthesizerWrapper(torch.nn.Module):
 
 
 def export_text_encoder(
-    model: torch.nn.Module, output_path: str | Path,
+    model: torch.nn.Module,
+    output_path: str | Path,
 ) -> Path:
     """Export TextEncoder to ONNX (variable-length L)."""
     output_path = Path(output_path)
@@ -132,7 +132,8 @@ def export_text_encoder(
 
 
 def export_duration_predictor(
-    model: torch.nn.Module, output_path: str | Path,
+    model: torch.nn.Module,
+    output_path: str | Path,
 ) -> Path:
     """Export DurationPredictor to ONNX (variable-length L)."""
     output_path = Path(output_path)
@@ -141,7 +142,7 @@ def export_duration_predictor(
 
     wrapper = _DurationPredictorWrapper(model).eval()
     L = 50
-    dummy_features = torch.randn(1, D_TEXT_ENCODER, L)
+    dummy_features = torch.randn(1, D_MODEL, L)
     dummy_style = torch.zeros(1, D_STYLE)
 
     torch.onnx.export(
@@ -161,7 +162,8 @@ def export_duration_predictor(
 
 
 def export_f0_predictor(
-    model: torch.nn.Module, output_path: str | Path,
+    model: torch.nn.Module,
+    output_path: str | Path,
 ) -> Path:
     """Export F0Predictor to ONNX (variable-length T)."""
     output_path = Path(output_path)
@@ -170,7 +172,7 @@ def export_f0_predictor(
 
     wrapper = _F0PredictorWrapper(model).eval()
     T = 200
-    dummy_features = torch.randn(1, D_TEXT_ENCODER, T)
+    dummy_features = torch.randn(1, D_MODEL, T)
     dummy_style = torch.zeros(1, D_STYLE)
 
     torch.onnx.export(
@@ -191,7 +193,8 @@ def export_f0_predictor(
 
 
 def export_content_synthesizer(
-    model: torch.nn.Module, output_path: str | Path,
+    model: torch.nn.Module,
+    output_path: str | Path,
 ) -> Path:
     """Export ContentSynthesizer to ONNX (variable-length T)."""
     output_path = Path(output_path)
@@ -200,7 +203,7 @@ def export_content_synthesizer(
 
     wrapper = _ContentSynthesizerWrapper(model).eval()
     T = 200
-    dummy_features = torch.randn(1, D_TEXT_ENCODER, T)
+    dummy_features = torch.randn(1, D_MODEL, T)
 
     torch.onnx.export(
         wrapper,
@@ -242,16 +245,20 @@ def export_tts_all(
 
     paths = {}
     paths["text_encoder"] = export_text_encoder(
-        text_encoder, output_dir / "text_encoder.onnx",
+        text_encoder,
+        output_dir / "text_encoder.onnx",
     )
     paths["duration_predictor"] = export_duration_predictor(
-        duration_predictor, output_dir / "duration_predictor.onnx",
+        duration_predictor,
+        output_dir / "duration_predictor.onnx",
     )
     paths["f0_predictor"] = export_f0_predictor(
-        f0_predictor, output_dir / "f0_predictor.onnx",
+        f0_predictor,
+        output_dir / "f0_predictor.onnx",
     )
     paths["content_synthesizer"] = export_content_synthesizer(
-        content_synthesizer, output_dir / "content_synthesizer.onnx",
+        content_synthesizer,
+        output_dir / "content_synthesizer.onnx",
     )
 
     logger.info("All 4 TTS models exported to %s", output_dir)
@@ -276,7 +283,8 @@ class _StyleEncoderWrapper(torch.nn.Module):
 
 
 def export_style_encoder(
-    model: torch.nn.Module, output_path: str | Path,
+    model: torch.nn.Module,
+    output_path: str | Path,
 ) -> Path:
     """Export StyleEncoder (audio mode) to ONNX.
 
@@ -309,7 +317,8 @@ def export_style_encoder(
 
 
 def verify_text_encoder(
-    model: torch.nn.Module, onnx_path: str | Path,
+    model: torch.nn.Module,
+    onnx_path: str | Path,
     atol: float = 5e-5,
 ) -> list[dict]:
     """Verify TextEncoder ONNX parity."""
@@ -327,23 +336,29 @@ def verify_text_encoder(
         with torch.no_grad():
             pt_out = model(phonemes, lang).numpy()
 
-        ort_out = session.run(None, {
-            "phoneme_ids": phonemes.numpy(),
-            "language_ids": lang.numpy(),
-        })[0]
+        ort_out = session.run(
+            None,
+            {
+                "phoneme_ids": phonemes.numpy(),
+                "language_ids": lang.numpy(),
+            },
+        )[0]
 
         max_diff = float(np.abs(pt_out - ort_out).max())
-        results.append({
-            "model": "text_encoder",
-            "test": name,
-            "max_abs_diff": max_diff,
-            "passed": max_diff < atol,
-        })
+        results.append(
+            {
+                "model": "text_encoder",
+                "test": name,
+                "max_abs_diff": max_diff,
+                "passed": max_diff < atol,
+            }
+        )
     return results
 
 
 def verify_duration_predictor(
-    model: torch.nn.Module, onnx_path: str | Path,
+    model: torch.nn.Module,
+    onnx_path: str | Path,
     atol: float = 5e-5,
 ) -> list[dict]:
     """Verify DurationPredictor ONNX parity."""
@@ -354,29 +369,35 @@ def verify_duration_predictor(
 
     results = []
     for name, L in [("short", 10), ("long", 80)]:
-        features = torch.randn(1, D_TEXT_ENCODER, L)
+        features = torch.randn(1, D_MODEL, L)
         style = torch.randn(1, D_STYLE) * 0.5
 
         with torch.no_grad():
             pt_out = model(features, style).numpy()
 
-        ort_out = session.run(None, {
-            "text_features": features.numpy(),
-            "style": style.numpy(),
-        })[0]
+        ort_out = session.run(
+            None,
+            {
+                "text_features": features.numpy(),
+                "style": style.numpy(),
+            },
+        )[0]
 
         max_diff = float(np.abs(pt_out - ort_out).max())
-        results.append({
-            "model": "duration_predictor",
-            "test": name,
-            "max_abs_diff": max_diff,
-            "passed": max_diff < atol,
-        })
+        results.append(
+            {
+                "model": "duration_predictor",
+                "test": name,
+                "max_abs_diff": max_diff,
+                "passed": max_diff < atol,
+            }
+        )
     return results
 
 
 def verify_f0_predictor(
-    model: torch.nn.Module, onnx_path: str | Path,
+    model: torch.nn.Module,
+    onnx_path: str | Path,
     atol: float = 5e-5,
 ) -> list[dict]:
     """Verify F0Predictor ONNX parity."""
@@ -387,7 +408,7 @@ def verify_f0_predictor(
 
     results = []
     for name, T in [("short", 50), ("long", 300)]:
-        features = torch.randn(1, D_TEXT_ENCODER, T)
+        features = torch.randn(1, D_MODEL, T)
         style = torch.randn(1, D_STYLE) * 0.5
 
         with torch.no_grad():
@@ -395,25 +416,34 @@ def verify_f0_predictor(
             f0_pt = f0_pt.numpy()
             voiced_pt = voiced_pt.numpy()
 
-        ort_outs = session.run(None, {
-            "text_features": features.numpy(),
-            "style": style.numpy(),
-        })
+        ort_outs = session.run(
+            None,
+            {
+                "text_features": features.numpy(),
+                "style": style.numpy(),
+            },
+        )
         f0_ort, voiced_ort = ort_outs[0], ort_outs[1]
 
-        for out_name, pt, ort_val in [("f0", f0_pt, f0_ort), ("voiced", voiced_pt, voiced_ort)]:
+        for out_name, pt, ort_val in [
+            ("f0", f0_pt, f0_ort),
+            ("voiced", voiced_pt, voiced_ort),
+        ]:
             max_diff = float(np.abs(pt - ort_val).max())
-            results.append({
-                "model": "f0_predictor",
-                "test": f"{name}_{out_name}",
-                "max_abs_diff": max_diff,
-                "passed": max_diff < atol,
-            })
+            results.append(
+                {
+                    "model": "f0_predictor",
+                    "test": f"{name}_{out_name}",
+                    "max_abs_diff": max_diff,
+                    "passed": max_diff < atol,
+                }
+            )
     return results
 
 
 def verify_content_synthesizer(
-    model: torch.nn.Module, onnx_path: str | Path,
+    model: torch.nn.Module,
+    onnx_path: str | Path,
     atol: float = 5e-5,
 ) -> list[dict]:
     """Verify ContentSynthesizer ONNX parity."""
@@ -424,27 +454,33 @@ def verify_content_synthesizer(
 
     results = []
     for name, T in [("short", 50), ("long", 300)]:
-        features = torch.randn(1, D_TEXT_ENCODER, T)
+        features = torch.randn(1, D_MODEL, T)
 
         with torch.no_grad():
             pt_out = model(features).numpy()
 
-        ort_out = session.run(None, {
-            "text_features": features.numpy(),
-        })[0]
+        ort_out = session.run(
+            None,
+            {
+                "text_features": features.numpy(),
+            },
+        )[0]
 
         max_diff = float(np.abs(pt_out - ort_out).max())
-        results.append({
-            "model": "content_synthesizer",
-            "test": name,
-            "max_abs_diff": max_diff,
-            "passed": max_diff < atol,
-        })
+        results.append(
+            {
+                "model": "content_synthesizer",
+                "test": name,
+                "max_abs_diff": max_diff,
+                "passed": max_diff < atol,
+            }
+        )
     return results
 
 
 def verify_style_encoder(
-    model: torch.nn.Module, onnx_path: str | Path,
+    model: torch.nn.Module,
+    onnx_path: str | Path,
     atol: float = 5e-5,
 ) -> list[dict]:
     """Verify StyleEncoder ONNX parity."""
@@ -463,10 +499,12 @@ def verify_style_encoder(
         ort_out = session.run(None, {"mel": mel.numpy()})[0]
 
         max_diff = float(np.abs(pt_out - ort_out).max())
-        results.append({
-            "model": "style_encoder",
-            "test": name,
-            "max_abs_diff": max_diff,
-            "passed": max_diff < atol,
-        })
+        results.append(
+            {
+                "model": "style_encoder",
+                "test": name,
+                "max_abs_diff": max_diff,
+                "passed": max_diff < atol,
+            }
+        )
     return results

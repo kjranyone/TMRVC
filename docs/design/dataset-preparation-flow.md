@@ -1,234 +1,68 @@
-# データセット作成フロー設計
+# データセット作成フロー設計 (UCLM v2 統合版)
 
 ## 概要
 
-雑多な音声ファイルを TMRVC 学習用データセットに変換するパイプライン。
-UCLM v2 では `acoustic_tokens(A_t)`、`control_tokens(B_t)`、`delta_voice_state` を追加保存する。
+本ドキュメントは、生音声ファイルから UCLM v2 (Unified Codec Language Model) の学習に必要な全特徴量を一括抽出する標準パイプラインの設計を定義する。TMRVC では「書き捨てスクリプト」を排し、設定ファイル駆動の再現可能なデータ準備を徹底する。
 
-## 入力
+## 1. データの配置と管理
 
+ユーザーデータは以下のいずれかのルールで配置し、`configs/datasets.yaml` に登録する。
+
+### ルール A: 話者分類済みデータ
 ```
-data/raw_my_voices/           # 任意のディレクトリ
-├── character_a/
-│   ├── voice_001.wav         # 48kHz, stereo, 音量バラバラ
-│   ├── voice_002.mp3         # 44.1kHz, mono
-│   └── ...
-├── character_b/
-│   └── ...
-└── flat/
-    ├── 001.wav               # 話者不明
-    └── 002.wav
+data/my_dataset/
+├── speaker_001/
+│   └── *.wav
+├── speaker_002/
+│   └── *.wav
 ```
+- 最上位のディレクトリ名が自動的に `speaker_id` として認識される。
 
-## 出力
+### ルール B: 未分類データ（自動クラスタリング）
+1. `data/unclassified/` に全ての wav を置く。
+2. `scripts/eval/cluster_speakers.py` を実行して `speaker_map.json` を生成。
+3. `datasets.yaml` の `speaker_map` フィールドにそのパスを記述。
 
-```
-data/cache/my_voices/train/
-├── my_voices_character_a/
-│   ├── my_voices_voice_001/
-│   │   ├── mel.npy           # [80, T] 24kHz log-mel
-│   │   ├── content.npy       # [768, T] ContentVec
-│   │   ├── f0.npy            # [1, T] Hz
-│   │   ├── spk_embed.npy     # [192] speaker embedding
-│   │   └── meta.json         # アノテーション
-│   └── ...
-└── my_voices_character_b/
-    └── ...
-```
+## 2. 統合抽出パイプライン (tmrvc-preprocess)
 
-## パイプライン構成
+`tmrvc-preprocess` CLI は、1つの音声から以下の 6 要素を同時に抽出し、10ms 精度で同期させて保存する。
 
-### Stage 1: スキャン & フィルタリング
+1.  **Acoustic Stream (`A_t`)**: `codec_tokens.npy` [8, T]
+2.  **Control Stream (`B_t`)**: `control_tokens.npy` [4, T]
+3.  **Physical Voice State**: `explicit_state.npy` [T, 8]
+4.  **SSL Latent**: `ssl_state.npy` [T, 128] (WavLM Context)
+5.  **Speaker Embed**: `spk_embed.npy` [192]
+6.  **TTS Alignment**: `phoneme_ids.npy`, `durations.npy` (自動文字起こし & Forced Alignment)
 
-```python
-# 入力: 音声ファイル群
-# 出力: 有効なファイルリスト
+## 3. 実行手順 (Standard Protocol)
 
-フィルタ条件:
-- min_duration: 0.5秒 (短すぎる=ノイズ)
-- max_duration: 30秒 (長すぎる=処理時間過多)
-- min_rms: 0.005 (無音除外)
-- max_rms: 0.99 (クリップ除外)
-```
+個別のスクリプトを直接叩くことは禁止。常に統合管理スクリプトを経由する。
 
-### Stage 2: 音声正規化
+### 手順 1: レジストリ登録
+`configs/datasets.yaml` に対象データセットを追加・有効化（`enabled: true`）する。
 
-```python
-# 入力: 生音声
-# 出力: 正規化済み音声
-
-処理:
-1. モノラル化
-2. 24kHz リサンプリング
-3. Loudness正規化 (-23 LUFS)
-4. クリッピング防止
-```
-
-### Stage 3: 特徴量抽出
-
-```python
-# 入力: 正規化済み音声
-# 出力: mel, content, f0, spk_embed
-
-モデル:
-- ContentVec: HuBERT-based content extractor
-- F0: pyworld (cheaptrick)
-- Speaker: SpeechBrain ECAPA-TDNN (192-dim)
-```
-
-### Stage 4: 自動アノテーション
-
-```python
-# 入力: 音声 + 特徴量
-# 出力: text, emotion_id, vad, prosody
-
-モデル:
-- Whisper large-v3: 文字起こし
-- wav2vec2-emotion: 感情分類 (12クラス)
-- ルールベース: VAD推定、韻律特徴量
-```
-
-### Stage 5: データセット保存
-
-```python
-# 入力: 特徴量 + アノテーション
-# 出力: キャッシュディレクトリ
-
-構造:
-{cache_dir}/{dataset}/train/{speaker_id}/{utt_id}/
-├── mel.npy
-├── content.npy
-├── f0.npy
-├── spk_embed.npy
-└── meta.json
-```
-
-## CLI インターフェース
-
+### 手順 2: パイプライン実行
 ```bash
-# 基本実行
-uv run python scripts/data/prepare_dataset.py \
-    --input data/raw_my_voices \
-    --output data/cache \
-    --name my_voices \
-    --language ja \
-    --device cuda
-
-# 話者マップ使用（フラットディレクトリ用）
-uv run python scripts/data/prepare_dataset.py \
-    --input data/raw_voices \
-    --output data/cache \
-    --name game_voices \
-    --speaker-map data/raw_voices/_speaker_map.json \
-    --device cuda
-
-# 再開実行（既存キャッシュをスキップ）
-uv run python scripts/data/prepare_dataset.py \
-    --input data/raw_my_voices \
-    --output data/cache \
-    --name my_voices \
-    --resume
-
-# ドライラン（ファイル数確認のみ）
-uv run python scripts/data/prepare_dataset.py \
-    --input data/raw_my_voices \
-    --dry-run
+# 全有効データセットに対して一括処理を実行
+uv run python scripts/data/prepare_datasets.py --device cuda --skip-existing
 ```
 
-## 設定ファイル
+## 4. 特徴量保存スキーマ
 
-```yaml
-# configs/prepare_dataset.yaml
-input:
-  audio_dir: data/raw_my_voices
-  speaker_map: null  # optional
+各発話はキャッシュディレクトリ内の以下の構造に保存される：
+`{cache_dir}/{dataset}/train/{speaker_id}/{utterance_id}/`
 
-output:
-  cache_dir: data/cache
-  dataset_name: my_voices
+| ファイル名 | 形状 | 説明 |
+|:---|:---|:---|
+| `codec_tokens.npy` | [8, T] | UCLM v2 Acoustic Tokens |
+| `control_tokens.npy` | [4, T] | UCLM v2 Control Tokens (op, type, dur, int) |
+| `explicit_state.npy` | [T, 8] | Physical parameters (breathiness, tension, etc.) |
+| `ssl_state.npy` | [T, 128] | WavLM large layer 7 features |
+| `spk_embed.npy` | [192] | ECAPA-TDNN speaker embedding |
+| `phoneme_ids.npy` | [L] | Phoneme indices (TTS Mode) |
+| `durations.npy` | [L] | Phoneme durations in frames (TTS Mode) |
+| `meta.json` | - | Transcription, sample rate, and stats |
 
-filter:
-  min_duration: 0.5
-  max_duration: 30.0
-  min_rms: 0.005
-  max_rms: 0.99
-  extensions: [".wav", ".flac", ".ogg", ".mp3"]
+## 5. 品質保証 (Manifest)
 
-normalize:
-  target_sr: 24000
-  target_lufs: -23.0
-  mono: true
-
-annotate:
-  whisper_model: large-v3
-  emotion_model: ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition
-  language: ja
-
-device: cuda
-```
-
-## meta.json スキーマ
-
-```json
-{
-  "utterance_id": "my_voices_voice_001",
-  "speaker_id": "my_voices_character_a",
-  "n_frames": 246,
-  "duration_sec": 2.46,
-  "sample_rate": 24000,
-  
-  "text": "こんにちは、元気ですか？",
-  "language_id": 0,
-  
-  "emotion_id": 6,
-  "emotion_label": "neutral",
-  "emotion_confidence": 0.85,
-  
-  "vad": [0.5, 0.3, 0.5],
-  "prosody": [1.0, 0.5, 0.5],
-  
-  "source_path": "data/raw_my_voices/character_a/voice_001.wav",
-  "pipeline_version": "1.0"
-}
-```
-
-## エラーハンドリング
-
-| エラー | 処理 |
-|--------|------|
-| ファイル読み込み失敗 | スキップ、ログ出力 |
-| 短すぎる/長すぎる | スキップ、統計に記録 |
-| 無音検出 | スキップ |
-| Whisper失敗 | text="" で保存、継続 |
-| 感情分類失敗 | emotion_id=6 (neutral) で保存 |
-
-## 進捗表示
-
-```
-[Stage 1/5] Scanning...          Found 8116 files, 7992 valid
-[Stage 2/5] Normalizing...       ████████░░ 80% (6394/7992)
-[Stage 3/5] Extracting...        ██████████ 100% (7992/7992)
-[Stage 4/5] Transcribing...      ██████░░░░ 60% (4795/7992)
-[Stage 5/5] Saving...            ██████████ 100% (7992/7992)
-
-Summary:
-  Processed: 7992
-  Skipped:   124 (too short: 89, too long: 35)
-  Errors:    23
-  Duration:  2h 15m
-```
-
-## 次のステップ
-
-データセット作成後:
-
-```bash
-# マニフェスト確認
-cat data/cache/_manifests/my_voices_train.json
-
-# UCLM 学習開始
-uv run tmrvc-train-uclm \
-    --cache-dir data/cache \
-    --datasets my_voices \
-    --device cuda
-```
+処理完了後、`data/cache/_manifests/{dataset}_train.json` が自動生成される。このファイルに記載された `n_utterances` や `total_duration_sec` を確認し、データの欠落がないか検証すること。

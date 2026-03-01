@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tmrvc_core.constants import (
-    D_CONTENT_VEC,
+    D_MODEL,
     D_SPEAKER,
     HOP_LENGTH,
     N_MELS,
@@ -59,7 +59,7 @@ def mock_feature_set() -> FeatureSet:
     n_frames = 100
     return FeatureSet(
         mel=torch.randn(N_MELS, n_frames),
-        content=torch.randn(D_CONTENT_VEC, n_frames),
+        content=torch.randn(D_MODEL, n_frames),
         f0=torch.randn(1, n_frames),
         spk_embed=torch.randn(D_SPEAKER),
         utterance_id="test_utt_001",

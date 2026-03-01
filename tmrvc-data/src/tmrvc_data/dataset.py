@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from tmrvc_core.audio import compute_mel
 from tmrvc_core.constants import (
     CROSS_SPEAKER_PROB,
-    D_CONTENT_VEC,
+    D_MODEL,
     D_SPEAKER,
     DEFAULT_BATCH_SIZE,
     N_MELS,

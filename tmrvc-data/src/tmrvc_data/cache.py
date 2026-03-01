@@ -1,4 +1,4 @@
-"""Feature cache: save/load individual .npy files with optional mmap."""
+"""Feature cache: save/load individual .npy files for UCLM v2."""
 
 from __future__ import annotations
 
@@ -10,22 +10,25 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tmrvc_core.types import FeatureSet
+from tmrvc_core.types import UCLMFeatureSet
 
 logger = logging.getLogger(__name__)
 
 
 class FeatureCache:
-    """Disk-backed feature cache using individual .npy files.
+    """Disk-backed feature cache for UCLM v2.
 
     Layout::
 
         cache_dir/{dataset}/{split}/{speaker}/{utterance}/
-            mel.npy         # [80, T]
-            content.npy     # [content_dim, T] where content_dim ∈ {768, 1024}
-            f0.npy          # [1, T]
-            spk_embed.npy   # [192]
-            meta.json       # {utterance_id, speaker_id, n_frames, content_dim, ...}
+            codec_tokens_a.npy       # [8, T]
+            codec_tokens_b.npy       # [4, T]
+            explicit_state.npy       # [T, 8]
+            ssl_state.npy            # [T, 128]
+            spk_embed.npy            # [192]
+            phoneme_ids.npy          # [L] (optional)
+            durations.npy            # [L] (optional)
+            meta.json
     """
 
     def __init__(self, cache_dir: str | Path) -> None:
@@ -38,107 +41,38 @@ class FeatureCache:
 
     def save(
         self,
-        features: FeatureSet,
+        features: UCLMFeatureSet,
         dataset: str,
         split: str = "train",
-        waveform: torch.Tensor | None = None,
     ) -> Path:
-        """Save a FeatureSet to disk as individual .npy files.
-
-        Args:
-            waveform: Optional ``[1, T_samples]`` waveform for audio-level augmentation.
-
-        Returns:
-            Path to the utterance directory.
-        """
-        utt_dir = self._utt_dir(
-            dataset, split, features.speaker_id, features.utterance_id
-        )
+        """Save a UCLMFeatureSet to disk."""
+        utt_dir = self._utt_dir(dataset, split, features.speaker_id, features.utterance_id)
         utt_dir.mkdir(parents=True, exist_ok=True)
 
-        np.save(utt_dir / "mel.npy", features.mel.numpy())
-        np.save(utt_dir / "content.npy", features.content.numpy())
-        np.save(utt_dir / "f0.npy", features.f0.numpy())
+        np.save(utt_dir / "codec_tokens.npy", features.codec_tokens_a.numpy())
+        np.save(utt_dir / "control_tokens.npy", features.codec_tokens_b.numpy())
+        np.save(utt_dir / "explicit_state.npy", features.voice_state_explicit.numpy().T) # Save as [T, 8]
+        np.save(utt_dir / "ssl_state.npy", features.voice_state_ssl.numpy().T)           # Save as [T, 128]
         np.save(utt_dir / "spk_embed.npy", features.spk_embed.numpy())
 
-        if waveform is not None:
-            np.save(utt_dir / "waveform.npy", waveform.numpy())
+        if features.phoneme_ids is not None:
+            np.save(utt_dir / "phoneme_ids.npy", features.phoneme_ids.numpy())
+        if features.durations is not None:
+            np.save(utt_dir / "durations.npy", features.durations.numpy())
+        if features.waveform is not None:
+            np.save(utt_dir / "waveform.npy", features.waveform.numpy())
 
         meta = {
             "utterance_id": features.utterance_id,
             "speaker_id": features.speaker_id,
             "n_frames": features.n_frames,
-            "content_dim": features.content_dim,
+            "text": features.text,
+            "language_id": features.language_id,
         }
         with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f)
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
         return utt_dir
-
-    def load(
-        self,
-        dataset: str,
-        split: str,
-        speaker_id: str,
-        utterance_id: str,
-        mmap: bool = True,
-        load_waveform: bool = False,
-        max_frames: int = 0,
-    ) -> FeatureSet:
-        """Load a FeatureSet from disk.
-
-        Args:
-            mmap: If True, use ``mmap_mode='r'`` for zero-copy reads.
-            load_waveform: If True, also load ``waveform.npy`` (if it exists).
-            max_frames: If > 0 and the utterance is longer, random-crop at the
-                mmap level so that only the needed slice is read from disk.
-                This avoids materializing the full array for long utterances.
-        """
-        utt_dir = self._utt_dir(dataset, split, speaker_id, utterance_id)
-        mmap_mode = "r" if mmap else None
-
-        mel_mm = np.load(utt_dir / "mel.npy", mmap_mode=mmap_mode)
-        content_mm = np.load(utt_dir / "content.npy", mmap_mode=mmap_mode)
-        f0_mm = np.load(utt_dir / "f0.npy", mmap_mode=mmap_mode)
-        spk_embed = np.load(utt_dir / "spk_embed.npy", mmap_mode=mmap_mode)
-
-        with open(utt_dir / "meta.json", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        content_dim = meta["content_dim"]
-
-        # Lazy crop: only materialize the needed frames from mmap
-        T = mel_mm.shape[-1]
-        if max_frames > 0 and T > max_frames:
-            start = random.randint(0, T - max_frames)
-            end = start + max_frames
-            mel = np.array(mel_mm[:, start:end])
-            content = np.array(content_mm[:, start:end])
-            f0 = np.array(f0_mm[:, start:end])
-        else:
-            mel = np.array(mel_mm)
-            content = np.array(content_mm)
-            f0 = np.array(f0_mm)
-
-        waveform = None
-        if load_waveform:
-            wav_path = utt_dir / "waveform.npy"
-            if wav_path.exists():
-                waveform = torch.from_numpy(
-                    np.array(np.load(wav_path, mmap_mode=mmap_mode))
-                )
-
-        return FeatureSet(
-            mel=torch.from_numpy(mel),
-            content=torch.from_numpy(content),
-            f0=torch.from_numpy(f0),
-            spk_embed=torch.from_numpy(np.array(spk_embed)),
-            utterance_id=meta["utterance_id"],
-            speaker_id=meta["speaker_id"],
-            n_frames=meta["n_frames"],
-            content_dim=content_dim,
-            waveform=waveform,
-        )
 
     def exists(
         self, dataset: str, split: str, speaker_id: str, utterance_id: str
@@ -148,64 +82,24 @@ class FeatureCache:
         return (utt_dir / "meta.json").exists()
 
     def iter_entries(self, dataset: str, split: str = "train") -> list[dict[str, str]]:
-        """List all cached entries for a dataset/split.
-
-        Returns:
-            List of dicts with keys ``speaker_id``, ``utterance_id``.
-        """
         base = self.cache_dir / dataset / split
-        if not base.exists():
-            return []
-
+        if not base.exists(): return []
         entries = []
         for spk_dir in sorted(base.iterdir()):
-            if not spk_dir.is_dir():
-                continue
+            if not spk_dir.is_dir(): continue
             for utt_dir in sorted(spk_dir.iterdir()):
-                if not utt_dir.is_dir():
-                    continue
+                if not utt_dir.is_dir(): continue
                 if (utt_dir / "meta.json").exists():
-                    entries.append(
-                        {
-                            "speaker_id": spk_dir.name,
-                            "utterance_id": utt_dir.name,
-                        }
-                    )
+                    entries.append({"speaker_id": spk_dir.name, "utterance_id": utt_dir.name})
         return entries
 
     def verify(self, dataset: str, split: str = "train") -> dict[str, int]:
-        """Verify cache integrity.
-
-        Returns:
-            Dict with counts: ``total``, ``valid``, ``invalid``.
-        """
         entries = self.iter_entries(dataset, split)
-        valid = 0
-        invalid = 0
-
+        valid, invalid = 0, 0
         for entry in entries:
-            utt_dir = self._utt_dir(
-                dataset, split, entry["speaker_id"], entry["utterance_id"]
-            )
-            required_files = [
-                "mel.npy",
-                "content.npy",
-                "f0.npy",
-                "spk_embed.npy",
-                "meta.json",
-            ]
-            if all((utt_dir / f).exists() for f in required_files):
-                try:
-                    with open(utt_dir / "meta.json", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    mel = np.load(utt_dir / "mel.npy", mmap_mode="r")
-                    assert mel.shape[0] == 80
-                    assert mel.shape[1] == meta["n_frames"]
-                    valid += 1
-                except Exception:
-                    logger.warning("Invalid cache entry: %s", utt_dir)
-                    invalid += 1
+            utt_dir = self._utt_dir(dataset, split, entry["speaker_id"], entry["utterance_id"])
+            if (utt_dir / "codec_tokens.npy").exists() and (utt_dir / "meta.json").exists():
+                valid += 1
             else:
                 invalid += 1
-
         return {"total": len(entries), "valid": valid, "invalid": invalid}

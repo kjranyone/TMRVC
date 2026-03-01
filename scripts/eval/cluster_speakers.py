@@ -108,42 +108,31 @@ def extract_embeddings(
 
 def cluster_embeddings(
     embeddings: dict[str, np.ndarray],
-    method: str = "hdbscan",
+    method: str = "auto",
     min_cluster_size: int = 20,
     min_samples: int = 5,
 ) -> dict[str, str]:
-    """Cluster speaker embeddings with HDBSCAN.
-
-    Returns mapping from filename to speaker label.
-    Noise points (label -1) are mapped to ``"spk_noise"``.
-    """
-    import hdbscan
-
+    """Cluster speaker embeddings. Falls back to KMeans if hdbscan is missing."""
     names = sorted(embeddings.keys())
-    matrix = np.stack([embeddings[n] for n in names])  # [N, 192]
-
-    logger.info(
-        "Clustering %d embeddings (method=%s, min_cluster_size=%d, min_samples=%d)",
-        len(names), method, min_cluster_size, min_samples,
-    )
-
-    # L2-normalize before clustering — speaker embeddings are already L2-normed,
-    # so euclidean distance on normalized vectors ∝ cosine distance.
+    matrix = np.stack([embeddings[n] for n in names])
+    
+    # Normalization
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)
-    matrix = matrix / norms
+    matrix = matrix / np.maximum(norms, 1e-8)
 
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        metric="euclidean",
-    )
-    labels = clusterer.fit_predict(matrix)
-
-    # Build speaker map
-    n_clusters = labels.max() + 1 if len(labels) > 0 else 0
-    n_noise = int((labels == -1).sum())
-    logger.info("Found %d clusters, %d noise points", n_clusters, n_noise)
+    labels = None
+    try:
+        import hdbscan
+        logger.info("Using HDBSCAN for clustering...")
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples)
+        labels = clusterer.fit_predict(matrix)
+    except ImportError:
+        from sklearn.cluster import KMeans
+        # Heuristic: estimate number of speakers based on 100 files per speaker
+        n_clusters = max(2, len(names) // 100)
+        logger.info("HDBSCAN not available. Falling back to KMeans (n_clusters=%d)...", n_clusters)
+        kmeans = KMeans(n_clusters=n_clusters, n_init=10)
+        labels = kmeans.fit_predict(matrix)
 
     mapping: dict[str, str] = {}
     for name, label in zip(names, labels):
@@ -151,7 +140,6 @@ def cluster_embeddings(
             mapping[name] = "spk_noise"
         else:
             mapping[name] = f"spk_{label + 1:04d}"
-
     return mapping
 
 

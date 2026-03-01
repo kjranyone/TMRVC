@@ -1,105 +1,117 @@
+"""``tmrvc-train-uclm`` — Train Disentangled UCLM (v2)."""
+
+from __future__ import annotations
+
 import argparse
 import logging
 from pathlib import Path
+
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from tmrvc_train.models import DisentangledUCLM
 from tmrvc_train.dataset import DisentangledUCLMDataset
 from tmrvc_train.trainer import UCLMTrainer
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 def collate_fn(batch):
-    """Pad tensors to max length in batch."""
-    # Find max length
+    """Unified collate for TTS and VC tasks."""
     max_len = max(item["target_a"].shape[1] for item in batch)
     
-    source_a_t = []
-    target_a = []
-    target_b = []
-    explicit_state = []
-    ssl_state = []
-    speaker_embed = []
-    
-    for item in batch:
-        T = item["target_a"].shape[1]
-        pad_len = max_len - T
-        
-        # [8, T] -> [8, max_len]
-        s_a = torch.nn.functional.pad(item["source_a_t"], (0, pad_len), value=-1)
-        t_a = torch.nn.functional.pad(item["target_a"], (0, pad_len), value=-1)
-        t_b = torch.nn.functional.pad(item["target_b"], (0, pad_len), value=-1)
-        
-        # [T, d] -> [max_len, d]
-        e_s = torch.nn.functional.pad(item["explicit_state"].transpose(0, 1), (0, pad_len)).transpose(0, 1)
-        s_s = torch.nn.functional.pad(item["ssl_state"].transpose(0, 1), (0, pad_len)).transpose(0, 1)
-        
-        source_a_t.append(s_a)
-        target_a.append(t_a)
-        target_b.append(t_b)
-        explicit_state.append(e_s)
-        ssl_state.append(s_s)
-        speaker_embed.append(item["speaker_embed"])
-        
-    return {
-        "source_a_t": torch.stack(source_a_t),
-        "target_a": torch.stack(target_a),
-        "target_b": torch.stack(target_b),
-        "explicit_state": torch.stack(explicit_state),
-        "ssl_state": torch.stack(ssl_state),
-        "speaker_embed": torch.stack(speaker_embed)
+    # Handle TTS lengths
+    max_phonemes = 0
+    if any(item.get("phoneme_ids") is not None for item in batch):
+        max_phonemes = max(len(item["phoneme_ids"]) for item in batch if item.get("phoneme_ids") is not None)
+
+    collated = {
+        "target_a": [], "target_b": [], "source_a_t": [],
+        "explicit_state": [], "ssl_state": [], "speaker_embed": [],
+        "speaker_id": [], "f0_condition": [],
+        "phoneme_ids": [], "phoneme_lens": [], "durations": [], "language_id": []
     }
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Disentangled UCLM")
-    parser.add_argument("--cache-dir", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-frames", type=int, default=400)
-    parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
-    
-    logger.info("Initializing Disentangled UCLM dataset...")
-    dataset = DisentangledUCLMDataset(args.cache_dir, max_frames=args.max_frames)
-    
-    if len(dataset) == 0:
-        logger.error("No valid dataset found in %s", args.cache_dir)
-        return
+    for item in batch:
+        T = item["target_a"].shape[1]
+        pad = max_len - T
         
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+        collated["target_a"].append(nn.functional.pad(item["target_a"], (0, pad), value=-1))
+        collated["target_b"].append(nn.functional.pad(item["target_b"], (0, pad), value=-1))
+        collated["source_a_t"].append(nn.functional.pad(item["source_a_t"], (0, pad), value=-1))
+        
+        collated["explicit_state"].append(nn.functional.pad(item["explicit_state"].transpose(0, 1), (0, pad)).transpose(0, 1))
+        collated["ssl_state"].append(nn.functional.pad(item["ssl_state"].transpose(0, 1), (0, pad)).transpose(0, 1))
+        
+        collated["speaker_embed"].append(item["speaker_embed"])
+        collated["speaker_id"].append(item["speaker_id"])
+        
+        if item.get("f0_condition") is not None:
+            collated["f0_condition"].append(nn.functional.pad(item["f0_condition"].transpose(0, 1), (0, pad)).transpose(0, 1))
+        else:
+            collated["f0_condition"].append(torch.zeros(max_len, 2))
+
+        # TTS padding
+        if max_phonemes > 0 and item.get("phoneme_ids") is not None:
+            P = len(item["phoneme_ids"])
+            p_pad = max_phonemes - P
+            collated["phoneme_ids"].append(nn.functional.pad(item["phoneme_ids"], (0, p_pad), value=0))
+            collated["durations"].append(nn.functional.pad(item["durations"], (0, p_pad), value=0))
+            collated["phoneme_lens"].append(item["phoneme_lens"])
+            collated["language_id"].append(item["language_id"])
+        elif max_phonemes > 0:
+            # Empty placeholders if some items lack TTS data
+            collated["phoneme_ids"].append(torch.zeros(max_phonemes, dtype=torch.long))
+            collated["durations"].append(torch.zeros(max_phonemes, dtype=torch.long))
+            collated["phoneme_lens"].append(torch.tensor(0))
+            collated["language_id"].append(torch.tensor(0))
+
+    # Convert lists to stacks
+    res = {}
+    for k, v in collated.items():
+        if v: res[k] = torch.stack(v)
+    return res
+
+
+def train_uclm(cache_dir, output_dir, batch_size, max_steps, device, lr):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dataset = DisentangledUCLMDataset(cache_dir)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     
-    logger.info("Initializing Disentangled UCLM model...")
-    model = DisentangledUCLM(
-        d_model=512,
-        n_heads=8,
-        n_layers=12,
-        rvq_vocab_size=1024,
-        n_codebooks=8,
-        control_vocab_size=64,
-        d_explicit=8,
-        d_ssl=128,
-        d_speaker=192,
-        vq_bins=128
-    )
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    trainer = UCLMTrainer(model, optimizer, device=args.device)
-    
-    logger.info("Starting training loop...")
+    model = DisentangledUCLM().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    trainer = UCLMTrainer(model, optimizer, device=device)
+
+    pbar = tqdm(total=max_steps, desc="Training UCLM")
     step = 0
-    while step < args.max_steps:
+    while step < max_steps:
         for batch in loader:
-            losses = trainer.train_step(batch)
-            if step % 10 == 0:
-                logger.info(f"Step {step}: Total Loss={losses['loss']:.4f}, VQ Loss={losses['loss_vq']:.4f}")
-                
+            if step >= max_steps: break
+            metrics = trainer.train_step(batch)
+            pbar.update(1)
+            pbar.set_postfix({"loss": f"{metrics['loss']:.4f}", "mode": "TTS" if metrics["mode"] else "VC"})
             step += 1
-            if step >= args.max_steps:
-                break
-                
-    logger.info("Training finished.")
+            
+            if step % 1000 == 0:
+                torch.save({"model": model.state_dict(), "step": step}, output_dir / f"uclm_step_{step}.pt")
+
+    torch.save({"model": model.state_dict()}, output_dir / "uclm_final.pt")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--cache-dir", type=Path, required=True)
+    p.add_argument("--output-dir", type=Path, default=Path("checkpoints/uclm"))
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--max-steps", type=int, default=10000)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--device", default="cuda")
+    args = p.parse_args()
+    
+    logging.basicConfig(level=logging.INFO)
+    train_uclm(**vars(args))
 
 if __name__ == "__main__":
     main()

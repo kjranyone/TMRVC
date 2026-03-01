@@ -2,7 +2,7 @@
 
 import torch
 
-from tmrvc_core.constants import D_CONTENT_VEC, D_SPEAKER, N_MELS
+from tmrvc_core.constants import D_MODEL, D_SPEAKER, N_MELS
 from tmrvc_core.types import FeatureSet
 from tmrvc_data.cache import FeatureCache
 
@@ -65,7 +65,7 @@ class TestFeatureCache:
         for i in range(5):
             fs = FeatureSet(
                 mel=torch.randn(N_MELS, 50),
-                content=torch.randn(D_CONTENT_VEC, 50),
+                content=torch.randn(D_MODEL, 50),
                 f0=torch.randn(1, 50),
                 spk_embed=torch.randn(D_SPEAKER),
                 utterance_id=f"utt_{i}",

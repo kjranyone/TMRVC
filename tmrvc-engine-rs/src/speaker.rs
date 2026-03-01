@@ -246,10 +246,13 @@ impl SpeakerFile {
             SpeakerMetadata::default()
         };
 
-        // Use metadata.f0_mean if available, otherwise use binary f0_mean
-        let f0_mean = if metadata.f0_mean > 0.0 {
+        // Single source of truth: binary f0_mean
+        // Legacy support: use metadata.f0_mean only for old files (deprecated)
+        let f0_mean = if metadata.f0_mean > 0.0 && f0_mean <= 0.0 {
+            // Legacy: metadata has f0_mean but binary doesn't (shouldn't happen in v3)
             metadata.f0_mean
         } else {
+            // Standard: binary section is the single source of truth
             f0_mean
         };
 

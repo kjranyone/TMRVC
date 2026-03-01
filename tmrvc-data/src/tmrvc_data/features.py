@@ -9,7 +9,7 @@ from typing import Protocol
 import torch
 import torch.nn.functional as F
 
-from tmrvc_core.constants import D_CONTENT_VEC, D_WAVLM_LARGE, HOP_LENGTH, SAMPLE_RATE
+from tmrvc_core.constants import D_MODEL, 1024, HOP_LENGTH, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ class ContentVecExtractor:
 
     @property
     def output_dim(self) -> int:
-        return D_CONTENT_VEC  # 768
+        return D_MODEL  # 768
 
     def _load_model(self) -> None:
         if self._model is not None:
@@ -125,7 +125,7 @@ class WavLMExtractor:
 
     @property
     def output_dim(self) -> int:
-        return D_WAVLM_LARGE  # 1024
+        return 1024  # 1024
 
     def _load_model(self) -> None:
         if self._model is not None:

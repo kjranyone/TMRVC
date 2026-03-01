@@ -117,3 +117,63 @@ class EmotionAwareCodec(nn.Module):
 
     def encode(self, audio, states=None): return self.encoder(audio, states)
     def decode(self, a, b, v, states=None): return self.decoder(a, b, v, states)
+
+
+def multiscale_stft_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Multi-scale STFT loss for high-fidelity reconstruction."""
+    pred_flat = pred.squeeze(1)
+    target_flat = target.squeeze(1)
+    
+    total_loss = 0.0
+    scales = [512, 1024, 2048]
+    
+    for n_fft in scales:
+        hop = n_fft // 4
+        win = n_fft
+        
+        stft_pred = torch.stft(
+            pred_flat, n_fft=n_fft, hop_length=hop, win_length=win,
+            window=torch.hann_window(win, device=pred.device),
+            return_complex=True
+        )
+        stft_target = torch.stft(
+            target_flat, n_fft=n_fft, hop_length=hop, win_length=win,
+            window=torch.hann_window(win, device=target.device),
+            return_complex=True
+        )
+        
+        mag_pred = torch.abs(stft_pred) + 1e-7
+        mag_target = torch.abs(stft_target) + 1e-7
+        
+        sc_loss = torch.norm(mag_pred - mag_target, p="fro") / (torch.norm(mag_target, p="fro") + 1e-7)
+        log_loss = F.l1_loss(torch.log(mag_pred), torch.log(mag_target))
+        total_loss += (sc_loss + log_loss)
+        
+    return total_loss / len(scales)
+
+
+class CodecLoss(nn.Module):
+    """Loss for EmotionAwareCodec: STFT + B_t CrossEntropy."""
+    def __init__(self, lambda_stft: float = 1.0, lambda_control: float = 0.1):
+        super().__init__()
+        self.lambda_stft = lambda_stft
+        self.lambda_control = lambda_control
+
+    def forward(self, audio_pred, audio_target, b_logits, b_target):
+        # 1. Reconstruction Loss
+        loss_stft = multiscale_stft_loss(audio_pred, audio_target)
+        
+        # 2. Control Stream Loss (B_t)
+        # b_logits: [B, 4, T, 64], b_target: [B, 4, T]
+        B, n_slots, T, vocab = b_logits.shape
+        loss_control = F.cross_entropy(
+            b_logits.reshape(-1, vocab),
+            b_target.reshape(-1)
+        )
+        
+        total = self.lambda_stft * loss_stft + self.lambda_control * loss_control
+        return {
+            "loss": total,
+            "loss_stft": loss_stft,
+            "loss_control": loss_control
+        }

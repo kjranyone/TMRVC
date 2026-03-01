@@ -1,8 +1,4 @@
-"""Python streaming voice-conversion engine using UCLM v2.
-
-This module provides a QThread-based audio engine using UCLMEngine
-for real-time unified TTS/VC processing in the GUI.
-"""
+"""Python streaming voice-conversion engine using UCLM v2."""
 
 from __future__ import annotations
 
@@ -16,7 +12,7 @@ from PySide6.QtCore import QThread, Signal
 
 from tmrvc_core.constants import SAMPLE_RATE
 from tmrvc_core.dialogue_types import StyleParams
-from tmrvc_serve.uclm_engine import UCLMEngine
+from tmrvc_serve.uclm_engine import UCLMEngine, EngineState
 from tmrvc_gui.workers.ring_buffer import RING_BUFFER_CAPACITY, RingBuffer
 
 # UCLM v2 uses 10ms frames (240 samples @ 24kHz)
@@ -24,19 +20,7 @@ FRAME_SIZE = 240
 
 
 class AudioEngine(QThread):
-    """Python streaming voice-conversion engine using UCLM v2.
-
-    Signals
-    -------
-    level_updated(float, float)
-        Emitted periodically with (input_db, output_db) levels.
-    timing_updated(float)
-        Emitted with inference time in milliseconds per frame.
-    buffer_status(bool)
-        Emitted when a buffer underrun occurs.
-    error(str)
-        Emitted on unrecoverable errors.
-    """
+    """Python streaming voice-conversion engine using UCLM v2."""
 
     level_updated = Signal(float, float)
     timing_updated = Signal(float)
@@ -52,7 +36,7 @@ class AudioEngine(QThread):
 
         self._engine: Optional[UCLMEngine] = None
         self._spk_t: Optional[torch.Tensor] = None
-        self._kv_cache: Optional[torch.Tensor] = None
+        self._state = EngineState()
         self._style = StyleParams.neutral()
 
         # Ring buffers
@@ -71,12 +55,17 @@ class AudioEngine(QThread):
 
     def _load_resources(self) -> None:
         """Load UCLM engine and speaker embedding."""
-        self._engine = UCLMEngine(
-            uclm_checkpoint=self._uclm_checkpoint,
-            codec_checkpoint=self._codec_checkpoint,
-            device="cpu", # GUI uses CPU for stability
-        )
-        self._engine.load_models()
+        self._engine = UCLMEngine(device="cpu") # GUI uses CPU for stability
+        self._engine.load_from_combined_checkpoint(self._uclm_checkpoint)
+        
+        # Manually load codec for now since engine expects split files but we provide combined
+        # In a real GUI scenario, the paths would be handled by the page.
+        try:
+            codec_ckpt = torch.load(self._codec_checkpoint, map_location="cpu")
+            self._engine.codec_dec.load_state_dict({k.replace("decoder.", ""): v for k, v in codec_ckpt["model"].items() if k.startswith("decoder.")}, strict=False)
+            self._engine.codec_enc.load_state_dict({k.replace("encoder.", ""): v for k, v in codec_ckpt["model"].items() if k.startswith("encoder.")}, strict=False)
+        except Exception as e:
+            logger.warning("Failed to load codec sub-components: %s", e)
 
         # Load speaker
         if self._speaker_path.suffix == ".tmrvc_speaker":
@@ -130,9 +119,7 @@ class AudioEngine(QThread):
             self.error.emit(f"Failed to load engine: {e}")
             return
 
-        self._kv_cache = None
-        
-        # Warmup ring buffer
+        self._state = EngineState()
         self._output_ring.write(np.zeros(FRAME_SIZE, dtype=np.float32))
 
         while not self._stopped:
@@ -141,35 +128,25 @@ class AudioEngine(QThread):
                 continue
 
             t0 = time.perf_counter()
-            
-            # Read input frame
             in_frame = self._input_ring.read(FRAME_SIZE)
             in_t = torch.from_numpy(in_frame).float().unsqueeze(0).unsqueeze(0)
-            
-            # Measure input level
             input_db = self._rms_to_db(in_frame)
 
-            # UCLMEngine VC Step
-            out_t, next_kv = self._engine.vc_frame(
+            # UCLMEngine VC Step with full EngineState
+            out_t, next_state = self._engine.vc_frame(
                 audio_frame=in_t,
                 speaker_embed=self._spk_t,
                 style=self._style,
-                kv_cache=self._kv_cache
+                state=self._state
             )
-            self._kv_cache = next_kv
-            
+            self._state = next_state
             out_frame = out_t.cpu().numpy()
             
-            # Dry/Wet and Gain
             mixed = (self._dry_wet * out_frame + (1.0 - self._dry_wet) * in_frame)
             mixed *= self._output_gain
-            
             output_db = self._rms_to_db(mixed)
             
-            # Write to output
             self._output_ring.write(mixed.astype(np.float32))
-            
-            # Timing and level
             ms = (time.perf_counter() - t0) * 1000.0
             self.timing_updated.emit(ms)
             self.level_updated.emit(input_db, output_db)

@@ -1,8 +1,8 @@
 """tmrvc-core: shared constants, mel computation, type definitions."""
 
 from tmrvc_core.constants import (
-    D_CONTENT,
-    D_CONTENT_VEC,
+    D_MODEL,
+    D_MODEL,
     D_SPEAKER,
     HOP_LENGTH,
     MEL_FMAX,
@@ -15,8 +15,8 @@ from tmrvc_core.constants import (
 from tmrvc_core.device import get_device, pin_memory_for_device
 
 __all__ = [
-    "D_CONTENT",
-    "D_CONTENT_VEC",
+    "D_MODEL",
+    "D_MODEL",
     "D_SPEAKER",
     "HOP_LENGTH",
     "MEL_FMAX",

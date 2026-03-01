@@ -37,7 +37,12 @@ class DisentangledUCLM(nn.Module):
         self.rvq_vocab_size = rvq_vocab_size
         self.control_vocab_size = control_vocab_size
 
-        self.vc_encoder = VCEncoder(n_codebooks, rvq_vocab_size, d_model, vq_bins)
+        self.vc_encoder = VCEncoder(
+            n_codebooks=n_codebooks,
+            vocab_size=rvq_vocab_size,
+            d_model=d_model,
+            vq_bins=vq_bins,
+        )
 
         self.text_encoder = TextEncoder(
             vocab_size=vocab_size, d_model=d_model, n_layers=4
@@ -45,7 +50,9 @@ class DisentangledUCLM(nn.Module):
         self.duration_predictor = DurationPredictor(d_model=d_model)
         self.feature_expander = TextFeatureExpander(d_model=d_model)
 
-        self.voice_state_enc = VoiceStateEncoder(d_explicit, d_ssl, d_model)
+        self.voice_state_enc = VoiceStateEncoder(
+            d_explicit=d_explicit, d_ssl=d_ssl, d_model=d_model
+        )
 
         self.f0_proj = nn.Linear(2, d_model)  # F0 condition: [norm_f0, shift]
 
@@ -70,11 +77,8 @@ class DisentangledUCLM(nn.Module):
     ) -> dict:
         content_features, vq_loss = self.vc_encoder(source_a_t)
 
-        state_out = self.voice_state_enc(explicit_state, ssl_state)
-        if isinstance(state_out, tuple):
-            state_cond, adv_logits = state_out
-        else:
-            state_cond, adv_logits = state_out, None
+        v_out = self.voice_state_enc(explicit_state, ssl_state)
+        state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
         if f0_condition is not None:
             content_features = content_features + self.f0_proj(f0_condition)
@@ -87,7 +91,7 @@ class DisentangledUCLM(nn.Module):
             "logits_a": logits_a,
             "logits_b": logits_b,
             "vq_loss": vq_loss,
-            "adv_logits": adv_logits,
+            "adv_logits": v_out[1] if isinstance(v_out, tuple) else None,
         }
 
     def forward_tts(
@@ -128,11 +132,8 @@ class DisentangledUCLM(nn.Module):
             content_features = content_features + self.f0_proj(f0_condition)
 
         # 5. Predict tokens
-        state_out = self.voice_state_enc(explicit_state, ssl_state)
-        if isinstance(state_out, tuple):
-            state_cond, adv_logits = state_out
-        else:
-            state_cond, adv_logits = state_out, None
+        v_out = self.voice_state_enc(explicit_state, ssl_state)
+        state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
         logits_a, logits_b = self.uclm_core.forward_no_cache(
             content_features, state_cond, speaker_embed, cfg_scale
@@ -142,23 +143,26 @@ class DisentangledUCLM(nn.Module):
             "logits_a": logits_a,
             "logits_b": logits_b,
             "log_durations": log_durations,
-            "adv_logits": adv_logits,
+            "adv_logits": v_out[1] if isinstance(v_out, tuple) else None,
         }
 
     def forward_streaming(
         self,
         content_features: torch.Tensor,
-        state_cond: torch.Tensor,
+        b_ctx: torch.Tensor,
         speaker_embed: torch.Tensor,
+        state_cond: torch.Tensor,
         cfg_scale: float = 1.0,
         kv_caches: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> dict:
         """Forward pass for streaming inference with KV cache list."""
+        cfg_tensor = torch.tensor([cfg_scale], device=content_features.device)
         logits_a, logits_b, next_kv_caches = self.uclm_core(
             content_features,
-            state_cond,
+            b_ctx,
             speaker_embed,
-            cfg_scale,
+            state_cond,
+            cfg_tensor,
             kv_caches,
         )
 
