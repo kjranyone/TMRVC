@@ -14,6 +14,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 
@@ -23,12 +24,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from tmrvc_core.constants import (
-    D_MODEL,
-    N_CODEBOOKS,
-    RVQ_VOCAB_SIZE,
-    CONTROL_VOCAB_SIZE,
-)
 from tmrvc_train.models.emotion_codec import EmotionAwareCodec
 
 logger = logging.getLogger(__name__)
@@ -173,13 +168,7 @@ def train_codec(
     )
 
     logger.info("Initializing EmotionAwareCodec model")
-    model = EmotionAwareCodec(
-        d_model=D_MODEL,
-        n_codebooks=N_CODEBOOKS,
-        rvq_vocab_size=RVQ_VOCAB_SIZE,
-        control_vocab_size=CONTROL_VOCAB_SIZE,
-        d_voice_state=8,
-    ).to(device)
+    model = EmotionAwareCodec().to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     logger.info("Total parameters: %d", total_params)
@@ -235,35 +224,29 @@ def train_codec(
 
             optimizer.zero_grad()
 
-            a_tokens, b_logits, vq_loss = model.encoder(waveform)
+            a_tokens, b_logits, enc_states = model.encode(waveform)
 
-            B, _, T = a_tokens.shape
+            B = a_tokens.shape[0]
+            T_frames = a_tokens.shape[-1]
+
+            voice_state_frames = voice_state[:, :T_frames, :]
+
             b_tokens = b_logits.argmax(dim=-1)
-
-            voice_state_expanded = voice_state[:, :T, :].transpose(1, 2).unsqueeze(-1)
-            voice_state_expanded = voice_state_expanded.expand(-1, -1, -1, T).squeeze(
-                -1
-            )
-            voice_state_flat = voice_state[:, :T, :]
-
-            audio_recon = model.decoder(
+            audio_recon, dec_states = model.decode(
                 a_tokens,
-                b_tokens.transpose(1, 2),
-                voice_state_flat,
+                b_tokens,
+                voice_state_frames,
             )
 
             min_len = min(waveform.shape[-1], audio_recon.shape[-1])
+            if min_len < 512:
+                continue
             waveform_crop = waveform[..., :min_len]
             audio_recon_crop = audio_recon[..., :min_len]
 
             loss_stft = stft_loss(audio_recon_crop, waveform_crop)
-            loss_vq = (
-                vq_loss
-                if isinstance(vq_loss, torch.Tensor)
-                else torch.tensor(0.0, device=device)
-            )
 
-            total_loss = loss_stft + 0.1 * loss_vq
+            total_loss = loss_stft
 
             total_loss.backward()
             optimizer.step()
@@ -274,9 +257,6 @@ def train_codec(
                     "step": step,
                     "loss": f"{total_loss.item():.4f}",
                     "stft": f"{loss_stft.item():.4f}",
-                    "vq": f"{loss_vq.item():.4f}"
-                    if isinstance(loss_vq, torch.Tensor)
-                    else "0.0",
                 }
             )
 

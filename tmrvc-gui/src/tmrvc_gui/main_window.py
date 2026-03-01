@@ -29,15 +29,15 @@ from tmrvc_gui.pages.tts import TTSPage
 _TABS: list[tuple[str, type[QWidget]]] = [
     ("Data Prep", DataPrepPage),
     ("Codec Training", CodecTrainPage),
-    ("Token Model Training", TokenTrainPage),
+    ("UCLM Training", TokenTrainPage),
     ("Evaluation", EvaluationPage),
     ("Speaker Enrollment", EnrollmentPage),
-    ("Realtime Demo", RealtimeDemoPage),
+    ("Realtime VC (UCLM)", RealtimeDemoPage),
     ("ONNX Export", OnnxExportPage),
-    ("TTS", TTSPage),
-    ("Script (Example)", ScriptPage),
-    ("Style Editor", StyleEditorPage),
-    ("TTS Server", ServerPage),
+    ("TTS (UCLM v2)", TTSPage),
+    ("Batch Script", ScriptPage),
+    ("Physical Style Editor", StyleEditorPage),
+    ("Inference Server", ServerPage),
 ]
 
 

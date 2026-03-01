@@ -48,74 +48,43 @@ CODEBOOK_DIM = 64
 
 
 class StreamingCodecEncoder(nn.Module):
-    """Streaming codec encoder with explicit state management.
+    """Streaming codec encoder wrapper for ONNX export.
 
-    Single-frame processing version for ONNX export.
+    Wraps the new CausalStridedConv1d-based encoder.
     """
 
     def __init__(self, codec: EmotionAwareCodec):
         super().__init__()
         self.encoder = codec.encoder
-        self.d_model = codec.encoder.d_model
-        self.n_codebooks = codec.encoder.n_codebooks
 
     def forward(
         self,
         audio_frame: torch.Tensor,
         state_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process single 10ms frame.
+        """Process audio chunk (240 samples → 1 frame).
 
         Args:
             audio_frame: [B, 1, 240] single frame
-            state_in: [B, ENC_STATE_DIM, ENC_STATE_FRAMES] encoder state
+            state_in: [B, ENC_STATE_DIM, ENC_STATE_FRAMES] encoder state (unused)
 
         Returns:
             acoustic_tokens: [B, 8] RVQ indices
             state_out: [B, ENC_STATE_DIM, ENC_STATE_FRAMES] updated state
         """
-        x = audio_frame
-
-        new_state = torch.roll(state_in, -1, dims=2)
-        new_state[:, :, -1] = 0
-
-        for layer in self.encoder.encoder:
-            if hasattr(layer, "padding"):
-                x = F.pad(x, (layer.padding, 0))
-                x = layer.conv(x)
-            elif isinstance(layer, nn.Conv1d):
-                x = layer(x)
-            else:
-                x = layer(x)
-
-        if x.shape[-1] > 0:
-            new_state[:, :, -1] = x[:, :, -1]
-
-        z = self.encoder.rvq(x.transpose(1, 2))[1]
-        acoustic_tokens = z[:, :, -1]
-
-        return acoustic_tokens, new_state
+        a_tokens, b_logits, _ = self.encoder(audio_frame, states=None)
+        return a_tokens[:, :, -1], state_in
 
 
 class StreamingCodecDecoder(nn.Module):
-    """Streaming codec decoder for single-frame processing.
+    """Streaming codec decoder wrapper for ONNX export.
 
-    Uses the original EmotionAwareDecoder backbone (ConvTranspose1d layers).
-    Projects control encoder output to match acoustic embedding dimension.
+    Wraps the new CausalStridedTransposeConv1d-based decoder.
     """
 
     def __init__(self, codec: EmotionAwareCodec):
         super().__init__()
-        self.n_codebooks = codec.decoder.n_codebooks
-        self.d_model = codec.decoder.d_model
-
-        self.codebook_embeds = codec.decoder.codebook_embeds
-        self.control_encoder = codec.decoder.control_encoder
-        self.film = codec.decoder.film
-        self.decoder = codec.decoder.decoder
-
-        ctrl_dim = codec.decoder.control_encoder.d_model
-        self.ctrl_proj = nn.Linear(ctrl_dim, self.d_model)
+        self.decoder = codec.decoder
 
     def forward(
         self,
@@ -132,31 +101,23 @@ class StreamingCodecDecoder(nn.Module):
             control_tokens: [B, 4] B_t [op, type, dur, int]
             voice_state: [B, 8] voice state parameters
             event_trace_in: [B, EVENT_TRACE_DIM] event hysteresis
-            state_in: [B, DEC_STATE_DIM, DEC_STATE_FRAMES] decoder state (unused in conv)
+            state_in: [B, DEC_STATE_DIM, DEC_STATE_FRAMES] decoder state (unused)
 
         Returns:
             audio_frame: [B, 1, 240] decoded audio
             event_trace_out: [B, EVENT_TRACE_DIM] updated trace
             state_out: [B, DEC_STATE_DIM, DEC_STATE_FRAMES] updated state
         """
-        embeds = []
-        for i, emb in enumerate(self.codebook_embeds):
-            embeds.append(emb(acoustic_tokens[:, i]))
-        z_a = torch.cat(embeds, dim=-1)
+        a_tokens = acoustic_tokens.unsqueeze(-1)
+        b_tokens = control_tokens.unsqueeze(-1)
 
-        z_b = self.control_encoder(control_tokens).squeeze(-1)
-        z_b = self.ctrl_proj(z_b)
+        audio, _ = self.decoder(a_tokens, b_tokens, voice_state, states=None)
 
-        z = z_a + z_b
+        audio_frame = audio[:, :, :FRAME_SIZE]
 
-        z = self.film(z.unsqueeze(1), voice_state)
+        event_trace_out = event_trace_in
 
-        audio = self.decoder(z.transpose(1, 2))
-
-        if audio.shape[-1] >= FRAME_SIZE:
-            audio_frame = audio[:, :, :FRAME_SIZE]
-        else:
-            audio_frame = F.pad(audio, (0, FRAME_SIZE - audio.shape[-1]))
+        return audio_frame, event_trace_out, state_in
 
         audio_frame = torch.tanh(audio_frame)
 
@@ -342,13 +303,7 @@ def export_codec(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Creating EmotionAwareCodec model")
-    codec = EmotionAwareCodec(
-        d_model=512,
-        n_codebooks=N_CODEBOOKS,
-        rvq_vocab_size=RVQ_VOCAB_SIZE,
-        control_vocab_size=CONTROL_VOCAB_SIZE,
-        d_voice_state=D_VOICE_STATE,
-    ).to(device)
+    codec = EmotionAwareCodec().to(device)
 
     if checkpoint_path:
         logger.info("Loading checkpoint from %s", checkpoint_path)

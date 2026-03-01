@@ -1,7 +1,6 @@
-"""ONNX export and quantization worker for TMRVC.
+"""ONNX export and quantization worker for TMRVC UCLM v2.
 
-Converts PyTorch checkpoints to the 5 ONNX models required by the
-streaming engine and optionally applies INT8 dynamic quantisation.
+Converts UCLM and Codec checkpoints to ONNX for the unified engine.
 """
 
 from __future__ import annotations
@@ -16,107 +15,49 @@ from .base_worker import BaseWorker
 
 logger = logging.getLogger(__name__)
 
-# The ONNX model names that compose the TMRVC inference pipeline.
-# converter_hq is optional (HQ mode only).
+# UCLM v2 Unified ONNX components
 MODEL_NAMES: list[str] = [
-    "content_encoder",
-    "converter",
-    "converter_hq",
-    "vocoder",
-    "ir_estimator",
+    "uclm",
+    "codec",
     "speaker_encoder",
 ]
 
-# Export function mapping: model_name → (export_func_name, model_class)
 _EXPORT_MAP = {
-    "content_encoder": "export_content_encoder",
-    "converter": "export_converter",
-    "converter_hq": "export_converter_hq",
-    "vocoder": "export_vocoder",
-    "ir_estimator": "export_ir_estimator",
+    "uclm": "export_uclm",
+    "codec": "export_codec",
     "speaker_encoder": "export_speaker_encoder",
 }
 
 
-def _load_models_from_checkpoint(
-    checkpoint_path: Path,
-    model_names: list[str],
-) -> dict[str, torch.nn.Module]:
-    """Load student models from a training checkpoint.
+def _load_model_from_path(
+    name: str,
+    path: Path,
+) -> torch.nn.Module:
+    """Load a specific model from a checkpoint path."""
+    from tmrvc_train.models import DisentangledUCLM, EmotionAwareCodec, SpeakerEncoderWithLoRA
 
-    The checkpoint is expected to contain model state dicts keyed by
-    model name (e.g. ``content_encoder``, ``converter``, etc.).
-
-    Returns:
-        Dict of model_name → instantiated PyTorch model in eval mode.
-    """
-    from tmrvc_train.models.content_encoder import ContentEncoderStudent
-    from tmrvc_train.models.converter import ConverterStudent, ConverterStudentHQ
-    from tmrvc_train.models.ir_estimator import IREstimator
-    from tmrvc_train.models.speaker_encoder import SpeakerEncoderWithLoRA
-    from tmrvc_train.models.vocoder import VocoderStudent
-
-    _MODEL_CLASSES: dict[str, type] = {
-        "content_encoder": ContentEncoderStudent,
-        "converter": ConverterStudent,
-        "converter_hq": ConverterStudentHQ,
-        "vocoder": VocoderStudent,
-        "ir_estimator": IREstimator,
+    _CLASSES = {
+        "uclm": DisentangledUCLM,
+        "codec": EmotionAwareCodec,
         "speaker_encoder": SpeakerEncoderWithLoRA,
     }
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    cls = _CLASSES.get(name)
+    if cls is None:
+        raise ValueError(f"Unknown model: {name}")
 
-    models = {}
-    for name in model_names:
-        cls = _MODEL_CLASSES.get(name)
-        if cls is None:
-            raise ValueError(f"Unknown model: {name}")
-
-        model = cls()
-
-        if name == "converter_hq" and name not in ckpt:
-            # Initialize from causal converter weights if no dedicated weights
-            if "converter" in models:
-                model = ConverterStudentHQ.from_causal(models["converter"])
-            elif "converter" in ckpt:
-                causal = ConverterStudent()
-                causal.load_state_dict(ckpt["converter"])
-                model = ConverterStudentHQ.from_causal(causal)
-            else:
-                logger.warning("No converter weights found for converter_hq init")
-                continue
-        else:
-            if name not in ckpt:
-                logger.warning("Key '%s' not in checkpoint, skipping", name)
-                continue
-            model.load_state_dict(ckpt[name])
-
-        model.eval()
-        models[name] = model
-
-    return models
+    model = cls()
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    
+    # Handle both full checkpoints and state_dicts
+    state_dict = ckpt.get("model", ckpt)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
 
 
 class ExportWorker(BaseWorker):
-    """Background worker for ONNX export and quantization.
-
-    Parameters
-    ----------
-    checkpoint_path : Path
-        Path to the PyTorch checkpoint file (``.pt`` or ``.ckpt``).
-    output_dir : Path
-        Directory where exported ONNX files will be written.
-    models : list[str]
-        Subset of :data:`MODEL_NAMES` to export.  Pass all five for a
-        full export.
-    quantize : bool
-        If *True*, apply INT8 dynamic quantisation to eligible models
-        after export.  ``speaker_encoder`` is always excluded from
-        quantisation (it runs offline only).
-    parent : QObject, optional
-        Parent Qt object.
-    """
+    """Background worker for ONNX export and quantization (UCLM v2)."""
 
     def __init__(
         self,
@@ -132,94 +73,53 @@ class ExportWorker(BaseWorker):
         self.models = models
         self.quantize = quantize
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
     def run(self) -> None:
-        """Export ONNX models and optionally quantise."""
         from tmrvc_export import export_onnx
         from tmrvc_export.quantize import quantize_model
 
         total_steps = len(self.models)
         if self.quantize:
-            quantizable = [m for m in self.models if m != "speaker_encoder"]
-            total_steps += len(quantizable)
+            total_steps += len([m for m in self.models if m != "speaker_encoder"])
 
         current_step = 0
 
-        self.log_message.emit(
-            f"[ExportWorker] Starting export from {self.checkpoint_path} "
-            f"to {self.output_dir}  models={self.models}  "
-            f"quantize={self.quantize}"
-        )
-
         try:
-            # Load models from checkpoint
-            self.log_message.emit("[ExportWorker] Loading models from checkpoint...")
-            pytorch_models = _load_models_from_checkpoint(
-                self.checkpoint_path, self.models,
-            )
-
-            # ----------------------------------------------------------
-            # Phase 1: FP32 ONNX export
-            # ----------------------------------------------------------
             fp32_dir = self.output_dir / "fp32"
             fp32_dir.mkdir(parents=True, exist_ok=True)
 
             for model_name in self.models:
                 if self.is_cancelled:
-                    self.log_message.emit("[ExportWorker] Cancelled by user.")
                     self.finished.emit(False, "Cancelled")
                     return
 
+                self.log_message.emit(f"Loading and exporting {model_name}...")
+                
+                # In UCLM v2, each component might be in its own file or shared
+                # For simplicity, we assume the provided path contains the target model
+                pytorch_model = _load_model_from_path(model_name, self.checkpoint_path)
+                
                 onnx_path = fp32_dir / f"{model_name}.onnx"
-                self.log_message.emit(
-                    f"[ExportWorker] Exporting {model_name} -> {onnx_path}"
-                )
-
                 export_fn = getattr(export_onnx, _EXPORT_MAP[model_name])
-                export_fn(pytorch_models[model_name], onnx_path)
+                export_fn(pytorch_model, onnx_path)
 
                 current_step += 1
                 self.progress.emit(current_step, total_steps)
-                self.log_message.emit(
-                    f"[ExportWorker] Exported {model_name} (FP32)"
-                )
 
-            # ----------------------------------------------------------
-            # Phase 2: INT8 dynamic quantization (optional)
-            # ----------------------------------------------------------
-            if self.quantize:
-                int8_dir = self.output_dir / "int8"
-                int8_dir.mkdir(parents=True, exist_ok=True)
-
-                for model_name in self.models:
-                    if model_name == "speaker_encoder":
-                        continue
-
-                    if self.is_cancelled:
-                        self.log_message.emit("[ExportWorker] Cancelled by user.")
-                        self.finished.emit(False, "Cancelled")
-                        return
-
-                    src = fp32_dir / f"{model_name}.onnx"
+                if self.quantize and model_name != "speaker_encoder":
+                    int8_dir = self.output_dir / "int8"
+                    int8_dir.mkdir(parents=True, exist_ok=True)
                     dst = int8_dir / f"{model_name}_int8.onnx"
-                    self.log_message.emit(
-                        f"[ExportWorker] Quantizing {model_name} -> {dst}"
-                    )
-
-                    quantize_model(str(src), str(dst))
-
+                    
+                    self.log_message.emit(f"Quantizing {model_name}...")
+                    quantize_model(str(onnx_path), str(dst))
+                    
                     current_step += 1
                     self.progress.emit(current_step, total_steps)
-                    self.log_message.emit(
-                        f"[ExportWorker] Quantized {model_name} (INT8)"
-                    )
 
-            self.log_message.emit("[ExportWorker] Export complete.")
+            self.log_message.emit("Export complete.")
             self.finished.emit(True, "Export completed successfully")
 
         except Exception as exc:
+            logger.exception("Export failed")
             self.error.emit(str(exc))
             self.finished.emit(False, str(exc))

@@ -152,6 +152,52 @@ def extract_style_embedding(audio_paths: list[Path], device: str) -> np.ndarray:
     return compute_style_from_files([str(p) for p in audio_paths], device=device)
 
 
+def extract_ssl_state(audio_paths: list[Path], device: str) -> np.ndarray | None:
+    """Extract default SSL state from audio files using WavLM.
+
+    Returns the mean SSL state across all audio files, shape [128].
+    Returns None if WavLM is not available.
+    """
+    try:
+        import torch
+        from tmrvc_train.models.ssl_extractor import WavLMSSLExtractor
+    except ImportError:
+        logger.warning("WavLMSSLExtractor not available, skipping ssl_state extraction")
+        return None
+
+    logger.info("Extracting SSL state from %d file(s)...", len(audio_paths))
+
+    try:
+        extractor = WavLMSSLExtractor(d_ssl=128, cache_dir=None).to(device)
+        extractor.eval()
+    except Exception as e:
+        logger.warning("Failed to load WavLM: %s, using zeros", e)
+        return np.zeros(128, dtype=np.float32)
+
+    ssl_states = []
+
+    with torch.no_grad():
+        for path in audio_paths:
+            try:
+                audio = load_audio(path)
+                ssl = extractor.extract(audio, sample_rate=24000)
+                # Take mean across time dimension: [1, T, 128] -> [128]
+                ssl_mean = ssl.mean(dim=1).squeeze(0).cpu().numpy()
+                ssl_states.append(ssl_mean)
+            except Exception as e:
+                logger.warning("Failed to extract SSL from %s: %s", path, e)
+                continue
+
+    if not ssl_states:
+        logger.warning("No SSL states extracted, using zeros")
+        return np.zeros(128, dtype=np.float32)
+
+    # Average across all files
+    avg_ssl = np.mean(ssl_states, axis=0).astype(np.float32)
+    logger.info("  ssl_state shape: %s", avg_ssl.shape)
+    return avg_ssl
+
+
 def extract_reference_tokens(
     audio_paths: list[Path],
     codec_checkpoint: Path,
@@ -281,6 +327,9 @@ def main(argv: list[str] | None = None) -> None:
         style_embed = extract_style_embedding(audio_paths, args.device)
         logger.info("  style_embed shape: %s", style_embed.shape)
 
+    # Extract SSL state (always, for voice conditioning)
+    ssl_state = extract_ssl_state(audio_paths, args.device)
+
     reference_tokens = None
     if args.level in ("standard", "full") and args.codec_checkpoint:
         logger.info("Extracting reference tokens...")
@@ -326,6 +375,7 @@ def main(argv: list[str] | None = None) -> None:
         style_embed=style_embed,
         reference_tokens=reference_tokens,
         lora_delta=lora_delta,
+        ssl_state=ssl_state,
         metadata=metadata,
     )
 

@@ -59,6 +59,7 @@ class SpeakerFile:
     """Speaker file v3 data container."""
 
     spk_embed: np.ndarray  # [192]
+    f0_mean: float = 220.0  # Mean F0 frequency in Hz
     style_embed: np.ndarray | None = None  # [128]
     reference_tokens: np.ndarray | None = None  # [T, 4]
     lora_delta: np.ndarray | None = None  # [15872]
@@ -78,6 +79,7 @@ class SpeakerFile:
 def write_speaker_file(
     output_path: str | Path,
     spk_embed: np.ndarray,
+    f0_mean: float = 220.0,
     style_embed: np.ndarray | None = None,
     reference_tokens: np.ndarray | None = None,
     lora_delta: np.ndarray | None = None,
@@ -89,6 +91,7 @@ def write_speaker_file(
     Args:
         output_path: Output file path.
         spk_embed: Speaker embedding array, shape ``(192,)``, float32. (required)
+        f0_mean: Mean F0 frequency in Hz. Default 220.0.
         style_embed: Style embedding array, shape ``(128,)``, float32. (optional)
         reference_tokens: Reference codec tokens, shape ``(T, 4)``, int32. (optional)
         lora_delta: LoRA delta array, shape ``(15872,)``, float32. (optional)
@@ -162,6 +165,7 @@ def write_speaker_file(
 
     # Build data section
     data += spk_embed.tobytes()
+    data += struct.pack("<f", f0_mean)  # f0_mean as float32
     if style_embed is not None:
         data += style_embed.tobytes()
     if reference_tokens is not None:
@@ -239,6 +243,10 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
     ).copy()
     offset += spk_size * 4
 
+    # Extract f0_mean (4 bytes float32)
+    f0_mean = struct.unpack("<f", data[offset : offset + 4])[0]
+    offset += 4
+
     # Extract style_embed (optional)
     style_embed = None
     if flags & FLAG_HAS_STYLE:
@@ -284,6 +292,7 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
 
     return SpeakerFile(
         spk_embed=spk_embed,
+        f0_mean=f0_mean,
         style_embed=style_embed,
         reference_tokens=reference_tokens,
         lora_delta=lora_delta,

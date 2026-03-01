@@ -15,29 +15,7 @@ from .uclm_transformer import CodecTransformer
 
 
 class DisentangledUCLM(nn.Module):
-    """The complete SOTA Disentangled UCLM model tying all components together.
-
-    Architecture:
-        - VCEncoder: Information bottleneck to extract content from source audio
-        - TextEncoder: Encode phonemes for TTS mode
-        - DurationPredictor: Predict phoneme durations for TTS
-        - TextFeatureExpander: Expand phoneme features to frame-level
-        - VoiceStateEncoder: Encode explicit + SSL voice state parameters
-        - CodecTransformer: Dual-stream token prediction (A_t, B_t)
-
-    Args:
-        d_model: Model dimension.
-        n_heads: Number of attention heads.
-        n_layers: Number of transformer layers.
-        rvq_vocab_size: Vocabulary size for acoustic tokens.
-        n_codebooks: Number of RVQ codebooks.
-        control_vocab_size: Vocabulary size for control tokens.
-        d_explicit: Explicit voice state dimension.
-        d_ssl: SSL latent dimension.
-        d_speaker: Speaker embedding dimension.
-        vq_bins: VQ bottleneck codebook size.
-        vocab_size: Text vocabulary size.
-    """
+    """The complete SOTA Disentangled UCLM model tying all components together."""
 
     def __init__(
         self,
@@ -90,19 +68,6 @@ class DisentangledUCLM(nn.Module):
         f0_condition: Optional[torch.Tensor] = None,
         cfg_scale: float = 1.0,
     ) -> dict:
-        """Forward pass for Voice Conversion mode.
-
-        Args:
-            source_a_t: [B, 8, T] source acoustic tokens
-            explicit_state: [B, T, 8] explicit voice parameters
-            ssl_state: [B, T, 128] SSL latent features
-            speaker_embed: [B, 192] speaker embedding
-            f0_condition: [B, T, 2] optional F0 conditioning
-            cfg_scale: CFG amplification scale
-
-        Returns:
-            Dict with logits_a, logits_b, vq_loss
-        """
         content_features, vq_loss = self.vc_encoder(source_a_t)
 
         state_out = self.voice_state_enc(explicit_state, ssl_state)
@@ -137,22 +102,6 @@ class DisentangledUCLM(nn.Module):
         f0_condition: Optional[torch.Tensor] = None,
         cfg_scale: float = 1.0,
     ) -> dict:
-        """Forward pass for Text-to-Speech mode.
-
-        Args:
-            phonemes: [B, L] phoneme IDs
-            phoneme_lens: [B] phoneme lengths
-            language_ids: [B] language IDs
-            explicit_state: [B, T, 8] explicit voice parameters
-            ssl_state: [B, T, 128] SSL latent features
-            speaker_embed: [B, 192] speaker embedding
-            durations: [B, L] ground truth durations (for training)
-            f0_condition: [B, T, 2] optional F0 conditioning
-            cfg_scale: CFG amplification scale
-
-        Returns:
-            Dict with logits_a, logits_b, log_durations, adv_logits
-        """
         # 1. Encode phonemes
         phoneme_features = self.text_encoder(phonemes, language_ids, phoneme_lens)
         phoneme_features = phoneme_features.transpose(1, 2)  # [B, L, d_model]
@@ -166,7 +115,6 @@ class DisentangledUCLM(nn.Module):
 
         # 3. Expand to frame-level
         if durations is None:
-            # Inference: use predicted durations
             durations = torch.round(torch.exp(log_durations) - 1.0).long()
             durations = torch.clamp(durations, min=1)
 
@@ -203,33 +151,19 @@ class DisentangledUCLM(nn.Module):
         state_cond: torch.Tensor,
         speaker_embed: torch.Tensor,
         cfg_scale: float = 1.0,
-        kv_cache_in: Optional[torch.Tensor] = None,
-        max_seq_len: int = 200,
+        kv_caches: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> dict:
-        """Forward pass for streaming inference with KV cache.
-
-        Args:
-            content_features: [B, T, d_model] content features
-            state_cond: [B, T, d_model] voice state condition
-            speaker_embed: [B, 192] speaker embedding
-            cfg_scale: CFG scale
-            kv_cache_in: [B, kv_cache_size] input KV cache
-            max_seq_len: Maximum sequence length for KV cache
-
-        Returns:
-            Dict with logits_a, logits_b, kv_cache_out
-        """
-        logits_a, logits_b, kv_cache_out = self.uclm_core(
+        """Forward pass for streaming inference with KV cache list."""
+        logits_a, logits_b, next_kv_caches = self.uclm_core(
             content_features,
             state_cond,
             speaker_embed,
             cfg_scale,
-            kv_cache_in,
-            max_seq_len,
+            kv_caches,
         )
 
         return {
             "logits_a": logits_a,
             "logits_b": logits_b,
-            "kv_cache_out": kv_cache_out,
+            "kv_cache_out": next_kv_caches,
         }

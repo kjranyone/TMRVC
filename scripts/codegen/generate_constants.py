@@ -275,17 +275,27 @@ def generate_rust(cfg: dict) -> str:
         ],
         "uclm": [
             "n_codebooks",
-            "vocab_size",
+            "rvq_vocab_size",
+            "control_vocab_size",
+            "control_slots",
             "d_model",
             "d_voice_state",
+            "d_voice_state_explicit",
+            "d_voice_state_ssl",
             "uclm_n_heads",
             "uclm_n_layers",
+            "uclm_vq_bins",
             "uclm_dropout",
             "uclm_max_seq_len",
             "uclm_context_frames",
             "uclm_block_size",
-            "n_nonverbal_tokens",
-            "nonverbal_token_start_id",
+            "codebook_dim",
+            "latent_dim",
+            "enc_state_dim",
+            "enc_state_frames",
+            "dec_state_dim",
+            "dec_state_frames",
+            "d_event_trace",
         ],
         "f0": [
             "d_f0",
@@ -332,6 +342,31 @@ def generate_rust(cfg: dict) -> str:
     lines.append("")
     lines.append("// Past context for causal windowing: WINDOW_LENGTH - HOP_LENGTH")
     lines.append("pub const PAST_CONTEXT: usize = WINDOW_LENGTH - HOP_LENGTH;")
+    lines.append("")
+    lines.append("// UCLM derived constants")
+    lines.append("pub const FRAME_SIZE: usize = HOP_LENGTH;")
+    lines.append("pub const FRAME_RATE: usize = 100;")
+    lines.append("pub const CONTEXT_FRAMES: usize = UCLM_CONTEXT_FRAMES;")
+    lines.append("pub const CONTEXT_LENGTH: usize = UCLM_CONTEXT_FRAMES;")
+    lines.append("pub const CODEBOOK_SIZE: usize = RVQ_VOCAB_SIZE;")
+    lines.append("pub const N_HEADS: usize = UCLM_N_HEADS;")
+    lines.append("pub const N_LAYERS: usize = UCLM_N_LAYERS;")
+    lines.append("pub const HEAD_DIM: usize = D_MODEL / N_HEADS;")
+    lines.append(
+        "pub const CODEC_ENCODER_STATE_SIZE: usize = ENC_STATE_DIM * ENC_STATE_FRAMES;"
+    )
+    lines.append(
+        "pub const CODEC_DECODER_STATE_SIZE: usize = DEC_STATE_DIM * DEC_STATE_FRAMES;"
+    )
+    lines.append(
+        "pub const KV_CACHE_SIZE: usize = UCLM_N_LAYERS * 2 * N_HEADS * UCLM_CONTEXT_FRAMES * HEAD_DIM;"
+    )
+    lines.append(
+        "pub const CTX_A_BUFFER_SIZE: usize = UCLM_CONTEXT_FRAMES * N_CODEBOOKS;"
+    )
+    lines.append(
+        "pub const CTX_B_BUFFER_SIZE: usize = UCLM_CONTEXT_FRAMES * CONTROL_SLOTS;"
+    )
     lines.append("")
 
     return "\n".join(lines)

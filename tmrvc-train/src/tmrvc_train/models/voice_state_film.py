@@ -26,25 +26,26 @@ class VoiceStateFiLM(nn.Module):
         Returns:
             Modulated tensor with same shape as x
         """
+        x_is_transposed = x.dim() == 3 and x.shape[1] == self.d_model
+
+        if x_is_transposed:
+            x = x.transpose(1, 2)
+
         if voice_state.dim() == 2:
-            voice_state = voice_state.unsqueeze(1)
+            gamma_beta = self.proj(voice_state)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            gamma = gamma.unsqueeze(1).expand(-1, x.shape[1], -1)
+            beta = beta.unsqueeze(1).expand(-1, x.shape[1], -1)
+        else:
+            gamma_beta = self.proj(voice_state)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
 
-        gamma_beta = self.proj(voice_state)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        result = gamma * x + beta
 
-        if x.dim() == 3 and x.shape[1] != voice_state.shape[1]:
-            if x.shape[1] == self.d_model:
-                x = x.transpose(1, 2)
-                gamma = gamma.transpose(1, 2)
-                beta = beta.transpose(1, 2)
-                result = gamma * x + beta
-                return result.transpose(1, 2)
-            else:
-                gamma = gamma.expand(-1, x.shape[1], -1)
-                beta = beta.expand(-1, x.shape[1], -1)
-                return gamma * x + beta
+        if x_is_transposed:
+            result = result.transpose(1, 2)
 
-        return gamma * x + beta
+        return result
 
 
 class MultiVoiceStateFiLM(nn.Module):

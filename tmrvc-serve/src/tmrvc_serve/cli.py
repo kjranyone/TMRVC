@@ -1,8 +1,8 @@
-"""``tmrvc-serve`` — Start the TTS API server.
+"""``tmrvc-serve`` — Start the Unified UCLM v2 API server.
 
 Usage::
 
-    tmrvc-serve --tts-checkpoint checkpoints/tts/tts_step200000.pt --device xpu
+    tmrvc-serve --uclm-checkpoint checkpoints/uclm/latest.pt --codec-checkpoint checkpoints/codec/latest.pt
     tmrvc-serve --port 8000 --api-key $ANTHROPIC_API_KEY
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmrvc-serve",
-        description="Start the TMRVC TTS API server.",
+        description="Start the TMRVC Unified (TTS/VC) API server.",
     )
     parser.add_argument(
         "--host",
@@ -31,27 +31,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bind port (default: 8000).",
     )
     parser.add_argument(
-        "--tts-checkpoint",
+        "--uclm-checkpoint",
         type=Path,
         default=None,
-        help="Path to TTS checkpoint (.pt).",
+        help="Path to UCLM model checkpoint (.pt).",
     )
     parser.add_argument(
-        "--vc-checkpoint",
+        "--codec-checkpoint",
         type=Path,
         default=None,
-        help="Path to VC/distill checkpoint (.pt) for Converter+Vocoder.",
+        help="Path to Emotion-Aware Codec checkpoint (.pt).",
     )
     parser.add_argument(
         "--device",
         default="cpu",
         help="Torch device (default: cpu).",
-    )
-    parser.add_argument(
-        "--text-frontend",
-        choices=["phoneme", "tokenizer", "auto"],
-        default="tokenizer",
-        help="Text frontend mode (default: tokenizer).",
     )
     parser.add_argument(
         "--api-key",
@@ -85,11 +79,10 @@ def main(argv: list[str] | None = None) -> None:
     from tmrvc_serve.app import init_app
 
     init_app(
-        tts_checkpoint=args.tts_checkpoint,
-        vc_checkpoint=args.vc_checkpoint,
+        uclm_checkpoint=args.uclm_checkpoint,
+        codec_checkpoint=args.codec_checkpoint,
         device=args.device,
         api_key=api_key,
-        text_frontend=args.text_frontend,
     )
 
     import uvicorn

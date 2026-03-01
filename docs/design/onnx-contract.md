@@ -273,6 +273,7 @@ uv run python -m tmrvc_export.verify_parity \
 - [x] `B_t`: `[1,4]` / vocab `64` (`[op,type,dur,int]`)
 - [x] `uclm_core` が `logits_a[1,8,1024]` と `logits_b[1,4,64]` を出力
 - [x] `delta_voice_state` が推論入力に含まれる (voice_state_enc に `delta_state` 入力として追加)
+- [x] `ssl_state` [128] が voice_state_enc で処理 (WavLM から抽出、.tmrvc_speaker に保存可能)
 - [x] `event_trace` が decoder の入出力で維持される
 - [x] rolling context (`ctx_A`, `ctx_B`) が 1-2秒保持される (CONTEXT_FRAMES=200)
 - [x] 全 state が pre-allocated で RT-safe

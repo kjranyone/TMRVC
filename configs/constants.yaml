@@ -1,180 +1,79 @@
-# TMRVC Shared Constants
-# This file is the single source of truth for all constants.
-# Auto-generated to Python (tmrvc_core/constants.py) and C++ header.
+# TMRVC UCLM v2 Shared Constants
+# Single source of truth for Unified Codec Language Model architecture.
 
 # --- Audio Processing ---
 sample_rate: 24000
 n_fft: 1024
-hop_length: 240          # 10ms @ 24kHz
+hop_length: 240          # 10ms @ 24kHz (Strict UCLM v2 requirement)
 window_length: 960        # 40ms @ 24kHz
 n_mels: 80
 mel_fmin: 0.0
 mel_fmax: 12000.0
-n_freq_bins: 513          # n_fft // 2 + 1
+n_freq_bins: 513
 log_floor: 1.0e-10
 
 # --- Model Dimensions ---
-d_content: 256
-d_speaker: 192
-n_ir_params: 24           # 8 subbands x 3 parameters
-n_voice_source_params: 8  # breathiness(2) + tension(2) + jitter + shimmer + formant_shift + roughness
-n_acoustic_params: 32     # n_ir_params + n_voice_source_params
-d_converter_hidden: 384
-d_ir_estimator_hidden: 128
-d_vocoder_hidden: 256     # = d_content (vocoder internal width)
-d_vocoder_features: 513   # = n_freq_bins
+d_model: 512              # UCLM Transformer core dimension
+d_content: 256            # Content feature dimension (ContentVec)
+d_content_vec: 768        # ContentVec output dimension
+d_speaker: 192            # Global speaker embedding dimension
+d_f0: 2                   # F0 conditioning: [log_f0_norm, pitch_shift]
 
-# --- Feature Extraction ---
-d_content_vec: 768        # ContentVec output dim (Phase 0)
-d_wavlm_large: 1024       # WavLM-large layer 7 output dim (Phase 1+)
-wavlm_layer: 7            # WavLM-large layer to use
-content_vec_hop_ms: 20.0  # ContentVec native hop (ms)
+# --- UCLM v2 Token Spec ---
+n_codebooks: 8            # Acoustic stream (A_t) codebooks
+rvq_vocab_size: 1024      # Acoustic vocabulary size
+control_slots: 4          # Control stream (B_t) slots [op, type, dur, int]
+control_vocab_size: 64    # Control vocabulary size
 
-# --- VQ Bottleneck (Speaker Leakage 対策) ---
-vq_n_codebooks: 2         # Factorized VQ: number of codebooks
-vq_codebook_size: 8192    # Entries per codebook
-vq_codebook_dim: 128      # Dimension per codebook (= d_content / vq_n_codebooks)
-vq_commitment_lambda: 0.25  # Commitment loss weight
+# --- Voice State (8-dim Physical Style) ---
+d_voice_state: 8          # breathiness, tension, arousal, valence, roughness, voicing, energy, rate
+d_voice_state_explicit: 8 # Same as d_voice_state (explicit parameters)
+d_voice_state_ssl: 128    # WavLM latent context dimension
 
-# --- Inference Parameters ---
-student_steps: 1
-ir_update_interval: 10    # frames (~100ms)
-
-# --- LoRA Parameters ---
-lora_rank: 4
-lora_alpha: 8
-n_lora_layers: 4
-lora_delta_size: 15872    # 4 layers x ((d_speaker+n_acoustic_params)*rank + rank*(d_converter_hidden*2)) = 4 x 3968
-
-# --- State Tensor Dimensions ---
-content_encoder_state_frames: 28
-ir_estimator_state_frames: 6
-converter_state_frames: 52
-vocoder_state_frames: 14
-
-# --- IR Subbands ---
-n_ir_subbands: 8
-ir_subband_edges_hz:
-  - 0
-  - 375
-  - 750
-  - 1500
-  - 3000
-  - 4500
-  - 6000
-  - 9000
-  - 12000
-
-# --- Teacher Architecture ---
-d_teacher_hidden: 512         # Teacher U-Net bottleneck
-teacher_down_channels: [128, 256, 384, 512]
-teacher_n_heads: 8            # Cross-attention heads
-
-# --- Global Timbre Memory ---
-gtm_n_entries: 8              # Number of memory entries
-gtm_d_entry: 48               # Dimension per entry (8 * 48 = 384 = d_converter_hidden)
-gtm_n_heads: 4                # Cross-attention heads
-
-# --- Lookahead / HQ Mode ---
-max_lookahead_hops: 6              # HQ mode lookahead (60ms)
-converter_hq_state_frames: 46     # sum of left_ctx for semi-causal
-hq_threshold_q: 0.3               # q > 0.3 で HQ mode 有効
-crossfade_frames: 10              # 100ms crossfade on mode switch
-
-# --- Training ---
-flow_matching_steps: 20       # Teacher sampling steps
-use_ot_cfm: true              # OT-CFM (optimal transport pairing) for straight trajectories
-ot_cfm_batch_ot: true         # Enable minibatch optimal transport pairing
-
-# --- Quality Targets (Phase 1+) ---
-target_secs_phase0: 0.75      # Minimum SECS for Phase 0 validation
-target_secs_phase1: 0.90      # Target SECS for Phase 1 (WavLM + VQ + OT-CFM)
-target_utmos_phase1: 4.0      # Target UTMOS for Phase 1
-target_secs_reverb: 0.86      # Target SECS under reverberant conditions (Phase 2)
-
-# --- Training Defaults ---
-default_batch_size: 64
-segment_min_sec: 2.0
-segment_max_sec: 15.0
-loudness_target_lufs: -23.0
-cross_speaker_prob: 0.2
-
-# --- Voice Source Param Names (for presets, not runtime) ---
-voice_source_param_names:
-  - breathiness_low
-  - breathiness_high
-  - tension_low
-  - tension_high
-  - jitter
-  - shimmer
-  - formant_shift
-  - roughness
-
-# --- TTS Extension ---
-d_style: 32                       # Emotion style additional dimensions
-n_style_params: 64                # n_acoustic_params(32) + d_style(32)
-d_text_encoder: 256               # TextEncoder hidden dimension
-n_text_encoder_layers: 6          # Transformer encoder layers
-n_text_encoder_heads: 4           # Multi-head attention heads
-text_encoder_ff_dim: 1024         # Feed-forward dimension
-phoneme_vocab_size: 200           # Unified IPA phoneme vocabulary
-tokenizer_vocab_size: 262         # Byte-level tokenizer vocab (6 special + 256 bytes)
-n_emotion_categories: 12          # happy,sad,angry,fearful,surprised,disgusted,neutral,bored,excited,tender,sarcastic,whisper
-d_f0_predictor: 128               # F0Predictor hidden dimension
-d_content_synthesizer: 256        # ContentSynthesizer hidden dimension (= d_content)
-n_languages: 4                    # ja, en, zh, ko
-
-# --- Scene State Latent (SSL) ---
-d_scene_state: 64                 # Scene state latent dimension
-d_history: 128                    # Dialogue history summary dimension
-ssl_n_gru_layers: 1               # GRU layers in state update
-ssl_prosody_stats_dim: 8          # Prosody statistics for L_state_recon (pitch_mean, pitch_std, energy_mean, energy_std, rate, voiced_ratio, pause_ratio, spectral_tilt)
-
-# --- Breath-Pause Event Head (BPEH) ---
-bpeh_d_hidden: 128                # BPEH hidden dimension
-bpeh_n_blocks: 3                  # BPEH conv blocks
-bpeh_breath_threshold_db: -40.0   # Energy threshold for breath candidate detection (dB)
-bpeh_min_pause_ms: 50.0           # Minimum pause duration to label (ms)
-bpeh_min_breath_ms: 80.0          # Minimum breath duration to label (ms)
-
-# --- UCLM (Unified Codec Language Model) Token Spec v2 ---
-n_codebooks: 8                    # Emotion-Aware Codec codebook count
-rvq_vocab_size: 1024              # RVQ codebook vocabulary size (0..1023)
-control_vocab_size: 64            # Control stream vocabulary [op, type, dur, int]
-control_slots: 4                  # Control stream slots [op, type, dur, int]
-codebook_dim: 128                 # Dimension per codebook
-latent_dim: 512                   # n_codebooks * codebook_dim
-d_model: 512                      # UCLM model dimension
-d_voice_state: 8                  # Voice state parameter count (breathiness, tension, arousal, valence, roughness, voicing, energy, rate)
-d_voice_state_explicit: 8         # Explicit voice state params (same as d_voice_state)
-d_voice_state_ssl: 128            # WavLM latent style dimension
-uclm_n_heads: 8                   # UCLM attention heads
-uclm_n_layers: 12                 # UCLM transformer layers
-uclm_vq_bins: 128                 # VQ bottleneck codebook size
-uclm_text_vocab_size: 256         # Text encoder vocabulary size
-uclm_dropout: 0.1                 # UCLM dropout rate
-uclm_max_seq_len: 2000            # Maximum sequence length
-uclm_context_frames: 200          # Rolling context (2.0 sec at 10ms/frame)
-uclm_block_size: 4                # Streaming block size (frames per block)
+# --- VQ Bottleneck (Content Extraction) ---
+uclm_vq_bins: 128         # VQ codebook size for VC Encoder
+codebook_dim: 128         # Per-codebook embedding dimension
+latent_dim: 512            # Encoder output dimension
 
 # --- Encoder/Decoder State ---
 enc_state_dim: 512
 enc_state_frames: 32
 dec_state_dim: 256
 dec_state_frames: 32
-d_event_trace: 64                 # Non-verbal hysteresis trace
+d_event_trace: 64
 
-# --- Voice State Parameters (for UCLM conditioning) ---
-voice_state_names:
-  - breathiness
-  - tension
-  - arousal
-  - valence
-  - roughness
-  - voicing
-  - energy
-  - rate
+# --- Lookahead / HQ Mode ---
+max_lookahead_hops: 6
+hq_threshold_q: 0.3
+
+# --- Text / TTS ---
+d_text_encoder: 256       # Text encoder hidden dimension
+n_text_encoder_layers: 6
+n_text_encoder_heads: 4
+text_encoder_ff_dim: 1024
+phoneme_vocab_size: 200   # Unified IPA phoneme vocabulary
+n_languages: 4            # ja, en, zh, ko
+n_voice_source_params: 8  # Legacy: voice source parameters (for .tmrvc_character compat)
+n_acoustic_params: 32     # Voice source + IR parameters
+d_style: 32               # Style embedding dimension
+n_style_params: 64        # Number of style parameters
+
+# --- LoRA (for Speaker Personalization) ---
+lora_rank: 4
+lora_alpha: 8
+# lora_delta_size is now calculated based on UCLM core layers (updated implementation)
+lora_delta_size: 32768    # 12 layers x (d_model * rank * 2) approx
+
+# --- Scene State Latent (Dialogue Context) ---
+d_scene_state: 64         # Context predictor summary dimension
+
+# --- Training / Inference ---
+uclm_n_heads: 8
+uclm_n_layers: 12
+uclm_dropout: 0.1
+uclm_max_seq_len: 2048
+uclm_context_frames: 200  # 2.0 sec rolling context
+uclm_block_size: 4        # 40ms streaming step
 
 # --- F0 Conditioning ---
-d_f0: 2                           # F0 conditioning dim (log_f0_normalized, pitch_shift_semitones)
-f0_smoothing_frames: 5            # F0 smoothing window
+f0_smoothing_frames: 5

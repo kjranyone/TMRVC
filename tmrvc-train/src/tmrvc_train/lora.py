@@ -1,9 +1,7 @@
-"""LoRA (Low-Rank Adaptation) for Token Model fine-tuning.
+"""LoRA (Low-Rank Adaptation) for UCLM v2 fine-tuning.
 
-Implements LoRA for speaker adaptation in the Codec-Latent paradigm.
-Applied to attention projections and FFN layers.
-
-Reference: LoRA: Low-Rank Adaptation of Large Language Models (arXiv:2106.09685)
+Implements LoRA for speaker adaptation in the UCLM architecture.
+Applied to Transformer attention projections.
 """
 
 from __future__ import annotations
@@ -16,275 +14,116 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tmrvc_core.constants import LORA_DELTA_SIZE
+
 
 @dataclass
 class LoRAConfig:
     rank: int = 4
-    alpha: float = 1.0
+    alpha: float = 8.0
     dropout: float = 0.0
-    target_modules: tuple[str, ...] = (
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "out_proj",
-        "fc1",
-        "fc2",
-    )
+    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "out_proj")
 
 
 class LoRALinear(nn.Module):
-    """LoRA-adapted Linear layer.
-
-    Wraps a base linear layer with low-rank adaptation:
-        output = W @ x + (alpha / r) * B @ A @ x
-
-    Where:
-        W: [out_features, in_features] - frozen base weight
-        A: [rank, in_features] - down projection
-        B: [out_features, rank] - up projection
-    """
-
-    def __init__(
-        self,
-        base_linear: nn.Linear,
-        rank: int = 4,
-        alpha: float = 1.0,
-        dropout: float = 0.0,
-    ) -> None:
+    def __init__(self, base_linear: nn.Linear, rank: int = 4, alpha: float = 8.0, dropout: float = 0.0):
         super().__init__()
         self.base = base_linear
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
-
-        in_features = base_linear.in_features
-        out_features = base_linear.out_features
-
-        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-
+        self.lora_A = nn.Parameter(torch.zeros(rank, base_linear.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(base_linear.out_features, rank))
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
         self._init_weights()
+        for param in self.base.parameters(): param.requires_grad = False
 
-        for param in self.base.parameters():
-            param.requires_grad = False
-
-    def _init_weights(self) -> None:
+    def _init_weights(self):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base(x)
-        lora_out = self.dropout(x) @ self.lora_A.T @ self.lora_B.T * self.scaling
-        return base_out + lora_out
-
-    def merge_weights(self) -> None:
-        with torch.no_grad():
-            delta = (self.lora_B @ self.lora_A) * self.scaling
-            self.base.weight.data += delta
-            self.lora_A.zero_()
-            self.lora_B.zero_()
+        return self.base(x) + (self.dropout(x) @ self.lora_A.T @ self.lora_B.T) * self.scaling
 
     def get_delta(self) -> torch.Tensor:
         return (self.lora_B @ self.lora_A) * self.scaling
 
 
-def apply_lora_to_model(
-    model: nn.Module,
-    config: LoRAConfig,
-) -> dict[str, LoRALinear]:
-    """Apply LoRA to target modules in the model.
+class UCLMLoRAWrapper:
+    """Wrapper for fine-tuning DisentangledUCLM with LoRA."""
 
-    Args:
-        model: TokenModel or similar
-        config: LoRA configuration
-
-    Returns:
-        Dict mapping parameter names to LoRALinear instances
-    """
-    lora_modules = {}
-
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            module_name = name.split(".")[-1]
-            if module_name in config.target_modules:
-                lora = LoRALinear(
-                    module,
-                    rank=config.rank,
-                    alpha=config.alpha,
-                    dropout=config.dropout,
-                )
-                lora_modules[name] = lora
-
-    return lora_modules
-
-
-def get_lora_parameters(lora_modules: dict[str, LoRALinear]) -> list[nn.Parameter]:
-    """Get all trainable LoRA parameters."""
-    params = []
-    for lora in lora_modules.values():
-        params.extend([lora.lora_A, lora.lora_B])
-    return params
-
-
-def extract_lora_deltas(lora_modules: dict[str, LoRALinear]) -> dict[str, torch.Tensor]:
-    """Extract weight deltas from all LoRA modules.
-
-    Returns:
-        Dict mapping module names to weight deltas [out_features, in_features]
-    """
-    deltas = {}
-    for name, lora in lora_modules.items():
-        deltas[name] = lora.get_delta().detach().clone()
-    return deltas
-
-
-def flatten_lora_deltas(
-    deltas: dict[str, torch.Tensor], target_size: int
-) -> torch.Tensor:
-    """Flatten all deltas into a single vector.
-
-    Args:
-        deltas: Dict of weight deltas
-        target_size: Target size for the flat vector (LORA_DELTA_SIZE)
-
-    Returns:
-        Flattened delta vector [target_size]
-    """
-    flat_parts = []
-    for name in sorted(deltas.keys()):
-        flat_parts.append(deltas[name].flatten())
-
-    flat = torch.cat(flat_parts)
-
-    if len(flat) > target_size:
-        flat = flat[:target_size]
-    elif len(flat) < target_size:
-        flat = F.pad(flat, (0, target_size - len(flat)))
-
-    return flat
-
-
-class TokenModelLoRAWrapper:
-    """Wrapper for fine-tuning TokenModel with LoRA.
-
-    Handles the full fine-tuning pipeline:
-    1. Freeze base model, apply LoRA
-    2. Train on speaker's reference audio
-    3. Extract and flatten LoRA deltas
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        config: Optional[LoRAConfig] = None,
-    ) -> None:
+    def __init__(self, model: nn.Module, config: Optional[LoRAConfig] = None):
         self.model = model
         self.config = config or LoRAConfig()
         self.lora_modules: dict[str, LoRALinear] = {}
 
-    def setup(self) -> None:
-        for param in self.model.parameters():
-            param.requires_grad = False
+    def setup(self):
+        """Apply LoRA to UCLM core layers."""
+        for param in self.model.parameters(): param.requires_grad = False
+        self._apply_recursive(self.model.uclm_core, "uclm_core")
 
-        self._apply_lora_recursive(self.model, "")
-
-    def _apply_lora_recursive(self, module: nn.Module, prefix: str) -> None:
+    def _apply_recursive(self, module: nn.Module, prefix: str):
         for name, child in module.named_children():
-            full_name = f"{prefix}.{name}" if prefix else name
-
-            if isinstance(child, nn.Linear):
-                module_name = name
-                if module_name in self.config.target_modules:
-                    lora = LoRALinear(
-                        child,
-                        rank=self.config.rank,
-                        alpha=self.config.alpha,
-                        dropout=self.config.dropout,
-                    )
-                    setattr(module, name, lora)
-                    self.lora_modules[full_name] = lora
+            full_name = f"{prefix}.{name}"
+            if isinstance(child, nn.Linear) and name in self.config.target_modules:
+                lora = LoRALinear(child, self.config.rank, self.config.alpha, self.config.dropout)
+                setattr(module, name, lora)
+                self.lora_modules[full_name] = lora
             else:
-                self._apply_lora_recursive(child, full_name)
+                self._apply_recursive(child, full_name)
 
-    def get_trainable_parameters(self) -> list[nn.Parameter]:
+    def parameters(self):
         params = []
         for lora in self.lora_modules.values():
             params.extend([lora.lora_A, lora.lora_B])
         return params
 
-    def parameters(self) -> list[nn.Parameter]:
-        return self.get_trainable_parameters()
+    def extract_delta_flat(self) -> torch.Tensor:
+        flat_parts = [self.lora_modules[n].get_delta().flatten() for n in sorted(self.lora_modules.keys())]
+        flat = torch.cat(flat_parts)
+        # Pad or trim to LORA_DELTA_SIZE
+        if len(flat) > LORA_DELTA_SIZE: flat = flat[:LORA_DELTA_SIZE]
+        else: flat = F.pad(flat, (0, LORA_DELTA_SIZE - len(flat)))
+        return flat
 
-    def extract_delta_flat(self, target_size: int = 15872) -> torch.Tensor:
-        deltas = extract_lora_deltas(self.lora_modules)
-        return flatten_lora_deltas(deltas, target_size)
 
-
-def finetune_token_model_lora(
+def finetune_uclm_lora(
     model: nn.Module,
-    reference_tokens: torch.Tensor,
-    spk_embed: torch.Tensor,
+    ref_audio_tokens: torch.Tensor, # [B, 8, T]
+    ref_control_tokens: torch.Tensor, # [B, 4, T]
+    speaker_embed: torch.Tensor,
+    voice_state: torch.Tensor,
     n_steps: int = 200,
     lr: float = 1e-4,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """Fine-tune TokenModel with LoRA on reference tokens.
-
-    Args:
-        model: TokenModel instance
-        reference_tokens: Reference codec tokens [T, 4] or [1, 4, T]
-        spk_embed: Speaker embedding [192]
-        n_steps: Number of fine-tuning steps
-        lr: Learning rate
-        device: Device
-
-    Returns:
-        Flattened LoRA delta vector [15872]
-    """
+    """Few-shot fine-tune UCLM core using LoRA."""
     model = model.to(device)
-    model.eval()
-
-    wrapper = TokenModelLoRAWrapper(model)
+    wrapper = UCLMLoRAWrapper(model)
     wrapper.setup()
-
+    
     optimizer = torch.optim.Adam(wrapper.parameters(), lr=lr)
-
-    if reference_tokens.dim() == 2:
-        reference_tokens = reference_tokens.unsqueeze(0).transpose(1, 2)
-
-    reference_tokens = reference_tokens.to(device)
-    spk_embed = spk_embed.to(device).unsqueeze(0)
-
-    B, K, T = reference_tokens.shape
-
+    
+    # Simple Reconstruction Loss on tokens
     for step in range(n_steps):
-        total_loss = 0.0
-        n_batches = 0
-
-        for t in range(T - 1):
-            input_tokens = reference_tokens[:, :, t : t + 1]
-            target_token = reference_tokens[:, :, t + 1]
-
-            optimizer.zero_grad()
-
-            logits, _ = model(input_tokens, spk_embed)
-
-            loss = F.cross_entropy(
-                logits.squeeze(2),
-                target_token,
-            )
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            n_batches += 1
-
-        if step % 50 == 0:
-            avg_loss = total_loss / max(n_batches, 1)
-            print(f"Step {step}/{n_steps}, loss: {avg_loss:.4f}")
-
-    delta_flat = wrapper.extract_delta_flat()
-    return delta_flat
+        optimizer.zero_grad()
+        # Mocking content features from source tokens for VC-style reconstruction
+        content, _ = model.vc_encoder(ref_audio_tokens.to(device))
+        
+        state_cond = model.voice_state_enc(voice_state.to(device), torch.zeros_like(content)) # SSL zero
+        
+        out = model.forward_streaming(
+            content, state_cond, speaker_embed.to(device)
+        )
+        
+        # Loss against ground truth tokens
+        from .uclm_loss import uclm_loss
+        losses = uclm_loss(
+            out["logits_a"], out["logits_b"], 
+            ref_audio_tokens.to(device), ref_control_tokens.to(device)
+        )
+        
+        losses["loss"].backward()
+        optimizer.step()
+        
+    return wrapper.extract_delta_flat()

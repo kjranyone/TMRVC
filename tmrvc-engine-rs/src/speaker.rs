@@ -20,8 +20,6 @@ const FLAG_HAS_STYLE: u32 = 1 << 0;
 const FLAG_HAS_REF_TOKENS: u32 = 1 << 1;
 const FLAG_HAS_LORA: u32 = 1 << 2;
 
-const D_STYLE: usize = 128;
-
 /// Metadata embedded in a .tmrvc_speaker file.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct SpeakerMetadata {
@@ -271,8 +269,11 @@ impl SpeakerFile {
 
     /// Save as .tmrvc_speaker v3 file.
     pub fn save(&self, path: &Path) -> Result<()> {
+        // Include ssl_state in metadata for serialization
+        let mut metadata = self.metadata.clone();
+        metadata.ssl_state = self.ssl_state.clone();
         let metadata_json =
-            serde_json::to_vec(&self.metadata).context("Failed to serialize metadata")?;
+            serde_json::to_vec(&metadata).context("Failed to serialize metadata")?;
         let metadata_size = metadata_json.len();
 
         // Calculate flags and sizes
@@ -499,5 +500,71 @@ mod tests {
         let zeros = sf.lora_delta_or_zeros();
         assert_eq!(zeros.len(), LORA_DELTA_SIZE);
         assert!(zeros.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn save_load_roundtrip_with_ssl_state() {
+        let spk_embed = [0.5f32; D_SPEAKER];
+        let ssl_state = Some(vec![0.25f32; D_VOICE_STATE_SSL]);
+
+        let original = SpeakerFile {
+            spk_embed,
+            f0_mean: 200.0,
+            style_embed: None,
+            reference_tokens: None,
+            lora_delta: None,
+            ssl_state,
+            metadata: default_metadata(),
+        };
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_v3_ssl_state.tmrvc_speaker");
+        original.save(&path).expect("save failed");
+
+        let loaded = SpeakerFile::load(&path).expect("load failed");
+        assert_eq!(original.spk_embed, loaded.spk_embed);
+        assert_eq!(
+            loaded.ssl_state.as_ref().map(|s| s.len()),
+            Some(D_VOICE_STATE_SSL)
+        );
+        assert!(loaded
+            .ssl_state
+            .as_ref()
+            .map(|s| s.iter().all(|&v| (v - 0.25).abs() < 1e-5))
+            .unwrap_or(false));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_python_created_speaker_file() {
+        // This test expects a speaker file created by Python with ssl_state
+        // Run: PYTHONPATH=tmrvc-export/src:tmrvc-core/src .venv/bin/python -c "
+        //   from tmrvc_export.speaker_file import write_speaker_file
+        //   import numpy as np
+        //   write_speaker_file('/tmp/test_python_speaker.tmrvc_speaker',
+        //       spk_embed=np.random.randn(192).astype(np.float32),
+        //       ssl_state=np.random.randn(128).astype(np.float32),
+        //       metadata={'speaker_name': 'python_test'})
+        // "
+        let path = std::path::Path::new("/tmp/test_python_speaker.tmrvc_speaker");
+        if !path.exists() {
+            eprintln!(
+                "Skipping test: {} not found. Create it with Python first.",
+                path.display()
+            );
+            return;
+        }
+        let loaded = SpeakerFile::load(path).expect("load failed");
+        assert_eq!(loaded.spk_embed.len(), D_SPEAKER);
+        assert!(loaded.ssl_state.is_some());
+        assert_eq!(
+            loaded.ssl_state.as_ref().map(|s| s.len()),
+            Some(D_VOICE_STATE_SSL)
+        );
+        println!(
+            "Loaded Python speaker file with ssl_state: {:?}",
+            loaded.ssl_state.as_ref().map(|s| &s[..5])
+        );
     }
 }
