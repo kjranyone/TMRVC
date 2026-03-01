@@ -27,12 +27,15 @@ class SimpleUpsample(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, stride: int):
         super().__init__()
         self.stride = stride
+        self.out_channels = out_channels
         self.conv = nn.Conv1d(in_channels, out_channels * stride, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T = x.shape
         x = self.conv(x)
-        return x.view(B, -1, T * self.stride)
+        x = x.view(B, self.out_channels, self.stride, T)
+        x = x.transpose(2, 3).reshape(B, self.out_channels, T * self.stride)
+        return x
 
 
 class ResidualVectorQuantizer(nn.Module):
@@ -107,9 +110,10 @@ class EmotionAwareDecoder(nn.Module):
 
 
 class EmotionAwareCodec(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model: int = 512):
         super().__init__()
-        self.encoder = EmotionAwareEncoder()
-        self.decoder = EmotionAwareDecoder()
+        self.encoder = EmotionAwareEncoder(d_model=d_model)
+        self.decoder = EmotionAwareDecoder(d_model=d_model)
+
     def encode(self, audio, states=None): return self.encoder(audio, states)
     def decode(self, a, b, v, states=None): return self.decoder(a, b, v, states)

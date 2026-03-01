@@ -143,7 +143,7 @@ class TestWavLMSSLExtractorMocked:
 
             importlib.reload(mod)
 
-            extractor = mod.WavLMSSLExtractor(d_ssl=d_ssl, layer=7, freeze=True)
+            extractor = mod.WavLMSSLExtractor(d_ssl=d_ssl, layer=7, freeze_wavlm=True)
             audio = torch.randn(B, T_audio)
             out = extractor(audio, sample_rate=16000)
 

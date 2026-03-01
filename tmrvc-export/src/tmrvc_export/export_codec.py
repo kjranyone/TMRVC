@@ -242,7 +242,7 @@ def verify_codec_parity(
         None,
         {
             "audio_frame": dummy_audio.cpu().numpy(),
-            "state_in": dummy_state_enc.cpu().numpy(),
+            "state_out_orig": dummy_state_enc.cpu().numpy(),
         },
     )
 
@@ -252,8 +252,8 @@ def verify_codec_parity(
             "acoustic_tokens": onnx_tokens,
             "control_tokens": dummy_control.cpu().numpy(),
             "voice_state": dummy_voice.cpu().numpy(),
-            "event_trace_in": dummy_event.cpu().numpy(),
-            "state_in": dummy_state_dec.cpu().numpy(),
+            "event_trace_out_orig": dummy_event.cpu().numpy(),
+            "state_out_orig": dummy_state_dec.cpu().numpy(),
         },
     )
 

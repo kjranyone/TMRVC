@@ -12,7 +12,7 @@ from typing import Optional, Union
 from dataclasses import dataclass
 
 try:
-    from transformers import Wav2Vec2Model, Wav2Vec2Processor
+    from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor
 
     HAS_TRANSFORMERS = True
 except ImportError:
@@ -84,7 +84,7 @@ class WavLMSSLExtractor(nn.Module):
         self.layer = layer
         self.d_ssl = d_ssl
 
-        self.processor = Wav2Vec2Processor.from_pretrained(
+        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             model_name, cache_dir=cache_dir
         )
         self.wavlm = Wav2Vec2Model.from_pretrained(model_name, cache_dir=cache_dir)
@@ -123,7 +123,7 @@ class WavLMSSLExtractor(nn.Module):
             resampler = T.Resample(sample_rate, 16000)
             audio = resampler(audio)
 
-        inputs = self.processor(
+        inputs = self.feature_extractor(
             audio.squeeze(0).numpy() if audio.shape[0] == 1 else audio.numpy(),
             sampling_rate=16000,
             return_tensors="pt",

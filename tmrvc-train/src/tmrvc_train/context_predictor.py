@@ -291,6 +291,8 @@ class ContextStylePredictor:
                     elif key != "emotion":
                         if key == "speech_rate":
                             params[key] = _clamp(params[key] * (1.0 + (value - 1.0)), 0.5, 2.0)
+                        elif key == "voicing" and params["emotion"] == "whisper":
+                            params[key] = value # Force direct value
                         else:
                             params[key] = _clamp(params[key] + value, -1.0, 1.0)
 

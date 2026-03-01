@@ -45,7 +45,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         Returns:
             ``[B, L, d_model]`` with positional encoding added.
         """
-        return x + self.pe[:, :x.size(1)]
+        return x + self.pe[:, : x.size(1)]
 
 
 class TextEncoder(nn.Module):
@@ -98,6 +98,7 @@ class TextEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=n_layers,
+            enable_nested_tensor=False,
         )
 
         self.output_norm = nn.LayerNorm(d_model)
@@ -129,10 +130,9 @@ class TextEncoder(nn.Module):
         # Padding mask for Transformer
         src_key_padding_mask = None
         if phoneme_lengths is not None:
-            src_key_padding_mask = (
-                torch.arange(L, device=phoneme_ids.device).unsqueeze(0)
-                >= phoneme_lengths.unsqueeze(1)
-            )  # [B, L] True = masked
+            src_key_padding_mask = torch.arange(L, device=phoneme_ids.device).unsqueeze(
+                0
+            ) >= phoneme_lengths.unsqueeze(1)  # [B, L] True = masked
 
         # Transformer encoder
         x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)  # [B, L, d]

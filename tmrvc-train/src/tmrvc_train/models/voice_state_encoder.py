@@ -146,9 +146,9 @@ class VoiceStateEncoder(nn.Module):
             x = self.temporal_conv(x)
             x = x.transpose(1, 2)
         else:
-            x = x.unsqueeze(1)
+            x = x.unsqueeze(-1)  # [B, 512] -> [B, 512, 1]
             x = self.temporal_conv(x)
-            x = x.squeeze(1)
+            x = x.squeeze(-1)  # [B, 512, 1] -> [B, 512]
 
         state_cond = self.norm(x)
 

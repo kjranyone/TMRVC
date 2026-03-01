@@ -49,13 +49,16 @@ class EngineState:
 class UCLMEngine:
     """Orchestrates split ONNX-ready models according to onnx-contract.md."""
 
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", d_model: int = 512):
         self.device = torch.device(device)
-        self.codec_enc = EmotionAwareEncoder().to(self.device).eval()
-        self.vc_enc = VCEncoder().to(self.device).eval()
-        self.voice_state_enc = VoiceStateEncoder().to(self.device).eval()
-        self.uclm_core = CodecTransformer().to(self.device).eval()
-        self.codec_dec = EmotionAwareDecoder().to(self.device).eval()
+        self.d_model = d_model
+        
+        # Initialize components with dynamic d_model
+        self.codec_enc = EmotionAwareEncoder(d_model=d_model).to(self.device).eval()
+        self.vc_enc = VCEncoder(d_model=d_model).to(self.device).eval()
+        self.voice_state_enc = VoiceStateEncoder(d_model=d_model).to(self.device).eval()
+        self.uclm_core = CodecTransformer(d_model=d_model).to(self.device).eval()
+        self.codec_dec = EmotionAwareDecoder(d_model=d_model).to(self.device).eval()
         self._loaded = False
 
     def load_from_combined_checkpoint(self, path: Path | str):
@@ -64,7 +67,6 @@ class UCLMEngine:
         state_dict = ckpt.get("model", ckpt)
         
         # Mapping logic from unified DisentangledUCLM keys to split components
-        # This assumes the combined model was saved with these prefixes
         self.codec_enc.load_state_dict({k.replace("codec.encoder.", ""): v for k, v in state_dict.items() if k.startswith("codec.encoder.")}, strict=False)
         self.vc_enc.load_state_dict({k.replace("vc_encoder.", ""): v for k, v in state_dict.items() if k.startswith("vc_encoder.")}, strict=False)
         self.voice_state_enc.load_state_dict({k.replace("voice_state_enc.", ""): v for k, v in state_dict.items() if k.startswith("voice_state_enc.")}, strict=False)
@@ -138,9 +140,4 @@ class UCLMEngine:
         style: StyleParams,
         cfg_scale: float = 1.5,
     ) -> torch.Tensor:
-        """
-        Batch TTS (simplified for now, uses uclm_core internally).
-        """
-        # (Implementation details omitted for brevity, focusing on VC alignment first)
-        # Note: In a real system, this would also maintain a temporary state.
         return torch.zeros(SAMPLE_RATE) 
