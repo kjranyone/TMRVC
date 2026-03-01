@@ -198,6 +198,45 @@ def extract_ssl_state(audio_paths: list[Path], device: str) -> np.ndarray | None
     return avg_ssl
 
 
+def extract_f0_mean(audio_paths: list[Path]) -> float:
+    """Extract mean F0 frequency from audio files.
+
+    Uses librosa.pyin for pitch estimation.
+    Returns mean F0 in Hz, or 220.0 as default if extraction fails.
+    """
+    import librosa
+
+    logger.info("Extracting F0 from %d file(s)...", len(audio_paths))
+
+    all_f0 = []
+
+    for path in audio_paths:
+        try:
+            audio = load_audio(path)
+            f0, voiced_flags, _ = librosa.pyin(
+                audio,
+                fmin=50,
+                fmax=500,
+                sr=24000,
+                hop_length=240,
+            )
+            # Filter voiced frames only
+            f0_voiced = f0[voiced_flags] if voiced_flags is not None else np.array([])
+            if len(f0_voiced) > 0:
+                all_f0.extend(f0_voiced.tolist())
+        except Exception as e:
+            logger.warning("Failed to extract F0 from %s: %s", path, e)
+            continue
+
+    if not all_f0:
+        logger.warning("No F0 values extracted, using default 220.0 Hz")
+        return 220.0
+
+    f0_mean = float(np.mean(all_f0))
+    logger.info("  f0_mean: %.1f Hz (%d voiced frames)", f0_mean, len(all_f0))
+    return f0_mean
+
+
 def extract_reference_tokens(
     audio_paths: list[Path],
     codec_checkpoint: Path,
@@ -330,6 +369,9 @@ def main(argv: list[str] | None = None) -> None:
     # Extract SSL state (always, for voice conditioning)
     ssl_state = extract_ssl_state(audio_paths, args.device)
 
+    # Extract F0 mean for pitch normalization
+    f0_mean = extract_f0_mean(audio_paths)
+
     reference_tokens = None
     if args.level in ("standard", "full") and args.codec_checkpoint:
         logger.info("Extracting reference tokens...")
@@ -372,6 +414,7 @@ def main(argv: list[str] | None = None) -> None:
     write_speaker_file(
         output_path=args.output,
         spk_embed=spk_embed,
+        f0_mean=f0_mean,
         style_embed=style_embed,
         reference_tokens=reference_tokens,
         lora_delta=lora_delta,

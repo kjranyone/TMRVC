@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 
 import numpy as np
 import torch
@@ -28,21 +28,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EngineState:
     """Persistent inference states for a single session (mirroring Rust StreamingEngine)."""
-    # Encoder causal states [B, C, P]
     enc_states: List[torch.Tensor] = field(default_factory=lambda: [
-        torch.zeros(1, 64, 6), torch.zeros(1, 128, 4), 
-        torch.zeros(1, 256, 4), torch.zeros(1, 512, 2)
+        torch.zeros(1, 1, 6), torch.zeros(1, 64, 4), 
+        torch.zeros(1, 128, 4), torch.zeros(1, 256, 2)
     ])
-    # Decoder causal states [B, C, P]
-    dec_states: List[torch.Tensor] = field(default_factory=lambda: [
-        torch.zeros(1, 256, 2), torch.zeros(1, 128, 4), 
-        torch.zeros(1, 64, 6), torch.zeros(1, 1, 6)
-    ])
-    # Transformer KV Cache (list of tuples per layer)
+    dec_states: List[torch.Tensor] = field(default_factory=lambda: [torch.empty(0)]*4)
     kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
-    # Control Context (B_t history) [1, 4, 200]
     ctx_b: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 4, 200, dtype=torch.long))
-    # Previous voice state for delta computation
     prev_voice_state: torch.Tensor = field(default_factory=lambda: torch.zeros(1, 1, 8))
 
 
@@ -53,7 +45,6 @@ class UCLMEngine:
         self.device = torch.device(device)
         self.d_model = d_model
         
-        # Initialize components with dynamic d_model
         self.codec_enc = EmotionAwareEncoder(d_model=d_model).to(self.device).eval()
         self.vc_enc = VCEncoder(d_model=d_model).to(self.device).eval()
         self.voice_state_enc = VoiceStateEncoder(d_model=d_model).to(self.device).eval()
@@ -62,19 +53,14 @@ class UCLMEngine:
         self._loaded = False
 
     def load_from_combined_checkpoint(self, path: Path | str):
-        """Load all sub-models from a unified training checkpoint."""
         ckpt = torch.load(path, map_location=self.device)
         state_dict = ckpt.get("model", ckpt)
-        
-        # Mapping logic from unified DisentangledUCLM keys to split components
         self.codec_enc.load_state_dict({k.replace("codec.encoder.", ""): v for k, v in state_dict.items() if k.startswith("codec.encoder.")}, strict=False)
         self.vc_enc.load_state_dict({k.replace("vc_encoder.", ""): v for k, v in state_dict.items() if k.startswith("vc_encoder.")}, strict=False)
         self.voice_state_enc.load_state_dict({k.replace("voice_state_enc.", ""): v for k, v in state_dict.items() if k.startswith("voice_state_enc.")}, strict=False)
         self.uclm_core.load_state_dict({k.replace("uclm_core.", ""): v for k, v in state_dict.items() if k.startswith("uclm_core.")}, strict=False)
         self.codec_dec.load_state_dict({k.replace("codec.decoder.", ""): v for k, v in state_dict.items() if k.startswith("codec.decoder.")}, strict=False)
-        
         self._loaded = True
-        logger.info("UCLM components loaded and aligned with Contract.")
 
     @torch.no_grad()
     def vc_frame(
@@ -85,10 +71,6 @@ class UCLMEngine:
         state: EngineState,
         cfg_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, EngineState]:
-        """
-        Processes a single 10ms frame [1, 1, 240] precisely as defined in 
-        onnx-contract.md Section 4.2.
-        """
         # 1. Codec Encoder
         a_src_t, b_logits_src, new_enc_states = self.codec_enc(audio_frame, state.enc_states)
         
@@ -98,30 +80,24 @@ class UCLMEngine:
         # 3. Voice State Conditioning
         v_state = torch.tensor(style.to_vector(), device=self.device).float().unsqueeze(0).unsqueeze(0)
         delta_state = v_state - state.prev_voice_state
-        ssl_state = torch.zeros(1, 1, 128, device=self.device) # Placeholder
+        ssl_state = torch.zeros(1, 1, 128, device=self.device)
         
-        state_cond = self.voice_state_enc(v_state, ssl_state, delta_state)
+        v_out = self.voice_state_enc(v_state, ssl_state, delta_state)
+        state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
         
         # 4. UCLM Core Prediction
         logits_a, logits_b, new_kv = self.uclm_core(
-            content_features,
-            state.ctx_b,
-            speaker_embed,
-            state_cond,
-            torch.tensor([cfg_scale], device=self.device),
-            state.kv_caches
+            content_features, state.ctx_b, speaker_embed, state_cond,
+            torch.tensor([cfg_scale], device=self.device), state.kv_caches
         )
         
-        # 5. Sampling (Greedy for parity)
-        a_t = logits_a.argmax(dim=-1) # [1, 8, 1]
-        b_t = logits_b.argmax(dim=-1) # [1, 4, 1]
+        # 5. Sampling
+        a_t = logits_a.argmax(dim=-1)
+        b_t = logits_b.argmax(dim=-1)
         
         # 6. Codec Decoder
-        audio_out, new_dec_states = self.codec_dec(
-            a_t, b_t, v_state, state.dec_states
-        )
+        audio_out, new_dec_states = self.codec_dec(a_t, b_t, v_state, state.dec_states)
         
-        # Update and return State
         new_state = EngineState(
             enc_states=new_enc_states,
             dec_states=new_dec_states,
@@ -129,15 +105,8 @@ class UCLMEngine:
             ctx_b=torch.cat([state.ctx_b[:, :, 1:], b_t], dim=-1),
             prev_voice_state=v_state
         )
-        
         return audio_out.squeeze(), new_state
 
     @torch.no_grad()
-    def tts(
-        self,
-        phonemes: torch.Tensor,
-        speaker_embed: torch.Tensor,
-        style: StyleParams,
-        cfg_scale: float = 1.5,
-    ) -> torch.Tensor:
-        return torch.zeros(SAMPLE_RATE) 
+    def tts(self, phonemes, speaker_embed, style, cfg_scale=1.5):
+        return torch.zeros(SAMPLE_RATE)

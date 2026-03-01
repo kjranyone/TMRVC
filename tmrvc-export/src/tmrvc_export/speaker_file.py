@@ -132,10 +132,11 @@ def write_speaker_file(
         assert ssl_state.dtype == np.float32
         flags |= FLAG_HAS_SSL_STATE
 
-    # Build metadata (include ssl_state in metadata for simplicity)
+    # Build metadata (include ssl_state and f0_mean in metadata for simplicity)
     meta = {**_DEFAULT_METADATA, **(metadata or {})}
     if ssl_state is not None:
         meta["ssl_state"] = ssl_state.tolist()
+    meta["f0_mean"] = f0_mean  # Include f0_mean in metadata for Rust compatibility
     if "adaptation_level" not in meta:
         if flags & FLAG_HAS_LORA:
             meta["adaptation_level"] = "full"

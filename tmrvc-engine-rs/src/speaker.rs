@@ -567,4 +567,29 @@ mod tests {
             loaded.ssl_state.as_ref().map(|s| &s[..5])
         );
     }
+
+    #[test]
+    fn load_f0_mean_from_python_file() {
+        // Create a speaker file with custom f0_mean using Python
+        // PYTHONPATH=tmrvc-export/src:tmrvc-core/src .venv/bin/python -c "
+        //   from tmrvc_export.speaker_file import write_speaker_file
+        //   import numpy as np
+        //   write_speaker_file('/tmp/test_f0.tmrvc_speaker',
+        //       spk_embed=np.zeros(192, dtype=np.float32),
+        //       f0_mean=360.5,
+        //       metadata={'speaker_name': 'f0_test'})
+        // "
+        let path = std::path::Path::new("/tmp/test_f0.tmrvc_speaker");
+        if !path.exists() {
+            eprintln!("Skipping test: {} not found", path.display());
+            return;
+        }
+        let loaded = SpeakerFile::load(path).expect("load failed");
+        assert!(
+            (loaded.f0_mean - 360.5).abs() < 0.1,
+            "f0_mean mismatch: {}",
+            loaded.f0_mean
+        );
+        println!("Loaded f0_mean: {}", loaded.f0_mean);
+    }
 }
