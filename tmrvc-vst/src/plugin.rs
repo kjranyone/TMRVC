@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
+use tmrvc_engine_rs::constants::D_VOICE_STATE;
 use tmrvc_engine_rs::constants::{FRAME_SIZE, SAMPLE_RATE};
 use tmrvc_engine_rs::nam::NamChain;
-use tmrvc_engine_rs::processor::Processor;
+use tmrvc_engine_rs::processor::{FrameParams, StreamingEngine};
 use tmrvc_engine_rs::resampler::PolyphaseResampler;
 
 use crate::params::TmrvcParams;
@@ -55,7 +56,7 @@ fn resolve_speaker_path(persisted: &str) -> Option<PathBuf> {
 
 pub struct TmrvcPlugin {
     params: Arc<TmrvcParams>,
-    processor: Option<Processor>,
+    processor: Option<StreamingEngine>,
 
     daw_rate: f32,
 
@@ -76,7 +77,7 @@ pub struct TmrvcPlugin {
     reported_latency_samples: u32,
 
     nam_chain: NamChain,
-    
+
     dry_wet: f32,
     output_gain: f32,
 }
@@ -240,14 +241,29 @@ impl Plugin for TmrvcPlugin {
                 let input_frame: Vec<f32> = self.accum_in[..FRAME_SIZE].to_vec();
                 let out_start = engine_out_len;
                 let out_end = out_start + FRAME_SIZE;
-                
-                if let Err(e) = proc.process_frame(
+
+                let frame_params = FrameParams {
+                    dry_wet: 1.0,
+                    output_gain: 1.0,
+                    alpha_timbre: 1.0,
+                    beta_prosody: 0.0,
+                    gamma_articulation: 0.0,
+                    voice_source_alpha: 0.0,
+                    latency_quality_q: self.params.latency_quality_q.smoothed.next(),
+                    pitch_shift: self.params.pitch_shift.smoothed.next(),
+                    cfg_scale: 1.0,
+                    temperature_a: 1.0,
+                    temperature_b: 1.0,
+                    top_k_a: 50,
+                    top_k_b: 20,
+                    voice_state: [0.5f32; D_VOICE_STATE],
+                };
+
+                proc.process_one_frame(
                     &input_frame,
                     &mut self.engine_out_scratch[out_start..out_end],
-                ) {
-                    nih_error!("Frame processing error: {}", e);
-                    self.engine_out_scratch[out_start..out_end].fill(0.0);
-                }
+                    &frame_params,
+                );
             } else {
                 let out_start = engine_out_len;
                 let out_end = out_start + FRAME_SIZE;
@@ -264,7 +280,7 @@ impl Plugin for TmrvcPlugin {
             for i in 0..engine_out_len {
                 self.engine_out_scratch[i] *= self.output_gain;
             }
-            
+
             let upsampled_len;
             if let Some(ref mut resampler) = self.resampler_out {
                 upsampled_len = resampler.process(
@@ -328,8 +344,9 @@ impl TmrvcPlugin {
         let persisted_speaker = self.params.speaker_path.lock().clone();
 
         if let Some(dir) = resolve_models_dir(&persisted_models) {
-            match Processor::new(&dir) {
-                Ok(proc) => {
+            let mut proc = StreamingEngine::new(None);
+            match proc.load_models(&dir) {
+                Ok(()) => {
                     nih_log!("ONNX models loaded from {:?}", dir);
                     *self.params.models_dir.lock() = dir.display().to_string();
                     self.processor = Some(proc);

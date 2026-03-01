@@ -102,6 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip utterances already in cache.",
     )
     parser.add_argument(
+        "--save-waveform",
+        action="store_true",
+        help="Save waveform.npy for later UCLM feature extraction.",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -131,7 +136,9 @@ def main(argv: list[str] | None = None) -> None:
         with open(datasets_yaml, encoding="utf-8") as _f:
             _registry = yaml.safe_load(_f) or {}
         ds_cfg = (_registry.get("datasets") or {}).get(args.dataset) or {}
-        adapter_type = ds_cfg.get("type") if ds_cfg.get("type") != args.dataset else None
+        adapter_type = (
+            ds_cfg.get("type") if ds_cfg.get("type") != args.dataset else None
+        )
         language = ds_cfg.get("language", "en")
         speaker_map_path = ds_cfg.get("speaker_map")
 
@@ -243,7 +250,12 @@ def main(argv: list[str] | None = None) -> None:
                     n_frames=n_frames,
                     content_dim=content_extractor.output_dim,
                 )
-                cache.save(features, args.dataset, args.split)
+                cache.save(
+                    features,
+                    args.dataset,
+                    args.split,
+                    waveform=segment.unsqueeze(0) if args.save_waveform else None,
+                )
                 processed += 1
 
                 if processed % 100 == 0:

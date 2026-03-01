@@ -185,15 +185,19 @@ pub fn create_voice_profile(
         voice_source_param_names: Vec::new(),
         style_embed: None,
         reference_tokens: None,
+        ssl_state: None,
+        f0_mean: 220.0,
     };
 
     // Save
     progress_fn(ProfileProgress::Saving);
     let speaker_file = SpeakerFile {
         spk_embed,
+        f0_mean: 220.0,
         style_embed: None,
         reference_tokens: None,
         lora_delta: Some(lora_delta),
+        ssl_state: None,
         metadata,
     };
     speaker_file.save(output_path)?;

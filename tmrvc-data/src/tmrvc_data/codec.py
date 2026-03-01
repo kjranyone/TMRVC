@@ -58,6 +58,7 @@ class EnCodecWrapper(nn.Module):
         self.device = device
         self.bandwidth = bandwidth
         self.model_name = model_name
+        self.finetuned_decoder_path = None # Set this after init if needed
 
         # Lazy loading to avoid importing transformers at module load
         self._model = None
@@ -87,6 +88,12 @@ class EnCodecWrapper(nn.Module):
         model = EncodecModel.from_pretrained(self.model_name)
         model.to(self.device)
         model.eval()
+
+        if self.finetuned_decoder_path is not None:
+            import torch
+            logger.info(f"Loading fine-tuned decoder from {self.finetuned_decoder_path}")
+            state_dict = torch.load(self.finetuned_decoder_path, map_location=self.device)
+            model.decoder.load_state_dict(state_dict)
 
         self._model = model
         self._initialized = True

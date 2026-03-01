@@ -310,3 +310,46 @@ def voice_state_to_dict(voice_state: torch.Tensor) -> dict[str, torch.Tensor]:
     ]
 
     return {name: voice_state[..., i] for i, name in enumerate(names)}
+
+from .wavlm_extractor import WavLMFeatureExtractor
+
+class SSLVoiceStateEstimator(nn.Module):
+    """Extract both explicit (8-dim) and SSL (128-dim) voice state.
+    
+    Combines the heuristic VoiceStateEstimator with a WavLM feature extractor.
+    """
+    def __init__(self, n_mels: int = 80, device: str = "cuda"):
+        super().__init__()
+        self.explicit_estimator = VoiceStateEstimator(n_mels=n_mels, device=device)
+        self.wavlm_extractor = WavLMFeatureExtractor(d_output=128).to(device)
+        self.device = device
+
+    def forward(
+        self,
+        audio_16k: torch.Tensor,
+        audio_24k: torch.Tensor,
+        mel: torch.Tensor,
+        f0: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            audio_16k: Audio waveform [B, T_16k] for WavLM.
+            audio_24k: Audio waveform [B, T_24k] for frame alignment.
+            mel: Mel spectrogram [B, n_mels, T].
+            f0: F0 contour [B, 1, T].
+            
+        Returns:
+            dict with:
+                explicit_state: [B, T, 8]
+                ssl_state: [B, 128, T] -> transposed to [B, T, 128]
+        """
+        explicit_state = self.explicit_estimator.estimate(mel, f0)
+        
+        # WavLM extracts [B, 128, T] aligned to mel frames
+        ssl_state = self.wavlm_extractor.extract_for_distillation(audio_16k, audio_24k)
+        ssl_state = ssl_state.transpose(1, 2)  # [B, T, 128]
+        
+        return {
+            "explicit_state": explicit_state,
+            "ssl_state": ssl_state,
+        }

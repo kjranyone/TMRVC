@@ -1,11 +1,4 @@
-"""Production-ready VC Engine with session isolation and connection pooling.
-
-Features:
-- Per-session state management (KV-cache isolation)
-- Connection pooling with configurable max concurrency
-- Request queueing with backpressure
-- GPU memory management
-"""
+"""Production-ready UCLM VC Engine with session isolation and connection pooling."""
 
 from __future__ import annotations
 
@@ -15,27 +8,29 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import numpy as np
 import torch
 from concurrent.futures import ThreadPoolExecutor
 
-from tmrvc_core.constants import FRAME_SIZE, SAMPLE_RATE
+from tmrvc_core.constants import SAMPLE_RATE
+from tmrvc_core.dialogue_types import StyleParams
+from tmrvc_serve.uclm_engine import UCLMEngine
 
 logger = logging.getLogger(__name__)
+
+# UCLM v2 uses 10ms frames
+FRAME_SIZE = 240
 
 
 @dataclass
 class SessionState:
-    """Isolated state for a single VC session."""
+    """Isolated state for a single UCLM VC session."""
 
     session_id: str
     spk_embed: np.ndarray | None = None
-    codec_encoder_state: torch.Tensor | None = None
-    codec_decoder_state: torch.Tensor | None = None
-    token_kv_cache: list | None = None
-    token_context: list = field(default_factory=list)
+    token_kv_cache: torch.Tensor | None = None
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
 
@@ -44,132 +39,101 @@ class SessionState:
 
 
 class ModelPool:
-    """Thread-safe model pool with lazy loading.
-
-    Supports:
-    - Multiple model instances (for GPU parallelism)
-    - CPU fallback when GPU exhausted
-    - Reference counting for cleanup
-    """
+    """Thread-safe UCLM model pool with lazy loading."""
 
     def __init__(
         self,
-        model_dir: Path,
+        uclm_checkpoint: Path,
+        codec_checkpoint: Path,
         max_gpu_instances: int = 2,
         max_cpu_instances: int = 4,
         device: str = "cuda",
     ):
-        self.model_dir = Path(model_dir)
+        self.uclm_checkpoint = Path(uclm_checkpoint)
+        self.codec_checkpoint = Path(codec_checkpoint)
         self.max_gpu_instances = max_gpu_instances
         self.max_cpu_instances = max_cpu_instances
         self.primary_device = device
 
         self._lock = threading.Lock()
-        self._gpu_pool: list = []
-        self._cpu_pool: list = []
+        self._gpu_pool: list[UCLMEngine] = []
+        self._cpu_pool: list[UCLMEngine] = []
         self._gpu_available = threading.Semaphore(max_gpu_instances)
         self._cpu_available = threading.Semaphore(max_cpu_instances)
 
         self._models_loaded = False
 
     def load_models(self) -> None:
-        """Pre-load models into pool."""
+        """Load state dicts into memory."""
         if self._models_loaded:
             return
 
-        from tmrvc_train.models.streaming_codec import StreamingCodec, CodecConfig
-        from tmrvc_train.models.token_model import TokenModel, TokenModelConfig
+        uclm_ckpt = torch.load(self.uclm_checkpoint, map_location="cpu")
+        self._uclm_state = uclm_ckpt["model"]
 
-        # Load codec
-        codec_ckpt = self.model_dir / "codec.pt"
-        if codec_ckpt.exists():
-            ckpt = torch.load(codec_ckpt, map_location="cpu", weights_only=False)
-            self._codec_config = CodecConfig(**ckpt.get("config", {}))
-            self._codec_state = ckpt["model"]
-
-        # Load token model
-        token_ckpt = self.model_dir / "token_model.pt"
-        if token_ckpt.exists():
-            ckpt = torch.load(token_ckpt, map_location="cpu", weights_only=False)
-            self._token_config = TokenModelConfig(**ckpt.get("config", {}))
-            self._token_state = ckpt["model"]
+        codec_ckpt = torch.load(self.codec_checkpoint, map_location="cpu")
+        self._codec_state = codec_ckpt["model"]
 
         self._models_loaded = True
         logger.info(
-            "Models loaded into pool (GPU=%d, CPU=%d)",
+            "UCLM models loaded into pool (GPU=%d, CPU=%d)",
             self.max_gpu_instances,
             self.max_cpu_instances,
         )
 
-    def acquire_gpu(self, timeout: float | None = None) -> tuple | None:
-        """Acquire a GPU model instance.
-
-        Returns (codec, token_model, release_fn) or None if timeout.
-        """
+    def acquire_gpu(self, timeout: float | None = None) -> tuple[UCLMEngine, callable] | None:
+        """Acquire a GPU UCLMEngine instance."""
         if not self._gpu_available.acquire(timeout=timeout):
             return None
 
         with self._lock:
             if self._gpu_pool:
-                instance = self._gpu_pool.pop()
+                engine = self._gpu_pool.pop()
             else:
-                instance = self._create_instance(self.primary_device)
+                engine = UCLMEngine(device=self.primary_device)
+                engine.load_from_state_dicts(self._uclm_state, self._codec_state)
 
         def release():
             with self._lock:
-                self._gpu_pool.append(instance)
+                self._gpu_pool.append(engine)
             self._gpu_available.release()
 
-        return (*instance, release)
+        return engine, release
 
-    def acquire_cpu(self, timeout: float | None = None) -> tuple | None:
-        """Acquire a CPU model instance."""
+    def acquire_cpu(self, timeout: float | None = None) -> tuple[UCLMEngine, callable] | None:
+        """Acquire a CPU UCLMEngine instance."""
         if not self._cpu_available.acquire(timeout=timeout):
             return None
 
         with self._lock:
             if self._cpu_pool:
-                instance = self._cpu_pool.pop()
+                engine = self._cpu_pool.pop()
             else:
-                instance = self._create_instance("cpu")
+                engine = UCLMEngine(device="cpu")
+                engine.load_from_state_dicts(self._uclm_state, self._codec_state)
 
         def release():
             with self._lock:
-                self._cpu_pool.append(instance)
+                self._cpu_pool.append(engine)
             self._cpu_available.release()
 
-        return (*instance, release)
-
-    def _create_instance(self, device: str) -> tuple:
-        """Create a new model instance."""
-        from tmrvc_train.models.streaming_codec import StreamingCodec
-        from tmrvc_train.models.token_model import TokenModel
-
-        device = torch.device(device)
-
-        codec = StreamingCodec(self._codec_config).to(device)
-        codec.load_state_dict(self._codec_state)
-        codec.eval()
-
-        token_model = TokenModel(self._token_config).to(device)
-        token_model.load_state_dict(self._token_state)
-        token_model.eval()
-
-        return (codec, token_model, device)
+        return engine, release
 
 
 class VCEnginePool:
-    """Production VC engine with session isolation and concurrency control."""
+    """Production UCLM VC engine with session isolation and concurrency control."""
 
     def __init__(
         self,
-        model_dir: Path | str,
-        max_concurrent_sessions: int = 10,
+        uclm_checkpoint: Path | str,
+        codec_checkpoint: Path | str,
+        max_concurrent_sessions: int = 20,
         max_gpu_inference: int = 2,
         session_timeout_sec: float = 300.0,
         device: str = "cuda",
     ):
-        self.model_dir = Path(model_dir)
+        self.uclm_checkpoint = Path(uclm_checkpoint)
+        self.codec_checkpoint = Path(codec_checkpoint)
         self.max_concurrent_sessions = max_concurrent_sessions
         self.session_timeout = session_timeout_sec
 
@@ -178,12 +142,12 @@ class VCEnginePool:
         self._sessions_lock = threading.Lock()
 
         self._model_pool = ModelPool(
-            model_dir=self.model_dir,
+            uclm_checkpoint=self.uclm_checkpoint,
+            codec_checkpoint=self.codec_checkpoint,
             max_gpu_instances=max_gpu_inference,
             device=device,
         )
 
-        self._executor = ThreadPoolExecutor(max_workers=max_concurrent_sessions)
         self._cleanup_task: asyncio.Task | None = None
 
     def load_models(self) -> None:
@@ -223,17 +187,10 @@ class VCEnginePool:
                 del self._sessions[session_id]
                 logger.info("Cleaned up expired session: %s", session_id)
 
-        if expired:
-            logger.info("Cleaned up %d expired sessions", len(expired))
-
     async def create_session(
         self, session_id: str, spk_embed: np.ndarray
     ) -> SessionState:
-        """Create a new isolated session.
-
-        Raises:
-            asyncio.TimeoutError: If max concurrent sessions reached
-        """
+        """Create a new isolated session."""
         await asyncio.wait_for(self._session_semaphore.acquire(), timeout=30.0)
 
         state = SessionState(
@@ -244,7 +201,7 @@ class VCEnginePool:
         with self._sessions_lock:
             self._sessions[session_id] = state
 
-        logger.info("Created session %s (active: %d)", session_id, len(self._sessions))
+        logger.info("Created UCLM session %s", session_id)
         return state
 
     def close_session(self, session_id: str) -> None:
@@ -254,30 +211,20 @@ class VCEnginePool:
                 del self._sessions[session_id]
 
         self._session_semaphore.release()
-        logger.info("Closed session %s", session_id)
-
-    def get_session(self, session_id: str) -> SessionState | None:
-        """Get session state."""
-        with self._sessions_lock:
-            session = self._sessions.get(session_id)
-            if session:
-                session.touch()
-            return session
 
     @torch.no_grad()
     def process_frame(
         self,
         session: SessionState,
         audio_frame: np.ndarray,
-        temperature: float = 1.0,
-        top_k: int = 50,
+        style: StyleParams | None = None,
         prefer_gpu: bool = True,
     ) -> np.ndarray:
-        """Process a single audio frame.
+        """Process a single 10ms frame using UCLM dual-stream engine."""
+        if style is None:
+            style = StyleParams.neutral()
 
-        Uses session's isolated state. Acquires model from pool.
-        """
-        # Try GPU first, fallback to CPU
+        # Acquire model
         if prefer_gpu:
             acquired = self._model_pool.acquire_gpu(timeout=0.1)
         else:
@@ -286,70 +233,37 @@ class VCEnginePool:
         if acquired is None:
             acquired = self._model_pool.acquire_cpu(timeout=1.0)
             if acquired is None:
-                logger.warning("No model available, returning passthrough")
-                return audio_frame
+                return audio_frame # Passthrough fallback
 
-        codec, token_model, device, release = acquired
+        engine, release = acquired
 
         try:
+            # Prep inputs
             audio_t = torch.from_numpy(audio_frame).float().unsqueeze(0).unsqueeze(0)
-            audio_t = audio_t.to(device)
+            audio_t = audio_t.to(engine.device)
+            spk_t = torch.from_numpy(session.spk_embed).float().unsqueeze(0).to(engine.device)
 
-            spk_t = torch.from_numpy(session.spk_embed).float().unsqueeze(0).to(device)
+            # Move kv_cache to device if it exists
+            kv = session.token_kv_cache
+            if kv is not None:
+                kv = kv.to(engine.device)
 
-            # Encode with session state
-            indices, _, enc_state = codec.encode(audio_t, session.codec_encoder_state)
-            session.codec_encoder_state = enc_state
-
-            # Token context
-            session.token_context.append(indices[:, :, -1].cpu())
-            if len(session.token_context) > 10:
-                session.token_context.pop(0)
-
-            # Token model
-            if len(session.token_context) >= 10:
-                context = torch.cat(session.token_context[-10:], dim=-1)
-                next_tokens, kv = token_model.generate_next_tokens(
-                    context.unsqueeze(0),
-                    spk_t,
-                    session.token_kv_cache,
-                    temperature=temperature,
-                    top_k=top_k,
-                )
-                session.token_kv_cache = kv
-            else:
-                next_tokens = indices[:, :, -1]
-
-            # Decode with session state
-            audio_out, dec_state = codec.decode(
-                next_tokens, session.codec_decoder_state
+            # Process
+            audio_out, new_kv = engine.vc_frame(
+                audio_t,
+                spk_t,
+                style,
+                kv_cache=kv
             )
-            session.codec_decoder_state = dec_state
 
-            return audio_out.squeeze().cpu().numpy()
+            # Save state (back to CPU for isolation/pooling flexibility)
+            session.token_kv_cache = new_kv.cpu()
+            session.touch()
+
+            return audio_out.cpu().numpy()
 
         finally:
             release()
-
-    def process_stream(
-        self,
-        session: SessionState,
-        audio_generator: Generator[np.ndarray, None, None],
-        temperature: float = 1.0,
-        top_k: int = 50,
-    ) -> Generator[np.ndarray, None, None]:
-        """Process audio stream with session state."""
-        buffer = np.array([], dtype=np.float32)
-
-        for chunk in audio_generator:
-            buffer = np.concatenate([buffer, chunk])
-
-            while len(buffer) >= FRAME_SIZE:
-                frame = buffer[:FRAME_SIZE]
-                buffer = buffer[FRAME_SIZE:]
-
-                output = self.process_frame(session, frame, temperature, top_k)
-                yield output
 
     @property
     def active_sessions(self) -> int:

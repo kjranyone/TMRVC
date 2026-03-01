@@ -1,4 +1,4 @@
-"""TTS generation worker: synthesizes audio from text in a background thread."""
+"""TTS generation worker: synthesizes audio from text using UCLM v2."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ logger = logging.getLogger(__name__)
 
 
 class TTSWorker(BaseWorker):
-    """Background worker for TTS audio generation.
+    """Background worker for UCLM v2 TTS audio generation.
 
     Config dict keys:
-    - text: str — Input text
-    - language: str — 'ja' or 'en'
-    - tts_checkpoint: str — Path to TTS checkpoint
-    - vc_checkpoint: str | None — Path to VC checkpoint
-    - speaker_file: str | None — Path to .tmrvc_speaker
-    - speed: float — Speed factor
-    - emotion: str — Emotion category
-    - valence/arousal/energy/pitch_range: float — Style sliders
+    - text: str
+    - language: str
+    - uclm_checkpoint: str
+    - codec_checkpoint: str
+    - speaker_file: str | None
+    - speed: float
+    - emotion: str
+    - breathiness/tension/arousal/valence/roughness/voicing/energy: float
     """
 
     def __init__(self, config: dict, parent=None) -> None:
@@ -38,16 +38,17 @@ class TTSWorker(BaseWorker):
         import numpy as np
         import torch
 
-        self.log_message.emit("Loading TTS models...")
+        self.log_message.emit("Loading UCLM models...")
         t0 = time.perf_counter()
 
-        from tmrvc_serve.tts_engine import TTSEngine
+        from tmrvc_serve.uclm_engine import UCLMEngine
         from tmrvc_core.dialogue_types import StyleParams
+        from tmrvc_core.text_utils import text_to_phonemes
 
-        engine = TTSEngine(
-            tts_checkpoint=self.config.get("tts_checkpoint"),
-            vc_checkpoint=self.config.get("vc_checkpoint"),
-            device="cpu",
+        engine = UCLMEngine(
+            uclm_checkpoint=self.config.get("uclm_checkpoint"),
+            codec_checkpoint=self.config.get("codec_checkpoint"),
+            device="cpu", # GUI default to CPU for stability
         )
         engine.load_models()
 
@@ -58,40 +59,57 @@ class TTSWorker(BaseWorker):
             self.finished.emit(False, "Cancelled")
             return
 
-        # Build style
+        # Build 8-dim style
         style = StyleParams(
             emotion=self.config.get("emotion", "neutral"),
-            valence=self.config.get("valence", 0.0),
+            breathiness=self.config.get("breathiness", 0.0),
+            tension=self.config.get("tension", 0.0),
             arousal=self.config.get("arousal", 0.0),
+            valence=self.config.get("valence", 0.0),
+            roughness=self.config.get("roughness", 0.0),
+            voicing=self.config.get("voicing", 1.0),
             energy=self.config.get("energy", 0.0),
-            pitch_range=self.config.get("pitch_range", 0.0),
+            speech_rate=self.config.get("speed", 1.0),
         )
+
+        # G2P
+        self.log_message.emit("Converting text to phonemes...")
+        phoneme_ids = text_to_phonemes(
+            self.config["text"], 
+            language=self.config.get("language", "ja")
+        )
+        phonemes_t = torch.tensor(phoneme_ids).long().unsqueeze(0)
 
         # Load speaker embedding
         spk_file = self.config.get("speaker_file")
         if spk_file and Path(spk_file).exists():
-            spk_embed = torch.from_numpy(np.load(spk_file)).float()
+            # Support .tmrvc_speaker (contains meta) and .npy
+            if spk_file.endswith(".tmrvc_speaker"):
+                from tmrvc_export.speaker_file import read_speaker_file
+                spk_embed_np, _, _, _ = read_speaker_file(Path(spk_file))
+                spk_t = torch.from_numpy(spk_embed_np).float().unsqueeze(0)
+            else:
+                spk_t = torch.from_numpy(np.load(spk_file)).float().unsqueeze(0)
         else:
-            spk_embed = torch.zeros(192)
+            from tmrvc_core.constants import D_SPEAKER
+            spk_t = torch.zeros(1, D_SPEAKER)
             self.log_message.emit("Warning: No speaker file, using zero embedding")
 
-        self.log_message.emit("Synthesizing...")
+        self.log_message.emit("Synthesizing (UCLM v2)...")
         t1 = time.perf_counter()
 
-        audio, duration_sec = engine.synthesize(
-            text=self.config["text"],
-            language=self.config.get("language", "ja"),
-            spk_embed=spk_embed,
+        audio_t, metrics = engine.tts(
+            phonemes=phonemes_t,
+            speaker_embed=spk_t,
             style=style,
-            speed=self.config.get("speed", 1.0),
         )
 
         synth_time = time.perf_counter() - t1
-        self.audio = audio
-        self.duration_sec = duration_sec
+        self.audio = audio_t.cpu().numpy()
+        self.duration_sec = metrics.output_duration_ms / 1000
 
         self.log_message.emit(
-            f"Done: {duration_sec:.2f}s audio in {synth_time:.2f}s "
-            f"(RTF={synth_time / max(duration_sec, 0.01):.2f}x)"
+            f"Done: {self.duration_sec:.2f}s audio in {synth_time:.2f}s "
+            f"(RTF={synth_time / max(self.duration_sec, 0.01):.2f}x)"
         )
-        self.finished.emit(True, f"Generated {duration_sec:.2f}s audio")
+        self.finished.emit(True, f"Generated {self.duration_sec:.2f}s audio")

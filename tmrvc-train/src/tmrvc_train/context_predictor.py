@@ -4,17 +4,6 @@ Uses Claude API to predict appropriate emotion and style parameters
 based on character profile, conversation history, and the next utterance text.
 
 Falls back to rule-based heuristics when API is unavailable.
-
-Usage::
-
-    predictor = ContextStylePredictor(api_key="sk-ant-...")
-    style = await predictor.predict(character, history, "ゆきちゃん！久しぶり！")
-
-    # Sync version
-    style = predictor.predict_sync(character, history, "ゆきちゃん！久しぶり！")
-
-    # Rule-based fallback (no API needed)
-    style = predictor.predict_rule_based("えっ！？本当に？")
 """
 
 from __future__ import annotations
@@ -36,17 +25,19 @@ logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT = """\
 あなたは音声合成システムの感情コントローラーです。
 以下のキャラクターと会話コンテキストを踏まえ、
-次の発話に最適な感情パラメータを JSON で出力してください。
+次の発話に最適な音響パラメータを JSON で出力してください。
 
 出力は以下の JSON 形式のみで、余計な説明は不要です:
 {
   "emotion": "<12カテゴリから1つ>",
+  "breathiness": <0.0 ~ 1.0>,
+  "tension": <0.0 ~ 1.0>,
+  "arousal": <0.0 ~ 1.0>,
   "valence": <-1.0 ~ 1.0>,
-  "arousal": <-1.0 ~ 1.0>,
-  "dominance": <-1.0 ~ 1.0>,
-  "speech_rate": <-1.0 ~ 1.0>,
-  "energy": <-1.0 ~ 1.0>,
-  "pitch_range": <-1.0 ~ 1.0>,
+  "roughness": <0.0 ~ 1.0>,
+  "voicing": <0.0 ~ 1.0>,
+  "energy": <0.0 ~ 1.0>,
+  "speech_rate": <0.5 ~ 2.0>,
   "reasoning": "<推論の根拠を簡潔に>"
 }
 
@@ -54,32 +45,32 @@ _SYSTEM_PROMPT = """\
 
 # Rule-based punctuation/keyword → style adjustment mapping
 _PUNCTUATION_RULES: list[tuple[str, dict[str, Any]]] = [
-    ("！！", {"arousal": 0.5, "energy": 0.4, "pitch_range": 0.3}),
+    ("！！", {"arousal": 0.5, "energy": 0.4, "tension": 0.3}),
     ("！", {"arousal": 0.3, "energy": 0.2}),
-    ("？？", {"pitch_range": 0.4, "arousal": 0.2}),
-    ("？", {"pitch_range": 0.3}),
-    ("…", {"arousal": -0.2, "speech_rate": -0.3}),
-    ("。。。", {"arousal": -0.2, "speech_rate": -0.3}),
-    ("〜", {"pitch_range": 0.2, "valence": 0.1}),
-    ("♪", {"valence": 0.4, "arousal": 0.2}),
+    ("？？", {"arousal": 0.2, "tension": 0.1}),
+    ("？", {"arousal": 0.1}),
+    ("…", {"arousal": -0.2, "speech_rate": 0.8, "energy": -0.2}),
+    ("。。。", {"arousal": -0.2, "speech_rate": 0.7, "energy": -0.3}),
+    ("〜", {"valence": 0.1, "tension": -0.1}),
+    ("♪", {"valence": 0.4, "arousal": 0.2, "energy": 0.1}),
 ]
 
 _KEYWORD_RULES: list[tuple[str, dict[str, Any]]] = [
-    ("ありがとう", {"emotion": "happy", "valence": 0.5}),
-    ("ごめん", {"emotion": "sad", "valence": -0.3}),
+    ("ありがとう", {"emotion": "happy", "valence": 0.5, "tension": -0.2}),
+    ("ごめん", {"emotion": "sad", "valence": -0.3, "arousal": -0.1}),
     ("すみません", {"emotion": "sad", "valence": -0.2}),
-    ("怒", {"emotion": "angry", "arousal": 0.5}),
-    ("悲し", {"emotion": "sad", "valence": -0.5}),
-    ("嬉し", {"emotion": "happy", "valence": 0.6}),
-    ("楽し", {"emotion": "happy", "valence": 0.5}),
-    ("怖", {"emotion": "fearful", "arousal": 0.3}),
-    ("驚", {"emotion": "surprised", "arousal": 0.4}),
+    ("怒", {"emotion": "angry", "arousal": 0.5, "tension": 0.6}),
+    ("悲し", {"emotion": "sad", "valence": -0.5, "energy": -0.3}),
+    ("嬉し", {"emotion": "happy", "valence": 0.6, "arousal": 0.3}),
+    ("楽し", {"emotion": "happy", "valence": 0.5, "arousal": 0.4}),
+    ("怖", {"emotion": "fearful", "arousal": 0.3, "tension": 0.4}),
+    ("驚", {"emotion": "surprised", "arousal": 0.4, "tension": 0.2}),
     ("えっ", {"emotion": "surprised", "arousal": 0.3}),
-    ("はぁ", {"emotion": "bored", "arousal": -0.3}),
-    ("ふふ", {"emotion": "happy", "valence": 0.3, "energy": -0.2}),
-    ("うう", {"emotion": "sad", "valence": -0.4}),
-    ("ひそひそ", {"emotion": "whisper", "energy": -0.5}),
-    ("内緒", {"emotion": "whisper", "energy": -0.4}),
+    ("はぁ", {"emotion": "bored", "arousal": -0.3, "energy": -0.3}),
+    ("ふふ", {"emotion": "happy", "valence": 0.3, "breathiness": 0.3, "energy": -0.2}),
+    ("うう", {"emotion": "sad", "valence": -0.4, "tension": 0.2}),
+    ("ひそひそ", {"emotion": "whisper", "breathiness": 0.7, "energy": -0.5, "voicing": 0.3}),
+    ("内緒", {"emotion": "whisper", "breathiness": 0.6, "energy": -0.4, "voicing": 0.4}),
 ]
 
 
@@ -266,24 +257,28 @@ class ContextStylePredictor:
         """
         params: dict[str, Any] = {
             "emotion": "neutral",
-            "valence": 0.0,
+            "breathiness": 0.0,
+            "tension": 0.0,
             "arousal": 0.0,
-            "dominance": 0.0,
-            "speech_rate": 0.0,
+            "valence": 0.0,
+            "roughness": 0.0,
+            "voicing": 1.0,
             "energy": 0.0,
-            "pitch_range": 0.0,
+            "speech_rate": 1.0,
             "reasoning": "rule-based",
         }
 
         # Apply character defaults
         if character and character.default_style:
             ds = character.default_style
-            params["valence"] = ds.valence
+            params["breathiness"] = ds.breathiness
+            params["tension"] = ds.tension
             params["arousal"] = ds.arousal
-            params["dominance"] = ds.dominance
-            params["speech_rate"] = ds.speech_rate
+            params["valence"] = ds.valence
+            params["roughness"] = ds.roughness
+            params["voicing"] = ds.voicing
             params["energy"] = ds.energy
-            params["pitch_range"] = ds.pitch_range
+            params["speech_rate"] = ds.speech_rate
 
         # Apply keyword rules (first match sets emotion)
         emotion_set = False
@@ -294,14 +289,20 @@ class ContextStylePredictor:
                         params["emotion"] = value
                         emotion_set = True
                     elif key != "emotion":
-                        params[key] = _clamp(params[key] + value, -1.0, 1.0)
+                        if key == "speech_rate":
+                            params[key] = _clamp(params[key] * (1.0 + (value - 1.0)), 0.5, 2.0)
+                        else:
+                            params[key] = _clamp(params[key] + value, -1.0, 1.0)
 
         # Apply punctuation rules (additive)
         for pattern, adjustments in _PUNCTUATION_RULES:
             if pattern in text:
                 for key, value in adjustments.items():
                     if key != "emotion":
-                        params[key] = _clamp(params[key] + value, -1.0, 1.0)
+                        if key == "speech_rate":
+                            params[key] = _clamp(params[key] * (1.0 + (value - 1.0)), 0.5, 2.0)
+                        else:
+                            params[key] = _clamp(params[key] + value, -1.0, 1.0)
 
         return StyleParams.from_dict(params)
 

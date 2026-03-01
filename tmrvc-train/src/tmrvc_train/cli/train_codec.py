@@ -1,299 +1,386 @@
-"""
-Streaming Codec Training CLI
+"""``tmrvc-train-codec`` — Train EmotionAwareCodec for UCLM.
 
-Usage:
-    uv run tmrvc-train-codec --cache-dir data/cache --device cuda
+Trains the EmotionAwareCodec model:
+- Encoder: audio → A_t (acoustic tokens) + B_t (control logits)
+- Decoder: A_t + B_t + voice_state → audio
+
+Uses pre-extracted features from cache (mel, f0, voice_state).
+
+Usage::
+
+    tmrvc-train-codec --cache-dir data/cache/vctk --output-dir checkpoints/codec --device cuda
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from tmrvc_train.models.streaming_codec import (
-    CodecConfig,
-    StreamingCodec,
-    MultiScaleDiscriminator,
-    MultiScaleSTFTLoss,
+from tmrvc_core.constants import (
+    D_MODEL,
+    N_CODEBOOKS,
+    RVQ_VOCAB_SIZE,
+    CONTROL_VOCAB_SIZE,
 )
+from tmrvc_train.models.emotion_codec import EmotionAwareCodec
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train Streaming Codec")
+class CodecDataset(Dataset):
+    """Dataset for EmotionAwareCodec training from cached features."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        max_frames: int = 400,
+        sample_rate: int = 24000,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.max_frames = max_frames
+        self.sample_rate = sample_rate
+        self.utterances = []
+
+        for meta_path in self.cache_dir.rglob("meta.json"):
+            if "train" not in str(meta_path):
+                continue
+            utt_dir = meta_path.parent
+
+            required = ["mel.npy", "f0.npy", "waveform.npy"]
+            if not all((utt_dir / f).exists() for f in required):
+                continue
+
+            try:
+                with open(meta_path, encoding="utf-8") as f:
+                    import json
+
+                    meta = json.load(f)
+
+                self.utterances.append(
+                    {
+                        "path": utt_dir,
+                        "n_frames": meta.get("n_frames", 0),
+                    }
+                )
+            except Exception:
+                continue
+
+        self.utterances.sort(key=lambda x: x["path"].name)
+
+    def __len__(self) -> int:
+        return len(self.utterances)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        utt = self.utterances[idx]
+        utt_dir = utt["path"]
+
+        mel = np.load(utt_dir / "mel.npy")
+        f0 = np.load(utt_dir / "f0.npy")
+        waveform = np.load(utt_dir / "waveform.npy")
+
+        T = mel.shape[1]
+        if T > self.max_frames:
+            start = np.random.randint(0, T - self.max_frames)
+            mel = mel[:, start : start + self.max_frames]
+            f0 = f0[:, start : start + self.max_frames]
+
+            wav_start = start * 240
+            wav_end = start * 240 + self.max_frames * 240
+            if wav_end <= waveform.shape[-1]:
+                waveform = waveform[..., wav_start:wav_end]
+
+        explicit_state = np.zeros((mel.shape[1], 8), dtype=np.float32)
+        if (utt_dir / "explicit_state.npy").exists():
+            es = np.load(utt_dir / "explicit_state.npy")
+            if es.shape[0] >= mel.shape[1]:
+                explicit_state = es[: mel.shape[1], :]
+
+        return {
+            "mel": torch.from_numpy(mel).float(),
+            "f0": torch.from_numpy(f0).float(),
+            "waveform": torch.from_numpy(waveform).float(),
+            "voice_state": torch.from_numpy(explicit_state).float(),
+        }
+
+
+def collate_fn(batch: list[dict]) -> dict[str, torch.Tensor]:
+    max_len = max(item["mel"].shape[1] for item in batch)
+
+    mels, f0s, waveforms, voice_states = [], [], [], []
+
+    for item in batch:
+        T = item["mel"].shape[1]
+        pad_len = max_len - T
+
+        mels.append(nn.functional.pad(item["mel"], (0, pad_len)))
+        f0s.append(nn.functional.pad(item["f0"], (0, pad_len)))
+
+        vs = item["voice_state"]
+        if vs.dim() == 2:
+            vs = nn.functional.pad(vs, (0, 0, 0, pad_len))
+        voice_states.append(vs)
+
+        wav = item["waveform"]
+        wav_T = wav.shape[-1]
+        target_T = max_len * 240
+        if wav_T < target_T:
+            wav = nn.functional.pad(wav, (0, target_T - wav_T))
+        else:
+            wav = wav[..., :target_T]
+        waveforms.append(wav)
+
+    return {
+        "mel": torch.stack(mels),
+        "f0": torch.stack(f0s),
+        "waveform": torch.stack(waveforms),
+        "voice_state": torch.stack(voice_states),
+    }
+
+
+def train_codec(
+    cache_dir: Path,
+    output_dir: Path,
+    batch_size: int,
+    max_frames: int,
+    max_steps: int,
+    device: str,
+    lr: float,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading dataset from %s", cache_dir)
+    dataset = CodecDataset(cache_dir, max_frames=max_frames)
+
+    if len(dataset) == 0:
+        logger.error("No valid utterances found in %s", cache_dir)
+        return
+
+    logger.info("Found %d utterances", len(dataset))
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+
+    logger.info("Initializing EmotionAwareCodec model")
+    model = EmotionAwareCodec(
+        d_model=D_MODEL,
+        n_codebooks=N_CODEBOOKS,
+        rvq_vocab_size=RVQ_VOCAB_SIZE,
+        control_vocab_size=CONTROL_VOCAB_SIZE,
+        d_voice_state=8,
+    ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info("Total parameters: %d", total_params)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.8, 0.99))
+
+    def mel_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return nn.functional.l1_loss(pred, target)
+
+    def stft_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_flat = pred.squeeze(1)
+        target_flat = target.squeeze(1)
+
+        stft_pred = torch.stft(
+            pred_flat,
+            n_fft=1024,
+            hop_length=240,
+            win_length=960,
+            window=torch.hann_window(960, device=pred.device),
+            return_complex=True,
+        )
+        stft_target = torch.stft(
+            target_flat,
+            n_fft=1024,
+            hop_length=240,
+            win_length=960,
+            window=torch.hann_window(960, device=target.device),
+            return_complex=True,
+        )
+
+        mag_pred = torch.abs(stft_pred) + 1e-7
+        mag_target = torch.abs(stft_target) + 1e-7
+
+        sc_loss = torch.norm(mag_pred - mag_target, p="fro") / (
+            torch.norm(mag_target, p="fro") + 1e-7
+        )
+        log_loss = nn.functional.l1_loss(torch.log(mag_pred), torch.log(mag_target))
+
+        return sc_loss + log_loss
+
+    step = 0
+    epoch = 0
+    pbar = tqdm(total=max_steps, desc="Training")
+
+    while step < max_steps:
+        epoch += 1
+        for batch in loader:
+            if step >= max_steps:
+                break
+
+            waveform = batch["waveform"].to(device)
+            voice_state = batch["voice_state"].to(device)
+
+            optimizer.zero_grad()
+
+            a_tokens, b_logits, vq_loss = model.encoder(waveform)
+
+            B, _, T = a_tokens.shape
+            b_tokens = b_logits.argmax(dim=-1)
+
+            voice_state_expanded = voice_state[:, :T, :].transpose(1, 2).unsqueeze(-1)
+            voice_state_expanded = voice_state_expanded.expand(-1, -1, -1, T).squeeze(
+                -1
+            )
+            voice_state_flat = voice_state[:, :T, :]
+
+            audio_recon = model.decoder(
+                a_tokens,
+                b_tokens.transpose(1, 2),
+                voice_state_flat,
+            )
+
+            min_len = min(waveform.shape[-1], audio_recon.shape[-1])
+            waveform_crop = waveform[..., :min_len]
+            audio_recon_crop = audio_recon[..., :min_len]
+
+            loss_stft = stft_loss(audio_recon_crop, waveform_crop)
+            loss_vq = (
+                vq_loss
+                if isinstance(vq_loss, torch.Tensor)
+                else torch.tensor(0.0, device=device)
+            )
+
+            total_loss = loss_stft + 0.1 * loss_vq
+
+            total_loss.backward()
+            optimizer.step()
+
+            pbar.update(1)
+            pbar.set_postfix(
+                {
+                    "step": step,
+                    "loss": f"{total_loss.item():.4f}",
+                    "stft": f"{loss_stft.item():.4f}",
+                    "vq": f"{loss_vq.item():.4f}"
+                    if isinstance(loss_vq, torch.Tensor)
+                    else "0.0",
+                }
+            )
+
+            if step > 0 and step % 1000 == 0:
+                ckpt_path = output_dir / f"codec_step_{step}.pt"
+                torch.save(
+                    {
+                        "step": step,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    },
+                    ckpt_path,
+                )
+                logger.info("Saved checkpoint to %s", ckpt_path)
+
+            step += 1
+
+    pbar.close()
+
+    final_path = output_dir / "codec_final.pt"
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        final_path,
+    )
+    logger.info("Training complete. Final model saved to %s", final_path)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tmrvc-train-codec",
+        description="Train EmotionAwareCodec for UCLM.",
+    )
     parser.add_argument(
-        "--raw-dir",
+        "--cache-dir",
+        required=True,
         type=Path,
-        default=Path("data/raw/wav48_silence_trimmed"),
-        help="Raw audio directory (VCTK, JVS, etc.)",
+        help="Path to feature cache directory.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("checkpoints"),
-        help="Output directory for checkpoints",
+        default=Path("checkpoints/codec"),
+        help="Output directory for checkpoints.",
     )
     parser.add_argument(
-        "--device", type=str, default="cuda", help="Device to use (cuda/xpu/cpu)"
-    )
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument(
-        "--steps", type=int, default=100000, help="Total training steps"
-    )
-    parser.add_argument("--warmup-steps", type=int, default=1000, help="Warmup steps")
-    parser.add_argument(
-        "--lambda-rec", type=float, default=1.0, help="Reconstruction loss weight"
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size.",
     )
     parser.add_argument(
-        "--lambda-adv", type=float, default=1.0, help="Adversarial loss weight"
+        "--max-frames",
+        type=int,
+        default=400,
+        help="Max frames per utterance.",
     )
     parser.add_argument(
-        "--lambda-commit", type=float, default=0.25, help="Commitment loss weight"
+        "--max-steps",
+        type=int,
+        default=10000,
+        help="Max training steps.",
     )
     parser.add_argument(
-        "--lambda-stft", type=float, default=1.0, help="STFT loss weight"
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate.",
     )
-    parser.add_argument("--log-every", type=int, default=100, help="Log every N steps")
     parser.add_argument(
-        "--save-every", type=int, default=5000, help="Save checkpoint every N steps"
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device for training.",
     )
     parser.add_argument(
-        "--resume", type=Path, default=None, help="Resume from checkpoint"
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose logging.",
     )
-    return parser.parse_args()
+    return parser
 
 
-class CodecDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        raw_dir: Path,
-        sample_rate: int = 24000,
-        frame_size: int = 480,
-        segment_frames: int = 50,
-    ):
-        self.raw_dir = raw_dir
-        self.sample_rate = sample_rate
-        self.frame_size = frame_size
-        self.segment_frames = segment_frames
-        self.segment_samples = segment_frames * frame_size
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-        self.audio_files = self._collect_audio_files()
-        logger.info(f"Found {len(self.audio_files)} audio segments")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
-    def _collect_audio_files(self) -> list:
-        files = []
-        for ext in ["*.flac", "*.wav"]:
-            for f in self.raw_dir.rglob(ext):
-                if f.is_file():
-                    files.append(f)
-        return files
-
-    def __len__(self):
-        return len(self.audio_files)
-
-    def __getitem__(self, idx):
-        import torchaudio
-
-        audio_path = self.audio_files[idx]
-        audio, sr = torchaudio.load(audio_path)
-
-        if sr != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            audio = resampler(audio)
-
-        audio = audio.mean(dim=0, keepdim=True)
-
-        if audio.shape[1] < self.segment_samples:
-            audio = torch.nn.functional.pad(
-                audio, (0, self.segment_samples - audio.shape[1])
-            )
-        elif audio.shape[1] > self.segment_samples:
-            start = torch.randint(0, audio.shape[1] - self.segment_samples, (1,))
-            audio = audio[:, start : start + self.segment_samples]
-
-        return audio
-
-
-class CodecTrainer:
-    def __init__(self, args):
-        self.args = args
-        self.device = torch.device(args.device)
-
-        self.config = CodecConfig()
-        self.model = StreamingCodec(self.config).to(self.device)
-        self.discriminator = MultiScaleDiscriminator().to(self.device)
-
-        self.stft_loss = MultiScaleSTFTLoss().to(self.device)
-
-        self.optimizer_g = AdamW(self.model.parameters(), lr=args.lr)
-        self.optimizer_d = AdamW(self.discriminator.parameters(), lr=args.lr)
-
-        self.scheduler_g = CosineAnnealingLR(self.optimizer_g, T_max=args.steps)
-        self.scheduler_d = CosineAnnealingLR(self.optimizer_d, T_max=args.steps)
-
-        self.global_step = 0
-
-        if args.resume:
-            self._load_checkpoint(args.resume)
-
-    def _load_checkpoint(self, path: Path):
-        logger.info(f"Loading checkpoint from {path}")
-        ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model"])
-        self.discriminator.load_state_dict(ckpt["discriminator"])
-        self.optimizer_g.load_state_dict(ckpt["optimizer_g"])
-        self.optimizer_d.load_state_dict(ckpt["optimizer_d"])
-        self.global_step = ckpt["global_step"]
-
-    def _save_checkpoint(self, path: Path):
-        torch.save(
-            {
-                "model": self.model.state_dict(),
-                "discriminator": self.discriminator.state_dict(),
-                "optimizer_g": self.optimizer_g.state_dict(),
-                "optimizer_d": self.optimizer_d.state_dict(),
-                "global_step": self.global_step,
-                "config": self.config,
-            },
-            path,
-        )
-        logger.info(f"Saved checkpoint to {path}")
-
-    def _discriminator_loss(
-        self, real: torch.Tensor, fake: torch.Tensor
-    ) -> torch.Tensor:
-        real_outs = self.discriminator(real)
-        fake_outs = self.discriminator(fake.detach())
-
-        loss = 0.0
-        for real_out, fake_out in zip(real_outs, fake_outs):
-            loss = loss + torch.mean((real_out - 1) ** 2)
-            loss = loss + torch.mean(fake_out**2)
-        return loss
-
-    def _generator_adv_loss(self, fake: torch.Tensor) -> torch.Tensor:
-        fake_outs = self.discriminator(fake)
-        loss = 0.0
-        for fake_out in fake_outs:
-            loss = loss + torch.mean((fake_out - 1) ** 2)
-        return loss
-
-    def _feature_matching_loss(
-        self, real: torch.Tensor, fake: torch.Tensor
-    ) -> torch.Tensor:
-        real_outs = self.discriminator(real)
-        fake_outs = self.discriminator(fake)
-
-        loss = 0.0
-        for real_out, fake_out in zip(real_outs, fake_outs):
-            loss = loss + F.l1_loss(real_out, fake_out)
-        return loss
-
-    def train_step(self, batch: torch.Tensor) -> dict:
-        batch = batch.to(self.device)
-
-        audio_rec, indices, commit_loss, _, _ = self.model(batch)
-
-        self.optimizer_d.zero_grad()
-        d_loss = self._discriminator_loss(batch, audio_rec)
-        d_loss.backward()
-        self.optimizer_d.step()
-
-        self.optimizer_g.zero_grad()
-
-        stft_loss = self.stft_loss(audio_rec, batch)
-
-        adv_loss = self._generator_adv_loss(audio_rec)
-
-        fm_loss = self._feature_matching_loss(batch, audio_rec)
-
-        rec_loss = F.l1_loss(audio_rec, batch)
-
-        g_loss = (
-            self.args.lambda_rec * rec_loss
-            + self.args.lambda_stft * stft_loss
-            + self.args.lambda_adv * (adv_loss + 0.5 * fm_loss)
-            + self.args.lambda_commit * commit_loss
-        )
-
-        g_loss.backward()
-        self.optimizer_g.step()
-
-        self.scheduler_g.step()
-        self.scheduler_d.step()
-
-        self.global_step += 1
-
-        return {
-            "g_loss": g_loss.item(),
-            "d_loss": d_loss.item(),
-            "rec_loss": rec_loss.item(),
-            "stft_loss": stft_loss.item(),
-            "adv_loss": adv_loss.item(),
-            "commit_loss": commit_loss.item(),
-        }
-
-    def train(self):
-        dataset = CodecDataset(self.args.raw_dir)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=self.args.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-
-        output_dir = self.args.output_dir / "codec"
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        logger.info(f"Training for {self.args.steps} steps")
-        logger.info(f"Output directory: {output_dir}")
-
-        data_iter = iter(dataloader)
-        pbar = tqdm(total=self.args.steps, initial=self.global_step)
-
-        while self.global_step < self.args.steps:
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-
-            metrics = self.train_step(batch)
-
-            pbar.update(1)
-            pbar.set_postfix({k: f"{v:.4f}" for k, v in metrics.items()})
-
-            if self.global_step % self.args.log_every == 0:
-                logger.info(
-                    f"Step {self.global_step}: "
-                    + ", ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
-                )
-
-            if self.global_step % self.args.save_every == 0:
-                self._save_checkpoint(output_dir / f"codec_step{self.global_step}.pt")
-
-        self._save_checkpoint(output_dir / "codec_final.pt")
-        logger.info("Training complete!")
-
-
-def main():
-    args = parse_args()
-    trainer = CodecTrainer(args)
-    trainer.train()
+    train_codec(
+        cache_dir=args.cache_dir,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        max_frames=args.max_frames,
+        max_steps=args.max_steps,
+        device=args.device,
+        lr=args.lr,
+    )
 
 
 if __name__ == "__main__":

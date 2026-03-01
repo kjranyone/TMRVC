@@ -3,6 +3,7 @@
 ## 概要
 
 雑多な音声ファイルを TMRVC 学習用データセットに変換するパイプライン。
+UCLM v2 では `acoustic_tokens(A_t)`、`control_tokens(B_t)`、`delta_voice_state` を追加保存する。
 
 ## 入力
 
@@ -106,7 +107,7 @@ data/cache/my_voices/train/
 
 ```bash
 # 基本実行
-uv run python scripts/prepare_dataset.py \
+uv run python scripts/data/prepare_dataset.py \
     --input data/raw_my_voices \
     --output data/cache \
     --name my_voices \
@@ -114,22 +115,22 @@ uv run python scripts/prepare_dataset.py \
     --device cuda
 
 # 話者マップ使用（フラットディレクトリ用）
-uv run python scripts/prepare_dataset.py \
+uv run python scripts/data/prepare_dataset.py \
     --input data/raw_voices \
     --output data/cache \
     --name game_voices \
     --speaker-map data/raw_voices/_speaker_map.json \
     --device cuda
 
-# ステージ指定（部分的に再実行）
-uv run python scripts/prepare_dataset.py \
+# 再開実行（既存キャッシュをスキップ）
+uv run python scripts/data/prepare_dataset.py \
     --input data/raw_my_voices \
     --output data/cache \
     --name my_voices \
-    --stages annotate  # アノテーションのみ再実行
+    --resume
 
 # ドライラン（ファイル数確認のみ）
-uv run python scripts/prepare_dataset.py \
+uv run python scripts/data/prepare_dataset.py \
     --input data/raw_my_voices \
     --dry-run
 ```
@@ -225,9 +226,9 @@ Summary:
 # マニフェスト確認
 cat data/cache/_manifests/my_voices_train.json
 
-# Teacher学習開始
-uv run tmrvc-train-teacher \
+# UCLM 学習開始
+uv run tmrvc-train-uclm \
     --cache-dir data/cache \
-    --dataset my_voices \
+    --datasets my_voices \
     --device cuda
 ```

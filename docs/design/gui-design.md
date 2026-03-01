@@ -7,6 +7,7 @@ Updated: 2026-02-28 — Codec-Latent パラダイムに一本化
 > **対象アプリケーション:**
 > - **TMRVC Research Studio** (PySide6, 研究用ページ構成)
 > - **TMRVC Realtime VC** (egui/Rust, エンドユーザ向けシングルページ)
+> **Sync Note (2026-03-01):** 現行 UI は UCLM v2 前提。表示項目は `Acoustic(A_t)` / `Control(B_t)` / `voice_state` / `delta_voice_state` を基本とする。
 
 ---
 
@@ -188,7 +189,7 @@ Updated: 2026-02-28 — Codec-Latent パラダイムに一本化
 │  ┌─ Monitor ──────────────────────────────────────────────────────┐│
 │  │  Input:  [████████████░░░░░░░░] -12.3 dB                      ││
 │  │  Output: [██████████░░░░░░░░░░] -18.5 dB                      ││
-│  │  Inference: 20 ms  |  Latency: ~45 ms  |  Overruns: 0         ││
+│  │  Inference: 10-20 ms  |  Latency: ~35-45 ms  |  Overruns: 0    ││
 │  └────────────────────────────────────────────────────────────────┘│
 │  ┌─ Controls ─────────────────────────────────────────────────────┐│
 │  │  Dry/Wet:     [═══════════●═══] 0.85                           ││
@@ -205,8 +206,8 @@ Updated: 2026-02-28 — Codec-Latent パラダイムに一本化
 |------|---------|
 | **Input Level** | 入力音声レベルメーター (-∞ ~ 0 dB) |
 | **Output Level** | 出力音声レベルメーター |
-| **Inference** | 1フレームあたりの推論時間 (目標: ~20ms) |
-| **Latency** | End-to-end レイテンシ (目標: ~45ms) |
+| **Inference** | 1フレームあたりの推論時間 (目標: ~8-15ms) |
+| **Latency** | End-to-end レイテンシ (目標: ~35-45ms) |
 | **Overruns** | 処理遅延回数 |
 
 ---

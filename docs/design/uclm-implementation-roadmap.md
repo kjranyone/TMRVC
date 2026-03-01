@@ -2,9 +2,11 @@
 
 Kojiro Tanaka — UCLM Implementation Plan
 Created: 2026-02-27 (Asia/Tokyo)
+Updated: 2026-03-01 — Token Spec v2 (dual-stream) sync
 
 > **Goal:** UCLM (Unified Codec Language Model) の実装。
 > **優先順位:** TTS 優先、その後 VC。**既存資産は完全置き換え。**
+> **v2 Contract:** `A_t` (acoustic RVQ) + `B_t` (control tuple) を 10ms 単位で同時生成。
 
 ---
 
@@ -12,12 +14,12 @@ Created: 2026-02-27 (Asia/Tokyo)
 
 ```
 Phase 1: Data Pipeline (UCLM用拡張)
-Phase 2: EnCodec Integration
-Phase 3: UCLM Architecture (TTS mode)
+Phase 2: EnCodec Fine-Tuning & SSL Voice State Integration
+Phase 3: UCLM Architecture (TTS mode & Disentanglement)
 Phase 4: Training (TTS)
 Phase 5: UCLM Architecture (VC mode)
-Phase 6: Training (VC + joint)
-Phase 7: Streaming Inference
+Phase 6: Training (VC + joint, dual-stream)
+Phase 7: Streaming Inference (rolling A/B context + delta state)
 Phase 8: Evaluation & Paper
 ```
 
@@ -38,11 +40,11 @@ raw_audio → normalize → extract_features → annotate → save
 ### 2.2 Extended Pipeline for UCLM
 
 ```
-raw_audio → normalize → extract_features → annotate → encode_codec → save
-                ↓              ↓              ↓             ↓
-            24kHz/mono    mel/f0/spk_embed  text/emotion  codec_tokens
-                                                ↓
-                                        voice_state (estimated)
+raw_audio → normalize → extract_features → annotate → encode_codec/control → save
+                ↓              ↓              ↓                   ↓
+            24kHz/mono    mel/f0/spk_embed  text/emotion     A_t / B_t tokens
+                                                ↓                   ↓
+                                   voice_state (estimated)   delta_voice_state
 ```
 
 ### 2.3 New UtteranceMeta Fields
@@ -78,8 +80,10 @@ data/cache/{dataset}/train/{speaker}/{utt_id}/
 ├── f0.npy               # [1, T] - existing  
 ├── spk_embed.npy        # [192] - existing
 ├── meta.json            # UtteranceMeta
-├── codec_tokens.npy     # [n_codebooks, T] - NEW
+├── acoustic_tokens.npy  # [8, T] - NEW (A_t)
+├── control_tokens.npy   # [4, T] - NEW (B_t = [op,type,dur,int])
 ├── voice_state.npy      # [T, 8] - NEW
+├── delta_voice_state.npy # [T, 8] - NEW
 ├── phoneme_ids.npy      # [L] - NEW
 └── durations.npy        # [L] - NEW
 ```
@@ -88,7 +92,8 @@ data/cache/{dataset}/train/{speaker}/{utt_id}/
 
 | Task | File | Description |
 |---|---|---|
-| Add EnCodec encoder | `tmrvc_data/codec.py` | Wrap EnCodec for token extraction |
+| Add codec encoder | `tmrvc_data/codec.py` | Acoustic token extraction (`A_t`) |
+| Add control tokenizer | `tmrvc_data/control_tokens.py` | Event tuple extraction (`B_t`) |
 | Add voice state estimator | `tmrvc_data/voice_state.py` | Frame-level acoustic params |
 | Add G2P to pipeline | `prepare_dataset.py` | Call existing G2P module |
 | Add MFA alignment | `prepare_dataset.py` | Call existing alignment module |
@@ -115,14 +120,14 @@ class EnCodecWrapper:
         self.device = device
         self.sample_rate = 24000
         self.n_codebooks = 8
-        self.vocab_size = 1024
+        self.rvq_vocab_size = 1024
         
     def encode(self, waveform: torch.Tensor) -> torch.Tensor:
         """
         Args:
             waveform: [B, 1, T_samples] at 24kHz
         Returns:
-            tokens: [B, n_codebooks, T_frames] at 100fps (10ms/frame)
+            tokens: [B, n_codebooks, T_frames] at 100fps (10ms/frame), IDs in 0..1023
         """
         with torch.no_grad():
             encoded = self.model.encode(waveform, bandwidth=6.0)
@@ -143,37 +148,28 @@ class EnCodecWrapper:
             return decoded.audio_values
 ```
 
-### 3.2 Voice State Estimator
+### 3.2 SSL Voice State Estimator
 
 ```python
 # tmrvc_data/voice_state.py
 
-class VoiceStateEstimator(nn.Module):
-    """Estimate frame-level voice state parameters from audio."""
-    
-    # Voice state dimensions:
-    # [0]: breathiness    [0, 1]
-    # [1]: tension        [0, 1]
-    # [2]: arousal        [0, 1]
-    # [3]: valence        [-1, 1]
-    # [4]: roughness      [0, 1]
-    # [5]: voicing        [0, 1]
-    # [6]: energy         [0, 1]
-    # [7]: rate           [0.5, 2.0]
+class SSLVoiceStateEstimator(nn.Module):
+    """Extract explicit parameters + latent SSL style space."""
     
     def __init__(self):
-        # Pre-trained on labeled data or use heuristics
-        self.breathiness_detector = load_pretrained("breathiness_model.pt")
-        self.tension_estimator = load_pretrained("tension_model.pt")
-        # ... etc.
+        self.explicit_estimator = VoiceStateEstimator() # 8-dim heuristic
+        self.wavlm_extractor = WavLMFeatureExtractor(d_output=128)
         
-    def forward(self, mel: torch.Tensor, f0: torch.Tensor) -> torch.Tensor:
+    def forward(self, audio_16k: torch.Tensor, audio_24k: torch.Tensor, mel: torch.Tensor, f0: torch.Tensor) -> dict:
         """
         Args:
+            audio_16k: [B, T_16k] for WavLM
+            audio_24k: [B, T_24k] for frame alignment
             mel: [B, 80, T]
             f0: [B, 1, T]
         Returns:
-            voice_state: [B, T, 8]
+            explicit_state: [B, T, 8]
+            ssl_state: [B, T, 128] (from WavLM)
         """
         B, _, T = mel.shape
         
@@ -212,9 +208,11 @@ class VoiceStateEstimator(nn.Module):
 
 | Task | Description |
 |---|---|
-| Install EnCodec | `uv add transformers` |
+| Install EnCodec & WavLM | `uv add transformers` |
+| Fine-tune EnCodec Decoder | Focus on high-frequency / breathiness (Intimate/Expresso data) |
 | Implement `EnCodecWrapper` | Token extraction and decoding |
-| Implement `VoiceStateEstimator` | Frame-level acoustic params |
+| Implement `SSLVoiceStateEstimator`| Extract latent style space via WavLM |
+| Implement `VoiceStateEstimator` | Frame-level acoustic params (8-dim) |
 | Test on sample audio | Verify token quality |
 
 **Duration: 1 week**
@@ -223,135 +221,84 @@ class VoiceStateEstimator(nn.Module):
 
 ## 4. Phase 3: UCLM Architecture (TTS Mode)
 
+### 4.0 v2 変更点 (必須)
+
+- 単一 `target_tokens` ではなく `target_A`, `target_B` を使用
+- 出力 head は `acoustic_heads (8 x 1024)` + `control_heads (4 x 64)`
+- `delta_voice_state` を forward 入力に追加
+- loss は `L = L_A + L_B + L_delta (+ optional disentangle losses)`
+
 ### 4.1 Model Components
 
 ```python
 # tmrvc_train/models/uclm.py
 
 class UCLM(nn.Module):
-    """Unified Codec Language Model."""
-    
+    """Unified Codec LM (dual-stream token prediction)."""
+
     def __init__(
         self,
-        vocab_size: int = 1024,
+        rvq_vocab_size: int = 1024,
+        control_vocab_size: int = 64,
         n_codebooks: int = 8,
         d_model: int = 512,
-        n_heads: int = 8,
-        n_layers: int = 12,
         d_speaker: int = 192,
         d_voice_state: int = 8,
-        d_text: int = 256,
     ):
-        # Text encoder
-        self.text_encoder = TextEncoder(d_text=d_text, d_model=d_model)
-        
-        # Voice state encoder
-        self.voice_state_encoder = VoiceStateEncoder(
-            d_state=d_voice_state, d_model=d_model
-        )
-        
-        # Speaker conditioning
+        self.backbone = CausalTransformer(d_model=d_model)
+        self.voice_state_encoder = VoiceStateEncoder(d_state=d_voice_state, d_model=d_model)
         self.speaker_proj = nn.Linear(d_speaker, d_model)
-        
-        # Mode embedding (TTS=0, VC=1)
-        self.mode_embed = nn.Embedding(2, d_model)
-        
-        # Main transformer (causal)
-        self.transformer = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model, n_heads, d_model * 4),
-            num_layers=n_layers,
-        )
-        
-        # Codebook embeddings
-        self.codebook_embed = nn.ModuleList([
-            nn.Embedding(vocab_size, d_model)
-            for _ in range(n_codebooks)
+
+        self.acoustic_heads = nn.ModuleList([
+            nn.Linear(d_model, rvq_vocab_size) for _ in range(n_codebooks)
         ])
-        
-        # Output heads
-        self.ar_head = nn.Linear(d_model, vocab_size)  # First codebook (AR)
-        self.parallel_heads = nn.ModuleList([
-            nn.Linear(d_model, vocab_size)
-            for _ in range(n_codebooks - 1)
+        self.control_heads = nn.ModuleList([
+            nn.Linear(d_model, control_vocab_size) for _ in range(4)  # [op,type,dur,int]
         ])
-        
+
     def forward(
         self,
-        text_features: torch.Tensor,       # [B, L, d_text]
-        voice_state: torch.Tensor,         # [B, T, d_state]
-        speaker_embed: torch.Tensor,       # [B, d_speaker]
-        past_tokens: torch.Tensor | None,  # [B, n_cb, k]
-        target_tokens: torch.Tensor,       # [B, n_cb, T] for training
-        mode: int = 0,                     # 0=TTS, 1=VC
+        cond_features: torch.Tensor,       # [B, T, d_model] (text or VC condition)
+        voice_state: torch.Tensor,         # [B, T, 8]
+        delta_voice_state: torch.Tensor,   # [B, T, 8]
+        speaker_embed: torch.Tensor,       # [B, 192]
+        past_a: torch.Tensor | None,       # [B, 8, k]
+        past_b: torch.Tensor | None,       # [B, 4, k]
     ) -> dict[str, torch.Tensor]:
-        """Training forward pass."""
-        B, T = voice_state.shape[:2]
-        
-        # Encode conditions
-        text_cond = self.text_encoder(text_features)  # [B, L, d_model]
-        state_cond = self.voice_state_encoder(voice_state)  # [B, T, d_model]
-        spk_cond = self.speaker_proj(speaker_embed).unsqueeze(1)  # [B, 1, d_model]
-        mode_cond = self.mode_embed(torch.tensor([mode])).unsqueeze(0)  # [1, 1, d_model]
-        
-        # Fuse conditions with voice state (frame-level)
-        cond = state_cond + spk_cond + mode_cond  # [B, T, d_model]
-        
-        # Cross-attend with text
-        memory = text_cond.transpose(0, 1)  # [L, B, d_model]
-        
-        # Target embedding (teacher forcing)
-        tgt_emb = torch.stack([
-            self.codebook_embed[i](target_tokens[:, i, :])
-            for i in range(self.n_codebooks)
-        ], dim=2).mean(dim=2)  # [B, T, d_model]
-        
-        tgt = (tgt_emb + cond).transpose(0, 1)  # [T, B, d_model]
-        
-        # Causal mask
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(T)
-        
-        # Transformer
-        out = self.transformer(tgt, memory, tgt_mask=tgt_mask)  # [T, B, d_model]
-        out = out.transpose(0, 1)  # [B, T, d_model]
-        
-        # Predict
-        logits_ar = self.ar_head(out)  # [B, T, vocab_size]
-        logits_parallel = torch.stack([
-            head(out) for head in self.parallel_heads
-        ], dim=1)  # [B, n_cb-1, T, vocab_size]
-        
-        return {
-            "logits_ar": logits_ar,
-            "logits_parallel": logits_parallel,
-        }
+        state_cond = self.voice_state_encoder(voice_state + delta_voice_state)
+        spk_cond = self.speaker_proj(speaker_embed).unsqueeze(1)
+        feat = self.backbone(cond_features + state_cond + spk_cond, past_a=past_a, past_b=past_b)
+
+        logits_a = torch.stack([head(feat) for head in self.acoustic_heads], dim=1)
+        logits_b = torch.stack([head(feat) for head in self.control_heads], dim=1)
+        return {"logits_a": logits_a, "logits_b": logits_b}
 ```
 
 ### 4.2 Training Loss
 
 ```python
 def uclm_loss(
-    logits_ar: torch.Tensor,        # [B, T, vocab]
-    logits_parallel: torch.Tensor,  # [B, n_cb-1, T, vocab]
-    target_tokens: torch.Tensor,    # [B, n_cb, T]
+    logits_a: torch.Tensor,         # [B, 8, T, 1024]
+    logits_b: torch.Tensor,         # [B, 4, T, 64]
+    target_a: torch.Tensor,         # [B, 8, T]
+    target_b: torch.Tensor,         # [B, 4, T]
+    delta_voice_state: torch.Tensor,# [B, T, 8]
+    pred_delta: torch.Tensor,       # [B, T, 8]
 ) -> torch.Tensor:
-    """Multi-codebook loss."""
-    
-    # AR loss (first codebook)
-    loss_ar = F.cross_entropy(
-        logits_ar.view(-1, logits_ar.size(-1)),
-        target_tokens[:, 0, :].reshape(-1),
-    )
-    
-    # Parallel loss (remaining codebooks)
-    loss_parallel = 0
-    for i in range(target_tokens.size(1) - 1):
-        loss_parallel += F.cross_entropy(
-            logits_parallel[:, i].reshape(-1, logits_parallel.size(-1)),
-            target_tokens[:, i + 1, :].reshape(-1),
-        )
-    loss_parallel /= (target_tokens.size(1) - 1)
-    
-    return loss_ar + loss_parallel
+    """Dual-stream loss for UCLM v2."""
+
+    loss_a = sum(
+        F.cross_entropy(logits_a[:, i].reshape(-1, logits_a.size(-1)), target_a[:, i, :].reshape(-1))
+        for i in range(8)
+    ) / 8.0
+
+    loss_b = sum(
+        F.cross_entropy(logits_b[:, i].reshape(-1, logits_b.size(-1)), target_b[:, i, :].reshape(-1))
+        for i in range(4)
+    ) / 4.0
+
+    loss_delta = F.l1_loss(pred_delta, delta_voice_state)
+    return loss_a + loss_b + 0.1 * loss_delta
 ```
 
 ### 4.3 Tasks
@@ -360,6 +307,7 @@ def uclm_loss(
 |---|---|
 | Implement `TextEncoder` | `models/text_encoder.py` (reuse existing) |
 | Implement `VoiceStateEncoder` | `models/voice_state_encoder.py` (new) |
+| Implement `ControlTokenizer` | `data/control_tokens.py` (new) |
 | Implement `UCLM` | `models/uclm.py` (new) |
 | Implement loss function | `models/uclm.py` |
 | Unit tests | `tests/python/test_uclm.py` |
@@ -384,11 +332,17 @@ class UCLMDataset(Dataset):
         return {
             "phoneme_ids": torch.tensor(utt.phoneme_ids),
             "durations": torch.tensor(utt.durations),
-            "codec_tokens": torch.from_numpy(
-                np.load(utt.path / "codec_tokens.npy")
+            "acoustic_tokens": torch.from_numpy(
+                np.load(utt.path / "acoustic_tokens.npy")
+            ),
+            "control_tokens": torch.from_numpy(
+                np.load(utt.path / "control_tokens.npy")
             ),
             "voice_state": torch.from_numpy(
                 np.load(utt.path / "voice_state.npy")
+            ),
+            "delta_voice_state": torch.from_numpy(
+                np.load(utt.path / "delta_voice_state.npy")
             ),
             "spk_embed": torch.from_numpy(
                 np.load(utt.path / "spk_embed.npy")
@@ -403,8 +357,7 @@ class UCLMDataset(Dataset):
 # TTS training
 uv run tmrvc-train-uclm \
     --cache-dir data/cache \
-    --datasets libritts_r,vctk,expresso \
-    --mode tts \
+    --datasets libritts_r vctk expresso \
     --batch-size 16 \
     --max-frames 400 \
     --device cuda \
@@ -416,7 +369,8 @@ uv run tmrvc-train-uclm \
 ```yaml
 # configs/train_uclm_tts.yaml
 model:
-  vocab_size: 1024
+  rvq_vocab_size: 1024
+  control_vocab_size: 64
   n_codebooks: 8
   d_model: 512
   n_heads: 8
@@ -439,7 +393,7 @@ data:
 
 | Task | Description |
 |---|---|
-| Implement `UCLMDataset` | Load codec tokens, voice state |
+| Implement `UCLMDataset` | Load `acoustic_tokens`, `control_tokens`, `voice_state`, `delta_voice_state` |
 | Implement `UCLMTrainer` | Training loop |
 | Implement CLI `tmrvc-train-uclm` | Entry point |
 | Run initial training | LibriTTS-R subset |
@@ -459,23 +413,27 @@ class UCLM(nn.Module):
     
     def forward_vc(
         self,
-        source_tokens: torch.Tensor,      # [B, n_cb, T]
+        source_a: torch.Tensor,           # [B, n_cb, T]
+        source_b: torch.Tensor,           # [B, 4, T]
         voice_state: torch.Tensor,        # [B, T, d_state]
+        delta_voice_state: torch.Tensor,  # [B, T, d_state]
         speaker_embed: torch.Tensor,      # [B, d_speaker]
-        past_tokens: torch.Tensor | None, # [B, n_cb, k]
-        target_tokens: torch.Tensor,      # [B, n_cb, T] for training
+        past_a: torch.Tensor | None,      # [B, n_cb, k]
+        past_b: torch.Tensor | None,      # [B, 4, k]
+        target_a: torch.Tensor,           # [B, n_cb, T] for training
+        target_b: torch.Tensor,           # [B, 4, T] for training
     ) -> dict[str, torch.Tensor]:
         """VC training forward pass."""
-        B, n_cb, T = source_tokens.shape
+        B, n_cb, T = source_a.shape
         
         # Encode source tokens
         src_emb = torch.stack([
-            self.codebook_embed[i](source_tokens[:, i, :])
+            self.codebook_embed[i](source_a[:, i, :])
             for i in range(n_cb)
         ], dim=2).mean(dim=2)  # [B, T, d_model]
         
         # Encode conditions
-        state_cond = self.voice_state_encoder(voice_state)
+        state_cond = self.voice_state_encoder(voice_state + delta_voice_state)
         spk_cond = self.speaker_proj(speaker_embed).unsqueeze(1)
         mode_cond = self.mode_embed(torch.tensor([1])).unsqueeze(0)  # VC mode
         
@@ -507,10 +465,18 @@ for batch in dataloader:
     
     if mode == 'tts':
         output = model.forward_tts(...)
-        loss = uclm_loss(output, batch['target_tokens'])
+        loss = uclm_loss(
+            output['logits_a'], output['logits_b'],
+            batch['target_a'], batch['target_b'],
+            batch['delta_voice_state'], output['pred_delta']
+        )
     else:
         output = model.forward_vc(...)
-        loss = uclm_loss(output, batch['target_tokens'])
+        loss = uclm_loss(
+            output['logits_a'], output['logits_b'],
+            batch['target_a'], batch['target_b'],
+            batch['delta_voice_state'], output['pred_delta']
+        )
     
     loss.backward()
 ```
@@ -545,27 +511,30 @@ class StreamingUCLM:
         self,
         text_block: torch.Tensor,
         voice_state_block: torch.Tensor,
+        delta_voice_state_block: torch.Tensor,
         speaker_embed: torch.Tensor,
     ) -> torch.Tensor:
         """Generate one block of audio."""
         
-        # Get past context
-        past_tokens = torch.stack(self.token_buffer[-3:], dim=1) if self.token_buffer else None
+        # Get past context (dual-stream)
+        past_a, past_b = self.get_past_context()
         
         # Generate tokens
         with torch.no_grad():
-            tokens = self.model.generate(
+            tokens_a, tokens_b = self.model.generate(
                 text=text_block,
                 voice_state=voice_state_block,
+                delta_voice_state=delta_voice_state_block,
                 speaker=speaker_embed,
-                past_tokens=past_tokens,
+                past_a=past_a,
+                past_b=past_b,
             )
         
         # Update buffer
-        self.token_buffer.append(tokens)
+        self.push_context(tokens_a, tokens_b)
         
         # Decode
-        audio = self.codec_decoder.decode(tokens)
+        audio = self.codec_decoder.decode(tokens_a, tokens_b, voice_state_block, delta_voice_state_block)
         
         return audio
 ```
@@ -584,7 +553,7 @@ uv run tmrvc-export-uclm \
 | Task | Description |
 |---|---|
 | Implement `StreamingUCLM` | Block-wise generation |
-| Implement ONNX export | UCLM + EnCodec decoder |
+| Implement ONNX export | `uclm_core` dual-head + codec decoder |
 | Integrate with tmrvc-engine | C++ streaming inference |
 | Latency measurement | Verify <50ms |
 
@@ -645,9 +614,10 @@ Target: **Interspeech 2026** or **ICASSP 2026**
 TMRVC/
 ├── tmrvc-data/src/tmrvc_data/
 │   ├── codec.py              # NEW: EnCodec wrapper
+│   ├── control_tokens.py     # NEW: Event tuple tokenizer
 │   ├── voice_state.py        # NEW: Voice state estimator
 │   ├── uclm_dataset.py       # NEW: UCLM dataset
-│   └── prepare_dataset.py    # MODIFIED: Add codec tokens
+│   └── prepare_dataset.py    # MODIFIED: Add A/B tokens
 │
 ├── tmrvc-train/src/tmrvc_train/
 │   ├── models/

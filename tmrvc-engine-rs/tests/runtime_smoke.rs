@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use tmrvc_engine_rs::constants::{D_SPEAKER, FRAME_SIZE, LORA_DELTA_SIZE, SAMPLE_RATE};
+use tmrvc_engine_rs::constants::{D_SPEAKER, FRAME_SIZE, SAMPLE_RATE};
 use tmrvc_engine_rs::ort_bundle::OrtBundle;
-use tmrvc_engine_rs::processor::Processor;
+use tmrvc_engine_rs::processor::{FrameParams, StreamingEngine};
 use tmrvc_engine_rs::speaker::SpeakerFile;
 
 fn workspace_root() -> PathBuf {
@@ -30,9 +30,11 @@ fn speaker_path_from_env_or_default(root: &Path) -> PathBuf {
 fn make_nonzero_lora_speaker(base_speaker: &Path) -> PathBuf {
     let mut data = fs::read(base_speaker).expect("base speaker file should be readable");
 
-    let header_size = 16usize;
-    let lora_offset = header_size + D_SPEAKER * 4;
-    data[lora_offset..lora_offset + 4].copy_from_slice(&0.123f32.to_le_bytes());
+    let header_size = 32usize;
+    let lora_offset = header_size + D_SPEAKER * 4 + 4;
+    if data.len() > lora_offset + 4 {
+        data[lora_offset..lora_offset + 4].copy_from_slice(&0.123f32.to_le_bytes());
+    }
 
     let checksum_size = 32usize;
     let checksum_offset = data.len() - checksum_size;
@@ -57,7 +59,7 @@ fn smoke_processor_runs_frame_inference() {
     let speaker_path = speaker_path_from_env_or_default(&root);
 
     if !model_dir.join("codec_encoder.onnx").exists()
-        || !model_dir.join("token_model.onnx").exists()
+        || !model_dir.join("uclm_core.onnx").exists()
         || !model_dir.join("codec_decoder.onnx").exists()
         || !speaker_path.exists()
     {
@@ -65,11 +67,27 @@ fn smoke_processor_runs_frame_inference() {
         return;
     }
 
-    let mut processor = Processor::new(&model_dir).expect("models should load");
-    processor
-        .load_speaker(&speaker_path)
-        .expect("speaker should load");
-    processor.start();
+    let mut engine = StreamingEngine::new(None);
+    engine.load_models(&model_dir).expect("models should load");
+    engine.load_speaker(&speaker_path).expect("speaker should load");
+    engine.start();
+
+    let frame_params = FrameParams {
+        dry_wet: 1.0,
+        output_gain: 1.0,
+        alpha_timbre: 1.0,
+        beta_prosody: 0.0,
+        gamma_articulation: 0.0,
+        voice_source_alpha: 0.0,
+        latency_quality_q: 0.0,
+        pitch_shift: 0.0,
+        cfg_scale: 1.0,
+        temperature_a: 1.0,
+        temperature_b: 1.0,
+        top_k_a: 50,
+        top_k_b: 20,
+        voice_state: [0.5; 8],
+    };
 
     let mut input = [0.0f32; FRAME_SIZE];
     let mut output = [0.0f32; FRAME_SIZE];
@@ -86,7 +104,7 @@ fn smoke_processor_runs_frame_inference() {
             }
         }
 
-        processor.process_frame(&input, &mut output).expect("frame should process");
+        engine.process_one_frame(&input, &mut output, &frame_params);
 
         for &y in &output {
             assert!(y.is_finite(), "output contains non-finite sample");
@@ -94,7 +112,7 @@ fn smoke_processor_runs_frame_inference() {
         }
     }
 
-    let timing = processor.timing();
+    let timing = engine.timing();
     println!(
         "timing: avg={:.2}us, max={:.2}us, frames={}, overruns={}",
         timing.avg_frame_us.load(std::sync::atomic::Ordering::SeqCst),
@@ -120,7 +138,7 @@ fn smoke_speaker_file_loadable() {
 }
 
 #[test]
-fn smoke_ort_bundle_new_codec_latent_signature_exists() {
+fn smoke_ort_bundle_new_uclm_signature_exists() {
     let root = workspace_root();
     let model_dir = model_dir_from_env_or_default(&root);
 
@@ -129,6 +147,6 @@ fn smoke_ort_bundle_new_codec_latent_signature_exists() {
         return;
     }
 
-    let result = OrtBundle::new_codec_latent(&model_dir);
+    let result = OrtBundle::new_uclm(&model_dir);
     assert!(result.is_ok() || result.is_err());
 }

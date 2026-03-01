@@ -1,223 +1,105 @@
-#!/usr/bin/env python3
-"""Train UCLM (Unified Codec Language Model).
-
-Usage:
-    uv run tmrvc-train-uclm --cache-dir data/cache --datasets libritts_r --device cuda
-
-    # Resume from checkpoint
-    uv run tmrvc-train-uclm --resume checkpoints/uclm/uclm_step10000.pt
-
-    # Custom config
-    uv run tmrvc-train-uclm --config configs/train_uclm.yaml
-"""
-
-from __future__ import annotations
-
 import argparse
 import logging
-import sys
 from pathlib import Path
+import torch
+from torch.utils.data import DataLoader
 
+from tmrvc_train.models import DisentangledUCLM
+from tmrvc_train.dataset import DisentangledUCLMDataset
+from tmrvc_train.trainer import UCLMTrainer
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def collate_fn(batch):
+    """Pad tensors to max length in batch."""
+    # Find max length
+    max_len = max(item["target_a"].shape[1] for item in batch)
+    
+    source_a_t = []
+    target_a = []
+    target_b = []
+    explicit_state = []
+    ssl_state = []
+    speaker_embed = []
+    
+    for item in batch:
+        T = item["target_a"].shape[1]
+        pad_len = max_len - T
+        
+        # [8, T] -> [8, max_len]
+        s_a = torch.nn.functional.pad(item["source_a_t"], (0, pad_len), value=-1)
+        t_a = torch.nn.functional.pad(item["target_a"], (0, pad_len), value=-1)
+        t_b = torch.nn.functional.pad(item["target_b"], (0, pad_len), value=-1)
+        
+        # [T, d] -> [max_len, d]
+        e_s = torch.nn.functional.pad(item["explicit_state"].transpose(0, 1), (0, pad_len)).transpose(0, 1)
+        s_s = torch.nn.functional.pad(item["ssl_state"].transpose(0, 1), (0, pad_len)).transpose(0, 1)
+        
+        source_a_t.append(s_a)
+        target_a.append(t_a)
+        target_b.append(t_b)
+        explicit_state.append(e_s)
+        ssl_state.append(s_s)
+        speaker_embed.append(item["speaker_embed"])
+        
+    return {
+        "source_a_t": torch.stack(source_a_t),
+        "target_a": torch.stack(target_a),
+        "target_b": torch.stack(target_b),
+        "explicit_state": torch.stack(explicit_state),
+        "ssl_state": torch.stack(ssl_state),
+        "speaker_embed": torch.stack(speaker_embed)
+    }
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train UCLM model",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+def main():
+    parser = argparse.ArgumentParser(description="Train Disentangled UCLM")
+    parser.add_argument("--cache-dir", type=Path, required=True)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-frames", type=int, default=400)
+    parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+    
+    logger.info("Initializing Disentangled UCLM dataset...")
+    dataset = DisentangledUCLMDataset(args.cache_dir, max_frames=args.max_frames)
+    
+    if len(dataset) == 0:
+        logger.error("No valid dataset found in %s", args.cache_dir)
+        return
+        
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    
+    logger.info("Initializing Disentangled UCLM model...")
+    model = DisentangledUCLM(
+        d_model=512,
+        n_heads=8,
+        n_layers=12,
+        rvq_vocab_size=1024,
+        n_codebooks=8,
+        control_vocab_size=64,
+        d_explicit=8,
+        d_ssl=128,
+        d_speaker=192,
+        vq_bins=128
     )
-
-    # Data
-    parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default="data/cache",
-        help="Cache directory with preprocessed data",
-    )
-    parser.add_argument(
-        "--datasets",
-        type=str,
-        nargs="+",
-        default=["libritts_r"],
-        help="Datasets to use for training",
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=400,
-        help="Maximum frames per utterance",
-    )
-    parser.add_argument(
-        "--min-frames",
-        type=int,
-        default=20,
-        help="Minimum frames per utterance",
-    )
-
-    # Model
-    parser.add_argument(
-        "--d-model",
-        type=int,
-        default=256,
-        help="Model dimension",
-    )
-    parser.add_argument(
-        "--n-heads",
-        type=int,
-        default=8,
-        help="Number of attention heads",
-    )
-    parser.add_argument(
-        "--n-layers",
-        type=int,
-        default=12,
-        help="Number of transformer layers",
-    )
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.1,
-        help="Dropout rate",
-    )
-
-    # Training
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=16,
-        help="Batch size",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate",
-    )
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=10000,
-        help="Warmup steps",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=200000,
-        help="Maximum training steps",
-    )
-    parser.add_argument(
-        "--gradient-accumulation",
-        type=int,
-        default=1,
-        help="Gradient accumulation steps",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="DataLoader workers",
-    )
-
-    # Checkpointing
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=str,
-        default="checkpoints/uclm",
-        help="Checkpoint directory",
-    )
-    parser.add_argument(
-        "--save-every",
-        type=int,
-        default=5000,
-        help="Save checkpoint every N steps",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Resume from checkpoint",
-    )
-
-    # Device
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        choices=["cuda", "cpu", "xpu"],
-        help="Device to use",
-    )
-
-    # Logging
-    parser.add_argument(
-        "--log-every",
-        type=int,
-        default=100,
-        help="Log every N steps",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging",
-    )
-
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-
-    # Setup logging
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    # Import here to avoid loading modules on --help
-    from tmrvc_train.uclm_trainer import UCLMTrainer, UCLMTrainerConfig
-
-    # Create config
-    config = UCLMTrainerConfig(
-        cache_dir=args.cache_dir,
-        datasets=args.datasets,
-        max_frames=args.max_frames,
-        min_frames=args.min_frames,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        dropout=args.dropout,
-        lr=args.lr,
-        warmup_steps=args.warmup_steps,
-        max_steps=args.max_steps,
-        gradient_accumulation=args.gradient_accumulation,
-        checkpoint_dir=args.checkpoint_dir,
-        save_every=args.save_every,
-        log_every=args.log_every,
-        device=args.device,
-    )
-
-    # Create trainer
-    trainer = UCLMTrainer(config)
-
-    # Resume if specified
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
-
-    # Run training
-    try:
-        trainer.train()
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-        return 1
-    except Exception as e:
-        logger.exception("Training failed: %s", e)
-        return 1
-
-    return 0
-
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    trainer = UCLMTrainer(model, optimizer, device=args.device)
+    
+    logger.info("Starting training loop...")
+    step = 0
+    while step < args.max_steps:
+        for batch in loader:
+            losses = trainer.train_step(batch)
+            if step % 10 == 0:
+                logger.info(f"Step {step}: Total Loss={losses['loss']:.4f}, VQ Loss={losses['loss_vq']:.4f}")
+                
+            step += 1
+            if step >= args.max_steps:
+                break
+                
+    logger.info("Training finished.")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

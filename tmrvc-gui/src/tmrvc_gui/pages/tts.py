@@ -1,4 +1,4 @@
-"""TTS page: text-to-speech generation with character/style control."""
+"""TTS page: text-to-speech generation with character/style control (UCLM v2)."""
 
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ EMOTION_OPTIONS = [
 class TTSPage(QWidget):
     """Text-to-speech generation page.
 
-    Provides text input, character/speaker selection, emotion/style sliders,
-    and generates audio via the TTS pipeline.
+    Provides text input, character/speaker selection, physical style sliders
+    (UCLM v2), and generates audio via the unified UCLMEngine.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -67,11 +67,11 @@ class TTSPage(QWidget):
         left_col.addWidget(input_group)
 
         # Character / model selection
-        model_group = QGroupBox("Character & Model")
+        model_group = QGroupBox("Character & Model (UCLM v2)")
         model_form = QFormLayout(model_group)
 
         self.language_combo = QComboBox()
-        self.language_combo.addItems(["ja (Japanese)", "en (English)"])
+        self.language_combo.addItems(["ja (Japanese)", "en (English)", "zh (Chinese)", "ko (Korean)"])
         model_form.addRow("Language:", self.language_combo)
 
         # Speaker file
@@ -84,25 +84,25 @@ class TTSPage(QWidget):
         spk_row.addWidget(btn_browse_spk)
         model_form.addRow("Speaker file:", spk_row)
 
-        # TTS checkpoint
-        ckpt_row = QHBoxLayout()
-        self.tts_ckpt_edit = QLineEdit()
-        self.tts_ckpt_edit.setPlaceholderText("checkpoints/tts/tts_step200000.pt")
-        ckpt_row.addWidget(self.tts_ckpt_edit)
-        btn_browse_ckpt = QPushButton("Browse...")
-        btn_browse_ckpt.clicked.connect(self._on_browse_tts_ckpt)
-        ckpt_row.addWidget(btn_browse_ckpt)
-        model_form.addRow("TTS checkpoint:", ckpt_row)
+        # UCLM checkpoint
+        uclm_row = QHBoxLayout()
+        self.uclm_ckpt_edit = QLineEdit()
+        self.uclm_ckpt_edit.setPlaceholderText("checkpoints/uclm/uclm_latest.pt")
+        uclm_row.addWidget(self.uclm_ckpt_edit)
+        btn_browse_uclm = QPushButton("Browse...")
+        btn_browse_uclm.clicked.connect(self._on_browse_uclm_ckpt)
+        uclm_row.addWidget(btn_browse_uclm)
+        model_form.addRow("UCLM checkpoint:", uclm_row)
 
-        # VC checkpoint (Converter + Vocoder)
-        vc_row = QHBoxLayout()
-        self.vc_ckpt_edit = QLineEdit()
-        self.vc_ckpt_edit.setPlaceholderText("checkpoints/distill/best.pt")
-        vc_row.addWidget(self.vc_ckpt_edit)
-        btn_browse_vc = QPushButton("Browse...")
-        btn_browse_vc.clicked.connect(self._on_browse_vc_ckpt)
-        vc_row.addWidget(btn_browse_vc)
-        model_form.addRow("VC checkpoint:", vc_row)
+        # Codec checkpoint
+        codec_row = QHBoxLayout()
+        self.codec_ckpt_edit = QLineEdit()
+        self.codec_ckpt_edit.setPlaceholderText("checkpoints/codec/codec_latest.pt")
+        codec_row.addWidget(self.codec_ckpt_edit)
+        btn_browse_codec = QPushButton("Browse...")
+        btn_browse_codec.clicked.connect(self._on_browse_codec_ckpt)
+        codec_row.addWidget(btn_browse_codec)
+        model_form.addRow("Codec checkpoint:", codec_row)
 
         left_col.addWidget(model_group)
         top_row.addLayout(left_col, stretch=2)
@@ -110,7 +110,7 @@ class TTSPage(QWidget):
         # --- Right: Style controls ---
         right_col = QVBoxLayout()
 
-        style_group = QGroupBox("Emotion & Style")
+        style_group = QGroupBox("Physical Style (UCLM)")
         style_form = QFormLayout(style_group)
 
         self.emotion_combo = QComboBox()
@@ -123,18 +123,27 @@ class TTSPage(QWidget):
         self.speed_spin.setValue(1.0)
         style_form.addRow("Speed:", self.speed_spin)
 
-        # VAD sliders
-        self.valence_slider = self._make_slider("Valence")
-        style_form.addRow("Valence:", self.valence_slider)
+        # 8-dim Physical Sliders
+        self.breathiness_slider = self._make_slider("Breathiness", 0, 100, 0)
+        style_form.addRow("Breathiness:", self.breathiness_slider)
 
-        self.arousal_slider = self._make_slider("Arousal")
+        self.tension_slider = self._make_slider("Tension", 0, 100, 0)
+        style_form.addRow("Tension:", self.tension_slider)
+
+        self.arousal_slider = self._make_slider("Arousal", 0, 100, 0)
         style_form.addRow("Arousal:", self.arousal_slider)
 
-        self.energy_slider = self._make_slider("Energy")
-        style_form.addRow("Energy:", self.energy_slider)
+        self.valence_slider = self._make_slider("Valence", -100, 100, 0)
+        style_form.addRow("Valence:", self.valence_slider)
 
-        self.pitch_range_slider = self._make_slider("Pitch range")
-        style_form.addRow("Pitch range:", self.pitch_range_slider)
+        self.roughness_slider = self._make_slider("Roughness", 0, 100, 0)
+        style_form.addRow("Roughness:", self.roughness_slider)
+
+        self.voicing_slider = self._make_slider("Voicing", 0, 100, 100) # Default 1.0
+        style_form.addRow("Voicing:", self.voicing_slider)
+
+        self.energy_slider = self._make_slider("Energy", 0, 100, 0)
+        style_form.addRow("Energy:", self.energy_slider)
 
         right_col.addWidget(style_group)
         top_row.addLayout(right_col, stretch=1)
@@ -174,20 +183,20 @@ class TTSPage(QWidget):
         log_layout.addWidget(self.log_edit)
         layout.addWidget(log_group)
 
-    def _make_slider(self, name: str) -> QSlider:
-        """Create a horizontal slider [-100, 100] mapped to [-1.0, 1.0]."""
+    def _make_slider(self, name: str, min_val: int, max_val: int, default: int) -> QSlider:
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(-100, 100)
-        slider.setValue(0)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default)
         slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        slider.setTickInterval(25)
+        slider.setTickInterval((max_val - min_val) // 4)
         return slider
 
     def _slider_value(self, slider: QSlider) -> float:
         return slider.value() / 100.0
 
     def _get_language(self) -> str:
-        return "ja" if self.language_combo.currentIndex() == 0 else "en"
+        idx = self.language_combo.currentIndex()
+        return ["ja", "en", "zh", "ko"][idx]
 
     def append_log(self, text: str) -> None:
         self.log_edit.append(text)
@@ -197,26 +206,26 @@ class TTSPage(QWidget):
     def _on_browse_speaker(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Speaker File", "",
-            "Speaker Files (*.tmrvc_speaker);;All Files (*)",
+            "Speaker/NPY Files (*.tmrvc_speaker *.npy);;All Files (*)",
         )
         if path:
             self.speaker_edit.setText(path)
 
-    def _on_browse_tts_ckpt(self) -> None:
+    def _on_browse_uclm_ckpt(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select TTS Checkpoint", "",
+            self, "Select UCLM Checkpoint", "",
             "PyTorch Checkpoint (*.pt);;All Files (*)",
         )
         if path:
-            self.tts_ckpt_edit.setText(path)
+            self.uclm_ckpt_edit.setText(path)
 
-    def _on_browse_vc_ckpt(self) -> None:
+    def _on_browse_codec_ckpt(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select VC Checkpoint", "",
+            self, "Select Codec Checkpoint", "",
             "PyTorch Checkpoint (*.pt);;All Files (*)",
         )
         if path:
-            self.vc_ckpt_edit.setText(path)
+            self.codec_ckpt_edit.setText(path)
 
     def _on_generate(self) -> None:
         text = self.text_edit.toPlainText().strip()
@@ -224,9 +233,10 @@ class TTSPage(QWidget):
             self.append_log("ERROR: No text entered.")
             return
 
-        tts_ckpt = self.tts_ckpt_edit.text().strip()
-        if not tts_ckpt:
-            self.append_log("ERROR: No TTS checkpoint selected.")
+        uclm_ckpt = self.uclm_ckpt_edit.text().strip()
+        codec_ckpt = self.codec_ckpt_edit.text().strip()
+        if not uclm_ckpt or not codec_ckpt:
+            self.append_log("ERROR: UCLM and Codec checkpoints required.")
             return
 
         self.append_log(f"Generating: \"{text[:50]}...\"")
@@ -236,15 +246,18 @@ class TTSPage(QWidget):
         config = {
             "text": text,
             "language": self._get_language(),
-            "tts_checkpoint": tts_ckpt,
-            "vc_checkpoint": self.vc_ckpt_edit.text().strip() or None,
+            "uclm_checkpoint": uclm_ckpt,
+            "codec_checkpoint": codec_ckpt,
             "speaker_file": self.speaker_edit.text().strip() or None,
             "speed": self.speed_spin.value(),
             "emotion": EMOTION_OPTIONS[self.emotion_combo.currentIndex()],
-            "valence": self._slider_value(self.valence_slider),
+            "breathiness": self._slider_value(self.breathiness_slider),
+            "tension": self._slider_value(self.tension_slider),
             "arousal": self._slider_value(self.arousal_slider),
+            "valence": self._slider_value(self.valence_slider),
+            "roughness": self._slider_value(self.roughness_slider),
+            "voicing": self._slider_value(self.voicing_slider),
             "energy": self._slider_value(self.energy_slider),
-            "pitch_range": self._slider_value(self.pitch_range_slider),
         }
 
         from tmrvc_gui.workers.tts_worker import TTSWorker
@@ -273,8 +286,6 @@ class TTSPage(QWidget):
             import sounddevice as sd
             sd.play(self._last_audio, self._last_sr)
             self.append_log("Playing audio...")
-        except ImportError:
-            self.append_log("ERROR: sounddevice not installed. Run: pip install sounddevice")
         except Exception as e:
             self.append_log(f"ERROR: Playback failed: {e}")
 

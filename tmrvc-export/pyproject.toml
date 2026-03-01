@@ -15,6 +15,9 @@ dependencies = [
 [project.scripts]
 tmrvc-export = "tmrvc_export.cli.export:main"
 tmrvc-enroll = "tmrvc_export.cli.enroll:main"
+tmrvc-export-uclm = "tmrvc_export.export_uclm:main"
+tmrvc-export-codec = "tmrvc_export.export_codec:main"
+tmrvc-export-speaker = "tmrvc_export.export_speaker:main"
 
 [build-system]
 requires = ["hatchling"]

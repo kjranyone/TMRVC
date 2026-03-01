@@ -7,7 +7,12 @@ import struct
 import numpy as np
 import pytest
 
-from tmrvc_core.constants import D_SPEAKER, D_STYLE, LORA_DELTA_SIZE, N_VOICE_SOURCE_PARAMS
+from tmrvc_core.constants import (
+    D_SPEAKER,
+    D_STYLE,
+    LORA_DELTA_SIZE,
+    N_VOICE_SOURCE_PARAMS,
+)
 from tmrvc_export.character_file import (
     CHECKSUM_SIZE,
     HEADER_SIZE,
@@ -57,7 +62,9 @@ class TestWriteRead:
             sample_arrays["lora_delta"],
         )
         spk, lora, vs, sty, prof = read_character_file(path)
-        np.testing.assert_array_equal(vs, np.zeros(N_VOICE_SOURCE_PARAMS, dtype=np.float32))
+        np.testing.assert_array_equal(
+            vs, np.zeros(N_VOICE_SOURCE_PARAMS, dtype=np.float32)
+        )
         np.testing.assert_array_equal(sty, np.zeros(D_STYLE, dtype=np.float32))
         assert prof["name"] == ""
         assert prof["language"] == "ja"
@@ -141,7 +148,7 @@ class TestFromSpeakerFile:
         write_speaker_file(
             spk_path,
             sample_arrays["spk_embed"],
-            sample_arrays["lora_delta"],
+            lora_delta=sample_arrays["lora_delta"],
             metadata={"profile_name": "TestSpk"},
         )
 

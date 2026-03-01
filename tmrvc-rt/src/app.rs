@@ -920,6 +920,13 @@ fn processor_thread(
                 gamma_articulation: gamma_articulation.load(Ordering::Relaxed),
                 voice_source_alpha: voice_source_alpha.load(Ordering::Relaxed),
                 latency_quality_q: latency_quality_q.load(Ordering::Relaxed),
+                pitch_shift: 0.0,
+                cfg_scale: 1.0,
+                temperature_a: 1.0,
+                temperature_b: 1.0,
+                top_k_a: 50,
+                top_k_b: 20,
+                voice_state: [0.5f32; 8],
             };
             engine.process_one_frame(&input_buf, &mut output_buf, &frame_params);
             let frame_ms = status.inference_ms.load(Ordering::Relaxed);

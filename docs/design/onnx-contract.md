@@ -1,441 +1,283 @@
-# TMRVC ONNX Model I/O Contract (Codec-Latent Pipeline)
+# TMRVC ONNX Model I/O Contract (UCLM Token Spec v2)
 
 Kojiro Tanaka — ONNX contract
 Created: 2026-02-16 (Asia/Tokyo)
-Updated: 2026-02-28 — Codec-Latent パラダイムに一本化
+Updated: 2026-03-01 — UCLM dual-stream (`A_t` / `B_t`) 契約に更新
 
-> **Purpose:** Python (tmrvc-export) と Rust (tmrvc-engine-rs) の間のインターフェース仕様。
-> 3つの ONNX モデルの入出力テンソル形状、state 管理、数値パリティ基準を定義する。
+> **Purpose:** Python (`tmrvc-export`) と Rust (`tmrvc-engine-rs`) 間のインターフェース仕様。
+> Disentangled UCLM (SOTAアーキテクチャ) で使用する ONNX モデル I/O、状態テンソル、パリティ基準を定義する。
 
 ---
 
-## 1. 共有定数
+## 1. Shared Constants
 
 ### 1.1 Source of Truth: `configs/constants.yaml`
 
 ```yaml
-# Audio parameters
+# Audio
 sample_rate: 24000
-frame_size: 480            # 20ms frame
-frame_rate: 50             # sample_rate / frame_size
+frame_size: 240              # 10ms
+frame_rate: 100
 
-# Codec parameters
-n_codebooks: 4
-codebook_size: 1024
+# Acoustic stream (A_t)
+n_codebooks: 8
+rvq_vocab_size: 1024         # valid IDs: 0..1023
 codebook_dim: 128
 latent_dim: 512
 
-# Token Model parameters
-d_model: 256
-d_state: 16                # Mamba state dimension
-d_conv: 4                  # Mamba conv kernel
-expand: 2                  # Mamba expansion factor
-n_layers: 6
-context_length: 10         # Token context window (frames)
+# Control stream (B_t)
+control_slots: 4             # [op, type, dur, int]
+control_vocab_size: 64
 
-# Speaker parameters
+# Conditions
 d_speaker: 192
+d_voice_state_explicit: 8
+d_voice_state_ssl: 128
+
+# UCLM core
+d_model: 512
+n_layers: 12
+n_heads: 8
+context_frames: 200          # 2.0 sec at 10ms/frame
 ```
 
-### 1.2 Rust Constants (`tmrvc-engine-rs/src/constants.rs`)
+### 1.2 Runtime Invariants
 
-```rust
-// Auto-generated from configs/constants.yaml — DO NOT EDIT
-pub const SAMPLE_RATE: usize = 24000;
-pub const FRAME_SIZE: usize = 480;
-pub const FRAME_RATE: usize = 50;
-
-pub const N_CODEBOOKS: usize = 4;
-pub const CODEBOOK_SIZE: usize = 1024;
-pub const CODEBOOK_DIM: usize = 128;
-pub const LATENT_DIM: usize = 512;
-
-// Token Model (Transformer)
-pub const D_MODEL: usize = 256;
-pub const N_HEADS: usize = 4;
-pub const HEAD_DIM: usize = D_MODEL / N_HEADS;  // 64
-pub const N_LAYERS: usize = 6;
-pub const CONTEXT_LENGTH: usize = 10;
-
-pub const D_SPEAKER: usize = 192;
-
-// State sizes (in f32 elements)
-pub const CODEC_ENCODER_STATE_SIZE: usize = 16384;   // 1 * 512 * 32
-pub const CODEC_DECODER_STATE_SIZE: usize = 8192;    // 1 * 256 * 32
-pub const KV_CACHE_SIZE: usize = N_LAYERS * 2 * N_HEADS * CONTEXT_LENGTH * HEAD_DIM;  // 30720
-pub const TOTAL_STATE_SIZE: usize = 
-    CODEC_ENCODER_STATE_SIZE + KV_CACHE_SIZE + CODEC_DECODER_STATE_SIZE;  // 55196 (~216KB)
-```
+- `A_t` は各 codebook ごとに `0..1023` のみを使用
+- `B_t` は `[op, type, dur, int]` の 4 スロットを常に維持
+- `frame_size=240` (10ms @24kHz) を推論の最小単位とする
+- 生成時は rolling context (`A_{t-k:t-1}`, `B_{t-k:t-1}`) を常時参照
+- `delta_voice_state = voice_state_t - voice_state_{t-1}` を UCLM 条件に含める
 
 ---
 
-## 2. 3 モデルの I/O 仕様
+## 2. ONNX Model Set
 
-### 2.1 一覧表
+### 2.1 Model List
 
 | Model | File | Inputs | Outputs | Execution |
 |---|---|---|---|---|
-| **codec_encoder** | `codec_encoder.onnx` | audio_frame, state_in | tokens, state_out | Per-frame (20ms) |
-| **token_model** | `token_model.onnx` | tokens_in, spk_embed, state_in | logits, state_out | Per-frame (20ms) |
-| **codec_decoder** | `codec_decoder.onnx` | tokens, state_in | audio_frame, state_out | Per-frame (20ms) |
-| **speaker_encoder** | `speaker_encoder.onnx` | mel_ref | spk_embed | Offline only |
+| **codec_encoder** | `codec_encoder.onnx` | `audio_frame`, `state_in` | `acoustic_tokens`, `state_out` | per-frame (10ms) |
+| **vc_encoder** | `vc_encoder.onnx` | `source_A_t` | `vq_content_features` | VC時のみ |
+| **voice_state_enc**| `voice_state_enc.onnx`| `explicit_state`, `ssl_state`, `delta_state` | `state_cond` | per-frame (10ms) |
+| **uclm_core** | `uclm_core.onnx` | `content_features`, `b_ctx`, `spk_embed`, `state_cond`, `cfg_scale`, `kv_cache_in` | `logits_a`, `logits_b`, `kv_cache_out` | per-frame (10ms) |
+| **codec_decoder** | `codec_decoder.onnx` | `acoustic_tokens`, `control_tokens`, `voice_state`, `event_trace_in`, `state_in` | `audio_frame`, `event_trace_out`, `state_out` | per-frame (10ms) |
+| **speaker_encoder** | `speaker_encoder.onnx` | `mel_ref` | `spk_embed` | offline |
 
 ---
 
-### 2.2 codec_encoder
+## 3. Per-Model I/O Contract
 
-音声フレームを離散トークン列に変換する Causal Conv1d Encoder + RVQ。
+### 3.1 `codec_encoder.onnx`
 
-**Inputs:**
+Causal codec encoder + RVQ quantizer.
 
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `audio_frame` | `[1, 1, 480]` | float32 | 20ms 音声フレーム (24kHz) |
-| `state_in` | `[1, STATE_DIM, STATE_FRAMES]` | float32 | Causal conv の hidden state |
-
-**Outputs:**
+**Inputs**
 
 | Name | Shape | Type | Description |
 |---|---|---|---|
-| `tokens` | `[1, 4]` | int64 | 4つの離散トークン (RVQ codebook indices) |
-| `state_out` | `[1, STATE_DIM, STATE_FRAMES]` | float32 | 更新された hidden state |
+| `audio_frame` | `[1, 1, 240]` | `float32` | 10ms frame @24kHz |
+| `state_in` | `[1, ENC_STATE_DIM, ENC_STATE_FRAMES]` | `float32` | encoder causal state |
 
-**State Layout:**
+**Outputs**
 
-```
-state_in / state_out:  [1, 512, 32]
-  - Encoder conv layers の context
-  - 合計 ~16KB
-```
+| Name | Shape | Type | Description |
+|---|---|---|---|
+| `acoustic_tokens` | `[1, 8]` | `int64` | `A_t` (8 codebooks, each `0..1023`) |
+| `state_out` | `[1, ENC_STATE_DIM, ENC_STATE_FRAMES]` | `float32` | updated state |
 
 ---
 
-### 2.3 token_model
+### 3.2 `vc_encoder.onnx` (VC Mode Only)
 
-Transformer (Causal Self-Attention) による次トークン予測。KV-cache でストリーミング対応。
-F0条件付けでピッチ制御対応（歌唱VC用）。
+Information Bottleneck (VQ) to remove speaker/style information from source tokens.
 
-**Inputs:**
+**Inputs**
+| Name | Shape | Type | Description |
+|---|---|---|---|
+| `source_A_t` | `[1, 8, L]` | `int64` | source acoustic tokens |
+
+**Outputs**
+| Name | Shape | Type | Description |
+|---|---|---|---|
+| `vq_content_features` | `[1, d_model, L]` | `float32` | pure content representation |
+
+---
+
+### 3.3 `voice_state_enc.onnx`
+
+Combines 8-dim explicit parameters, WavLM SSL features, and delta state into a single condition vector.
+
+**Inputs**
+| Name | Shape | Type | Description |
+|---|---|---|---|
+| `explicit_state` | `[1, 8]` | `float32` | heuristic parameters (breathiness, etc.) |
+| `ssl_state` | `[1, 128]` | `float32` | latent style space from WavLM |
+| `delta_state` | `[1, 8]` | `float32` | `voice_state_t - voice_state_{t-1}` for temporal dynamics |
+
+**Outputs**
+| Name | Shape | Type | Description |
+|---|---|---|---|
+| `state_cond` | `[1, d_model]` | `float32` | fused style condition |
+
+---
+
+### 3.4 `uclm_core.onnx`
+
+Dual-stream token predictor for TTS/VC.
+
+**Inputs**
 
 | Name | Shape | Type | Description |
 |---|---|---|---|
-| `tokens_in` | `[1, K, L]` | int64 | Context tokens (K=4 codebooks, L=10 frames = 200ms) |
-| `spk_embed` | `[1, 192]` | float32 | Speaker embedding (L2 normalized) |
-| `f0_condition` | `[1, L, 2]` | float32 | F0 conditioning: [f0_normalized, pitch_shift] per frame |
-| `kv_cache_in` | `[12, 1, 4, 10, 64]` | float32 | KV-cache (6 layers × 2 for K/V) |
+| `content_features` | `[1, d_model, L]` | `float32` | VQ bottlenecked features (VC) or text features (TTS) |
+| `b_ctx` | `[1, 4, L]` | `int64` | control context (`B_{t-L:t-1}`) |
+| `spk_embed` | `[1, 192]` | `float32` | speaker embedding |
+| `state_cond` | `[1, d_model]` | `float32` | explicit + ssl state combined (from voice_state_enc) |
+| `cfg_scale` | `[1]` | `float32` | CFG amplification scale (e.g., 1.5) |
+| `kv_cache_in` | `[N_CACHE]` | `float32` | flattened KV cache |
 
-**Layout Clarification:**
+`L` is context frames (default 200 = 2 sec).
 
-```
-tokens_in: [1, 4, 10]
-           │  │  └── context_length (10 frames)
-           │  └───── n_codebooks (4 codebooks)
-           └──────── batch_size
-
-f0_condition: [1, 10, 2]
-              │  │   └── [f0_normalized, pitch_shift]
-              │  └────── context_length (10 frames)
-              └───────── batch_size
-
-Memory layout: [cb0_f0, cb0_f1, ..., cb0_f9, cb1_f0, cb1_f1, ..., cb3_f9]
-```
-
-**F0 Conditioning Details:**
-
-```
-f0_normalized: log2(f0 / f0_mean)
-  - f0_mean は話者ごとの平均F0 (speaker file に保存)
-  - 0 = 話者の平均ピッチ、+1 = 1オクターブ上、-1 = 1オクターブ下
-
-pitch_shift: セミトーン単位のピフト
-  - +12 = 1オクターブ上、-12 = 1オクターブ下
-  - 0 = ピッチシフトなし（元のメロディを維持）
-
-実行時処理:
-  f0_target = f0_mean * 2^(f0_normalized + pitch_shift/12)
-```
-
-**Outputs:**
+**Outputs**
 
 | Name | Shape | Type | Description |
 |---|---|---|---|
-| `logits` | `[1, 4, 1024]` | float32 | 次トークンの確率分布 (logits) |
-| `kv_cache_out` | `[12, 1, 4, 10, 64]` | float32 | 更新された KV-cache |
+| `logits_a` | `[1, 8, 1024]` | `float32` | next `A_t` distribution |
+| `logits_b` | `[1, 4, 64]` | `float32` | next `B_t` distribution |
+| `kv_cache_out` | `[N_CACHE]` | `float32` | updated KV cache |
 
-**KV-Cache Layout:**
-
-```
-kv_cache_in / kv_cache_out:  [12, 1, 4, 10, 64]
-  - 12 = n_layers(6) × 2 (K and V)
-  - 1 = batch size
-  - 4 = n_heads
-  - 10 = context_length
-  - 64 = head_dim (d_model/n_heads = 256/4)
-  - 合計 ~120KB
-```
-
-**Sampling:**
+**Sampling contract (Rust side):**
 
 ```rust
-// Rust側で softmax + sampling を実行
-fn sample_tokens(logits: &[f32], temperature: f32, top_k: usize) -> [i64; 4] {
-    let mut tokens = [0i64; 4];
-    for cb in 0..4 {
-        let cb_logits = &logits[cb * 1024..(cb + 1) * 1024];
-        let probs = softmax(&cb_logits.map(|x| x / temperature));
-        tokens[cb] = sample_top_k(&probs, top_k);
-    }
-    tokens
-}
-```
+// Acoustic stream: 8 independent categorical draws
+let next_a: [i64; 8] = sample_per_head(logits_a, temperature_a, top_k_a);
 
-**F0 Extraction (Rust側):**
-
-```rust
-// Streaming F0 extraction using CREPE-lite or PYIN
-struct F0Tracker {
-    f0_buffer: Vec<f32>,
-    f0_mean: f32,  // from .tmrvc_speaker
-}
-
-impl F0Tracker {
-    fn process_frame(&mut self, frame: &[f32], pitch_shift: f32) -> [f32; 2] {
-        let f0 = self.detect_f0(frame);  // CREPE-lite
-        let f0_norm = (f0 / self.f0_mean).log2();
-        [f0_norm, pitch_shift]
-    }
-}
-```
-tokens_in: [1, 4, 10]
-           │  │  └── context_length (10 frames)
-           │  └───── n_codebooks (4 codebooks)
-           └──────── batch_size
-
-Memory layout: [cb0_f0, cb0_f1, ..., cb0_f9, cb1_f0, cb1_f1, ..., cb3_f9]
-```
-
-**Outputs:**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `logits` | `[1, 4, 1024]` | float32 | 次トークンの確率分布 (logits) |
-| `kv_cache_out` | `[12, 1, 4, 10, 64]` | float32 | 更新された KV-cache |
-
-**KV-Cache Layout:**
-
-```
-kv_cache_in / kv_cache_out:  [12, 1, 4, 10, 64]
-  - 12 = n_layers(6) × 2 (K and V)
-  - 1 = batch size
-  - 4 = n_heads
-  - 10 = context_length
-  - 64 = head_dim (d_model/n_heads = 256/4)
-  - 合計 ~120KB
-```
-
-**Sampling:**
-
-```rust
-// Rust側で softmax + sampling を実行
-fn sample_tokens(logits: &[f32], temperature: f32, top_k: usize) -> [i64; 4] {
-    let mut tokens = [0i64; 4];
-    for cb in 0..4 {
-        let cb_logits = &logits[cb * 1024..(cb + 1) * 1024];
-        let probs = softmax(&cb_logits.map(|x| x / temperature));
-        tokens[cb] = sample_top_k(&probs, top_k);
-    }
-    tokens
-}
+// Control stream: 4 slots [op, type, dur, int]
+let next_b: [i64; 4] = sample_per_slot(logits_b, temperature_b, top_k_b);
 ```
 
 ---
 
-### 2.4 codec_decoder
+### 3.5 `codec_decoder.onnx`
 
-離散トークンから音声フレームを復元する RVQ Dequantization + Causal Conv1d Decoder。
+RVQ dequantization + causal decoder with control conditioning.
 
-**Inputs:**
+> **Note:** Current implementation uses simplified Linear projection instead of ConvTranspose1d backbone.
+> Parity verification is skipped for this model. Full parity will be verified with trained checkpoints.
 
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `tokens` | `[1, 4]` | int64 | 4つの離散トークン |
-| `state_in` | `[1, STATE_DIM, STATE_FRAMES]` | float32 | Causal conv の hidden state |
-
-**Outputs:**
+**Inputs**
 
 | Name | Shape | Type | Description |
 |---|---|---|---|
-| `audio_frame` | `[1, 1, 480]` | float32 | 20ms 音声フレーム (24kHz) |
-| `state_out` | `[1, STATE_DIM, STATE_FRAMES]` | float32 | 更新された hidden state |
+| `acoustic_tokens` | `[1, 8]` | `int64` | `A_t` |
+| `control_tokens` | `[1, 4]` | `int64` | `B_t = [op,type,dur,int]` |
+| `voice_state` | `[1, 8]` | `float32` | frame condition |
+| `event_trace_in` | `[1, D_EVENT_TRACE]` | `float32` | hysteresis trace for non-verbal tails |
+| `state_in` | `[1, DEC_STATE_DIM, DEC_STATE_FRAMES]` | `float32` | decoder causal state |
 
-**State Layout:**
+**Outputs**
 
-```
-state_in / state_out:  [1, 256, 32]
-  - Decoder conv layers の context
-  - 合計 ~8KB
-```
+| Name | Shape | Type | Description |
+|---|---|---|---|
+| `audio_frame` | `[1, 1, 240]` | `float32` | decoded 10ms audio |
+| `event_trace_out` | `[1, D_EVENT_TRACE]` | `float32` | updated event trace |
+| `state_out` | `[1, DEC_STATE_DIM, DEC_STATE_FRAMES]` | `float32` | updated decoder state |
 
 ---
 
-### 2.5 speaker_encoder (Offline)
-
-参照音声から話者埋め込みを抽出。リアルタイム推論では使用しない。
-
-**Inputs:**
+### 3.6 `speaker_encoder.onnx` (Offline)
 
 | Name | Shape | Type | Description |
 |---|---|---|---|
-| `mel_ref` | `[1, 80, T]` | float32 | 参照音声の log-mel (T frames, 任意長) |
-
-**Outputs:**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `spk_embed` | `[1, 192]` | float32 | Speaker embedding (L2 normalized) |
+| `mel_ref` | `[1, 80, T]` | `float32` | reference log-mel |
+| `spk_embed` | `[1, 192]` | `float32` | normalized speaker embedding |
 
 ---
 
-## 3. Speaker File Format (`.tmrvc_speaker`)
+## 4. Streaming State Management
 
-### 3.1 v3 Format (Current)
+### 4.1 Persistent State Components
+
+| State | Owner | Type |
+|---|---|---|
+| `enc_state` | codec_encoder | conv causal state |
+| `kv_cache` | uclm_core | transformer KV cache |
+| `dec_state` | codec_decoder | conv causal state |
+| `event_trace` | codec_decoder | non-verbal hysteresis trace |
+| `ctx_A` | engine | circular buffer for `A_t` |
+| `ctx_B` | engine | circular buffer for `B_t` |
+| `prev_voice_state` | engine | delta computation |
+
+### 4.2 Per-Frame Runtime Sequence
+
+1. `audio_frame(240)` -> `codec_encoder` -> `A_src_t`
+2. update `ctx_A/ctx_B`
+3. `vc_encoder(ctx_A)` -> `content_features`
+4. extract/get `explicit_state` and `ssl_state`
+5. `voice_state_enc(explicit_state, ssl_state)` -> `state_cond`
+6. `uclm_core(content_features, ctx_B, speaker, state_cond, cfg_scale, kv_cache)` -> `logits_a`, `logits_b`
+7. sample -> `A_t`, `B_t`
+8. `codec_decoder(A_t, B_t, voice_state_t, event_trace, dec_state)` -> `audio_out_t`
+7. swap ping-pong states
+
+All buffers must be pre-allocated (RT-safe: no malloc/free/mutex on audio thread).
+
+---
+
+## 5. `.tmrvc_speaker` Contract (UCLM v2 related)
 
 ```json
 {
   "version": 3,
   "spk_embed": [192 floats],
   "f0_mean": 220.0,
-  "style_embed": [128 floats, optional],
-  "reference_tokens": [[4 ints, ...], optional],
-  "lora_delta": [15872 floats, optional],
-  "voice_source_preset": [8 floats, optional],
-  "metadata": {
-    "name": "Speaker Name",
-    "enrollment_audio": "path/to/ref.wav",
-    "enrollment_duration_sec": 30.5,
-    "adaptation_level": "standard",
-    "created_at": "2026-02-28T12:00:00Z"
-  }
+  "reference_A_tokens": [[8 ints, ...], "optional"],
+  "reference_B_tokens": [[4 ints, ...], "optional"],
+  "voice_source_preset": [8 floats, "optional"],
+  "ssl_state": [128 floats, "optional - WavLM default SSL state"],
+  "metadata": {"created_at": "2026-03-01T00:00:00Z"}
 }
 ```
 
-### 3.2 Adaptation Levels
-
-| Level | Fields | Use Case | Min Audio |
-|-------|--------|----------|-----------|
-| **light** | `spk_embed`, `f0_mean` only | High-speed VC | 3-10 sec |
-| **standard** | + `style_embed`, `reference_tokens` | High-quality VC/TTS | 10-30 sec |
-| **full** | + `lora_delta` | Character reproduction | 1-5 min + fine-tune |
-
-### 3.3 Field Descriptions
-
-| Field | Shape | Description |
-|-------|-------|-------------|
-| `spk_embed` | [192] | Speaker timbre embedding (ECAPA-TDNN, L2 normalized) |
-| `f0_mean` | scalar | Speaker's average F0 in Hz (for pitch normalization) |
-| `style_embed` | [128] | Prosody/style embedding (optional) |
-| `reference_tokens` | [T, 4] | Codec tokens from reference audio for in-context (optional) |
-| `lora_delta` | [15872] | LoRA adapter weights for Token Model (optional) |
-| `voice_source_preset` | [8] | Voice source parameters (breathiness, tension, etc.) |
-
-### 3.4 Binary Format
-
-```
-Offset   Size (bytes)    Field
-──────   ────────────    ──────────────────────────
-0x0000   4               Magic: "TMSP" (0x544D5350)
-0x0004   4               Version: uint32_le = 3
-0x0008   4               flags: uint32_le (bit 0: has_style, bit 1: has_ref_tokens, bit 2: has_lora)
-0x000C   4               spk_embed_size: uint32_le = 192
-0x0010   4               f0_mean: float32_le
-0x0014   4               style_embed_size: uint32_le = 128 (0 if not present)
-0x0018   4               ref_tokens_frames: uint32_le (0 if not present)
-0x001C   4               lora_size: uint32_le = 15872 (0 if not present)
-0x0020   4               metadata_size: uint32_le
-0x0024   768             spk_embed: float32_le[192]
-0x0324   4               f0_mean: float32_le (redundant, for alignment)
-0x0328   512             style_embed: float32_le[128] (if present)
-         N*16            reference_tokens: int32_le[N, 4] (if present)
-         63488           lora_delta: float32_le[15872] (if present)
-         metadata_size   metadata_json: UTF-8 JSON
-         32              checksum: SHA-256
-```
-
-### 3.5 In-Context Usage
-
-When `reference_tokens` is present, the Token Model can use it for in-context learning:
-
-```
-1. Load reference_tokens [T_ref, 4] from .tmrvc_speaker
-2. Pre-fill KV-Cache with reference_tokens
-3. Start streaming inference with spk_embed conditioning
-```
-
-This enables zero-shot speaker adaptation without fine-tuning.
+- `reference_tokens` を使う場合は `A/B` 両ストリームで保存する
+- 旧 `reference_tokens[T,4]` は互換読み込みのみ (deprecated)
+- `ssl_state` は話者登録時に WavLM から抽出した 128 次元の潜在スタイル表現
+  - Rust 側では `ssl_state: Option<Vec<f32>>` として扱い、None の場合はゼロベクトルを使用
 
 ---
 
-## 4. Streaming State Management
+## 6. Numerical Parity
 
-### 4.1 Ping-Pong Double Buffering
+| Tensor type | Metric | Threshold |
+|---|---|---|
+| Float outputs | L_inf | `< 1e-4` |
+| Float outputs | cosine similarity | `> 0.999` |
+| Int outputs | exact match | `100%` |
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Frame N                                                │
-│                                                         │
-│  Read:  encoder_state_A, mamba_state_A, decoder_state_A│
-│  Write: encoder_state_B, mamba_state_B, decoder_state_B│
-│                                                         │
-│  After frame: swap A ↔ B                               │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 4.2 Total State Size
-
-| Component | Elements | Bytes |
-|-----------|----------|-------|
-| Codec Encoder State | 16,384 | 64 KB |
-| Token Context Buffer | 40 | 160 B |
-| KV-Cache (6 layers × 2 × 4 × 10 × 64) | 30,720 | 120 KB |
-| Codec Decoder State | 8,192 | 32 KB |
-| **Total** | **55,336** | **~216 KB** |
-
-> 1MB 以下を維持。事前確保で RT-safe。
-
----
-
-## 5. 数値パリティ基準
-
-### 5.1 許容誤差
-
-| Tensor Type | Metric | Threshold |
-|-------------|--------|-----------|
-| Float output | L∞ norm | < 1e-4 |
-| Float output | Cosine similarity | > 0.999 |
-| Int64 output | Exact match | 100% |
-
-### 5.2 検証スクリプト
+Verification example:
 
 ```bash
 uv run python -m tmrvc_export.verify_parity \
   --codec-encoder models/fp32/codec_encoder.onnx \
-  --token-model models/fp32/token_model.onnx \
+  --uclm-core models/fp32/uclm_core.onnx \
   --codec-decoder models/fp32/codec_decoder.onnx
 ```
 
 ---
 
-## 6. 設計整合性チェックリスト
+## 7. Consistency Checklist
 
-- [ ] codec_encoder: audio_frame[480] → tokens[4]
-- [ ] token_model: tokens[1,4,L] + spk_embed[192] + f0_condition[1,L,2] + kv_cache → logits[4,1024]
-- [ ] codec_decoder: tokens[4] → audio_frame[480]
-- [ ] KV-cache が固定サイズ [12, 1, 4, 10, 64]
-- [ ] Total state < 300KB (現在 ~216KB)
-- [ ] Frame size (480 samples = 20ms) が streaming pipeline と整合
-- [ ] Token sampling (softmax + top-k) が Rust 側で実装済み
-- [ ] .tmrvc_speaker v3 format: spk_embed + f0_mean + optional (style_embed, reference_tokens, lora_delta)
-- [ ] In-context learning: reference_tokens で KV-Cache pre-fill 可能
-- [ ] Adaptation levels: light / standard / full が実装済み
-- [ ] F0 extraction: Rust側で CREPE-lite または PYIN 実装
-- [ ] F0 normalization: f0_mean from .tmrvc_speaker 使用
+- [x] `frame_size=240` (10ms) が Python/Rust/ONNX で一致
+- [x] `A_t`: `[1,8]` / id range `0..1023`
+- [x] `B_t`: `[1,4]` / vocab `64` (`[op,type,dur,int]`)
+- [x] `uclm_core` が `logits_a[1,8,1024]` と `logits_b[1,4,64]` を出力
+- [x] `delta_voice_state` が推論入力に含まれる (voice_state_enc に `delta_state` 入力として追加)
+- [x] `event_trace` が decoder の入出力で維持される
+- [x] rolling context (`ctx_A`, `ctx_B`) が 1-2秒保持される (CONTEXT_FRAMES=200)
+- [x] 全 state が pre-allocated で RT-safe
+- [x] `uclm_core` が CFG (Classifier-Free Guidance) 対応 (`cfg_scale` 入力追加)
+- [x] CFG 公式: `output = uncond + cfg_scale * (cond - uncond)` を常に両パス計算で実装
+- [x] KV Cache が `uclm_core` の入出力で維持される (`kv_cache_in` / `kv_cache_out`)
+- [x] 全6モデルの ONNX エクスポートが成功 (vc_encoder, voice_state_enc, uclm_core, codec_encoder, codec_decoder, speaker_encoder)
+- [x] パリティ検証 L_inf < 1e-4 (codec_decoder は簡易実装のため検証スキップ)

@@ -1,6 +1,7 @@
 # データ取得・前処理ガイド
 
 本ドキュメントは TMRVC の学習に必要な全データセットの取得・前処理手順をまとめた再現性ガイドである。
+Updated: 2026-03-01 (UCLM v2)
 
 ---
 
@@ -82,7 +83,7 @@ data/
 
 ```bash
 # 自動ダウンロード
-uv run python scripts/download_vctk.py --output-dir data/raw
+uv run python scripts/data/download_datasets.py --dataset vctk --output-dir data/raw
 
 # 展開先: data/raw/VCTK-Corpus-0.92/
 # datasets.yaml の raw_dir: data/raw/VCTK-Corpus
@@ -193,7 +194,7 @@ data/raw/libritts_r/
 
 ```bash
 # 自動ダウンロード
-uv run python scripts/download_datasets.py --dataset jsut --output-dir data/raw
+uv run python scripts/data/download_datasets.py --dataset jsut --output-dir data/raw
 
 # 展開先: data/raw/jsut/
 ```
@@ -210,7 +211,7 @@ uv run python scripts/download_datasets.py --dataset jsut --output-dir data/raw
 
 ```bash
 # 自動ダウンロード
-uv run python scripts/download_datasets.py --dataset ljspeech --output-dir data/raw
+uv run python scripts/data/download_datasets.py --dataset ljspeech --output-dir data/raw
 
 # 展開先: data/raw/ljspeech/
 ```
@@ -259,7 +260,7 @@ uv run python scripts/download_datasets.py --dataset ljspeech --output-dir data/
 
 ```bash
 # ダウンロード案内の表示
-uv run python scripts/download_datasets.py --dataset jvnv --output-dir data/raw
+uv run python scripts/data/download_datasets.py --dataset jvnv --output-dir data/raw
 ```
 
 **ディレクトリ構造:**
@@ -354,12 +355,12 @@ datasets:
 
 ```bash
 # 全有効データセットの前処理
-uv run python scripts/prepare_datasets.py \
+uv run python scripts/data/prepare_datasets.py \
   --config configs/datasets.yaml \
   --device xpu
 
 # 特定データセットのみ
-uv run python scripts/prepare_datasets.py \
+uv run python scripts/data/prepare_datasets.py \
   --config configs/datasets.yaml \
   --datasets vctk jvs \
   --device xpu
@@ -382,16 +383,43 @@ uv run tmrvc-preprocess \
 | `spk_embed.npy` | `[192]` | 話者埋め込み (ECAPA-TDNN) |
 | `meta.json` | — | メタデータ (speaker_id, n_frames, content_dim 等) |
 
-### 5.2 Phase 1a 移行 (ContentVec 768d → WavLM 1024d)
+### 5.2 UCLM v2 用 token 追加
 
 ```bash
-bash scripts/preprocess_phase1a.sh --device xpu
-
-# 古いキャッシュを削除してから再生成
-bash scripts/preprocess_phase1a.sh --device xpu --clean-old
+uv run python scripts/annotate/add_codec_to_cache.py \
+  --cache-dir data/cache/vctk/train \
+  --raw-dir data/raw/wav48_silence_trimmed \
+  --speaker vctk_p225 \
+  --device xpu
 ```
 
-### 5.3 強制アラインメント (TTS 用)
+> 現行 `add_codec_to_cache.py` は speaker 単位実行。全話者処理は話者一覧でループする。
+> 現行実装で確実に生成されるのは `codec_tokens.npy` / `voice_state.npy`。下表は UCLM v2 目標スキーマ。
+
+**追加されるキャッシュ:**
+
+| ファイル | 形状 | 内容 |
+|---|---|---|
+| `acoustic_tokens.npy` | `[8, T]` | `A_t` acoustic stream |
+| `control_tokens.npy` | `[4, T]` | `B_t = [op,type,dur,int]` |
+| `voice_state.npy` | `[T, 8]` | 連続状態 |
+| `delta_voice_state.npy` | `[T, 8]` | 状態差分 |
+
+### 5.3 Phase 1a 移行 (ContentVec 768d → WavLM 1024d, Legacy)
+
+```bash
+uv run python scripts/data/prepare_datasets.py \
+  --config configs/datasets.yaml \
+  --device xpu
+
+# 古いキャッシュを削除してから再生成
+rm -rf data/cache/vctk data/cache/jvs data/cache/tsukuyomi data/cache/libritts_r
+uv run python scripts/data/prepare_datasets.py \
+  --config configs/datasets.yaml \
+  --device xpu
+```
+
+### 5.4 強制アラインメント (TTS 用)
 
 TTS 学習にはテキストと音素レベルのデュレーション情報が必要。
 
@@ -428,14 +456,14 @@ mfa align data/raw/ljspeech/wavs/ english_mfa english_mfa data/alignments/ljspee
 
 ```bash
 # TextGrid がある場合 (MFA 実行済み)
-uv run python scripts/run_forced_alignment.py \
+uv run python scripts/annotate/run_forced_alignment.py \
   --cache-dir data/cache \
   --dataset jsut \
   --language ja \
   --textgrid-dir data/alignments/jsut
 
 # TextGrid がない場合 (G2P ヒューリスティック、均等分割)
-uv run python scripts/run_forced_alignment.py \
+uv run python scripts/annotate/run_forced_alignment.py \
   --cache-dir data/cache \
   --dataset jsut \
   --language ja
@@ -447,25 +475,25 @@ uv run python scripts/run_forced_alignment.py \
 
 ```bash
 # Expresso
-uv run python scripts/preprocess_emotion.py \
+uv run python scripts/annotate/preprocess_emotion.py \
   --dataset expresso \
   --raw-dir data/raw/expresso \
   --cache-dir data/cache
 
 # JVNV
-uv run python scripts/preprocess_emotion.py \
+uv run python scripts/annotate/preprocess_emotion.py \
   --dataset jvnv \
   --raw-dir data/raw/jvnv \
   --cache-dir data/cache
 
 # EmoV-DB
-uv run python scripts/preprocess_emotion.py \
+uv run python scripts/annotate/preprocess_emotion.py \
   --dataset emov_db \
   --raw-dir data/raw/EmoV-DB \
   --cache-dir data/cache
 
 # RAVDESS
-uv run python scripts/preprocess_emotion.py \
+uv run python scripts/annotate/preprocess_emotion.py \
   --dataset ravdess \
   --raw-dir data/raw/ravdess \
   --cache-dir data/cache
@@ -573,30 +601,40 @@ cat data/cache/_manifests/vctk_train.json
 
 ---
 
-## 9. 一括実行リファレンス
+## 9. 一括実行リファレンス (UCLM v2)
 
-### VC 学習用 (最小構成: Phase 0)
+### UCLM 学習用 (最小構成)
 
 ```bash
 # 1. データ取得
-uv run python scripts/download_vctk.py --output-dir data/raw
+uv run python scripts/data/download_datasets.py --dataset vctk --output-dir data/raw
 # JVS: 手動ダウンロード → data/raw/jvs_corpus/
 
 # 2. datasets.yaml を編集 (vctk, jvs を enabled: true に)
 
 # 3. 前処理
-uv run python scripts/prepare_datasets.py \
+uv run python scripts/data/prepare_datasets.py \
   --config configs/datasets.yaml --device xpu
 
-# 4. 学習開始
-uv run tmrvc-train-teacher --cache-dir data/cache --phase 0 --device xpu
+# 4. UCLM v2 用 token 追加
+uv run python scripts/annotate/add_codec_to_cache.py \
+  --cache-dir data/cache/vctk/train \
+  --raw-dir data/raw/wav48_silence_trimmed \
+  --speaker vctk_p225 \
+  --device xpu
+
+# 5. 学習開始
+uv run tmrvc-train-uclm \
+  --cache-dir data/cache \
+  --datasets vctk jvs \
+  --device xpu
 ```
 
 ### TTS 学習用 (Phase 2)
 
 ```bash
 # 1. TTS データ取得
-uv run python scripts/download_datasets.py --all --output-dir data/raw
+uv run python scripts/data/download_datasets.py --all --output-dir data/raw
 
 # 2. 前処理
 uv run tmrvc-preprocess --dataset jsut --raw-dir data/raw/jsut \
@@ -605,13 +643,28 @@ uv run tmrvc-preprocess --dataset ljspeech --raw-dir data/raw/ljspeech \
   --cache-dir data/cache --device xpu
 
 # 3. 強制アラインメント (MFA or G2P ヒューリスティック)
-uv run python scripts/run_forced_alignment.py \
+uv run python scripts/annotate/run_forced_alignment.py \
   --cache-dir data/cache --dataset jsut --language ja
-uv run python scripts/run_forced_alignment.py \
+uv run python scripts/annotate/run_forced_alignment.py \
   --cache-dir data/cache --dataset ljspeech --language en
 
-# 4. TTS 学習
-uv run tmrvc-train-tts --cache-dir data/cache --device xpu
+# 4. UCLM v2 用 token 追加
+uv run python scripts/annotate/add_codec_to_cache.py \
+  --cache-dir data/cache/jsut/train \
+  --raw-dir data/raw/jsut \
+  --speaker jsut_<speaker_id> \
+  --device xpu
+uv run python scripts/annotate/add_codec_to_cache.py \
+  --cache-dir data/cache/ljspeech/train \
+  --raw-dir data/raw/ljspeech \
+  --speaker ljspeech_<speaker_id> \
+  --device xpu
+
+# 5. 学習
+uv run tmrvc-train-uclm \
+  --cache-dir data/cache \
+  --datasets jsut ljspeech \
+  --device xpu
 ```
 
 ### 感情 TTS 学習用 (Phase 3)
@@ -625,7 +678,7 @@ uv run tmrvc-train-tts --cache-dir data/cache --device xpu
 
 # 2. 感情前処理
 for ds in expresso jvnv emov_db ravdess; do
-  uv run python scripts/preprocess_emotion.py \
+  uv run python scripts/annotate/preprocess_emotion.py \
     --dataset $ds --raw-dir data/raw/$ds --cache-dir data/cache
 done
 

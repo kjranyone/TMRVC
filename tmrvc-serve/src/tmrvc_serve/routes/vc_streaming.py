@@ -39,9 +39,13 @@ _engine_pool: VCEnginePool | None = None
 def get_engine_pool() -> VCEnginePool:
     global _engine_pool
     if _engine_pool is None:
-        model_dir = Path("models/fp32")
+        # Default paths for UCLM v2
+        uclm_path = Path("checkpoints/uclm/uclm_latest.pt")
+        codec_path = Path("checkpoints/codec/codec_latest.pt")
+        
         _engine_pool = VCEnginePool(
-            model_dir=model_dir,
+            uclm_checkpoint=uclm_path,
+            codec_checkpoint=codec_path,
             max_concurrent_sessions=20,
             max_gpu_inference=2,
             session_timeout_sec=300.0,
@@ -54,7 +58,7 @@ def get_engine_pool() -> VCEnginePool:
 @router.on_event("startup")
 async def startup():
     get_engine_pool()
-    logger.info("VC engine pool initialized")
+    logger.info("UCLM VC engine pool initialized")
 
 
 @router.on_event("shutdown")
@@ -67,9 +71,6 @@ async def shutdown():
 @router.get("/stats")
 async def vc_stats(ctx: AuthContext):
     """Get engine pool statistics (enterprise/admin only)."""
-    from tmrvc_serve.auth import UserRole
-    from fastapi import HTTPException
-
     if ctx.role not in (UserRole.ADMIN, UserRole.ENTERPRISE):
         raise HTTPException(status_code=403, detail="Enterprise or admin role required")
 
@@ -86,15 +87,13 @@ async def vc_stream(
     websocket: WebSocket,
     api_key: str | None = Query(None, description="API key for authentication"),
 ):
-    """Real-time VC streaming with session isolation.
-
-    Authentication via query param (WebSocket limitation).
+    """Real-time VC streaming with session isolation (UCLM v2).
 
     Protocol:
     1. Client sends: [192 float32 spk_embed]
     2. Server responds: [8 bytes session_id] or error
     3. Client sends: [N float32 audio chunks]
-    4. Server sends: [480 float32 audio frames]
+    4. Server sends: [240 float32 audio frames] (10ms)
     """
     await websocket.accept()
 
@@ -157,7 +156,7 @@ async def vc_stream(
         logger.info("Session %s started (tenant=%s)", session_id, key_meta.tenant_id)
 
         audio_buffer = np.array([], dtype=np.float32)
-        FRAME_SIZE = 480
+        FRAME_SIZE = 240 # 10ms @ 24kHz
 
         while True:
             try:
@@ -179,6 +178,7 @@ async def vc_stream(
                     pool.process_frame,
                     session,
                     frame,
+                    None, # Default StyleParams
                 )
 
                 total_audio_seconds += FRAME_SIZE / 24000
@@ -202,83 +202,3 @@ async def vc_stream(
 
         limiter.end_session(key_meta.tenant_id, total_audio_seconds)
         store.record_usage(api_key, total_audio_seconds)
-
-
-@router.get("/keys")
-async def list_api_keys(ctx: AuthContext):
-    """List API keys for tenant (admin only)."""
-    from tmrvc_serve.auth import get_key_store, require_role, UserRole
-
-    # Check role manually since AuthContext doesn't enforce it
-    if ctx.role not in (UserRole.ADMIN,):
-        from fastapi import HTTPException, status
-
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Role {ctx.role} not authorized",
-        )
-
-    store = get_key_store()
-    keys = store.get_tenant_keys(ctx.tenant_id)
-
-    return {
-        "keys": [
-            {
-                "prefix": k.key_prefix,
-                "role": k.role.value,
-                "enabled": k.enabled,
-                "created_at": k.created_at,
-                "expires_at": k.expires_at,
-                "total_requests": k.total_requests,
-                "total_audio_seconds": k.total_audio_seconds,
-            }
-            for k in keys
-        ]
-    }
-
-
-@router.post("/keys")
-async def create_api_key(
-    ctx: AuthContext,
-    user_id: str = Query(...),
-    role: UserRole = Query(UserRole.PRO),
-    expires_days: int | None = Query(None),
-):
-    """Create new API key (admin only)."""
-    from tmrvc_serve.auth import get_key_store, UserRole
-    from fastapi import HTTPException, status
-
-    if ctx.role != UserRole.ADMIN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required"
-        )
-
-    store = get_key_store()
-    api_key = store.create_key(
-        tenant_id=ctx.tenant_id,
-        user_id=user_id,
-        role=role,
-        expires_days=expires_days,
-    )
-
-    return {"api_key": api_key, "role": role.value}
-
-
-@router.delete("/keys/{key_prefix}")
-async def revoke_api_key(
-    key_prefix: str,
-    ctx: AuthContext,
-):
-    """Revoke API key (admin only)."""
-    from tmrvc_serve.auth import get_key_store, UserRole
-
-    if ctx.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Admin role required")
-
-    store = get_key_store()
-    success = store.revoke_key(key_prefix)
-
-    if not success:
-        raise HTTPException(status_code=404, detail="API key not found")
-
-    return {"revoked": key_prefix}

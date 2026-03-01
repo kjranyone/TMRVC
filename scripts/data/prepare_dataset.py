@@ -264,11 +264,13 @@ def extract_features(
         np.ndarray,
         np.ndarray | None,
         np.ndarray | None,
+        np.ndarray | None,
     ]
     | None
 ):
-    """Extract mel, content, f0, spk_embed, codec_tokens, voice_state."""
+    """Extract mel, content, f0, spk_embed, codec_tokens, explicit_state, ssl_state."""
     from tmrvc_core.audio import compute_mel
+    import torchaudio.transforms as T
 
     try:
         waveform_t = torch.from_numpy(waveform).float()
@@ -299,19 +301,27 @@ def extract_features(
             except Exception as e:
                 logger.debug("Codec encoding failed: %s", e)
 
-        # Voice state (NEW)
-        voice_state = None
+        # Voice state (explicit & SSL)
+        explicit_state = None
+        ssl_state = None
         if voice_state_estimator is not None and codec_tokens is not None:
             try:
                 mel_t = torch.from_numpy(mel).unsqueeze(0).to(device)
                 f0_t = torch.from_numpy(f0).to(device)
+                
+                # Resample for WavLM (16k)
+                resampler = T.Resample(sr, 16000).to(device)
+                audio_16k = resampler(waveform_t.to(device)).unsqueeze(0)
+                audio_24k = waveform_t.to(device).unsqueeze(0)
+                
                 with torch.no_grad():
-                    vs = voice_state_estimator.estimate(mel_t, f0_t)
-                    voice_state = vs.cpu().numpy()[0]  # [T, 8]
+                    vs_dict = voice_state_estimator(audio_16k, audio_24k, mel_t, f0_t)
+                    explicit_state = vs_dict["explicit_state"].cpu().numpy()[0]  # [T, 8]
+                    ssl_state = vs_dict["ssl_state"].cpu().numpy()[0]  # [T, 128]
             except Exception as e:
                 logger.debug("Voice state estimation failed: %s", e)
 
-        return mel, content, f0, spk_embed, codec_tokens, voice_state
+        return mel, content, f0, spk_embed, codec_tokens, explicit_state, ssl_state
 
     except Exception as e:
         logger.warning("Failed to extract features: %s", e)
@@ -363,7 +373,8 @@ def save_utterance(
     f0: np.ndarray,
     spk_embed: np.ndarray,
     codec_tokens: np.ndarray | None = None,
-    voice_state: np.ndarray | None = None,
+    explicit_state: np.ndarray | None = None,
+    ssl_state: np.ndarray | None = None,
 ) -> Path:
     """Save utterance to cache."""
     utt_dir = output_dir / dataset_name / "train" / meta.speaker_id / meta.utterance_id
@@ -379,10 +390,12 @@ def save_utterance(
         np.save(utt_dir / "codec_tokens.npy", codec_tokens)
         meta.has_codec_tokens = True
 
-    # NEW: Save voice state
-    if voice_state is not None:
-        np.save(utt_dir / "voice_state.npy", voice_state)
-        meta.voice_state_mean = voice_state.mean(axis=0).tolist()
+    # NEW: Save explicit state and ssl state
+    if explicit_state is not None:
+        np.save(utt_dir / "explicit_state.npy", explicit_state)
+        meta.voice_state_mean = explicit_state.mean(axis=0).tolist()
+    if ssl_state is not None:
+        np.save(utt_dir / "ssl_state.npy", ssl_state)
 
     (utt_dir / "meta.json").write_text(
         json.dumps(asdict(meta), ensure_ascii=False, indent=2),
@@ -494,13 +507,13 @@ def run_pipeline(config: PipelineConfig) -> int:
     voice_state_estimator = None
     try:
         from tmrvc_data.codec import EnCodecWrapper
-        from tmrvc_data.voice_state import VoiceStateEstimator
+        from tmrvc_data.voice_state import SSLVoiceStateEstimator
 
         logger.info("  Loading EnCodec...")
         codec_encoder = EnCodecWrapper(device=config.device)
 
-        logger.info("  Loading voice state estimator...")
-        voice_state_estimator = VoiceStateEstimator(device=config.device)
+        logger.info("  Loading SSL voice state estimator...")
+        voice_state_estimator = SSLVoiceStateEstimator(device=config.device)
     except ImportError as e:
         logger.warning("UCLM components not available: %s", e)
         logger.warning("Codec tokens and voice state will not be extracted.")
@@ -558,7 +571,7 @@ def run_pipeline(config: PipelineConfig) -> int:
                 stats["errors"] += 1
                 continue
 
-            mel, content, f0, spk_embed, codec_tokens, voice_state = features
+            mel, content, f0, spk_embed, codec_tokens, explicit_state, ssl_state = features
 
             # Annotate
             text = transcribe_audio(
@@ -598,7 +611,8 @@ def run_pipeline(config: PipelineConfig) -> int:
                 f0,
                 spk_embed,
                 codec_tokens,
-                voice_state,
+                explicit_state,
+                ssl_state,
             )
 
             stats["processed"] += 1

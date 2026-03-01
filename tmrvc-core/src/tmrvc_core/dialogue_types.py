@@ -30,48 +30,43 @@ SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja", "en", "zh", "ko")
 
 @dataclass
 class StyleParams:
-    """Parsed style parameters for TTS emotion conditioning.
+    """Parsed style parameters for UCLM v2 VoiceState conditioning (8-dim).
 
-    Maps to emotion_style[32d] vector:
-    - [0:3]  VAD (Valence, Arousal, Dominance)
-    - [3:6]  VAD uncertainty
-    - [6:9]  Speech rate, Energy, Pitch range
-    - [9:21] 12 emotion category softmax
-    - [21:29] Learned latent
-    - [29:32] Reserved
+    Dimensions:
+    - 0: breathiness [0, 1]
+    - 1: tension [0, 1]
+    - 2: arousal [0, 1]
+    - 3: valence [-1, 1]
+    - 4: roughness [0, 1]
+    - 5: voicing [0, 1]
+    - 6: energy [0, 1]
+    - 7: speech_rate [0.5, 2.0]
     """
 
     emotion: str = "neutral"
-    valence: float = 0.0
+    breathiness: float = 0.0
+    tension: float = 0.0
     arousal: float = 0.0
-    dominance: float = 0.0
-    speech_rate: float = 0.0
+    valence: float = 0.0
+    roughness: float = 0.0
+    voicing: float = 1.0
     energy: float = 0.0
-    pitch_range: float = 0.0
+    speech_rate: float = 1.0
+    pitch_range: float = 0.0  # Kept for backward compatibility, mapped to arousal/energy
     reasoning: str = ""
 
     def to_vector(self) -> list[float]:
-        """Convert to 32-dim emotion_style vector.
+        """Convert to 8-dim UCLM v2 VoiceState vector."""
+        vec = [0.0] * 8
 
-        Returns:
-            List of 32 float values.
-        """
-        vec = [0.0] * 32
-
-        # VAD [0:3]
-        vec[0] = _clamp(self.valence, -1.0, 1.0)
-        vec[1] = _clamp(self.arousal, -1.0, 1.0)
-        vec[2] = _clamp(self.dominance, -1.0, 1.0)
-
-        # VAD uncertainty [3:6] — default 0 (confident)
-        # Prosody [6:9]
-        vec[6] = _clamp(self.speech_rate, -1.0, 1.0)
-        vec[7] = _clamp(self.energy, -1.0, 1.0)
-        vec[8] = _clamp(self.pitch_range, -1.0, 1.0)
-
-        # Emotion category one-hot [9:21]
-        eid = EMOTION_TO_ID.get(self.emotion, EMOTION_TO_ID["neutral"])
-        vec[9 + eid] = 1.0
+        vec[0] = _clamp(self.breathiness, 0.0, 1.0)
+        vec[1] = _clamp(self.tension, 0.0, 1.0)
+        vec[2] = _clamp(self.arousal, 0.0, 1.0)
+        vec[3] = _clamp(self.valence, -1.0, 1.0)
+        vec[4] = _clamp(self.roughness, 0.0, 1.0)
+        vec[5] = _clamp(self.voicing, 0.0, 1.0)
+        vec[6] = _clamp(self.energy, 0.0, 1.0)
+        vec[7] = _clamp(self.speech_rate, 0.5, 2.0)
 
         return vec
 
@@ -80,11 +75,14 @@ class StyleParams:
         """Create from a dict (e.g. JSON response from LLM)."""
         return cls(
             emotion=d.get("emotion", "neutral"),
-            valence=d.get("valence", 0.0),
+            breathiness=d.get("breathiness", 0.0),
+            tension=d.get("tension", 0.0),
             arousal=d.get("arousal", 0.0),
-            dominance=d.get("dominance", 0.0),
-            speech_rate=d.get("speech_rate", 0.0),
+            valence=d.get("valence", 0.0),
+            roughness=d.get("roughness", 0.0),
+            voicing=d.get("voicing", 1.0),
             energy=d.get("energy", 0.0),
+            speech_rate=d.get("speech_rate", 1.0),
             pitch_range=d.get("pitch_range", 0.0),
             reasoning=d.get("reasoning", ""),
         )

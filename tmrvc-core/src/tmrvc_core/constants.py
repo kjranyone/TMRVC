@@ -136,10 +136,37 @@ BPEH_MIN_BREATH_MS: float = _cfg["bpeh_min_breath_ms"]
 
 # --- UCLM (Unified Codec Language Model) ---
 N_CODEBOOKS: int = _cfg["n_codebooks"]
-VOCAB_SIZE: int = _cfg["vocab_size"]
+RVQ_VOCAB_SIZE: int = _cfg["rvq_vocab_size"]
+CONTROL_VOCAB_SIZE: int = _cfg["control_vocab_size"]
+CONTROL_SLOTS: int = _cfg["control_slots"]
+CODEBOOK_DIM: int = _cfg["codebook_dim"]
+LATENT_DIM: int = _cfg["latent_dim"]
 D_MODEL: int = _cfg["d_model"]
 D_VOICE_STATE: int = _cfg["d_voice_state"]
+D_VOICE_STATE_EXPLICIT: int = _cfg["d_voice_state_explicit"]
+D_VOICE_STATE_SSL: int = _cfg["d_voice_state_ssl"]
 UCLM_N_HEADS: int = _cfg["uclm_n_heads"]
 UCLM_N_LAYERS: int = _cfg["uclm_n_layers"]
 UCLM_DROPOUT: float = _cfg["uclm_dropout"]
+UCLM_VQ_BINS: int = _cfg["uclm_vq_bins"]
+UCLM_TEXT_VOCAB_SIZE: int = _cfg["uclm_text_vocab_size"]
 UCLM_MAX_SEQ_LEN: int = _cfg["uclm_max_seq_len"]
+UCLM_CONTEXT_FRAMES: int = _cfg["uclm_context_frames"]
+UCLM_BLOCK_SIZE: int = _cfg["uclm_block_size"]
+
+# --- Encoder/Decoder State ---
+ENC_STATE_DIM: int = _cfg["enc_state_dim"]
+ENC_STATE_FRAMES: int = _cfg["enc_state_frames"]
+DEC_STATE_DIM: int = _cfg["dec_state_dim"]
+DEC_STATE_FRAMES: int = _cfg["dec_state_frames"]
+D_EVENT_TRACE: int = _cfg["d_event_trace"]
+
+# --- Voice State Parameters ---
+VOICE_STATE_NAMES: list[str] = _cfg["voice_state_names"]
+
+# --- F0 Conditioning ---
+D_F0: int = _cfg["d_f0"]
+F0_SMOOTHING_FRAMES: int = _cfg["f0_smoothing_frames"]
+
+# --- Legacy aliases (deprecated, use RVQ_VOCAB_SIZE instead) ---
+VOCAB_SIZE: int = RVQ_VOCAB_SIZE  # Alias for backward compatibility

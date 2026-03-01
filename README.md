@@ -97,6 +97,16 @@ lora_delta_size: 15872
 
 ## Quick Start
 
+### System Requirements
+
+**Linux (Ubuntu/Debian):**
+```bash
+# VST3 ビルド・スタンドアロン実行用
+sudo apt install libasound2-dev pkg-config
+```
+
+**Windows / macOS:** 追加のシステムライブラリ不要
+
 ### Python (学習・前処理)
 
 ```bash

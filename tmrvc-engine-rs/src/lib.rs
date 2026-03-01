@@ -12,5 +12,6 @@ pub mod ring_buffer;
 pub mod speaker;
 pub mod speaker_encoder;
 pub mod style;
+pub mod token_context;
 pub mod voice_profile;
 pub mod wav_reader;

@@ -1,137 +1,238 @@
-"""VoiceStateEncoder: encode continuous voice state parameters.
+"""Voice State Encoder for UCLM conditioning.
 
-Converts frame-level voice state parameters (breathiness, tension, etc.)
-to continuous features that can be used for conditioning the CodecLM.
+Combines 8-dim explicit parameters, 128-dim SSL features, and 8-dim delta state
+into a single 512-dim state condition for the UCLM core.
 
-Voice state dimensions (8):
-    0: breathiness [0, 1]
-    1: tension [0, 1]
-    2: arousal [0, 1]
-    3: valence [-1, 1]
-    4: roughness [0, 1]
-    5: voicing [0, 1]
-    6: energy [0, 1]
-    7: rate [0.5, 2.0]
+Design reference: docs/design/onnx-contract.md Section 3.3
 """
-
-from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from typing import Optional
 
-from tmrvc_core.constants import D_MODEL  # 256
+from .ssl_extractor import SSLProjection
+
+
+class GradientReversalLayer(torch.autograd.Function):
+    """Gradient Reversal Layer for adversarial disentanglement.
+
+    Forward: identity
+    Backward: -alpha * gradient
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversal(nn.Module):
+    """Module wrapper for Gradient Reversal Layer."""
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return GradientReversalLayer.apply(x, self.alpha)
 
 
 class VoiceStateEncoder(nn.Module):
-    """Encode voice state parameters to continuous features.
+    """Encodes voice state for UCLM conditioning.
 
-    Architecture::
+    Inputs:
+        - explicit_state: [B, T, 8] or [B, 8] — manual/heuristic parameters
+        - ssl_state: [B, T, 128] or [B, 128] — WavLM latent style
+        - delta_state: [B, T, 8] or [B, 8] — voice_state_t - voice_state_{t-1}
 
-        voice_state[B, T, 8] → Linear(8, d_model)
-            → CausalConv1d layers
-            → state_features[B, T, d_model]
+    Output:
+        - state_cond: [B, T, d_model] or [B, d_model] — fused condition
 
-    Args:
-        d_state: Input voice state dimension (default: 8).
-        d_model: Output feature dimension (default: 256).
-        n_layers: Number of conv layers.
-        kernel_size: Convolution kernel size.
-        dropout: Dropout rate.
+    Architecture:
+        - explicit_proj: Linear(8, d_model // 3)
+        - ssl_proj: Linear(128, d_model // 3)
+        - delta_proj: Linear(8, d_model // 3)
+        - fusion: Linear(d_model, d_model)
+        - temporal_conv: CausalConv1d for temporal smoothing
+        - GRL adversarial classifier for disentanglement
     """
 
     def __init__(
         self,
-        d_state: int = 8,
-        d_model: int = D_MODEL,
-        n_layers: int = 4,
-        kernel_size: int = 5,
-        dropout: float = 0.1,
-    ) -> None:
+        d_voice_state_explicit: int = 8,
+        d_voice_state_ssl: int = 128,
+        d_voice_state_delta: int = 8,
+        d_model: int = 512,
+        num_speakers: int = 0,
+        num_phonemes: int = 0,
+        use_grl: bool = True,
+    ):
         super().__init__()
-        self.d_state = d_state
+
         self.d_model = d_model
+        self.use_grl = use_grl
 
-        # Project to model dimension
-        self.input_proj = nn.Linear(d_state, d_model)
+        third = d_model // 3
 
-        # Causal conv layers
-        self.conv_layers = nn.ModuleList()
-        for i in range(n_layers):
-            self.conv_layers.append(
-                nn.Sequential(
-                    CausalConv1d(d_model, d_model, kernel_size=kernel_size),
-                    nn.LayerNorm(d_model),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                )
-            )
-
-    def forward(self, voice_state: torch.Tensor) -> torch.Tensor:
-        """Encode voice state parameters.
-
-        Args:
-            voice_state: ``[B, T, d_state]`` voice state tensor.
-
-        Returns:
-            ``[B, T, d_model]`` encoded state features.
-        """
-        # Project to model dimension
-        x = self.input_proj(voice_state)  # [B, T, d_model]
-
-        # Apply causal conv layers
-        for conv_layer in self.conv_layers:
-            # Conv expects [B, d, T]
-            x_t = x.transpose(1, 2)
-            x_t = conv_layer[0](x_t)  # CausalConv1d
-            x_t = x_t.transpose(1, 2)  # [B, T, d]
-            x_t = conv_layer[1](x_t)  # LayerNorm
-            x_t = conv_layer[2](x_t)  # GELU
-            x_t = conv_layer[3](x_t)  # Dropout
-            x = x + x_t  # Residual
-
-        return x
-
-
-class CausalConv1d(nn.Module):
-    """Causal 1D convolution with left padding.
-
-    Ensures that output at time t only depends on inputs at times <= t.
-
-    Args:
-        in_channels: Number of input channels.
-        out_channels: Number of output channels.
-        kernel_size: Convolution kernel size.
-        dilation: Dilation factor.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int = 1,
-    ) -> None:
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.dilation = dilation
-        self.padding = (kernel_size - 1) * dilation
-
-        self.conv = nn.Conv1d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            dilation=dilation,
+        self.explicit_proj = nn.Sequential(
+            nn.Linear(d_voice_state_explicit, third),
+            nn.GELU(),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply causal convolution.
+        self.ssl_proj = nn.Sequential(
+            nn.Linear(d_voice_state_ssl, third),
+            nn.GELU(),
+        )
+
+        self.delta_proj = nn.Sequential(
+            nn.Linear(d_voice_state_delta, third),
+            nn.GELU(),
+        )
+
+        self.fusion = nn.Sequential(
+            nn.Linear(third * 3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.GELU(),
+        )
+
+        self.norm = nn.LayerNorm(d_model)
+
+        if use_grl and (num_speakers > 0 or num_phonemes > 0):
+            self.adversarial_classifier = nn.Sequential(
+                GradientReversal(alpha=1.0),
+                nn.Linear(d_model, 256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, num_speakers + num_phonemes),
+            )
+        else:
+            self.adversarial_classifier = None
+
+    def forward(
+        self,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        delta_state: torch.Tensor,
+    ) -> tuple:
+        """Forward pass.
 
         Args:
-            x: ``[B, C, T]`` input tensor.
+            explicit_state: [B, T, 8] or [B, 8]
+            ssl_state: [B, T, 128] or [B, 128]
+            delta_state: [B, T, 8] or [B, 8]
 
         Returns:
-            ``[B, C, T]`` output tensor (same length as input).
+            state_cond: [B, T, d_model] or [B, d_model]
+            adv_logits: [B, num_classes] or None (if no GRL)
         """
-        # Left pad for causality
-        x = nn.functional.pad(x, (self.padding, 0))
-        return self.conv(x)
+        x_exp = self.explicit_proj(explicit_state)
+        x_ssl = self.ssl_proj(ssl_state)
+        x_delta = self.delta_proj(delta_state)
+
+        x = torch.cat([x_exp, x_ssl, x_delta], dim=-1)
+        x = self.fusion(x)
+
+        if x.dim() == 3:
+            x = x.transpose(1, 2)
+            x = self.temporal_conv(x)
+            x = x.transpose(1, 2)
+        else:
+            x = x.unsqueeze(1)
+            x = self.temporal_conv(x)
+            x = x.squeeze(1)
+
+        state_cond = self.norm(x)
+
+        adv_logits = None
+        if self.adversarial_classifier is not None:
+            adv_logits = self.adversarial_classifier(state_cond)
+
+        return state_cond, adv_logits
+
+
+class VoiceStateEncoderForStreaming(nn.Module):
+    """Optimized VoiceStateEncoder for streaming inference.
+
+    Simplified version without GRL for real-time use.
+    Outputs single state_cond per frame.
+    """
+
+    def __init__(
+        self,
+        d_voice_state_explicit: int = 8,
+        d_voice_state_ssl: int = 128,
+        d_voice_state_delta: int = 8,
+        d_model: int = 512,
+    ):
+        super().__init__()
+
+        self.explicit_proj = nn.Linear(d_voice_state_explicit, d_model // 4)
+        self.ssl_proj = nn.Linear(d_voice_state_ssl, d_model // 2)
+        self.delta_proj = nn.Linear(d_voice_state_delta, d_model // 4)
+
+        self.fusion = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        delta_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass for single frame.
+
+        Args:
+            explicit_state: [B, 8]
+            ssl_state: [B, 128]
+            delta_state: [B, 8]
+
+        Returns:
+            state_cond: [B, d_model]
+        """
+        x_exp = self.explicit_proj(explicit_state)
+        x_ssl = self.ssl_proj(ssl_state)
+        x_delta = self.delta_proj(delta_state)
+
+        x = torch.cat([x_exp, x_ssl, x_delta], dim=-1)
+        x = self.fusion(x)
+
+        return self.norm(x)
+
+
+def create_voice_state_encoder(
+    d_model: int = 512,
+    for_streaming: bool = False,
+    use_grl: bool = True,
+    num_speakers: int = 0,
+    num_phonemes: int = 0,
+) -> nn.Module:
+    """Factory function to create voice state encoder.
+
+    Args:
+        d_model: Output dimension
+        for_streaming: Use streaming-optimized version
+        use_grl: Use Gradient Reversal Layer (training only)
+        num_speakers: Number of speakers for adversarial loss
+        num_phonemes: Number of phonemes for adversarial loss
+
+    Returns:
+        VoiceStateEncoder module
+    """
+    if for_streaming:
+        return VoiceStateEncoderForStreaming(d_model=d_model)
+
+    return VoiceStateEncoder(
+        d_model=d_model,
+        use_grl=use_grl,
+        num_speakers=num_speakers,
+        num_phonemes=num_phonemes,
+    )

@@ -2,8 +2,8 @@
 """Generate Python, C++, and Rust constant files from configs/constants.yaml.
 
 Usage:
-    python scripts/generate_constants.py          # generate all
-    python scripts/generate_constants.py --check   # verify files are up-to-date
+    python scripts/codegen/generate_constants.py          # generate all
+    python scripts/codegen/generate_constants.py --check   # verify files are up-to-date
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 YAML_PATH = REPO_ROOT / "configs" / "constants.yaml"
 PY_OUT = REPO_ROOT / "tmrvc-core" / "src" / "tmrvc_core" / "_generated_constants.py"
 CPP_OUT = REPO_ROOT / "tmrvc-engine" / "include" / "tmrvc" / "constants.h"
@@ -64,6 +64,33 @@ _RUNTIME_KEYS = {
     "d_f0_predictor",
     "d_content_synthesizer",
     "n_languages",
+    # UCLM Token Spec v2
+    "n_codebooks",
+    "rvq_vocab_size",
+    "control_vocab_size",
+    "control_slots",
+    "d_model",
+    "d_voice_state",
+    "d_voice_state_explicit",
+    "d_voice_state_ssl",
+    "uclm_n_heads",
+    "uclm_n_layers",
+    "uclm_vq_bins",
+    "uclm_dropout",
+    "uclm_max_seq_len",
+    "uclm_context_frames",
+    "uclm_block_size",
+    "codebook_dim",
+    "latent_dim",
+    "enc_state_dim",
+    "enc_state_frames",
+    "dec_state_dim",
+    "dec_state_frames",
+    "d_event_trace",
+    "kv_cache_size",
+    # F0 Conditioning
+    "d_f0",
+    "f0_smoothing_frames",
 }
 
 # Rust name overrides (YAML key → Rust const name) for backward compat.
@@ -95,7 +122,7 @@ def generate_python(cfg: dict) -> str:
     lines = [
         '"""Auto-generated constants — DO NOT EDIT MANUALLY.',
         "",
-        "Run: python scripts/generate_constants.py",
+        "Run: python scripts/codegen/generate_constants.py",
         '"""',
         "",
     ]
@@ -246,6 +273,24 @@ def generate_rust(cfg: dict) -> str:
             "d_content_synthesizer",
             "n_languages",
         ],
+        "uclm": [
+            "n_codebooks",
+            "vocab_size",
+            "d_model",
+            "d_voice_state",
+            "uclm_n_heads",
+            "uclm_n_layers",
+            "uclm_dropout",
+            "uclm_max_seq_len",
+            "uclm_context_frames",
+            "uclm_block_size",
+            "n_nonverbal_tokens",
+            "nonverbal_token_start_id",
+        ],
+        "f0": [
+            "d_f0",
+            "f0_smoothing_frames",
+        ],
     }
 
     section_headers = {
@@ -256,6 +301,8 @@ def generate_rust(cfg: dict) -> str:
         "state": "\n// --- State tensor context lengths ---",
         "hq": "\n// --- Lookahead / HQ mode ---",
         "tts": "\n// --- TTS extension ---",
+        "uclm": "\n// --- UCLM (Unified Codec Language Model) ---",
+        "f0": "\n// --- F0 Conditioning ---",
     }
 
     # Remove the initial audio header since we add it per section

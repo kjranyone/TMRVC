@@ -1,456 +1,206 @@
-"""Unified Codec Language Model (UCLM).
-
-A single model that performs both TTS and VC through conditioned codec token
-transformation. Treats both tasks as instances of the same fundamental problem:
-generating acoustic tokens conditioned on input modality, speaker identity,
-and voice state parameters.
-
-Usage:
-    # TTS mode
-    output = model(text_features, voice_state, speaker_embed, mode='tts')
-
-    # VC mode
-    output = model(source_tokens, voice_state, speaker_embed, mode='vc')
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from tmrvc_core.constants import (
-    D_MODEL,
-    D_SPEAKER,
-    N_CODEBOOKS,
-    VOCAB_SIZE,
-)
+from typing import Optional
 
 
-@dataclass
-class UCLMConfig:
-    """Configuration for UCLM model."""
-
-    vocab_size: int = VOCAB_SIZE  # 1024
-    n_codebooks: int = N_CODEBOOKS  # 8
-    d_model: int = D_MODEL  # 256
-    n_heads: int = 8
-    n_layers: int = 12
-    d_speaker: int = D_SPEAKER  # 192
-    d_voice_state: int = 8
-    d_text: int | None = None  # If None, uses d_model (Identity projection)
-    dropout: float = 0.1
-    max_seq_len: int = 2000
-
-    def __post_init__(self):
-        if self.d_text is None:
-            self.d_text = self.d_model
+from .disentangle_losses import GradientReversalLayer
 
 
-class UCLM(nn.Module):
-    """Unified Codec Language Model for TTS and VC.
+class VoiceStateEncoder(nn.Module):
+    """Encode explicit continuous parameters and SSL latent space,
+    with a Gradient Reversal Layer (GRL) for adversarial disentanglement.
 
-    Architecture::
-
-        Inputs:
-            - text_features: [B, L, d_text] (TTS mode) or None (VC mode)
-            - source_tokens: [B, n_codebooks, T] (VC mode) or None (TTS mode)
-            - voice_state: [B, T, d_voice_state]
-            - speaker_embed: [B, d_speaker]
-            - past_tokens: [B, n_codebooks, k] (context from previous blocks)
-
-        Processing:
-            1. Encode conditions (text, voice_state, speaker, mode)
-            2. Fuse conditions with cross-attention
-            3. Predict codec tokens with AR + parallel decoding
-
-        Outputs:
-            - logits_ar: [B, T, vocab_size] for first codebook
-            - logits_parallel: [B, n_codebooks-1, T, vocab_size] for rest
-
-    Args:
-        config: UCLMConfig with model hyperparameters.
+    Supports delta_voice_state for temporal dynamics modeling (Section 4.3).
     """
 
-    def __init__(self, config: UCLMConfig | None = None) -> None:
+    def __init__(self, d_explicit=8, d_ssl=128, d_model=512, num_speakers=100):
         super().__init__()
-        self.config = config or UCLMConfig()
-        c = self.config
+        self.explicit_proj = nn.Linear(d_explicit, d_model // 2)
+        self.ssl_proj = nn.Linear(d_ssl, d_model // 2)
+        self.fusion = nn.Linear(d_model, d_model)
 
-        # Mode embedding (TTS=0, VC=1)
-        self.mode_embed = nn.Embedding(2, c.d_model)
+        self.delta_proj = nn.Linear(d_explicit, d_model // 4)
 
-        # Speaker conditioning
-        self.speaker_proj = nn.Linear(c.d_speaker, c.d_model)
+        self.final_proj = nn.Linear(d_model + d_model // 4, d_model)
 
-        # Voice state encoder
-        from tmrvc_train.models.voice_state_encoder import VoiceStateEncoder
+        self.temporal_conv = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
 
-        self.voice_state_encoder = VoiceStateEncoder(
-            d_state=c.d_voice_state,
-            d_model=c.d_model,
+        # GRL Adversarial Classifier (predicts speaker to unlearn it)
+        self.grl = GradientReversalLayer(lambda_=1.0)
+        self.adversarial_classifier = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_speakers),
         )
-
-        # Text projection (if text features are different dimension)
-        if c.d_text != c.d_model:
-            self.text_proj = nn.Linear(c.d_text, c.d_model)
-        else:
-            self.text_proj = nn.Identity()
-
-        # Source token embedding (for VC mode)
-        self.codebook_embed = nn.ModuleList(
-            [
-                nn.Embedding(c.vocab_size, c.d_model // c.n_codebooks)
-                for _ in range(c.n_codebooks)
-            ]
-        )
-
-        # Context encoder (for past tokens)
-        self.context_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=c.d_model,
-                nhead=c.n_heads,
-                dim_feedforward=c.d_model * 4,
-                dropout=c.dropout,
-                batch_first=True,
-            ),
-            num_layers=2,
-        )
-
-        # Main transformer decoder (causal)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=c.d_model,
-            nhead=c.n_heads,
-            dim_feedforward=c.d_model * 4,
-            dropout=c.dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=c.n_layers,
-        )
-
-        # Target token embedding (for teacher forcing)
-        self.target_codebook_embed = nn.ModuleList(
-            [
-                nn.Embedding(c.vocab_size, c.d_model // c.n_codebooks)
-                for _ in range(c.n_codebooks)
-            ]
-        )
-
-        # Output heads
-        self.ar_head = nn.Linear(c.d_model, c.vocab_size)  # First codebook (AR)
-        self.parallel_heads = nn.ModuleList(
-            [nn.Linear(c.d_model, c.vocab_size) for _ in range(c.n_codebooks - 1)]
-        )
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        """Initialize weights with small values."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
         self,
-        text_features: torch.Tensor | None = None,
-        source_tokens: torch.Tensor | None = None,
-        voice_state: torch.Tensor | None = None,
-        speaker_embed: torch.Tensor | None = None,
-        past_tokens: torch.Tensor | None = None,
-        target_tokens: torch.Tensor | None = None,
-        mode: str = "tts",
-    ) -> dict[str, torch.Tensor]:
-        """Training forward pass.
-
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        delta_state: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
         Args:
-            text_features: [B, L, d_text] text features (TTS mode).
-            source_tokens: [B, n_codebooks, T] source audio tokens (VC mode).
-            voice_state: [B, T, d_voice_state] voice state parameters.
-            speaker_embed: [B, d_speaker] speaker embedding.
-            past_tokens: [B, n_codebooks, k] context from previous blocks.
-            target_tokens: [B, n_codebooks, T] target tokens for training.
-            mode: "tts" or "vc".
+            explicit_state: [B, T, 8] voice state parameters
+            ssl_state: [B, T, 128] WavLM SSL features
+            delta_state: [B, T, 8] optional voice_state_t - voice_state_{t-1}
 
         Returns:
-            Dict with:
-                - logits_ar: [B, T, vocab_size]
-                - logits_parallel: [B, n_codebooks-1, T, vocab_size]
+            state_cond: [B, T, d_model]
+            adv_logits: [B, T, num_speakers] (only if in training and requested)
         """
-        c = self.config
+        x_exp = self.explicit_proj(explicit_state)
+        x_ssl = self.ssl_proj(ssl_state)
 
-        # Determine batch size and sequence length
-        if voice_state is not None:
-            B, T, _ = voice_state.shape
-            device = voice_state.device
-        elif target_tokens is not None:
-            B, n_cb, T = target_tokens.shape
-            device = target_tokens.device
-        else:
-            raise ValueError("Must provide voice_state or target_tokens")
+        x = torch.cat([x_exp, x_ssl], dim=-1)
+        x = self.fusion(x)
 
-        # Get mode embedding
-        mode_id = 0 if mode == "tts" else 1
-        mode_cond = (
-            self.mode_embed(torch.tensor([mode_id], device=device))
-            .unsqueeze(0)
-            .expand(B, -1, -1)
-        )  # [B, 1, d_model]
+        if delta_state is None:
+            delta_state = torch.zeros_like(explicit_state)
+            if explicit_state.shape[1] > 1:
+                delta_state[:, 1:, :] = (
+                    explicit_state[:, 1:, :] - explicit_state[:, :-1, :]
+                )
 
-        # Encode voice state
-        if voice_state is not None:
-            state_cond = self.voice_state_encoder(voice_state)  # [B, T, d_model]
-        else:
-            state_cond = torch.zeros(B, T, c.d_model, device=device)
+        x_delta = self.delta_proj(delta_state)
 
-        # Encode speaker
-        if speaker_embed is not None:
-            spk_cond = self.speaker_proj(speaker_embed).unsqueeze(1)  # [B, 1, d_model]
-        else:
-            spk_cond = torch.zeros(B, 1, c.d_model, device=device)
+        x = torch.cat([x, x_delta], dim=-1)
+        x = self.final_proj(x)
 
-        # Encode text (TTS mode)
-        if mode == "tts" and text_features is not None:
-            text_cond = self.text_proj(text_features)  # [B, L, d_model]
-            memory = text_cond  # [B, L, d_model] for batch_first=True
-        else:
-            # No text conditioning for VC
-            memory = state_cond  # [B, T, d_model] for batch_first=True
+        x = x.transpose(1, 2)
+        x = F.relu(self.temporal_conv(x))
+        x = x.transpose(1, 2)
 
-        # Encode source tokens (VC mode)
-        if mode == "vc" and source_tokens is not None:
-            source_cond = self._encode_source_tokens(source_tokens)  # [B, T, d_model]
-            state_cond = state_cond + source_cond
+        if self.training:
+            # Adversarial branch
+            reversed_x = self.grl(x)
+            adv_logits = self.adversarial_classifier(reversed_x)
+            return x, adv_logits
 
-        # Combine conditions
-        cond = state_cond + spk_cond + mode_cond  # [B, T, d_model]
+        return x
 
-        # Encode past context
-        if past_tokens is not None:
-            past_cond = self._encode_past_tokens(past_tokens)  # [B, k, d_model]
-            # Prepend past to cond
-            cond = torch.cat([past_cond, cond], dim=1)  # [B, k+T, d_model]
-
-        # Target embedding (teacher forcing)
-        if target_tokens is None:
-            tgt = cond[:, -T:]
-        else:
-            tgt_emb = self._embed_target_tokens(target_tokens)
-            tgt = tgt_emb + cond[:, -T:]
-
-        # Causal mask for autoregressive generation
-        tgt_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
-
-        # Transformer decoder (batch_first=True)
-        out = self.transformer(
-            tgt,
-            memory,  # [B, S, d_model] for batch_first=True
-            tgt_mask=tgt_mask,
-        )  # [B, T, d_model]
-
-        # Predict
-        logits_ar = self.ar_head(out)  # [B, T, vocab_size]
-
-        logits_parallel = torch.stack(
-            [head(out) for head in self.parallel_heads], dim=1
-        )  # [B, n_codebooks-1, T, vocab_size]
-
-        return {
-            "logits_ar": logits_ar,
-            "logits_parallel": logits_parallel,
-        }
-
-    def _encode_source_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Encode source tokens for VC mode.
-
-        Args:
-            tokens: [B, n_codebooks, T]
-
-        Returns:
-            [B, T, d_model]
-        """
-        embeddings = [
-            embed(tokens[:, i, :]) for i, embed in enumerate(self.codebook_embed)
-        ]
-        # Concatenate and project
-        concat = torch.cat(embeddings, dim=-1)  # [B, T, d_model]
-        return concat
-
-    def _encode_past_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Encode past tokens for context.
-
-        Args:
-            tokens: [B, n_codebooks, k]
-
-        Returns:
-            [B, k, d_model]
-        """
-        embeddings = [
-            embed(tokens[:, i, :]) for i, embed in enumerate(self.codebook_embed)
-        ]
-        concat = torch.cat(embeddings, dim=-1)  # [B, k, d_model]
-        return self.context_encoder(concat)
-
-    def _embed_target_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Embed target tokens for teacher forcing.
-
-        Args:
-            tokens: [B, n_codebooks, T]
-
-        Returns:
-            [B, T, d_model]
-        """
-        embeddings = [
-            embed(tokens[:, i, :]) for i, embed in enumerate(self.target_codebook_embed)
-        ]
-        # Concatenate across codebooks
-        # Each codebook contributes d_model // n_codebooks dimensions
-        return torch.cat(embeddings, dim=-1)  # [B, T, d_model]
-
-    @torch.no_grad()
-    def generate(
+    def forward_streaming(
         self,
-        voice_state: torch.Tensor,
-        speaker_embed: torch.Tensor,
-        text_features: torch.Tensor | None = None,
-        source_tokens: torch.Tensor | None = None,
-        past_tokens: torch.Tensor | None = None,
-        mode: str = "tts",
-        max_length: int | None = None,
-        temperature: float = 1.0,
-        top_k: int = 50,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        prev_explicit_state: torch.Tensor,
     ) -> torch.Tensor:
-        """Generate tokens autoregressively.
+        """Streaming forward with explicit delta computation.
 
         Args:
-            text_features: [B, L, d_text] text features (TTS mode).
-            source_tokens: [B, n_codebooks, T] source tokens (VC mode).
-            voice_state: [B, T, d_voice_state] voice state parameters.
-            speaker_embed: [B, d_speaker] speaker embedding.
-            past_tokens: [B, n_codebooks, k] context from previous blocks.
-            mode: "tts" or "vc".
-            max_length: Maximum number of tokens to generate.
-            temperature: Sampling temperature.
-            top_k: Top-k sampling parameter.
+            explicit_state: [B, 1, 8] current frame voice state
+            ssl_state: [B, 1, 128] current frame SSL features
+            prev_explicit_state: [B, 8] previous frame voice state
 
         Returns:
-            tokens: [B, n_codebooks, T] generated tokens.
+            state_cond: [B, 1, d_model]
         """
-        c = self.config
-        B, T, _ = voice_state.shape
+        delta_state = explicit_state.squeeze(1) - prev_explicit_state
+        delta_state = delta_state.unsqueeze(1)
 
-        if max_length is None:
-            max_length = T
-        assert max_length is not None
-
-        # Initialize with padding
-        generated = torch.zeros(
-            B, c.n_codebooks, max_length, dtype=torch.long, device=voice_state.device
-        )
-
-        # Generate first codebook autoregressively
-        for t in range(max_length):
-            vs_t = voice_state[:, : t + 1, :]
-            tgt_so_far = generated[:, :, : t + 1] if t > 0 else None
-
-            output = self.forward(
-                text_features=text_features,
-                source_tokens=source_tokens[:, :, : t + 1]
-                if source_tokens is not None
-                else None,
-                voice_state=vs_t,
-                speaker_embed=speaker_embed,
-                past_tokens=past_tokens,
-                target_tokens=tgt_so_far,
-                mode=mode,
-            )
-
-            logits = output["logits_ar"][:, -1, :] / temperature
-            top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
-            probs = F.softmax(top_k_logits, dim=-1)
-            sampled = torch.multinomial(probs, 1)
-            token = top_k_indices.gather(-1, sampled).squeeze(-1)
-            generated[:, 0, t] = token
-
-        # Generate remaining codebooks in parallel (non-AR)
-        # Pad target tokens for parallel decoding
-        target_for_parallel = torch.zeros(
-            B, c.n_codebooks, max_length, dtype=torch.long, device=voice_state.device
-        )
-        target_for_parallel[:, 0, :] = generated[:, 0, :]
-
-        output = self.forward(
-            text_features=text_features,
-            source_tokens=source_tokens,
-            voice_state=voice_state,
-            speaker_embed=speaker_embed,
-            past_tokens=past_tokens,
-            target_tokens=target_for_parallel,
-            mode=mode,
-        )
-
-        for i in range(c.n_codebooks - 1):
-            logits = output["logits_parallel"][:, i, :, :] / temperature
-            top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
-            probs = F.softmax(top_k_logits, dim=-1)
-            sampled = torch.multinomial(probs.view(B * max_length, -1), 1).view(
-                B, max_length, 1
-            )
-            tokens = top_k_indices.gather(-1, sampled).squeeze(-1)
-            generated[:, i + 1, :] = tokens
-
-        return generated
+        return self.forward(explicit_state, ssl_state, delta_state)
 
 
-def uclm_loss(
-    logits_ar: torch.Tensor,
-    logits_parallel: torch.Tensor,
-    target_tokens: torch.Tensor,
-    pad_id: int = 0,
-) -> dict[str, torch.Tensor]:
-    """Compute UCLM training loss.
-
-    Args:
-        logits_ar: [B, T, vocab] first codebook logits.
-        logits_parallel: [B, n_cb-1, T, vocab] remaining codebook logits.
-        target_tokens: [B, n_cb, T] target tokens.
-        pad_id: Padding token ID.
-
-    Returns:
-        Dict with loss values.
+class VectorQuantizer(nn.Module):
+    """Information Bottleneck (VQ) for VC Encoder.
+    Strips speaker and style info by mapping continuous embeddings to discrete codes.
     """
-    B, n_cb, T = target_tokens.shape
 
-    # AR loss (first codebook)
-    loss_ar = F.cross_entropy(
-        logits_ar.reshape(-1, logits_ar.size(-1)),
-        target_tokens[:, 0, :].reshape(-1),
-        ignore_index=pad_id,
-    )
+    def __init__(self, n_bins: int, d_model: int, beta: float = 0.25):
+        super().__init__()
+        self.n_bins = n_bins
+        self.d_model = d_model
+        self.beta = beta
 
-    # Parallel loss (remaining codebooks)
-    loss_parallel = 0.0
-    for i in range(n_cb - 1):
-        loss_parallel += F.cross_entropy(
-            logits_parallel[:, i].reshape(-1, logits_parallel.size(-1)),
-            target_tokens[:, i + 1, :].reshape(-1),
-            ignore_index=pad_id,
+        self.embedding = nn.Embedding(n_bins, d_model)
+        self.embedding.weight.data.uniform_(-1.0 / n_bins, 1.0 / n_bins)
+
+    def forward(
+        self, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z: [B, T, d_model]
+        Returns:
+            z_q: [B, T, d_model] quantized vectors
+            loss: VQ commitment loss
+            indices: [B, T] quantization indices
+        """
+        # Flatten
+        z_flattened = z.reshape(-1, self.d_model)
+
+        # Distances from z to embeddings
+        d = (
+            torch.sum(z_flattened**2, dim=1, keepdim=True)
+            + torch.sum(self.embedding.weight**2, dim=1)
+            - 2 * torch.matmul(z_flattened, self.embedding.weight.t())
         )
-    loss_parallel /= n_cb - 1
 
-    total_loss = loss_ar + loss_parallel
+        # Find closest embeddings
+        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
+        min_encodings = torch.zeros(
+            min_encoding_indices.shape[0], self.n_bins, device=z.device
+        )
+        min_encodings.scatter_(1, min_encoding_indices, 1)
 
-    return {
-        "loss": total_loss,
-        "loss_ar": loss_ar,
-        "loss_parallel": loss_parallel,
-    }
+        # Get quantized latent vectors
+        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
+
+        # Loss: commitment loss (pulling encoder output to embeddings) + codebook loss
+        loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean(
+            (z_q - z.detach()) ** 2
+        )
+
+        # Straight-through estimator
+        z_q = z + (z_q - z).detach()
+
+        indices = min_encoding_indices.view(z.shape[:2])
+        return z_q, loss, indices
+
+
+class VCEncoder(nn.Module):
+    """Encodes source A_t tokens and applies VQ bottleneck to remove style/speaker info."""
+
+    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=512, vq_bins=128):
+        super().__init__()
+        # Each codebook gets d_model // n_codebooks dimensions to concat into d_model
+        self.codebook_embeds = nn.ModuleList(
+            [
+                nn.Embedding(vocab_size, d_model // n_codebooks)
+                for _ in range(n_codebooks)
+            ]
+        )
+
+        # Causal convolution instead of full transformer to keep it light and causal
+        self.source_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=2)
+
+        self.vq_bottleneck = VectorQuantizer(vq_bins, d_model)
+
+    def forward(self, source_a_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            source_a_t: [B, 8, T] from EnCodec
+        Returns:
+            content_features: [B, T, d_model]
+            vq_loss: scalar tensor
+        """
+        B, n_cb, T = source_a_t.shape
+
+        # Embed and concatenate along feature dim
+        embeds = []
+        for i, emb_layer in enumerate(self.codebook_embeds):
+            embeds.append(emb_layer(source_a_t[:, i, :]))  # [B, T, d_model//8]
+
+        x = torch.cat(embeds, dim=-1)  # [B, T, d_model]
+
+        # Causal conv [B, d_model, T] -> [B, T, d_model]
+        x = x.transpose(1, 2)
+        x = F.relu(self.source_conv(x))
+        x = x[:, :, :-2]  # Remove padding to keep causal
+        x = x.transpose(1, 2)
+
+        # Apply Information Bottleneck
+        content_features, vq_loss, _ = self.vq_bottleneck(x)
+
+        return content_features, vq_loss

@@ -33,6 +33,16 @@ impl PingPongState {
         }
     }
 
+    /// Returns both current (immutable) and next (mutable) buffers simultaneously.
+    /// This allows borrowing both from the same struct without borrow checker issues.
+    pub fn get_both(&mut self) -> (&[f32], &mut [f32]) {
+        if !self.current {
+            (&self.buffer_a, &mut self.buffer_b)
+        } else {
+            (&self.buffer_b, &mut self.buffer_a)
+        }
+    }
+
     pub fn swap(&mut self) {
         self.current = !self.current;
     }

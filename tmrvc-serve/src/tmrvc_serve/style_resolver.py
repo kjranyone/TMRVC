@@ -23,16 +23,17 @@ _BACKCHANNEL_TOKENS = frozenset({
 
 @dataclasses.dataclass(frozen=True)
 class StylePresetConfig:
-    """High-level preset for ASMR-style speaking characteristics."""
+    """High-level preset for speaking characteristics."""
 
     emotion: str | None = None
-    delta_valence: float = 0.0
+    delta_breathiness: float = 0.0
+    delta_tension: float = 0.0
     delta_arousal: float = 0.0
-    delta_dominance: float = 0.0
-    delta_speech_rate: float = 0.0
+    delta_valence: float = 0.0
+    delta_roughness: float = 0.0
+    delta_voicing: float = 0.0
     delta_energy: float = 0.0
-    delta_pitch_range: float = 0.0
-    speed_multiplier: float = 1.0
+    speech_rate_multiplier: float = 1.0
     sentence_pause_ms: int = 120
     auto_style: bool = True
 
@@ -41,44 +42,40 @@ _STYLE_PRESET_TABLE: dict[str, StylePresetConfig] = {
     "default": StylePresetConfig(),
     "asmr_soft": StylePresetConfig(
         emotion="whisper",
-        delta_valence=0.10,
-        delta_arousal=-0.35,
-        delta_speech_rate=-0.25,
-        delta_energy=-0.55,
-        delta_pitch_range=-0.10,
-        speed_multiplier=0.90,
-        sentence_pause_ms=220,
+        delta_breathiness=0.6,
+        delta_tension=-0.3,
+        delta_arousal=-0.4,
+        delta_voicing=-0.5,
+        delta_energy=-0.4,
+        speech_rate_multiplier=0.85,
+        sentence_pause_ms=250,
         auto_style=False,
     ),
     "asmr_intimate": StylePresetConfig(
         emotion="whisper",
-        delta_valence=0.15,
-        delta_arousal=-0.45,
-        delta_speech_rate=-0.35,
-        delta_energy=-0.65,
-        delta_pitch_range=-0.20,
-        speed_multiplier=0.82,
-        sentence_pause_ms=280,
+        delta_breathiness=0.8,
+        delta_tension=-0.4,
+        delta_arousal=-0.5,
+        delta_voicing=-0.7,
+        delta_energy=-0.5,
+        speech_rate_multiplier=0.75,
+        sentence_pause_ms=300,
         auto_style=False,
+    ),
+    "angry_intense": StylePresetConfig(
+        emotion="angry",
+        delta_tension=0.7,
+        delta_arousal=0.6,
+        delta_roughness=0.3,
+        delta_energy=0.5,
+        speech_rate_multiplier=1.2,
+        sentence_pause_ms=80,
     ),
 }
 
 
-def _clamp_style(v: float) -> float:
-    return max(-1.0, min(1.0, v))
-
-
-def _clamp_speed(v: float) -> float:
-    return max(0.5, min(2.0, v))
-
-
-def _merge_reasoning(*parts: str | None) -> str:
-    chunks = [p.strip() for p in parts if p and p.strip()]
-    return "; ".join(chunks)
-
-
-def _blend_style_values(base: float, overlay: float, overlay_weight: float) -> float:
-    return _clamp_style((base * (1.0 - overlay_weight)) + (overlay * overlay_weight))
+def _clamp_style(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
 
 
 def _resolve_style_preset(
@@ -86,18 +83,23 @@ def _resolve_style_preset(
     preset: StylePreset,
 ) -> tuple[StyleParams | None, StylePresetConfig]:
     """Apply high-level style preset to a base style."""
-    cfg = _STYLE_PRESET_TABLE[str(preset)]
+    cfg = _STYLE_PRESET_TABLE.get(str(preset), _STYLE_PRESET_TABLE["default"])
     if preset == "default" and base_style is None:
         return None, cfg
 
     src = base_style or StyleParams.neutral()
     result = StyleParams(
         emotion=cfg.emotion or src.emotion,
-        valence=_clamp_style(src.valence + cfg.delta_valence),
+        breathiness=_clamp_style(src.breathiness + cfg.delta_breathiness),
+        tension=_clamp_style(src.tension + cfg.delta_tension),
         arousal=_clamp_style(src.arousal + cfg.delta_arousal),
-        dominance=_clamp_style(src.dominance + cfg.delta_dominance),
-        speech_rate=_clamp_style(src.speech_rate + cfg.delta_speech_rate),
+        valence=_clamp_style(src.valence + cfg.delta_valence, -1.0, 1.0),
+        roughness=_clamp_style(src.roughness + cfg.delta_roughness),
+        voicing=_clamp_style(src.voicing + cfg.delta_voicing),
         energy=_clamp_style(src.energy + cfg.delta_energy),
+        speech_rate=_clamp_style(src.speech_rate * cfg.speech_rate_multiplier, 0.5, 2.0),
+    )
+    return result, cfg
         pitch_range=_clamp_style(src.pitch_range + cfg.delta_pitch_range),
         reasoning=(src.reasoning + "; " if src.reasoning else "") + f"preset={preset}",
     )

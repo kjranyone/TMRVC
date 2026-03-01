@@ -2,6 +2,7 @@
 
 Kojiro Tanaka — Unified Architecture Design
 Created: 2026-02-27 (Asia/Tokyo)
+Updated: 2026-03-01 — Token Spec v2 dual-stream (`A_t`/`B_t`)
 
 > **Core Insight:** テキスト生成（TTS）も音声変換（VC）も、**「条件付けされた codec token 変換」** として統一的に扱う。単一の CodecLM で両モードをカバーし、50ms 以下のストリーミング推論を実現。
 
@@ -12,12 +13,23 @@ Created: 2026-02-27 (Asia/Tokyo)
 We propose **Unified Codec Language Model (UCLM)**, a single neural architecture that performs both text-to-speech synthesis and voice conversion through conditioned codec token transformation. Unlike pipeline-based approaches that separate TTS and VC into distinct systems, UCLM treats both as instances of the same fundamental task: generating acoustic tokens conditioned on input modality (text or source audio), speaker identity, and optional voice state parameters.
 
 Key innovations:
-1. **Unified TTS/VC**: Same model performs both tasks via mode conditioning
-2. **Continuous voice state**: Frame-level acoustic control (breathiness, tension, arousal, etc.)
-3. **Acoustic context**: Past tokens ensure continuity across verbal/non-verbal boundaries
-4. **Real-time streaming**: Block-wise generation at <50ms latency
+1. **Unified TTS/VC**: Same model performs both tasks via mode conditioning.
+2. **Disentangled Representations**: Vector Quantization (VQ) bottleneck and Gradient Reversal Layer (GRL) to perfectly separate content, style, and speaker.
+3. **Learning-based Voice State**: Frame-level acoustic control powered by SSL (WavLM) latent space and explicit 8-dim parameters.
+4. **Real-time streaming & CFG**: Block-wise generation (<50ms) with Classifier-Free Guidance (CFG) for amplified sensual and emotional expression.
 
 Experiments demonstrate state-of-the-art performance on both TTS (including non-verbal vocalizations) and VC (including speaker adaptation), while enabling seamless transitions between speaking modes in a single generation stream.
+
+---
+
+## 1.1 Token Spec v2 Sync
+
+This document follows the canonical spec in `emotion-aware-codec.md`.
+
+- Acoustic stream `A_t`: `[B, 8]`, RVQ IDs `0..1023` (`RVQ_VOCAB_SIZE=1024`)
+- Control stream `B_t`: `[B, 4]=[op, type, dur, int]` (`CONTROL_VOCAB_SIZE=64`)
+- Frame unit: 10ms (`240 samples @ 24kHz`)
+- Continuity: rolling context (`A/B` history) + `delta_voice_state`
 
 ---
 
@@ -28,14 +40,14 @@ Experiments demonstrate state-of-the-art performance on both TTS (including non-
 Both TTS and VC can be formulated as:
 
 ```
-P(output_tokens | input, speaker, voice_state, past_context)
+P(A_t, B_t | input, speaker, voice_state_t, delta_voice_state_t, past_A, past_B)
 ```
 
 | Mode | Input | Output |
 |---|---|---|
-| **TTS** | Text (phonemes) | Speech tokens |
-| **VC** | Source audio tokens | Target speaker tokens |
-| **TTS+VC** | Text + reference audio | Speech in reference voice |
+| **TTS** | Text (phonemes) | `A_t` + `B_t` |
+| **VC** | Source `A_t` + state | Target `A_t` + `B_t` |
+| **TTS+VC** | Text + reference audio | Speech with unified token control |
 
 The difference is only in the input modality; the core generation process is identical.
 
@@ -48,7 +60,7 @@ The difference is only in the input modality; the core generation process is ide
 │                                                                          │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐          │
 │  │   TTS Encoder   │  │   VC Encoder    │  │  Voice State    │          │
-│  │  (TextEncoder)  │  │ (SourceEncoder) │  │    Encoder      │          │
+│  │  (TextEncoder)  │  │ (+ VQ Bottleneck│  │  (+ SSL / GRL)  │          │
 │  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘          │
 │           │                    │                    │                    │
 │           └──────────────┬─────┴────────────────────┘                    │
@@ -77,8 +89,8 @@ The difference is only in the input modality; the core generation process is ide
 │                          │                                               │
 │                          ▼                                               │
 │              ┌───────────────────────┐                                   │
-│              │   Token Prediction    │                                   │
-│              │  Q_0: AR, Q_1..n: PAR │                                   │
+│              │  Dual Token Heads     │                                   │
+│              │  Acoustic A_t + B_t   │                                   │
 │              └───────────┬───────────┘                                   │
 │                          │                                               │
 │                          ▼                                               │
@@ -128,14 +140,16 @@ class TTSEncoder(nn.Module):
 
 ```python
 class VCEncoder(nn.Module):
-    """Encode source audio tokens for VC mode."""
+    """Encode source audio tokens for VC mode with Information Bottleneck."""
     
-    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=256):
+    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=256, vq_bins=128):
         self.codebook_embed = nn.ModuleList([
             nn.Embedding(vocab_size, d_model // n_codebooks)
             for _ in range(n_codebooks)
         ])
         self.source_transformer = nn.TransformerEncoder(...)
+        # NEW: Information Bottleneck to remove speaker/style from source
+        self.vq_bottleneck = VectorQuantizer(vq_bins, d_model)
         
     def forward(self, source_tokens):
         """
@@ -143,13 +157,18 @@ class VCEncoder(nn.Module):
             source_tokens: [B, n_codebooks, T] from EnCodec
         Returns:
             source_features: [B, T, d_model]
+            vq_loss: Commitment loss for bottleneck
         """
         embeddings = [
             embed(source_tokens[:, i, :])
             for i, embed in enumerate(self.codebook_embed)
         ]
         x = torch.cat(embeddings, dim=-1)
-        return self.source_transformer(x)
+        x = self.source_transformer(x)
+        
+        # Apply Information Bottleneck
+        x, vq_loss, _ = self.vq_bottleneck(x)
+        return x, vq_loss
 ```
 
 ### 3.3 F0 Conditioning (Singing VC)
@@ -197,40 +216,53 @@ x = film(x, spk_cond)  # Speaker conditioning
 x = x + f0_proj(f0_condition)  # F0 conditioning (additive)
 ```
 
-### 3.4 Voice State Encoder
+### 3.4 Voice State Encoder (with SSL & GRL)
 
 ```python
 class VoiceStateEncoder(nn.Module):
-    """Encode continuous voice state parameters."""
+    """Encode style using SSL representations and explicit continuous parameters.
+       Includes Gradient Reversal Layer (GRL) for perfect disentanglement."""
     
-    # Voice state dimensions:
-    # [0]: breathiness    [0, 1]
-    # [1]: tension        [0, 1]
-    # [2]: arousal        [0, 1]
-    # [3]: valence        [-1, 1]
-    # [4]: roughness      [0, 1]
-    # [5]: voicing        [0, 1]
-    # [6]: energy         [0, 1]
-    # [7]: rate           [0.5, 2.0]
+    # Voice state explicit dimensions (8-dim):
+    # breathiness, tension, arousal, valence, roughness, voicing, energy, rate
     
-    def __init__(self, d_state=8, d_model=256):
-        self.proj = nn.Linear(d_state, d_model)
+    def __init__(self, d_state=8, d_ssl=128, d_model=256):
+        self.explicit_proj = nn.Linear(d_state, d_model // 2)
+        self.ssl_proj = nn.Linear(d_ssl, d_model // 2)
+        self.fusion = nn.Linear(d_model, d_model)
         self.temporal_conv = CausalConv1d(d_model, d_model, kernel_size=5)
         
-    def forward(self, voice_state):
+        # GRL Adversarial Classifier (predicts speaker/text to unlearn them)
+        self.adversarial_classifier = nn.Sequential(
+            GradientReversal(alpha=1.0),
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_speakers + num_phonemes)
+        )
+        
+    def forward(self, voice_state_explicit, voice_state_ssl):
         """
         Args:
-            voice_state: [B, T, d_state] continuous parameters
+            voice_state_explicit: [B, T, 8] manual/heuristic parameters
+            voice_state_ssl: [B, T, 128] from WavLM VAE latent space
         Returns:
             state_features: [B, T, d_model]
+            adv_logits: For adversarial loss
         """
-        x = self.proj(voice_state)
+        x_exp = self.explicit_proj(voice_state_explicit)
+        x_ssl = self.ssl_proj(voice_state_ssl)
+        x = torch.cat([x_exp, x_ssl], dim=-1)
+        x = self.fusion(x)
+        
         x = x.transpose(1, 2)
         x = self.temporal_conv(x)
-        return x.transpose(1, 2)
+        x = x.transpose(1, 2)
+        
+        adv_logits = self.adversarial_classifier(x)
+        return x, adv_logits
 ```
 
-### 3.4 Modality Fusion
+### 3.5 Modality Fusion
 
 ```python
 class ModalityFusion(nn.Module):
@@ -269,64 +301,40 @@ class ModalityFusion(nn.Module):
 
 ## 4. Codec Language Model
 
-### 4.1 Token Prediction
-
-Following SoundStorm / AudioLM:
+### 4.1 Dual-Stream Token Prediction
 
 ```python
 class CodecTransformer(nn.Module):
-    """Predict codec tokens with AR + parallel decoding."""
+    """Predict A_t (acoustic) and B_t (control) each frame."""
     
-    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=512):
+    def __init__(self, n_codebooks=8, rvq_vocab=1024, ctrl_vocab=64, d_model=512):
         self.n_codebooks = n_codebooks
-        self.vocab_size = vocab_size
+        self.rvq_vocab = rvq_vocab
+        self.ctrl_vocab = ctrl_vocab
         
-        # First codebook: autoregressive
-        self.ar_transformer = nn.TransformerDecoder(...)
-        self.ar_head = nn.Linear(d_model, vocab_size)
-        
-        # Remaining codebooks: parallel (non-AR)
-        self.parallel_transformer = nn.TransformerEncoder(...)
-        self.parallel_heads = nn.ModuleList([
-            nn.Linear(d_model, vocab_size)
-            for _ in range(n_codebooks - 1)
+        self.backbone = CausalTransformer(...)
+        self.acoustic_heads = nn.ModuleList([
+            nn.Linear(d_model, rvq_vocab) for _ in range(n_codebooks)
+        ])
+        self.control_heads = nn.ModuleList([
+            nn.Linear(d_model, ctrl_vocab) for _ in range(4)  # [op, type, dur, int]
         ])
         
-        # Delay pattern for residual coding
-        self.delays = [0, 1, 2, 3, 4, 5, 6, 7]  # codebook delays
-        
-    def forward(self, cond, past_tokens=None):
+    def forward(self, cond, past_a=None, past_b=None):
         """
         Args:
-            cond: [B, T, d_model] conditioning (text/source + voice_state + speaker)
-            past_tokens: [B, n_codebooks, k] from previous block
+            cond: [B, T, d_model]
+            past_a: [B, 8, k] acoustic context
+            past_b: [B, 4, k] control context
         Returns:
-            tokens: [B, n_codebooks, T] predicted tokens
+            logits_a: [B, 8, T, 1024]
+            logits_b: [B, 4, T, 64]
         """
-        T = cond.shape[1]
-        
-        # Autoregressive generation for first codebook
-        if past_tokens is not None:
-            # Concatenate past context
-            ar_input = torch.cat([past_tokens[:, 0, :], cond[:, :, 0]], dim=1)
-        else:
-            ar_input = cond
-            
-        ar_logits = self.ar_head(self.ar_transformer(ar_input))
-        Q0 = ar_logits.argmax(dim=-1)[:, -T:]  # Take last T tokens
-        
-        # Parallel generation for remaining codebooks
-        # Condition on first codebook + original conditioning
-        parallel_input = self.embed_codebook_0(Q0) + cond
-        parallel_feat = self.parallel_transformer(parallel_input)
-        
-        Q_rest = []
-        for i, head in enumerate(self.parallel_heads):
-            logits = head(parallel_feat)
-            Q_rest.append(logits.argmax(dim=-1))
-        
-        tokens = torch.stack([Q0] + Q_rest, dim=1)  # [B, n_codebooks, T]
-        return tokens
+        feat = self.backbone(cond, past_a=past_a, past_b=past_b)
+
+        logits_a = torch.stack([head(feat) for head in self.acoustic_heads], dim=1)
+        logits_b = torch.stack([head(feat) for head in self.control_heads], dim=1)
+        return logits_a, logits_b
 ```
 
 ### 4.2 Streaming Generation
@@ -342,25 +350,27 @@ class StreamingCodecLM(nn.Module):
         self.codec_lm = CodecTransformer(...)
         self.codec_decoder = EnCodecDecoder(...)  # or DAC
         
-    def generate_block(self, cond, past_tokens, voice_state_block):
+    def generate_block(self, cond, past_a, past_b, voice_state_block, delta_state_block):
         """
         Generate one block of audio.
         
         Args:
             cond: [B, L, d] text or source conditioning
             voice_state_block: [B, block_size, d_state] voice state for this block
-            past_tokens: [B, n_codebooks, k] tokens from previous blocks
+            past_a: [B, 8, k]
+            past_b: [B, 4, k]
         Returns:
             audio_block: [B, 1, block_size * hop_length] waveform
-            new_tokens: [B, n_codebooks, block_size] for next block's context
+            new_a: [B, 8, block_size]
+            new_b: [B, 4, block_size]
         """
-        # Predict tokens
-        tokens = self.codec_lm(cond, past_tokens)
+        logits_a, logits_b = self.codec_lm(cond, past_a, past_b)
+        new_a = sample_a(logits_a)
+        new_b = sample_b(logits_b)
         
-        # Decode to waveform
-        audio = self.codec_decoder(tokens)
+        audio = self.codec_decoder(new_a, new_b, voice_state_block, delta_state_block)
         
-        return audio, tokens
+        return audio, new_a, new_b
 ```
 
 ---
@@ -394,12 +404,13 @@ class StreamingCodecLM(nn.Module):
 │  │              UCLM (VC Mode)                                  │    │
 │  │                                                              │    │
 │  │  Input:                                                      │    │
-│  │    • source_tokens: current input                            │    │
+│  │    • source_A_t: current acoustic tokens                     │    │
 │  │    • target_spk_embed: from .tmrvc_speaker file             │    │
 │  │    • voice_state: optional (from IR estimator or manual)    │    │
-│  │    • past_context: tokens from buffer                       │    │
+│  │    • delta_voice_state: frame delta                          │    │
+│  │    • past_context: A/B tokens from rolling buffer            │    │
 │  │                                                              │    │
-│  │  Output: target_tokens[B, 8, 1]                             │    │
+│  │  Output: target_A_t[B, 8, 1], target_B_t[B, 4, 1]           │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │         │                                                            │
 │         ▼                                                            │
@@ -447,7 +458,8 @@ class RealTimeVC:
         self.decoder = EnCodecDecoder()
         self.uclm = UCLM()
         
-        self.token_buffer = TokenBuffer(max_blocks=3)
+        self.token_buffer_a = TokenBuffer(max_blocks=6)
+        self.token_buffer_b = TokenBuffer(max_blocks=6)
         self.audio_buffer = AudioBuffer(hop_length=240)
         
     def process_frame(self, audio_frame, target_spk_embed, voice_state=None):
@@ -461,26 +473,27 @@ class RealTimeVC:
         Returns:
             output_frame: [1, 240] converted audio
         """
-        # Encode
-        tokens = self.encoder(audio_frame)
+        source_a = self.encoder(audio_frame)
         
-        # Store in buffer
-        self.token_buffer.append(tokens)
+        past_a = self.token_buffer_a.get_context()
+        past_b = self.token_buffer_b.get_context()
+        delta_state = voice_state - self.prev_voice_state
         
-        # Get context
-        past_tokens = self.token_buffer.get_context()
-        
-        # UCLM transform
-        target_tokens = self.uclm(
-            source_tokens=tokens,
+        target_a, target_b = self.uclm(
+            source_a=source_a,
             target_spk=target_spk_embed,
             voice_state=voice_state,
-            past_context=past_tokens,
+            delta_voice_state=delta_state,
+            past_a=past_a,
+            past_b=past_b,
             mode='vc'
         )
         
-        # Decode
-        output_audio = self.decoder(target_tokens)
+        self.token_buffer_a.append(target_a)
+        self.token_buffer_b.append(target_b)
+        self.prev_voice_state = voice_state
+
+        output_audio = self.decoder(target_a, target_b, voice_state, delta_state)
         
         return output_audio
 ```
@@ -503,15 +516,17 @@ for batch in dataloader:
         speaker = batch['speaker_embed']
         voice_state = batch['voice_state']  # extracted or manual
         
-        # Encode target audio
-        target_tokens = codec_encoder(audio)
+        target_a = codec_encoder(audio)
+        target_b = control_tokenizer(audio, voice_state)
         
         # Predict
-        pred_tokens = uclm(
+        pred_a, pred_b = uclm(
             text=text,
             speaker=speaker,
             voice_state=voice_state,
-            past_context=None,  # teacher forcing during training
+            delta_voice_state=compute_delta(voice_state),
+            past_a=None,
+            past_b=None,
             mode='tts'
         )
         
@@ -523,20 +538,32 @@ for batch in dataloader:
         voice_state = batch['voice_state']
         
         # Encode both
-        source_tokens = codec_encoder(source_audio)
-        target_tokens = codec_encoder(target_audio)
+        source_a = codec_encoder(source_audio)
+        target_a = codec_encoder(target_audio)
+        target_b = control_tokenizer(target_audio, voice_state)
         
         # Predict
-        pred_tokens = uclm(
-            source_tokens=source_tokens,
+        pred_a, pred_b = uclm(
+            source_a=source_a,
             speaker=target_speaker,
             voice_state=voice_state,
-            past_context=None,
+            delta_voice_state=compute_delta(voice_state),
+            past_a=None,
+            past_b=None,
             mode='vc'
         )
     
-    # Loss
-    loss = cross_entropy(pred_tokens, target_tokens)
+    # Classifier-Free Guidance (CFG) Dropout
+    if random.random() < 0.15:
+        voice_state = torch.zeros_like(voice_state)
+        target_speaker = torch.zeros_like(target_speaker)
+
+    # Loss (dual-stream + VQ + Adversarial)
+    loss_uclm = ce_acoustic(pred_a, target_a) + ce_control(pred_b, target_b)
+    loss_vq = vq_bottleneck_loss(batch)
+    loss_adv = adversarial_disentanglement_loss(pred_adv_logits, batch['speaker'], batch['text'])
+    
+    loss = loss_uclm + loss_vq + loss_adv
     loss.backward()
 ```
 
@@ -564,9 +591,9 @@ SpeakerEncoder (offline)
 IREstimator (100ms)
 ```
 
-**After (2 models):**
+**After (3 models + offline speaker):**
 ```
-EnCodecEncoder → UCLM → EnCodecDecoder
+CodecEncoder → UCLM Core (dual-head) → CodecDecoder
 SpeakerEncoder (offline, reused)
 ```
 
@@ -670,12 +697,14 @@ SpeakerEncoder (offline, reused)
 
 ## 12. Consistency Checklist
 
-- [ ] EnCodec frame rate = 100 fps (10ms) matches TMRVC hop_length
-- [ ] Speaker embedding dimension (192) matches current `.tmrvc_speaker`
-- [ ] Voice state dimension (8) compatible with voice source params
-- [ ] Streaming block size divisible by hop_length
-- [ ] Causal masking in transformer for real-time
-- [ ] Multi-codebook delay pattern matches EnCodec
+- [x] EnCodec frame rate = 100 fps (10ms) matches TMRVC hop_length
+- [x] Speaker embedding dimension (192) matches current `.tmrvc_speaker`
+- [x] Voice state dimension (8) compatible with voice source params
+- [x] `A_t` (`[B,8]`) and `B_t` (`[B,4]`) の dual-stream が全モードで一致
+- [x] `delta_voice_state` が学習/推論の両方で使用される
+- [x] Streaming block size divisible by hop_length
+- [x] Causal masking in transformer for real-time
+- [x] Control vocabulary size (64) が ONNX/Rust/Python で一致
 
 ---
 

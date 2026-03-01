@@ -49,6 +49,8 @@ pub struct SpeakerMetadata {
     pub style_embed: Option<Vec<f32>>,
     #[serde(default)]
     pub reference_tokens: Option<Vec<i32>>,
+    #[serde(default)]
+    pub ssl_state: Option<Vec<f32>>,
     #[serde(default = "default_f0_mean")]
     pub f0_mean: f32,
 }
@@ -64,13 +66,23 @@ pub struct SpeakerFile {
     pub style_embed: Option<Vec<f32>>,
     pub reference_tokens: Option<Vec<i32>>,
     pub lora_delta: Option<Vec<f32>>,
+    pub ssl_state: Option<Vec<f32>>,
     pub metadata: SpeakerMetadata,
 }
 
 impl SpeakerFile {
     /// Get lora_delta, defaulting to zeros if not present.
     pub fn lora_delta_or_zeros(&self) -> Vec<f32> {
-        self.lora_delta.clone().unwrap_or_else(|| vec![0.0f32; LORA_DELTA_SIZE])
+        self.lora_delta
+            .clone()
+            .unwrap_or_else(|| vec![0.0f32; LORA_DELTA_SIZE])
+    }
+
+    /// Get ssl_state, defaulting to zeros if not present.
+    pub fn ssl_state_or_zeros(&self) -> Vec<f32> {
+        self.ssl_state
+            .clone()
+            .unwrap_or_else(|| vec![0.0f32; D_VOICE_STATE_SSL])
     }
 
     /// Extract voice source preset as a fixed-size array, if present in metadata.
@@ -118,7 +130,18 @@ impl SpeakerFile {
         let metadata_size = u32::from_le_bytes(data[28..32].try_into().unwrap()) as usize;
 
         if spk_embed_size != D_SPEAKER {
-            bail!("Speaker embed size mismatch: expected {}, got {}", D_SPEAKER, spk_embed_size);
+            bail!(
+                "Speaker embed size mismatch: expected {}, got {}",
+                D_SPEAKER,
+                spk_embed_size
+            );
+        }
+        if (flags & FLAG_HAS_STYLE != 0) && (style_embed_size != D_STYLE) {
+            bail!(
+                "Style embed size mismatch: expected {}, got {}",
+                D_STYLE,
+                style_embed_size
+            );
         }
 
         // Calculate expected size
@@ -138,7 +161,11 @@ impl SpeakerFile {
         expected_size += CHECKSUM_SIZE;
 
         if data.len() != expected_size {
-            bail!("Speaker file size mismatch: expected {} bytes, got {}", expected_size, data.len());
+            bail!(
+                "Speaker file size mismatch: expected {} bytes, got {}",
+                expected_size,
+                data.len()
+            );
         }
 
         // SHA-256 verification
@@ -153,20 +180,30 @@ impl SpeakerFile {
 
         // Parse spk_embed
         let mut spk_embed = [0.0f32; D_SPEAKER];
-        for (i, chunk) in data[offset..offset + D_SPEAKER * 4].chunks_exact(4).enumerate() {
+        for (i, chunk) in data[offset..offset + D_SPEAKER * 4]
+            .chunks_exact(4)
+            .enumerate()
+        {
             spk_embed[i] = f32::from_le_bytes(chunk.try_into().unwrap());
         }
         offset += D_SPEAKER * 4;
 
         // Parse f0_mean (4 bytes after spk_embed)
         let f0_mean = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        let f0_mean = if f0_mean > 0.0 { f0_mean } else { default_f0_mean() };
+        let f0_mean = if f0_mean > 0.0 {
+            f0_mean
+        } else {
+            default_f0_mean()
+        };
         offset += 4;
 
         // Parse style_embed (optional)
         let style_embed = if flags & FLAG_HAS_STYLE != 0 {
             let mut se = vec![0.0f32; D_STYLE];
-            for (i, chunk) in data[offset..offset + D_STYLE * 4].chunks_exact(4).enumerate() {
+            for (i, chunk) in data[offset..offset + D_STYLE * 4]
+                .chunks_exact(4)
+                .enumerate()
+            {
                 se[i] = f32::from_le_bytes(chunk.try_into().unwrap());
             }
             offset += D_STYLE * 4;
@@ -191,7 +228,10 @@ impl SpeakerFile {
         // Parse lora_delta (optional)
         let lora_delta = if flags & FLAG_HAS_LORA != 0 && lora_size > 0 {
             let mut ld = vec![0.0f32; lora_size];
-            for (i, chunk) in data[offset..offset + lora_size * 4].chunks_exact(4).enumerate() {
+            for (i, chunk) in data[offset..offset + lora_size * 4]
+                .chunks_exact(4)
+                .enumerate()
+            {
                 ld[i] = f32::from_le_bytes(chunk.try_into().unwrap());
             }
             offset += lora_size * 4;
@@ -209,7 +249,14 @@ impl SpeakerFile {
         };
 
         // Use metadata.f0_mean if available, otherwise use binary f0_mean
-        let f0_mean = if metadata.f0_mean > 0.0 { metadata.f0_mean } else { f0_mean };
+        let f0_mean = if metadata.f0_mean > 0.0 {
+            metadata.f0_mean
+        } else {
+            f0_mean
+        };
+
+        // Extract ssl_state from metadata if present
+        let ssl_state = metadata.ssl_state.clone();
 
         Ok(Self {
             spk_embed,
@@ -217,13 +264,15 @@ impl SpeakerFile {
             style_embed,
             reference_tokens,
             lora_delta,
+            ssl_state,
             metadata,
         })
     }
 
     /// Save as .tmrvc_speaker v3 file.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let metadata_json = serde_json::to_vec(&self.metadata).context("Failed to serialize metadata")?;
+        let metadata_json =
+            serde_json::to_vec(&self.metadata).context("Failed to serialize metadata")?;
         let metadata_size = metadata_json.len();
 
         // Calculate flags and sizes
@@ -238,9 +287,21 @@ impl SpeakerFile {
             flags |= FLAG_HAS_LORA;
         }
 
-        let style_embed_size = if self.style_embed.is_some() { D_STYLE as u32 } else { 0 };
-        let ref_tokens_frames = self.reference_tokens.as_ref().map(|t| (t.len() / 4) as u32).unwrap_or(0);
-        let lora_size = self.lora_delta.as_ref().map(|l| l.len() as u32).unwrap_or(0);
+        let style_embed_size = if self.style_embed.is_some() {
+            D_STYLE as u32
+        } else {
+            0
+        };
+        let ref_tokens_frames = self
+            .reference_tokens
+            .as_ref()
+            .map(|t| (t.len() / 4) as u32)
+            .unwrap_or(0);
+        let lora_size = self
+            .lora_delta
+            .as_ref()
+            .map(|l| l.len() as u32)
+            .unwrap_or(0);
 
         // Build payload
         let mut buf = Vec::new();
@@ -292,7 +353,8 @@ impl SpeakerFile {
         buf.extend_from_slice(&hash);
 
         let mut file = fs::File::create(path).context("Failed to create speaker file")?;
-        file.write_all(&buf).context("Failed to write speaker file")?;
+        file.write_all(&buf)
+            .context("Failed to write speaker file")?;
 
         Ok(())
     }
@@ -319,6 +381,7 @@ mod tests {
             style_embed: None,
             reference_tokens: None,
             lora_delta: None,
+            ssl_state: None,
             metadata: default_metadata(),
         };
 
@@ -348,6 +411,7 @@ mod tests {
             style_embed,
             reference_tokens,
             lora_delta: None,
+            ssl_state: None,
             metadata: default_metadata(),
         };
 
@@ -377,6 +441,7 @@ mod tests {
             style_embed,
             reference_tokens,
             lora_delta,
+            ssl_state: None,
             metadata: default_metadata(),
         };
 
@@ -387,7 +452,10 @@ mod tests {
         let loaded = SpeakerFile::load(&path).expect("load failed");
         assert_eq!(loaded.style_embed.as_ref().map(|s| s.len()), Some(D_STYLE));
         assert_eq!(loaded.reference_tokens.as_ref().map(|r| r.len()), Some(4));
-        assert_eq!(loaded.lora_delta.as_ref().map(|l| l.len()), Some(LORA_DELTA_SIZE));
+        assert_eq!(
+            loaded.lora_delta.as_ref().map(|l| l.len()),
+            Some(LORA_DELTA_SIZE)
+        );
         assert!((loaded.f0_mean - 250.0).abs() < 0.1);
 
         let _ = fs::remove_file(&path);
@@ -401,6 +469,7 @@ mod tests {
             style_embed: None,
             reference_tokens: None,
             lora_delta: None,
+            ssl_state: None,
             metadata: default_metadata(),
         };
         let dir = std::env::temp_dir();
@@ -424,6 +493,7 @@ mod tests {
             style_embed: None,
             reference_tokens: None,
             lora_delta: None,
+            ssl_state: None,
             metadata: default_metadata(),
         };
         let zeros = sf.lora_delta_or_zeros();

@@ -14,13 +14,13 @@ use anyhow::Result;
 use atomic_float::AtomicF32;
 use rand::Rng;
 
+use crate::character::CharacterFile;
 use crate::constants::*;
 use crate::f0_tracker::F0Tracker;
 use crate::ort_bundle::OrtBundle;
 use crate::ping_pong::PingPongState;
 use crate::speaker::SpeakerFile;
 use crate::style::StyleFile;
-use crate::character::CharacterFile;
 
 // ============================================================================
 // Public Types
@@ -45,6 +45,18 @@ pub struct FrameParams {
     pub latency_quality_q: f32,
     /// Pitch shift in semitones (-24 to +24)
     pub pitch_shift: f32,
+    /// CFG scale for classifier-free guidance
+    pub cfg_scale: f32,
+    /// Temperature for acoustic token sampling
+    pub temperature_a: f32,
+    /// Temperature for control token sampling
+    pub temperature_b: f32,
+    /// Top-k for acoustic token sampling
+    pub top_k_a: usize,
+    /// Top-k for control token sampling
+    pub top_k_b: usize,
+    /// Voice state parameters [breathiness, tension, arousal, valence, roughness, voicing, energy, rate]
+    pub voice_state: [f32; D_VOICE_STATE],
 }
 
 /// Shared status for real-time monitoring (atomic values for thread-safe access).
@@ -52,30 +64,30 @@ pub struct SharedStatus {
     // Audio levels
     pub input_level_db: AtomicF32,
     pub output_level_db: AtomicF32,
-    
+
     // Timing
     pub inference_ms: AtomicF32,
     pub inference_p50_ms: AtomicF32,
     pub inference_p95_ms: AtomicF32,
-    
+
     // Counters
     pub frame_count: AtomicU64,
     pub overrun_count: AtomicU64,
     pub underrun_count: AtomicU64,
-    
+
     // Current parameters (mirrored for GUI)
     pub latency_quality_q: AtomicF32,
     pub alpha_timbre: AtomicF32,
     pub beta_prosody: AtomicF32,
     pub gamma_articulation: AtomicF32,
-    
+
     // Estimated values
     pub estimated_log_f0: AtomicF32,
-    
+
     // Style targets (if style loaded)
     pub style_target_log_f0: AtomicF32,
     pub style_target_articulation: AtomicF32,
-    
+
     // Flags
     pub style_loaded: AtomicBool,
     pub is_running: AtomicBool,
@@ -103,7 +115,7 @@ impl SharedStatus {
             is_running: AtomicBool::new(false),
         }
     }
-    
+
     pub fn reset(&self) {
         self.input_level_db.store(-100.0, Ordering::SeqCst);
         self.output_level_db.store(-100.0, Ordering::SeqCst);
@@ -373,12 +385,7 @@ impl StreamingEngine {
     /// - `input`: Input audio samples (FRAME_SIZE samples)
     /// - `output`: Output audio samples (FRAME_SIZE samples)
     /// - `params`: Per-frame parameters
-    pub fn process_one_frame(
-        &mut self,
-        input: &[f32],
-        output: &mut [f32],
-        params: &FrameParams,
-    ) {
+    pub fn process_one_frame(&mut self, input: &[f32], output: &mut [f32], params: &FrameParams) {
         debug_assert_eq!(input.len(), FRAME_SIZE);
         debug_assert_eq!(output.len(), FRAME_SIZE);
 
@@ -411,7 +418,8 @@ impl StreamingEngine {
                 for (i, out) in output.iter_mut().enumerate() {
                     let dry = input[i];
                     let wet = processed[i];
-                    *out = (dry * (1.0 - params.dry_wet) + wet * params.dry_wet) * params.output_gain;
+                    *out =
+                        (dry * (1.0 - params.dry_wet) + wet * params.dry_wet) * params.output_gain;
                 }
             }
             Err(e) => {
@@ -421,7 +429,8 @@ impl StreamingEngine {
         }
 
         // Update output level
-        let output_rms: f32 = (output.iter().map(|x| x * x).sum::<f32>() / output.len() as f32).sqrt();
+        let output_rms: f32 =
+            (output.iter().map(|x| x * x).sum::<f32>() / output.len() as f32).sqrt();
         let output_db = if output_rms > 1e-10 {
             20.0 * output_rms.log10()
         } else {
@@ -453,31 +462,90 @@ impl StreamingEngine {
             status.input_level_db.store(input_db, Ordering::Relaxed);
             status.output_level_db.store(output_db, Ordering::Relaxed);
             status.inference_ms.store(elapsed_ms, Ordering::Relaxed);
-            status.latency_quality_q.store(params.latency_quality_q, Ordering::Relaxed);
-            status.alpha_timbre.store(params.alpha_timbre, Ordering::Relaxed);
-            status.beta_prosody.store(params.beta_prosody, Ordering::Relaxed);
-            status.gamma_articulation.store(params.gamma_articulation, Ordering::Relaxed);
+            status
+                .latency_quality_q
+                .store(params.latency_quality_q, Ordering::Relaxed);
+            status
+                .alpha_timbre
+                .store(params.alpha_timbre, Ordering::Relaxed);
+            status
+                .beta_prosody
+                .store(params.beta_prosody, Ordering::Relaxed);
+            status
+                .gamma_articulation
+                .store(params.gamma_articulation, Ordering::Relaxed);
         }
     }
 
     fn process_frame_internal(&mut self, audio_in: &[f32]) -> Result<Vec<f32>> {
-        let models = self.models.as_mut().ok_or_else(|| anyhow::anyhow!("Models not loaded"))?;
-        let states = self.states.as_mut().ok_or_else(|| anyhow::anyhow!("States not initialized"))?;
-        
-        let tokens_in = self.run_codec_encoder(models, states, audio_in)?;
-        
+        let temperature = self.temperature;
+        let top_k = self.top_k;
+
+        let models = self
+            .models
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Models not loaded"))?;
+        let states = self
+            .states
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("States not initialized"))?;
+
+        // Codec encoder: audio → A_t tokens
+        let (state_in, state_out) = states.codec_encoder.get_both();
+        let tokens_in = models.run_codec_encoder(audio_in, state_in, state_out)?;
+
         self.token_buffer.push(&tokens_in);
-        
+
+        // Token model: A_t context → predicted A_t'
         let tokens_out = if self.token_buffer.is_full() {
             let f0_cond = self.f0_tracker.process_frame(audio_in);
-            let logits = self.run_token_model(models, states, f0_cond)?;
-            self.sample_tokens(&logits)
+            let tokens_ctx = self.token_buffer.get_context();
+
+            let spk_embed: &[f32] = self
+                .speaker
+                .as_ref()
+                .map(|s| s.spk_embed.as_slice())
+                .unwrap_or(&[0.0f32; D_SPEAKER]);
+
+            let f0_condition = vec![f0_cond[0].max(0.0); CONTEXT_LENGTH * 2];
+            let voice_state_ctx = vec![0.0f32; D_MODEL];
+            let mut logits_out = vec![0.0f32; N_CODEBOOKS * CODEBOOK_SIZE];
+
+            let (kv_in, kv_out) = states.token_model.get_both();
+            models.run_token_model(
+                &tokens_ctx,
+                spk_embed,
+                &f0_condition,
+                &voice_state_ctx,
+                kv_in,
+                &mut logits_out,
+                kv_out,
+            )?;
+
+            sample_tokens(&logits_out, top_k, temperature)
         } else {
             tokens_in
         };
-        
+
+        // Codec decoder: A_t' → audio
+        let control_tokens = [0i64; CONTROL_SLOTS];
+        let voice_state = [0.5f32; D_VOICE_STATE];
+        let event_trace_in = vec![0.0f32; D_EVENT_TRACE];
+        let mut event_trace_out = vec![0.0f32; D_EVENT_TRACE];
+
+        let (dec_in, dec_out) = states.codec_decoder.get_both();
+        let audio = models.run_codec_decoder(
+            &tokens_out,
+            &control_tokens,
+            &voice_state,
+            &event_trace_in,
+            dec_in,
+            &mut event_trace_out,
+            dec_out,
+        )?;
+
         let mut audio_out = vec![0.0f32; FRAME_SIZE];
-        self.run_codec_decoder(models, states, &tokens_out, &mut audio_out)?;
+        audio_out.copy_from_slice(&audio[..FRAME_SIZE]);
 
         states.codec_encoder.swap();
         states.token_model.swap();
@@ -485,114 +553,44 @@ impl StreamingEngine {
 
         Ok(audio_out)
     }
+}
 
-    fn run_codec_encoder(
-        &mut self,
-        models: &mut OrtBundle,
-        states: &mut ModelStates,
-        audio: &[f32],
-    ) -> Result<[i64; N_CODEBOOKS]> {
-        let (tokens_vec, state_vec) = models.run_codec_encoder(
-            audio,
-            states.codec_encoder.current(),
-        )?;
-        
-        let mut tokens = [0i64; N_CODEBOOKS];
-        tokens.copy_from_slice(&tokens_vec[..N_CODEBOOKS]);
-        
-        states.codec_encoder.next().copy_from_slice(&state_vec);
-        
-        Ok(tokens)
+fn sample_tokens(logits: &[f32], top_k: usize, temperature: f32) -> [i64; N_CODEBOOKS] {
+    let mut tokens = [0i64; N_CODEBOOKS];
+
+    for cb in 0..N_CODEBOOKS {
+        let cb_logits = &logits[cb * CODEBOOK_SIZE..(cb + 1) * CODEBOOK_SIZE];
+        tokens[cb] = sample_top_k(cb_logits, top_k, temperature);
     }
 
-    fn run_token_model(
-        &mut self,
-        models: &mut OrtBundle,
-        states: &mut ModelStates,
-        f0_cond: [f32; 2],
-    ) -> Result<Vec<f32>> {
-        let tokens_ctx = self.token_buffer.get_context();
-        
-        let spk_embed: &[f32] = self.speaker
-            .as_ref()
-            .map(|s| s.spk_embed.as_slice())
-            .unwrap_or(&[0.0f32; D_SPEAKER]);
-        
-        let f0_condition = self.build_f0_condition(f0_cond);
-        
-        let (logits_vec, state_vec) = models.run_token_model(
-            &tokens_ctx,
-            spk_embed,
-            &f0_condition,
-            states.token_model.current(),
-        )?;
-        
-        states.token_model.next().copy_from_slice(&state_vec);
-        
-        Ok(logits_vec)
-    }
+    tokens
+}
 
-    fn build_f0_condition(&self, f0_cond: [f32; 2]) -> Vec<f32> {
-        let mut f0_condition = vec![0.0f32; CONTEXT_LENGTH * 2];
-        for i in 0..CONTEXT_LENGTH {
-            f0_condition[i * 2] = f0_cond[0];
-            f0_condition[i * 2 + 1] = f0_cond[1];
+fn sample_top_k(logits: &[f32], k: usize, temperature: f32) -> i64 {
+    let scaled: Vec<f32> = logits.iter().map(|x| x / temperature).collect();
+
+    let mut indexed: Vec<(usize, f32)> = scaled.iter().cloned().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed.truncate(k);
+
+    let max_logit = indexed[0].1;
+    let exp_sum: f32 = indexed.iter().map(|(_, x)| (x - max_logit).exp()).sum();
+    let probs: Vec<f32> = indexed
+        .iter()
+        .map(|(_, x)| (x - max_logit).exp() / exp_sum)
+        .collect();
+
+    let mut rng = rand::thread_rng();
+    let r: f32 = rng.gen();
+    let mut cumsum = 0.0;
+    for (i, prob) in probs.iter().enumerate() {
+        cumsum += prob;
+        if r < cumsum {
+            return indexed[i].0 as i64;
         }
-        f0_condition
     }
 
-    fn sample_tokens(&self, logits: &[f32]) -> [i64; N_CODEBOOKS] {
-        let mut tokens = [0i64; N_CODEBOOKS];
-        
-        for cb in 0..N_CODEBOOKS {
-            let cb_logits = &logits[cb * CODEBOOK_SIZE..(cb + 1) * CODEBOOK_SIZE];
-            tokens[cb] = self.sample_top_k(cb_logits, self.top_k, self.temperature);
-        }
-        
-        tokens
-    }
-
-    fn sample_top_k(&self, logits: &[f32], k: usize, temperature: f32) -> i64 {
-        let scaled: Vec<f32> = logits.iter().map(|x| x / temperature).collect();
-        
-        let mut indexed: Vec<(usize, f32)> = scaled.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        indexed.truncate(k);
-        
-        let max_logit = indexed[0].1;
-        let exp_sum: f32 = indexed.iter().map(|(_, x)| (x - max_logit).exp()).sum();
-        let probs: Vec<f32> = indexed.iter().map(|(_, x)| (x - max_logit).exp() / exp_sum).collect();
-        
-        let mut rng = rand::thread_rng();
-        let r: f32 = rng.gen();
-        let mut cumsum = 0.0;
-        for (i, prob) in probs.iter().enumerate() {
-            cumsum += prob;
-            if r < cumsum {
-                return indexed[i].0 as i64;
-            }
-        }
-        
-        indexed[0].0 as i64
-    }
-
-    fn run_codec_decoder(
-        &mut self,
-        models: &mut OrtBundle,
-        states: &mut ModelStates,
-        tokens: &[i64; N_CODEBOOKS],
-        audio_out: &mut [f32],
-    ) -> Result<()> {
-        let (audio_vec, state_vec) = models.run_codec_decoder(
-            tokens,
-            states.codec_decoder.current(),
-        )?;
-        
-        audio_out.copy_from_slice(&audio_vec[..FRAME_SIZE]);
-        states.codec_decoder.next().copy_from_slice(&state_vec);
-        
-        Ok(())
-    }
+    indexed[0].0 as i64
 }
 
 // ============================================================================
@@ -606,13 +604,13 @@ mod tests {
     #[test]
     fn test_token_buffer() {
         let mut buf = TokenBuffer::new();
-        
+
         assert!(!buf.is_full());
-        
+
         for i in 0..CONTEXT_LENGTH {
             buf.push(&[i as i64; N_CODEBOOKS]);
         }
-        
+
         assert!(buf.is_full());
     }
 
@@ -635,6 +633,12 @@ mod tests {
             voice_source_alpha: 0.0,
             latency_quality_q: 0.0,
             pitch_shift: 0.0,
+            cfg_scale: 1.0,
+            temperature_a: 1.0,
+            temperature_b: 1.0,
+            top_k_a: 50,
+            top_k_b: 20,
+            voice_state: [0.5f32; D_VOICE_STATE],
         };
         assert_eq!(params.dry_wet, 0.8);
     }

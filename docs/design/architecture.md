@@ -2,10 +2,11 @@
 
 Kojiro Tanaka — architecture design
 Created: 2026-02-16 (Asia/Tokyo)
-Updated: 2026-02-28 — UCLM パラダイムに統合
+Updated: 2026-03-01 — UCLM Token Spec v2 を反映
 
-> **Goal:** End-to-end 50ms 以下 (DAW バッファ込み)、CPU-only リアルタイム Voice Conversion + TTS。
-> **Current Paradigm:** UCLM (Unified Codec Language Model) — 単一モデルで TTS と VC を統合。
+> **Goal:** End-to-end 50ms 以下 (DAW バッファ込み)、CPU-only リアルタイム Voice Conversion + TTS での究極の官能的表現の実現。
+> **Current Paradigm:** Disentangled UCLM — 単一モデルでTTSとVCを統合。Adversarial Disentanglement (分離) と WavLM ベースの Latent Voice State を導入した SOTA アーキテクチャ。
+> **Token Spec v2:** `A_t` (Acoustic RVQ, `[B,8]`, `0..1023`) + `B_t` (Control tuple, `[B,4]`, vocab=64) の dual-stream。
 
 ---
 
@@ -72,15 +73,18 @@ Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → D
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      UCLM (Unified Codec LM)                     │
+│                      Disentangled UCLM                           │
 │                                                                  │
-│  TTS Mode:  text + voice_state + speaker → CodecLM → Audio      │
-│  VC Mode:   source_tokens + speaker + voice_state → Audio       │
+│  TTS Mode: text + speaker + (voice_state + SSL) → UCLM → A_t/B_t │
+│  VC Mode:  source_A_t (VQ-bottlenecked) + speaker +              │
+│            (voice_state + SSL) → UCLM → A_t/B_t                  │
 │                                                                  │
 │  Components:                                                     │
-│    - EnCodec (Encoder + Decoder)                                │
-│    - UCLM Core (Transformer)                                    │
-│    - VoiceStateEncoder                                          │
+│    - Fine-tuned EnCodec (Encoder + Decoder)                      │
+│    - VC Encoder w/ Information Bottleneck (VQ)                   │
+│    - VoiceStateEncoder w/ WavLM SSL & GRL (Adversarial)          │
+│    - UCLM Core (Transformer) + CFG (Classifier-Free Guidance)    │
+│    - Control Encoder (B_t -> decoder conditioning)               │
 │    - SpeakerEncoder                                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -96,9 +100,11 @@ Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → D
 
 | モデル | 入力 | 出力 | 用途 |
 |---|---|---|---|
-| **EnCodec** | waveform | tokens [n_cb, T] | 符号化/復号 |
-| **UCLM Core** | (text \| source_tokens) + voice_state + spk_embed | tokens | トークン生成 |
-| **VoiceStateEncoder** | voice_state [T, 8] | features [T, d] | 条件付け |
+| **EnCodec** | waveform | `A_t` tokens [8, T] | 符号化/復号 |
+| **Control Tokenizer** | labels / estimated events | `B_t` tokens [4, T] | Non-verbal 制御トークン化 |
+| **UCLM Core** | (text \| source_A_t) + explicit_state + ssl_state + spk_embed + past(A,B) | `A_t', B_t'` | dual-stream 生成 (推論時 CFG 適用) |
+| **VCEncoder (VQ)** | source_A_t | bottlenecked_features | 音声のスタイル/話者情報削ぎ落とし |
+| **VoiceStateEncoder** | explicit_state [T, 8], ssl_state [T, 128] | features [T, d] | GRLによる分離・純粋スタイル抽出 |
 | **SpeakerEncoder** | audio | embed [192] | 話者埋め込み |
 
 ### 3.2 フレームレート
@@ -108,15 +114,16 @@ Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → D
 | DAW Audio | 48kHz | — |
 | 内部 Audio | 24kHz | — |
 | Mel / Voice State | 24kHz | 100 fps (10ms) |
-| EnCodec Tokens | 24kHz | 75 fps (~13.3ms) |
+| Acoustic Tokens (`A_t`) | 24kHz | 100 fps (10ms) |
+| Control Tokens (`B_t`) | 24kHz | 100 fps (10ms) |
 
 ### 3.3 推論フロー (VC Mode)
 
 ```
 1. DAW Audio (48kHz) → Resample → 24kHz
-2. 24kHz Audio → EnCodec Encoder → tokens [8, T]
-3. tokens + spk_embed + voice_state → UCLM Core → target_tokens
-4. target_tokens → EnCodec Decoder → 24kHz Audio
+2. 24kHz Audio → EnCodec Encoder → source_A_t [8, T]
+3. source_A_t + spk_embed + voice_state + past(A,B) → UCLM Core → target_A_t + target_B_t
+4. target_A_t + target_B_t → Codec Decoder (+Control Encoder/FiLM) → 24kHz Audio
 5. 24kHz Audio → Resample → 48kHz → DAW Output
 ```
 
@@ -124,8 +131,8 @@ Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → D
 
 ```
 1. Text → TextEncoder → text_features
-2. text_features + voice_state + spk_embed → UCLM Core → tokens
-3. tokens → EnCodec Decoder → 24kHz Audio
+2. text_features + voice_state + spk_embed + past(A,B) → UCLM Core → A_t + B_t
+3. A_t + B_t → Codec Decoder → 24kHz Audio
 ```
 
 ---
@@ -158,6 +165,7 @@ Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → D
 - **Codebooks:** 8
 - **Vocabulary:** 1024
 - **Bandwidth:** 6 kbps
+- **運用:** special token を持たず `0..1023` のみ (special/control は `B_t` 側)
 
 ---
 
@@ -166,15 +174,16 @@ Source Audio → CodecEncoder → Tokens → TokenModel (Mamba) → Tokens → D
 ```
 Raw Audio (data/raw/)
     │
-    ├──▶ prepare_dataset.py
+    ├──▶ scripts/data/prepare_dataset.py
     │      ├── Normalize (24kHz, loudness)
     │      ├── Annotate (Whisper, emotion)
     │      ├── Extract (mel, f0, spk_embed)
     │      └── Save (data/cache/)
     │
-    ├──▶ add_codec_to_cache.py
-    │      ├── EnCodec → codec_tokens
-    │      └── VoiceStateEstimator → voice_state
+    ├──▶ scripts/annotate/add_codec_to_cache.py
+    │      ├── EnCodec → acoustic_tokens (A_t)
+    │      ├── Control tokenizer → control_tokens (B_t)
+    │      └── SSLVoiceStateEstimator → explicit_state + ssl_state
     │
     └──▶ UCLMDataset
            └── DataLoader → Training
@@ -197,18 +206,22 @@ Raw Audio (data/raw/)
 
 ```bash
 # データ前処理
-uv run python scripts/parallel_prepare.py \
+uv run python scripts/data/parallel_prepare.py \
     --input data/moe_multispeaker_voices \
     --name moe_multispeaker \
     --n-jobs 4
 
-# codec_tokens 追加
-uv run python scripts/add_codec_to_cache.py --speaker moe_spk_01 --device cuda
+# codec_tokens 追加 (speaker 単位)
+uv run python scripts/annotate/add_codec_to_cache.py \
+    --cache-dir data/cache/moe_multispeaker/train \
+    --raw-dir data/raw/moe_multispeaker_voices \
+    --speaker moe_spk_01 \
+    --device cuda
 
 # UCLM 学習
 uv run tmrvc-train-uclm \
     --cache-dir data/cache \
-    --datasets vctk,moe_multispeaker \
+    --datasets vctk moe_multispeaker \
     --device cuda
 ```
 
@@ -238,28 +251,29 @@ uv run tmrvc-train-uclm \
 | `streaming-design.md` | ストリーミング設計 |
 | `dataset-preparation-flow.md` | データ準備フロー |
 
-### Archive (参考)
+### Archive (参考: docs/design/archive/ に移動済)
 
 | ファイル | 内容 | 状態 |
 |---|---|---|
-| `expressive-tts-design-VSF.md` | Voice Source Flow (パイプライン案) | 古い |
-| `unified-generator-tts-UCG.md` | UCG (初期案) | 古い |
-| `codec-latent-design.md` | Codec-Latent (Mamba案) | 参考 |
+| `model-architecture.md` | Legacy (旧 Codec-Latent 定義) | アーカイブ済 |
+| `codec-latent-design.md` | Codec-Latent (Mamba案) | アーカイブ済 |
+| `UCLM.md` | UCLM 概要 (旧版) | アーカイブ済 |
 
-### Legacy (更新予定)
+### Legacy & Spec
 
 | ファイル | 状態 |
 |---|---|
-| `model-architecture.md` | UCLM に更新必要 |
-| `acoustic-condition-pathway.md` | 参考資料 (UCLM では使用しない) |
-| `onnx-contract.md` | UCLM ONNX 仕様に更新必要 |
-| `cpp-engine-design.md` | Rust エンジン設計 (有効) |
+| `acoustic-condition-pathway.md` | 参考資料 (補助条件経路) |
+| `pitch-control-design.md` | 参考資料 (ピッチ制御) |
+| `onnx-contract.md` | UCLM ONNX 仕様 (v2) |
+| `rust-engine-design.md` | Rust エンジン設計 (有効) |
 
 ---
 
 ## 9. Consistency Checklist
 
-- [ ] UCLM のフレームレート: EnCodec 75fps vs Voice State 100fps → リサンプリング済み
-- [ ] constants.yaml に UCLM 定数追加済み
-- [ ] Rust エンジンは UCLM 対応予定
-- [ ] ONNX エクスポート未実装
+- [x] UCLM は 10ms (100fps) で `A_t/B_t` を同時生成
+- [x] constants.yaml に UCLM 定数追加済み
+- [x] `RVQ_VOCAB_SIZE=1024` と `CONTROL_VOCAB_SIZE=64` が全実装で一致
+- [x] Rust エンジンは UCLM 対応済み (processor.rs)
+- [x] ONNX エクスポート実装済み (export_uclm.py)

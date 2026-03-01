@@ -72,8 +72,12 @@ def write_character_file(
     """
     output_path = Path(output_path)
 
-    assert spk_embed.shape == (D_SPEAKER,), f"Expected ({D_SPEAKER},), got {spk_embed.shape}"
-    assert lora_delta.shape == (LORA_DELTA_SIZE,), f"Expected ({LORA_DELTA_SIZE},), got {lora_delta.shape}"
+    assert spk_embed.shape == (D_SPEAKER,), (
+        f"Expected ({D_SPEAKER},), got {spk_embed.shape}"
+    )
+    assert lora_delta.shape == (LORA_DELTA_SIZE,), (
+        f"Expected ({LORA_DELTA_SIZE},), got {lora_delta.shape}"
+    )
     assert spk_embed.dtype == np.float32
     assert lora_delta.dtype == np.float32
 
@@ -139,9 +143,18 @@ def read_character_file(
     path = Path(path)
     data = path.read_bytes()
 
-    min_size = HEADER_SIZE + SPK_EMBED_BYTES + LORA_DELTA_BYTES + VOICE_SOURCE_BYTES + STYLE_BYTES + CHECKSUM_SIZE
+    min_size = (
+        HEADER_SIZE
+        + SPK_EMBED_BYTES
+        + LORA_DELTA_BYTES
+        + VOICE_SOURCE_BYTES
+        + STYLE_BYTES
+        + CHECKSUM_SIZE
+    )
     if len(data) < min_size:
-        raise ValueError(f"Invalid file size: expected at least {min_size}, got {len(data)}")
+        raise ValueError(
+            f"Invalid file size: expected at least {min_size}, got {len(data)}"
+        )
 
     magic = data[:4]
     if magic != MAGIC:
@@ -158,16 +171,27 @@ def read_character_file(
     profile_size = struct.unpack("<I", data[24:28])[0]
 
     if spk_size != D_SPEAKER:
-        raise ValueError(f"Invalid spk_embed_size: expected {D_SPEAKER}, got {spk_size}")
+        raise ValueError(
+            f"Invalid spk_embed_size: expected {D_SPEAKER}, got {spk_size}"
+        )
     if lora_size != LORA_DELTA_SIZE:
-        raise ValueError(f"Invalid lora_delta_size: expected {LORA_DELTA_SIZE}, got {lora_size}")
+        raise ValueError(
+            f"Invalid lora_delta_size: expected {LORA_DELTA_SIZE}, got {lora_size}"
+        )
 
     expected_size = (
-        HEADER_SIZE + spk_size * 4 + lora_size * 4
-        + vs_size * 4 + style_size * 4 + profile_size + CHECKSUM_SIZE
+        HEADER_SIZE
+        + spk_size * 4
+        + lora_size * 4
+        + vs_size * 4
+        + style_size * 4
+        + profile_size
+        + CHECKSUM_SIZE
     )
     if len(data) != expected_size:
-        raise ValueError(f"File size mismatch: expected {expected_size}, got {len(data)}")
+        raise ValueError(
+            f"File size mismatch: expected {expected_size}, got {len(data)}"
+        )
 
     payload = data[:-CHECKSUM_SIZE]
     stored_checksum = data[-CHECKSUM_SIZE:]
@@ -176,22 +200,35 @@ def read_character_file(
         raise ValueError("Checksum mismatch: file is corrupted")
 
     offset = HEADER_SIZE
-    spk_embed = np.frombuffer(data[offset:offset + SPK_EMBED_BYTES], dtype=np.float32).copy()
+    spk_embed = np.frombuffer(
+        data[offset : offset + SPK_EMBED_BYTES], dtype=np.float32
+    ).copy()
     offset += SPK_EMBED_BYTES
 
-    lora_delta = np.frombuffer(data[offset:offset + LORA_DELTA_BYTES], dtype=np.float32).copy()
+    lora_delta = np.frombuffer(
+        data[offset : offset + LORA_DELTA_BYTES], dtype=np.float32
+    ).copy()
     offset += LORA_DELTA_BYTES
 
-    voice_source_preset = np.frombuffer(data[offset:offset + VOICE_SOURCE_BYTES], dtype=np.float32).copy()
+    voice_source_preset = np.frombuffer(
+        data[offset : offset + VOICE_SOURCE_BYTES], dtype=np.float32
+    ).copy()
     offset += VOICE_SOURCE_BYTES
 
-    default_style_arr = np.frombuffer(data[offset:offset + STYLE_BYTES], dtype=np.float32).copy()
+    default_style_arr = np.frombuffer(
+        data[offset : offset + STYLE_BYTES], dtype=np.float32
+    ).copy()
     offset += STYLE_BYTES
 
     if profile_size > 0:
-        profile = json.loads(data[offset:offset + profile_size])
+        profile = json.loads(data[offset : offset + profile_size])
     else:
-        profile = {"name": "", "personality": "", "voice_description": "", "language": "ja"}
+        profile = {
+            "name": "",
+            "personality": "",
+            "voice_description": "",
+            "language": "ja",
+        }
 
     return spk_embed, lora_delta, voice_source_preset, default_style_arr, profile
 
@@ -217,15 +254,19 @@ def from_speaker_file(
     """
     from tmrvc_export.speaker_file import read_speaker_file
 
-    spk_embed, lora_delta, metadata, _thumbnail = read_speaker_file(speaker_path)
+    speaker = read_speaker_file(speaker_path)
 
-    # Extract voice_source_preset from speaker metadata if available
+    lora_delta = speaker.lora_delta
+    if lora_delta is None:
+        lora_delta = np.zeros(LORA_DELTA_SIZE, dtype=np.float32)
+
+    metadata = speaker.metadata or {}
+
     if voice_source_preset is None:
         vs_preset = metadata.get("voice_source_preset")
         if vs_preset is not None:
             voice_source_preset = np.array(vs_preset, dtype=np.float32)
 
-    # Auto-populate profile from speaker metadata
     if profile is None:
         profile = {}
     if not profile.get("name"):
@@ -233,7 +274,7 @@ def from_speaker_file(
 
     return write_character_file(
         output_path=output_path,
-        spk_embed=spk_embed,
+        spk_embed=speaker.spk_embed,
         lora_delta=lora_delta,
         voice_source_preset=voice_source_preset,
         default_style=default_style,

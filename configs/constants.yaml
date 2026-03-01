@@ -137,12 +137,44 @@ bpeh_breath_threshold_db: -40.0   # Energy threshold for breath candidate detect
 bpeh_min_pause_ms: 50.0           # Minimum pause duration to label (ms)
 bpeh_min_breath_ms: 80.0          # Minimum breath duration to label (ms)
 
-# --- UCLM (Unified Codec Language Model) ---
-n_codebooks: 8                    # EnCodec codebook count
-vocab_size: 1024                  # EnCodec codebook vocabulary size
-d_model: 256                      # UCLM model dimension
-d_voice_state: 8                  # Voice state parameter count
+# --- UCLM (Unified Codec Language Model) Token Spec v2 ---
+n_codebooks: 8                    # Emotion-Aware Codec codebook count
+rvq_vocab_size: 1024              # RVQ codebook vocabulary size (0..1023)
+control_vocab_size: 64            # Control stream vocabulary [op, type, dur, int]
+control_slots: 4                  # Control stream slots [op, type, dur, int]
+codebook_dim: 128                 # Dimension per codebook
+latent_dim: 512                   # n_codebooks * codebook_dim
+d_model: 512                      # UCLM model dimension
+d_voice_state: 8                  # Voice state parameter count (breathiness, tension, arousal, valence, roughness, voicing, energy, rate)
+d_voice_state_explicit: 8         # Explicit voice state params (same as d_voice_state)
+d_voice_state_ssl: 128            # WavLM latent style dimension
 uclm_n_heads: 8                   # UCLM attention heads
 uclm_n_layers: 12                 # UCLM transformer layers
+uclm_vq_bins: 128                 # VQ bottleneck codebook size
+uclm_text_vocab_size: 256         # Text encoder vocabulary size
 uclm_dropout: 0.1                 # UCLM dropout rate
 uclm_max_seq_len: 2000            # Maximum sequence length
+uclm_context_frames: 200          # Rolling context (2.0 sec at 10ms/frame)
+uclm_block_size: 4                # Streaming block size (frames per block)
+
+# --- Encoder/Decoder State ---
+enc_state_dim: 512
+enc_state_frames: 32
+dec_state_dim: 256
+dec_state_frames: 32
+d_event_trace: 64                 # Non-verbal hysteresis trace
+
+# --- Voice State Parameters (for UCLM conditioning) ---
+voice_state_names:
+  - breathiness
+  - tension
+  - arousal
+  - valence
+  - roughness
+  - voicing
+  - energy
+  - rate
+
+# --- F0 Conditioning ---
+d_f0: 2                           # F0 conditioning dim (log_f0_normalized, pitch_shift_semitones)
+f0_smoothing_frames: 5            # F0 smoothing window

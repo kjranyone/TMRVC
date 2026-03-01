@@ -17,12 +17,15 @@ from pathlib import Path
 
 import numpy as np
 
-from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE
+from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE, D_VOICE_STATE_SSL
 
 logger = logging.getLogger(__name__)
 
 MAGIC = b"TMSP"
 VERSION = 3
+
+HEADER_SIZE = 32
+CHECKSUM_SIZE = 32
 
 D_STYLE = 128
 
@@ -30,6 +33,7 @@ D_STYLE = 128
 FLAG_HAS_STYLE = 1 << 0
 FLAG_HAS_REF_TOKENS = 1 << 1
 FLAG_HAS_LORA = 1 << 2
+FLAG_HAS_SSL_STATE = 1 << 3
 
 # Default metadata template
 _DEFAULT_METADATA = {
@@ -58,6 +62,7 @@ class SpeakerFile:
     style_embed: np.ndarray | None = None  # [128]
     reference_tokens: np.ndarray | None = None  # [T, 4]
     lora_delta: np.ndarray | None = None  # [15872]
+    ssl_state: np.ndarray | None = None  # [128] default SSL state from WavLM
     metadata: dict | None = None
 
     @property
@@ -76,6 +81,7 @@ def write_speaker_file(
     style_embed: np.ndarray | None = None,
     reference_tokens: np.ndarray | None = None,
     lora_delta: np.ndarray | None = None,
+    ssl_state: np.ndarray | None = None,
     metadata: dict | None = None,
 ) -> Path:
     """Write a .tmrvc_speaker v3 binary file.
@@ -86,6 +92,7 @@ def write_speaker_file(
         style_embed: Style embedding array, shape ``(128,)``, float32. (optional)
         reference_tokens: Reference codec tokens, shape ``(T, 4)``, int32. (optional)
         lora_delta: LoRA delta array, shape ``(15872,)``, float32. (optional)
+        ssl_state: Default SSL state from WavLM, shape ``(128,)``, float32. (optional)
         metadata: Optional metadata dict.
 
     Returns:
@@ -115,9 +122,17 @@ def write_speaker_file(
         )
         assert lora_delta.dtype == np.float32
         flags |= FLAG_HAS_LORA
+    if ssl_state is not None:
+        assert ssl_state.shape == (D_VOICE_STATE_SSL,), (
+            f"Expected ({D_VOICE_STATE_SSL},), got {ssl_state.shape}"
+        )
+        assert ssl_state.dtype == np.float32
+        flags |= FLAG_HAS_SSL_STATE
 
-    # Build metadata
+    # Build metadata (include ssl_state in metadata for simplicity)
     meta = {**_DEFAULT_METADATA, **(metadata or {})}
+    if ssl_state is not None:
+        meta["ssl_state"] = ssl_state.tolist()
     if "adaptation_level" not in meta:
         if flags & FLAG_HAS_LORA:
             meta["adaptation_level"] = "full"
@@ -255,10 +270,23 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
         json.loads(data[offset : offset + metadata_size]) if metadata_size > 0 else {}
     )
 
+    # Extract ssl_state from metadata if present
+    ssl_state = None
+    if "ssl_state" in metadata_dict:
+        ssl_state = np.array(metadata_dict["ssl_state"], dtype=np.float32)
+        if ssl_state.shape != (D_VOICE_STATE_SSL,):
+            logger.warning(
+                "ssl_state has unexpected shape: %s, expected (%d,)",
+                ssl_state.shape,
+                D_VOICE_STATE_SSL,
+            )
+            ssl_state = None
+
     return SpeakerFile(
         spk_embed=spk_embed,
         style_embed=style_embed,
         reference_tokens=reference_tokens,
         lora_delta=lora_delta,
+        ssl_state=ssl_state,
         metadata=metadata_dict,
     )

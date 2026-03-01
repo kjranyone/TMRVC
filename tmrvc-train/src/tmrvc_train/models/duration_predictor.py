@@ -1,93 +1,110 @@
-"""DurationPredictor: FastSpeech2-style explicit duration prediction.
+"""DurationPredictor: predict phoneme durations for TTS.
 
-Predicts per-phoneme duration (in frames) from text features with
-optional style conditioning via FiLM.
+Converts phoneme-level text features to log-durations (number of frames).
+Used for length regulation in UCLM TTS mode.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from tmrvc_core.constants import D_STYLE, D_TEXT_ENCODER
-
-from tmrvc_train.modules import FiLMConditioner
-
-
-class _ConvBlock(nn.Module):
-    """Conv1d + ReLU + Dropout (no LayerNorm on [B,C,T])."""
-
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float) -> None:
-        super().__init__()
-        padding = (kernel_size - 1) // 2
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, padding=padding)
-        self.act = nn.ReLU()
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.act(self.conv(x)))
+from tmrvc_core.constants import D_MODEL  # 512
 
 
 class DurationPredictor(nn.Module):
-    """Predict phoneme durations from text encoder output.
+    """Predict phoneme durations in log domain.
 
-    Architecture::
-
-        text_features[B, d, L] → Conv1d(d,d,k=3) + ReLU
-            → Conv1d(d,d,k=3) + ReLU + FiLM(style)
-            → Linear(d, 1) + Softplus
-            → durations[B, L]  (positive frame counts)
+    Architecture:
+        - Input: [B, L, d_model] phoneme features
+        - 3x CausalConv1d layers
+        - Output: [B, L] log-durations
 
     Args:
-        d_input: Input feature dimension (default: D_TEXT_ENCODER=256).
-        d_hidden: Hidden dimension (default: 256).
-        d_style: Style conditioning dimension (default: D_STYLE=32).
-        kernel_size: Conv kernel size.
+        d_model: Input feature dimension.
+        n_layers: Number of conv layers.
+        kernel_size: Convolution kernel size.
         dropout: Dropout rate.
     """
 
     def __init__(
         self,
-        d_input: int = D_TEXT_ENCODER,
-        d_hidden: int = 256,
-        d_style: int = D_STYLE,
+        d_model: int = D_MODEL,
+        n_layers: int = 3,
         kernel_size: int = 3,
         dropout: float = 0.1,
-    ) -> None:
+    ):
         super().__init__()
+        self.d_model = d_model
 
-        self.conv1 = _ConvBlock(d_input, d_hidden, kernel_size, dropout)
-        self.conv2 = _ConvBlock(d_hidden, d_hidden, kernel_size, dropout)
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            self.layers.append(
+                nn.Sequential(
+                    nn.Conv1d(
+                        d_model,
+                        d_model,
+                        kernel_size,
+                        padding=(kernel_size - 1) // 2,
+                    ),
+                    nn.LayerNorm(d_model),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                )
+            )
 
-        self.film = FiLMConditioner(d_style, d_hidden)
-        self.output_proj = nn.Linear(d_hidden, 1)
-        self.softplus = nn.Softplus()
+        self.proj = nn.Linear(d_model, 1)
 
-    def forward(
-        self,
-        text_features: torch.Tensor,
-        style: torch.Tensor | None = None,
-        phoneme_lengths: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Predict durations.
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Predict log-durations.
 
         Args:
-            text_features: ``[B, d, L]`` text encoder output.
-            style: ``[B, d_style]`` style conditioning (optional).
-            phoneme_lengths: ``[B]`` for masking (unused in forward, used in loss).
+            x: [B, L, d_model] phoneme-level features.
+            mask: [B, L] padding mask (optional).
 
         Returns:
-            ``[B, L]`` predicted durations in frames (positive values).
+            log_durations: [B, L] predicted log-durations.
         """
-        x = self.conv1(text_features)  # [B, d_hidden, L]
-        x = self.conv2(x)  # [B, d_hidden, L]
+        # Conv expects [B, d, L]
+        x = x.transpose(1, 2)
 
-        if style is not None:
-            x = self.film(x, style)
+        for layer in self.layers:
+            x_res = layer[0](x)
+            x_res = x_res.transpose(1, 2)
+            x_res = layer[1](x_res)
+            x_res = x_res.transpose(1, 2)
+            x_res = layer[2](x_res)
+            x_res = layer[3](x_res)
+            x = x + x_res
 
-        # Project to scalar duration
-        x = x.transpose(1, 2)  # [B, L, d_hidden]
-        x = self.output_proj(x).squeeze(-1)  # [B, L]
-        x = self.softplus(x)  # Ensure positive
+        x = x.transpose(1, 2)
+        log_dur = self.proj(x).squeeze(-1)  # [B, L]
 
-        return x
+        if mask is not None:
+            log_dur = log_dur.masked_fill(mask, 0.0)
+
+        return log_dur
+
+
+def duration_loss(
+    log_dur_pred: torch.Tensor,
+    dur_target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE loss in log domain for durations.
+
+    Args:
+        log_dur_pred: [B, L] predicted log-durations.
+        dur_target: [B, L] ground truth durations (frames).
+        mask: [B, L] padding mask.
+    """
+    log_dur_target = torch.log(dur_target.float() + 1.0)
+
+    if mask is not None:
+        loss = F.mse_loss(log_dur_pred, log_dur_target, reduction="none")
+        loss = loss.masked_select(~mask).mean()
+    else:
+        loss = F.mse_loss(log_dur_pred, log_dur_target)
+
+    return loss
