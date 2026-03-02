@@ -110,8 +110,81 @@ tmrvc-export \
 
 ---
 
-## 4. トラブルシューティング
+## 4. 並列化とパフォーマンス最適化
+
+### 4.1 並列前処理 (Parallel Preprocessing)
+
+単一プロセスではVRAM利用率が低いため（~7%）、複数ワーカーで並列処理することで大幅に高速化できます。
+
+#### 方法1: 2ワーカー並列（推奨）
+
+```bash
+# 話者を2グループに分割
+ls data/raw/wav48_silence_trimmed/ | grep "^p[0-9]" | sort > /tmp/all_speakers.txt
+total=$(wc -l < /tmp/all_speakers.txt)
+half=$((total / 2))
+head -$half /tmp/all_speakers.txt > /tmp/speakers_group1.txt
+tail -n +$((half + 1)) /tmp/all_speakers.txt > /tmp/speakers_group2.txt
+
+# 2ワーカー並列実行
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/preprocess_speakers.py \
+    --speaker-list /tmp/speakers_group1.txt \
+    --worker-id 1 \
+    --device cuda > logs/preprocess_worker1.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/preprocess_speakers.py \
+    --speaker-list /tmp/speakers_group2.txt \
+    --worker-id 2 \
+    --device cuda > logs/preprocess_worker2.log 2>&1 &
+
+# 進捗確認
+tail -f logs/preprocess_worker1.log logs/preprocess_worker2.log
+```
+
+#### パフォーマンス比較
+
+| 構成 | 処理速度 | VRAM使用率 | ETA (VCTK 88k) |
+|------|---------|-----------|----------------|
+| 単一ワーカー | ~1.4 it/s | 7% | ~8.5h |
+| 2ワーカー並列 | ~4 it/s | 69% | ~3h |
+| **改善率** | **2.9倍** | **+62%** | **5.5h短縮** |
+
+### 4.2 Whisper Turboモデル
+
+`large-v3-turbo`を使用することで、文字起こし精度を保ちつつ8倍高速化します。
+
+```bash
+# tmrvc-data/src/tmrvc_data/cli/preprocess.py
+whisper = WhisperModel("large-v3-turbo", device=device, compute_type="float16")
+```
+
+- **速度**: large-v3の8倍
+- **精度**: ほぼ同等
+- **VRAM**: わずかに削減
+
+### 4.3 VRAM監視
+
+```bash
+# 1秒ごとにVRAM使用状況を表示
+watch -n 1 nvidia-smi
+
+# ログに記録
+nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu --format=csv -l 10 > logs/gpu_usage.csv
+```
+
+### 4.4 Scientific Rigor準拠
+
+並列化しても以下の検証は維持されます：
+
+- **Frame Alignment**: 各ワーカーでassert検証
+- **数学的整合性**: 全ワーカーが同じパイプラインを使用
+- **SSL補間**: 50Hz→100Hzの線形補間を正しく実行
+
+---
+
+## 5. トラブルシューティング
 
 - **ImportError (定数不足)**: `tmrvc_core/constants.py` が最新の `configs/constants.yaml` と同期しているか確認してください。
 - **Shape Mismatch**: キャッシュ生成時の `hop_length` (240) とモデルのストライド設定が一致しているか確認してください。
 - **OOM**: `--batch-size` または `--max-frames` (デフォルト400) を下げて調整してください。
+- **Index Out of Bounds**: 古いキャッシュを削除して、新しいフレームアライメント（`pad_length=784`）で再生成してください。

@@ -94,7 +94,10 @@ def main(argv: list[str] | None = None) -> None:
     from faster_whisper import WhisperModel
 
     compute_type = "float16" if args.device == "cuda" else "int8"
-    whisper = WhisperModel("large-v3", device=args.device, compute_type=compute_type)
+    # Use turbo model for faster transcription (8x faster than large-v3)
+    whisper = WhisperModel(
+        "large-v3-turbo", device=args.device, compute_type=compute_type
+    )
 
     utterances = list(adapter.iter_utterances(args.raw_dir, args.split))
     logger.info("Found %d utterances in %s", len(utterances), args.dataset)
