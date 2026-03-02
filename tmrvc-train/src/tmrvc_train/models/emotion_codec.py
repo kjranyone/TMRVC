@@ -47,20 +47,42 @@ class ResidualVectorQuantizer(nn.Module):
             nn.Embedding(codebook_size, codebook_dim) for _ in range(n_codebooks)
         ])
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = z.shape
         z_q = torch.zeros_like(z)
         indices = []
+        logits_list = []
         residual = z.view(B, T, self.n_codebooks, self.codebook_dim).clone()
+        
+        # We need a separate z_q_differentiable to allow gradients to flow back to the codebook
+        z_q_differentiable = torch.zeros_like(z)
+        
         for i, cb in enumerate(self.codebooks):
             res_i = residual[:, :, i, :]
+            # dist shape: [B, T, codebook_size]
             dist = (res_i**2).sum(-1, keepdim=True) + (cb.weight**2).sum(-1) - 2 * (res_i @ cb.weight.T)
+            
+            # For distillation, we output negative distances as logits (so closest is highest probability)
+            logits_list.append(-dist)
+            
             idx = dist.argmin(-1)
             indices.append(idx)
-            q = cb(idx)
-            z_q.view(B, T, self.n_codebooks, self.codebook_dim)[:, :, i, :] = q
-            if i < self.n_codebooks - 1: residual[:, :, i+1, :] += (res_i - q)
-        return z_q.view(B, T, D), torch.stack(indices, dim=1)
+            
+            # For gradient flow to codebook embeddings
+            q_diff = cb(idx)
+            z_q_differentiable.view(B, T, self.n_codebooks, self.codebook_dim)[:, :, i, :] = q_diff
+            
+            # For next step residual, use detached q to stop gradients from future codebooks
+            q_detached = q_diff.detach()
+            if i < self.n_codebooks - 1: residual[:, :, i+1, :] += (res_i - q_detached)
+            
+        # Straight-Through Estimator (STE):
+        # Forward pass uses z_q_differentiable, but backward pass flows gradient to both z and codebooks
+        z_q = z + (z_q_differentiable - z).detach() + (z_q_differentiable - z_q_differentiable.detach())
+        
+        # logits shape: [B, n_codebooks, T, codebook_size] -> [B, 8, T, 1024]
+        logits = torch.stack(logits_list, dim=1)
+        return z_q.view(B, T, D), torch.stack(indices, dim=1), logits
 
 
 class EmotionAwareEncoder(nn.Module):
@@ -73,7 +95,7 @@ class EmotionAwareEncoder(nn.Module):
         self.rvq = ResidualVectorQuantizer(n_codebooks=8, codebook_dim=d_model // 8)
         self.control_head = nn.ModuleList([nn.Linear(d_model, 64) for _ in range(4)])
 
-    def forward(self, audio: torch.Tensor, states: Optional[List[torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    def forward(self, audio: torch.Tensor, states: Optional[List[torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor]:
         new_states = []
         x, s1 = self.conv1(audio, states[0] if states else None); x = F.elu(x); new_states.append(s1)
         x, s2 = self.conv2(x, states[1] if states else None); x = F.elu(x); new_states.append(s2)
@@ -82,9 +104,9 @@ class EmotionAwareEncoder(nn.Module):
         
         indices = torch.arange(239, x.shape[-1], 240, device=x.device)
         x_sub = x.index_select(-1, indices)
-        z_q, a_tokens = self.rvq(x_sub.transpose(1, 2))
+        z_q, a_tokens, a_logits = self.rvq(x_sub.transpose(1, 2))
         b_logits = torch.stack([head(z_q) for head in self.control_head], dim=1)
-        return a_tokens, b_logits, new_states
+        return a_tokens, b_logits, new_states, a_logits
 
 
 class EmotionAwareDecoder(nn.Module):
@@ -153,13 +175,14 @@ def multiscale_stft_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tens
 
 
 class CodecLoss(nn.Module):
-    """Loss for EmotionAwareCodec: STFT + B_t CrossEntropy."""
-    def __init__(self, lambda_stft: float = 1.0, lambda_control: float = 0.1):
+    """Loss for EmotionAwareCodec: STFT + B_t CrossEntropy + A_t Distillation."""
+    def __init__(self, lambda_stft: float = 1.0, lambda_control: float = 0.1, lambda_distill: float = 1.0):
         super().__init__()
         self.lambda_stft = lambda_stft
         self.lambda_control = lambda_control
+        self.lambda_distill = lambda_distill
 
-    def forward(self, audio_pred, audio_target, b_logits, b_target):
+    def forward(self, audio_pred, audio_target, b_logits, b_target, a_logits=None, a_target=None):
         # 1. Reconstruction Loss
         loss_stft = multiscale_stft_loss(audio_pred, audio_target)
         
@@ -168,12 +191,25 @@ class CodecLoss(nn.Module):
         B, n_slots, T, vocab = b_logits.shape
         loss_control = F.cross_entropy(
             b_logits.reshape(-1, vocab),
-            b_target.reshape(-1)
+            b_target.reshape(-1),
+            ignore_index=-1
         )
         
-        total = self.lambda_stft * loss_stft + self.lambda_control * loss_control
+        # 3. Acoustic Distillation Loss (A_t)
+        loss_distill = torch.tensor(0.0, device=audio_pred.device)
+        if a_logits is not None and a_target is not None:
+            # a_logits: [B, 8, T, 1024], a_target: [B, 8, T]
+            B_a, n_cb, T_a, vocab_a = a_logits.shape
+            loss_distill = F.cross_entropy(
+                a_logits.reshape(-1, vocab_a),
+                a_target.reshape(-1),
+                ignore_index=-1
+            )
+        
+        total = self.lambda_stft * loss_stft + self.lambda_control * loss_control + self.lambda_distill * loss_distill
         return {
             "loss": total,
             "loss_stft": loss_stft,
-            "loss_control": loss_control
+            "loss_control": loss_control,
+            "loss_distill": loss_distill
         }

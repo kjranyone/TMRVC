@@ -14,7 +14,7 @@ class TestResidualVectorQuantizer:
             n_codebooks=8, codebook_size=1024, codebook_dim=64
         )
         z = torch.randn(2, 100, 512)  # [B, T, D=8*64]
-        z_q, indices = rvq(z)
+        z_q, indices, _ = rvq(z)
 
         # z_qは非ゼロでなければならない
         assert z_q.abs().sum() > 0, "z_q is all zeros - view assignment bug!"
@@ -25,7 +25,7 @@ class TestResidualVectorQuantizer:
             n_codebooks=8, codebook_size=1024, codebook_dim=64
         )
         z = torch.randn(2, 100, 512)
-        z_q, indices = rvq(z)
+        z_q, indices, _ = rvq(z)
 
         assert z_q.shape == z.shape, f"z_q shape {z_q.shape} != z shape {z.shape}"
         assert indices.shape == (2, 8, 100), (
@@ -38,7 +38,7 @@ class TestResidualVectorQuantizer:
             n_codebooks=8, codebook_size=1024, codebook_dim=64
         )
         z = torch.randn(2, 100, 512)
-        z_q, indices = rvq(z)
+        z_q, indices, _ = rvq(z)
 
         assert indices.min() >= 0, f"Negative index: {indices.min()}"
         assert indices.max() < 1024, f"Index exceeds codebook_size: {indices.max()}"
@@ -49,7 +49,7 @@ class TestResidualVectorQuantizer:
             n_codebooks=8, codebook_size=1024, codebook_dim=64
         )
         z = torch.randn(2, 100, 512)
-        z_q, indices = rvq(z)
+        z_q, indices, _ = rvq(z)
 
         # インデックスから再構成
         z_q_reconstructed = torch.zeros_like(z_q)
@@ -69,7 +69,7 @@ class TestResidualVectorQuantizer:
             n_codebooks=8, codebook_size=1024, codebook_dim=64
         )
         z = torch.randn(2, 100, 512, requires_grad=True)
-        z_q, indices = rvq(z)
+        z_q, indices, _ = rvq(z)
 
         loss = z_q.sum()
         loss.backward()

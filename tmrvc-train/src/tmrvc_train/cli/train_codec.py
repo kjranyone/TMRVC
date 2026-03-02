@@ -49,11 +49,24 @@ def train_codec(cache_dir, output_dir, batch_size, max_steps, device, lr):
             if step >= max_steps: break
             optimizer.zero_grad()
             w, vs, ta, tb = batch["waveform"].to(device), batch["voice_state"].to(device), batch["target_a"].to(device), batch["target_b"].to(device)
-            _, bl, _ = model.encode(w)
+            
+            # Encoder forward for distillation
+            _, pred_b_logits, _, pred_a_logits = model.encode(w)
+            
+            # Decoder forward with ground truth tokens (Teacher forcing)
             recon, _ = model.decode(ta, tb, vs)
-            losses = crit(recon, w, bl, tb)
+            
+            losses = crit(recon, w, pred_b_logits, tb, pred_a_logits, ta)
             losses["loss"].backward(); optimizer.step()
-            pbar.update(1); pbar.set_postfix({"loss": f"{losses['loss'].item():.4f}"})
+            pbar.update(1)
+            pbar.set_postfix(
+                {
+                    "loss": f"{losses['loss'].item():.3f}",
+                    "stft": f"{losses['loss_stft'].item():.3f}",
+                    "ctrl": f"{losses['loss_control'].item():.3f}",
+                    "distill": f"{losses['loss_distill'].item():.3f}",
+                }
+            )
             step += 1
     torch.save({"model": model.state_dict()}, output_dir / "codec_final.pt")
 
