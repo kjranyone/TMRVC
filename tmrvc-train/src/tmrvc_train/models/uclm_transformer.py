@@ -82,25 +82,33 @@ class CodecTransformer(nn.Module):
         self.acoustic_heads = nn.ModuleList([nn.Linear(d_model, rvq_vocab_size) for _ in range(n_codebooks)])
         self.control_heads = nn.ModuleList([nn.Linear(d_model, control_vocab_size) for _ in range(4)])
 
-    def forward(self, content_features, b_ctx, speaker_embed, state_cond, cfg_scale, kv_caches=None):
-        # inputs: [B, T, D] or [B, D, T]
-        if content_features.shape[1] == self.d_model and content_features.shape[2] != self.d_model:
-            x = content_features.transpose(1, 2)
-        else:
-            x = content_features
-        
+    def forward(self, content_features, b_ctx, speaker_embed, state_cond, cfg_scale=1.0, kv_caches=None):
+        # content_features: [B, T, d_model]
+        x = content_features
         B, T, _ = x.shape
         
-        # b_ctx is [B, 4, T_full]. We need the same T as content
-        b_ctx_curr = b_ctx[:, :, -T:]
-        b_embeds = [self.b_ctx_embeds[i](b_ctx_curr[:, i, :]) for i in range(4)]
-        x = x + self.b_ctx_fusion(torch.cat(b_embeds, dim=-1))
+        # b_ctx: [B, 4, T_full] - These should be tokens B_{t-1} for predicting A_t, B_t
+        # Slice b_ctx to match content length T
+        b_ctx_curr = b_ctx[:, :, :T]
         
+        # Embed control context and add to x
+        b_embeds = torch.stack([self.b_ctx_embeds[i](b_ctx_curr[:, i, :]) for i in range(4)], dim=1) # [B, 4, T, d_model//4]
+        b_ctx_fused = self.b_ctx_fusion(b_embeds.permute(0, 2, 1, 3).reshape(B, T, -1)) # [B, T, d_model]
+        x = x + b_ctx_fused
+        
+        # Add speaker embedding (global)
         x = x + self.speaker_proj(speaker_embed).unsqueeze(1)
         
-        sc = state_cond
-        if sc.dim() == 2: sc = sc.unsqueeze(1)
-        if sc.shape[1] != T: sc = sc[:, -T:, :]
+        # Add voice state condition (temporal)
+        if state_cond.dim() == 2:
+            sc = state_cond.unsqueeze(1).expand(-1, T, -1)
+        else:
+            sc = state_cond
+        
+        # Ensure state_cond matches T (in case of streaming/KV cache)
+        if sc.shape[1] > T:
+            sc = sc[:, -T:, :]
+            
         x = x + sc
 
         new_kv_caches = []
@@ -111,15 +119,14 @@ class CodecTransformer(nn.Module):
             new_kv_caches.append((nk, nv))
 
         x = self.norm(x)
-        la = torch.stack([head(x) for head in self.acoustic_heads], dim=1)
-        lb = torch.stack([head(x) for head in self.control_heads], dim=1)
-        return la, lb, new_kv_caches
-
-    def forward_no_cache(self, content_features, state_cond, speaker_embed, cfg_scale=1.0):
-        # Determine T from content_features
-        if content_features.shape[1] == self.d_model: T = content_features.shape[2]
-        else: T = content_features.shape[1]
         
-        b_ctx = torch.zeros(content_features.shape[0], 4, T, dtype=torch.long, device=content_features.device)
+        # Dual-stream heads
+        logits_a = torch.stack([head(x) for head in self.acoustic_heads], dim=1) # [B, 8, T, 1024]
+        logits_b = torch.stack([head(x) for head in self.control_heads], dim=1)  # [B, 4, T, 64]
+        
+        return logits_a, logits_b, new_kv_caches
+
+    def forward_no_cache(self, content_features, b_ctx, state_cond, speaker_embed, cfg_scale=1.0):
+        """Non-streaming forward for training. b_ctx must be shifted B_{t-1}."""
         la, lb, _ = self.forward(content_features, b_ctx, speaker_embed, state_cond, cfg_scale)
         return la, lb

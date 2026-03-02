@@ -69,6 +69,7 @@ class DisentangledUCLM(nn.Module):
     def forward_vc(
         self,
         source_a_t: torch.Tensor,
+        target_b: torch.Tensor,
         explicit_state: torch.Tensor,
         ssl_state: torch.Tensor,
         speaker_embed: torch.Tensor,
@@ -83,8 +84,13 @@ class DisentangledUCLM(nn.Module):
         if f0_condition is not None:
             content_features = content_features + self.f0_proj(f0_condition)
 
+        # Shift target_b to use as context B_{t-1}
+        B, n_slots, T = target_b.shape
+        b_ctx = torch.zeros_like(target_b)
+        b_ctx[:, :, 1:] = target_b[:, :, :-1]
+
         logits_a, logits_b = self.uclm_core.forward_no_cache(
-            content_features, state_cond, speaker_embed, cfg_scale
+            content_features, b_ctx, state_cond, speaker_embed, cfg_scale
         )
 
         return {
@@ -99,6 +105,7 @@ class DisentangledUCLM(nn.Module):
         phonemes: torch.Tensor,
         phoneme_lens: torch.Tensor,
         language_ids: torch.Tensor,
+        target_b: torch.Tensor,
         explicit_state: torch.Tensor,
         ssl_state: torch.Tensor,
         speaker_embed: torch.Tensor,
@@ -135,8 +142,13 @@ class DisentangledUCLM(nn.Module):
         v_out = self.voice_state_enc(explicit_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
+        # Shift target_b to use as context B_{t-1}
+        B, n_slots, T = target_b.shape
+        b_ctx = torch.zeros_like(target_b)
+        b_ctx[:, :, 1:] = target_b[:, :, :-1]
+
         logits_a, logits_b = self.uclm_core.forward_no_cache(
-            content_features, state_cond, speaker_embed, cfg_scale
+            content_features, b_ctx, state_cond, speaker_embed, cfg_scale
         )
 
         return {

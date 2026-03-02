@@ -21,7 +21,8 @@ def test_uclm_vc_forward():
     ssl_state = torch.randn(B, T, 128)
     speaker_embed = torch.randn(B, 192)
     
-    out = model.forward_vc(source_a_t, explicit_state, ssl_state, speaker_embed)
+    target_b = torch.randint(0, 64, (B, 4, T))
+    out = model.forward_vc(source_a_t, target_b, explicit_state, ssl_state, speaker_embed)
     
     assert "logits_a" in out
     assert "logits_b" in out
@@ -52,18 +53,19 @@ def test_uclm_tts_forward():
     phoneme_lens = torch.full((B,), L) 
     language_ids = torch.zeros((B,), dtype=torch.long)
     
-    explicit_state = torch.randn(B, L, 8)
-    ssl_state = torch.randn(B, L, 128)
+    explicit_state = torch.randn(B, T, 8)
+    ssl_state = torch.randn(B, T, 128)
     speaker_embed = torch.randn(B, 192)
     
-    out = model.forward_tts(phonemes, phoneme_lens, language_ids, explicit_state, ssl_state, speaker_embed)
+    target_b = torch.randint(0, 64, (B, 4, T))
+    out = model.forward_tts(phonemes, phoneme_lens, language_ids, target_b, explicit_state, ssl_state, speaker_embed)
     
     assert "logits_a" in out
     assert "logits_b" in out
     assert "vq_loss" not in out
     
-    assert out["logits_a"].shape == (B, 8, L, 1024)
-    assert out["logits_b"].shape == (B, 4, L, 64)
+    assert out["logits_a"].shape == (B, 8, T, 1024)
+    assert out["logits_b"].shape == (B, 4, T, 64)
 
 if __name__ == "__main__":
     test_uclm_vc_forward()

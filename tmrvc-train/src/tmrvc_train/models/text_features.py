@@ -49,14 +49,12 @@ def expand_phonemes_to_frames(
             frame_idx += dur
 
     if target_length is not None and frame_features.shape[1] < target_length:
-        # Pad to target length
+        # Zero-pad to target length (mathematically consistent with explicit_state padding)
         pad_len = target_length - frame_features.shape[1]
-        frame_features = torch.cat(
-            [frame_features, frame_features[:, -1:, :].expand(-1, pad_len, -1)],
-            dim=1,
-        )
+        padding = torch.zeros(B, pad_len, d, device=device)
+        frame_features = torch.cat([frame_features, padding], dim=1)
     elif target_length is not None and frame_features.shape[1] > target_length:
-        # Trim to target length
+        # Trim to target length (rare, only if durations sum > audio frames)
         frame_features = frame_features[:, :target_length, :]
 
     return frame_features

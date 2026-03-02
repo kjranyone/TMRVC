@@ -59,6 +59,7 @@ class UCLMTrainer:
             source_a_t = batch["source_a_t"].to(self.device)
             out = self.model.forward_vc(
                 source_a_t=source_a_t,
+                target_b=target_b,
                 explicit_state=explicit_state,
                 ssl_state=ssl_state,
                 speaker_embed=speaker_embed,
@@ -86,6 +87,7 @@ class UCLMTrainer:
                 phonemes=phonemes,
                 phoneme_lens=phoneme_lens,
                 language_ids=language_ids,
+                target_b=target_b,
                 explicit_state=explicit_state,
                 ssl_state=ssl_state,
                 speaker_embed=speaker_embed,
