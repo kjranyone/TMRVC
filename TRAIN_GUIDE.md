@@ -42,41 +42,52 @@ uv run python scripts/data/prepare_datasets.py --sample-ratio 0.01 --device cuda
 | `waveform.npy` | [1, T*240] | 24kHz 正規化済み波形 |
 | `meta.json` | - | テキスト、話者ID、統計情報 |
 
-### 1.3 TTS用アライメントの実行 (MFA統合)
+### 1.2 パフォーマンス・チューニングと並列度の決定
 
-VC学習には不要ですが、TTS学習を行う場合は正確な音素単位のアライメントが必須です。
+前処理パイプラインは VRAM を主に消費します。以下のリソース消費表に基づき、ご自身の GPU メモリ容量（VRAM）に収まる範囲で並列ワーカー数を決定してください。
+
+#### モデル別 VRAM 消費量 (目安)
+
+| コンポーネント | モデル | VRAM 消費 (FP16) | 役割 |
+| :--- | :--- | :--- | :--- |
+| **Whisper ASR** | large-v3-turbo | **~1.6 GB** | テキスト書き起こし |
+| **SSL Estimator** | WavLM Large | **~1.3 GB** | SSL音声状態の抽出 |
+| **Codec** | Emotion-Aware | **~0.4 GB** | A_t, B_t トークン抽出 |
+| **Speaker Encoder**| CAM++ | **~0.2 GB** | 話者埋め込みの抽出 |
+| **その他/Overhead**| PyTorch/System | **~0.5 GB** | テンソル演算・キャッシュ |
+| **合計 (1ワーカー)** | - | **約 4.0 GB** | - |
+
+#### 並列度の計算式
+$$並列ワーカー数 = \lfloor \frac{GPU VRAM (GB) - 1.0}{4.0} \rfloor$$
+*(システム用マージン 1GB を差し引いて計算)*
+
+*   **VRAM 12GB の場合**: マージンを引いて **2並列** が推奨です。
+*   **VRAM 22GB の場合**: マージンを引いて **5並列** が最適です。
+*   **VRAM 24GB (RTX 3090/4090) の場合**: **5〜6並列** が可能です。
+
+#### 並列実行の実行方法
+`scripts/parallel_preprocess.sh` を編集し、計算したワーカー数を設定して実行してください。
 
 ```bash
-# 1. Montreal Forced Aligner で TextGrid を生成
-# (事前に MFA のインストールと acoustic model のダウンロードが必要)
-mfa align data/raw/vctk/wav48 english_us_arpa english_us_arpa data/alignments/vctk
-
-# 2. 生成された TextGrid をキャッシュに注入
-uv run python scripts/annotate/run_forced_alignment.py \
-    --cache-dir data/cache \
-    --dataset vctk \
-    --language en \
-    --textgrid-dir data/alignments/vctk
+# ワーカー数を環境に合わせて編集
+./scripts/parallel_preprocess.sh
 ```
 
-- **MFA統合の重要性**: ヒューリスティックな均等割り（`--allow-heuristic`）は品質を著しく低下させるため、論文実装レベルの学習には MFA の使用を強く推奨します。
-- **BOS/EOS**: 注入時に自動的に `<bos>`, `<eos>` トークンが前後に追加されます。
-
----
-
-## 2. モデル学習 (Training)
-
-学習は大きく分けて2つのステージ（CodecとUCLM本体）で行われます。
-
+### 1.3 TTS用アライメントの実行 (MFA統合)
+...
 ### 2.1 Stage 1: Emotion-Aware Codec学習
 
 音声のトークン化と復元を行う基盤モデルを学習します。
+
+#### VRAMチューニング (Stage 1)
+- **消費目安**: Base 2GB + (0.4GB × BatchSize)
+- **22GB環境の例**: `--batch-size 48` (約21.2GB消費) が最大効率です。
 
 ```bash
 tmrvc-train-codec \
     --cache-dir data/cache \
     --output-dir checkpoints/codec \
-    --batch-size 8 \
+    --batch-size 48 \
     --max-steps 50000 \
     --device cuda
 ```
@@ -88,6 +99,10 @@ tmrvc-train-codec \
 
 TTSとVCを同時にこなす統合トランスフォーマーを学習します。
 
+#### VRAMチューニング (Stage 2)
+- **消費目安**: Base 6GB + (0.8GB × BatchSize)
+- **22GB環境の例**: `--batch-size 16〜20` が安定稼働のラインです。
+
 ```bash
 tmrvc-train-uclm \
     --cache-dir data/cache \
@@ -96,6 +111,7 @@ tmrvc-train-uclm \
     --max-steps 100000 \
     --device cuda
 ```
+
 
 - **学習内容**:
     - **VC Task**: `A_src_t → content → A_t, B_t`
