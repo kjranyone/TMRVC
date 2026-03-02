@@ -24,7 +24,6 @@ from tmrvc_data.codec import UCLMCodecWrapper
 from tmrvc_data.voice_state import SSLVoiceStateEstimator
 from tmrvc_data.preprocessing import preprocess_audio, segment_utterance
 from tmrvc_data.speaker import SpeakerEncoder
-from tmrvc_data.alignment import extract_alignment
 
 logger = logging.getLogger(__name__)
 
@@ -156,15 +155,8 @@ def main(argv: list[str] | None = None) -> None:
             text = "".join(seg.text for seg in segments).strip()
 
             phoneme_ids, durations = None, None
-            if text:
-                try:
-                    align = extract_alignment(
-                        str(utt.audio_path), text, language=args.language
-                    )
-                    phoneme_ids = torch.tensor(align["phoneme_ids"])
-                    durations = torch.tensor(align["durations"])
-                except:
-                    pass
+            # Note: TTS alignment (phonemes, durations) is deferred to a specialized
+            # MFA pipeline. This script focuses on UCLM v2 acoustic/control feature extraction.
 
             spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
 

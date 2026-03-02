@@ -29,7 +29,6 @@ from tmrvc_core.constants import SAMPLE_RATE
 from tmrvc_data.codec import UCLMCodecWrapper
 from tmrvc_data.voice_state import SSLVoiceStateEstimator
 from tmrvc_data.speaker import SpeakerEncoder
-from tmrvc_data.alignment import extract_alignment # NEW: For TTS data
 
 logger = logging.getLogger(__name__)
 
@@ -116,14 +115,7 @@ def run_pipeline(config: PipelineConfig) -> int:
             
             phoneme_ids = None
             durations = None
-            if text:
-                try:
-                    # Forced Alignment logic
-                    align_res = extract_alignment(str(audio_path), text, language=config.language)
-                    phoneme_ids = align_res["phoneme_ids"]
-                    durations = align_res["durations"]
-                except Exception as e:
-                    logger.debug("Alignment failed for %s: %s", utt_id, e)
+            # Text alignment is skipped here. Use `run_mfa_align` pipeline separately.
 
             # 4. Extract Speaker Embed
             with torch.no_grad():
