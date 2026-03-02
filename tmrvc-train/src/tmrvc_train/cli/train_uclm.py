@@ -80,7 +80,11 @@ def train_uclm(cache_dir, output_dir, batch_size, max_steps, device, lr):
     dataset = DisentangledUCLMDataset(cache_dir)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     
-    model = DisentangledUCLM().to(device)
+    num_speakers = len(dataset.speaker_to_id)
+    # Ensure at least 1 speaker even if dataset is empty
+    num_speakers = max(num_speakers, 1)
+    
+    model = DisentangledUCLM(num_speakers=num_speakers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     trainer = UCLMTrainer(model, optimizer, device=device)
 

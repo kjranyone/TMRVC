@@ -14,7 +14,7 @@ class VoiceStateEncoder(nn.Module):
     Supports delta_voice_state for temporal dynamics modeling (Section 4.3).
     """
 
-    def __init__(self, d_explicit=8, d_ssl=128, d_model=512, num_speakers=100):
+    def __init__(self, d_explicit=8, d_ssl=128, d_model=512, num_speakers=1000):
         super().__init__()
         self.explicit_proj = nn.Linear(d_explicit, d_model // 2)
         self.ssl_proj = nn.Linear(d_ssl, d_model // 2)

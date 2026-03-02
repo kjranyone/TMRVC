@@ -56,11 +56,12 @@ def main() -> None:
         return
 
     engine = UCLMEngine(
-        uclm_checkpoint=args.uclm_checkpoint,
-        codec_checkpoint=args.codec_checkpoint,
         device=args.device,
     )
-    engine.load_models()
+    engine.load_models(
+        uclm_path=args.uclm_checkpoint,
+        codec_path=args.codec_checkpoint,
+    )
     logger.info("Engine loaded in %.0fms", (time.perf_counter() - t0) * 1000)
 
     # 2. Prepare Inputs

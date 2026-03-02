@@ -147,29 +147,21 @@ class UCLMCoreExportWrapper(nn.Module):
         """
         B, D, L = content_features.shape
         
-        # Unflatten KV cache list
-        # For simplicity in this logical fix, we assume kv_cache_in is handled 
-        # or we implement a non-flattened version if the model expects it.
-        # Current CodecTransformer.forward expects a list of tuples.
-        
-        # Logic fix: match CodecTransformer.forward signature:
-        # forward(content_features, b_ctx, speaker_embed, state_cond, cfg_scale, kv_caches)
-        
-        # Note: CodecTransformer expects [B, T, D] for content_features
-        logits_a_full, logits_b_full, kv_cache_out_list = self.uclm_core(
+        # Now uses the improved CodecTransformer which supports flattened tensor cache
+        logits_a_full, logits_b_full, kv_cache_out = self.uclm_core(
             content_features.transpose(1, 2),
             b_ctx,
             spk_embed,
             state_cond,
             cfg_scale.item(),
-            None # For now, ONNX export with flattened KV cache needs more complex logic
+            kv_cache_in,
+            self.max_seq_len
         )
 
         logits_a = logits_a_full[:, :, -1, :]
         logits_b = logits_b_full[:, :, -1, :]
 
-        # placeholder for flattened kv_cache_out
-        return logits_a, logits_b, kv_cache_in
+        return logits_a, logits_b, kv_cache_out
 
 
 def export_vc_encoder(

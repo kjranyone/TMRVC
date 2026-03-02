@@ -11,3 +11,8 @@ datasets:
     enabled: false
     language: ja
     raw_dir: data/raw/jvs_corpus
+  tsukuyomi:
+    type: tsukuyomi
+    enabled: true
+    language: ja
+    raw_dir: "data/raw/tsukuyomi/corpus1/01 WAV（収録時の音量のまま）"

@@ -30,6 +30,7 @@ class DisentangledUCLM(nn.Module):
         d_speaker: int = 192,
         vq_bins: int = 128,
         vocab_size: int = 256,
+        num_speakers: int = 1000,
     ):
         super().__init__()
         self.d_model = d_model
@@ -51,7 +52,7 @@ class DisentangledUCLM(nn.Module):
         self.feature_expander = TextFeatureExpander(d_model=d_model)
 
         self.voice_state_enc = VoiceStateEncoder(
-            d_explicit=d_explicit, d_ssl=d_ssl, d_model=d_model
+            d_explicit=d_explicit, d_ssl=d_ssl, d_model=d_model, num_speakers=num_speakers
         )
 
         self.f0_proj = nn.Linear(2, d_model)  # F0 condition: [norm_f0, shift]

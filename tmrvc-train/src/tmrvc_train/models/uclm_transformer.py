@@ -82,7 +82,7 @@ class CodecTransformer(nn.Module):
         self.acoustic_heads = nn.ModuleList([nn.Linear(d_model, rvq_vocab_size) for _ in range(n_codebooks)])
         self.control_heads = nn.ModuleList([nn.Linear(d_model, control_vocab_size) for _ in range(4)])
 
-    def forward(self, content_features, b_ctx, speaker_embed, state_cond, cfg_scale=1.0, kv_caches=None):
+    def forward(self, content_features, b_ctx, speaker_embed, state_cond, cfg_scale=1.0, kv_caches=None, max_seq_len=200):
         # content_features: [B, T, d_model]
         x = content_features
         B, T, _ = x.shape
@@ -111,12 +111,35 @@ class CodecTransformer(nn.Module):
             
         x = x + sc
 
-        new_kv_caches = []
+        # Handle KV cache (optional flattening for ONNX)
+        kv_list = None
+        if kv_caches is not None:
+            if isinstance(kv_caches, torch.Tensor):
+                # Unflatten: [B, kv_cache_size] -> list of (k, v)
+                # Size: 2 * n_layers * n_heads * head_dim * max_seq_len
+                head_dim = self.d_model // self.n_heads
+                kv_list = []
+                offset = 0
+                step = self.n_heads * head_dim * max_seq_len
+                for _ in range(self.n_layers):
+                    k = kv_caches[:, offset : offset + step].view(B, self.n_heads, max_seq_len, head_dim)
+                    v = kv_caches[:, offset + step : offset + 2 * step].view(B, self.n_heads, max_seq_len, head_dim)
+                    kv_list.append((k, v))
+                    offset += 2 * step
+            else:
+                kv_list = kv_caches
+
+        new_kv_list = []
         for i, layer in enumerate(self.layers):
-            k_in = kv_caches[i][0] if kv_caches else None
-            v_in = kv_caches[i][1] if kv_caches else None
+            k_in = kv_list[i][0] if kv_list else None
+            v_in = kv_list[i][1] if kv_list else None
             x, nk, nv = layer(x, k_in, v_in)
-            new_kv_caches.append((nk, nv))
+            
+            # If we used cache, we only want to keep the last max_seq_len frames
+            if nk.shape[2] > max_seq_len:
+                nk = nk[:, :, -max_seq_len:, :]
+                nv = nv[:, :, -max_seq_len:, :]
+            new_kv_list.append((nk, nv))
 
         x = self.norm(x)
         
@@ -124,7 +147,12 @@ class CodecTransformer(nn.Module):
         logits_a = torch.stack([head(x) for head in self.acoustic_heads], dim=1) # [B, 8, T, 1024]
         logits_b = torch.stack([head(x) for head in self.control_heads], dim=1)  # [B, 4, T, 64]
         
-        return logits_a, logits_b, new_kv_caches
+        # Flatten KV cache if output requested as tensor
+        if kv_caches is not None and isinstance(kv_caches, torch.Tensor):
+            out_kv = torch.cat([torch.cat([k.reshape(B, -1), v.reshape(B, -1)], dim=1) for k, v in new_kv_list], dim=1)
+            return logits_a, logits_b, out_kv
+            
+        return logits_a, logits_b, new_kv_list
 
     def forward_no_cache(self, content_features, b_ctx, state_cond, speaker_embed, cfg_scale=1.0):
         """Non-streaming forward for training. b_ctx must be shifted B_{t-1}."""

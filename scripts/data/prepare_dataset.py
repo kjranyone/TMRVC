@@ -67,7 +67,20 @@ def run_pipeline(config: PipelineConfig) -> int:
     # Faster-Whisper for transcription (needed for alignment)
     from faster_whisper import WhisperModel
     compute_type = "float16" if config.device == "cuda" else "int8"
-    whisper = WhisperModel("large-v3", device=config.device, compute_type=compute_type)
+    whisper = WhisperModel("large-v3-turbo", device=config.device, compute_type=compute_type)
+
+    # Load speaker map if exists in configs/datasets.yaml or inferred
+    speaker_map = None
+    datasets_yaml = Path("configs/datasets.yaml")
+    if datasets_yaml.exists():
+        import yaml
+        with open(datasets_yaml, encoding="utf-8") as _f:
+            _registry = yaml.safe_load(_f) or {}
+        ds_cfg = (_registry.get("datasets") or {}).get(config.dataset_name) or {}
+        spk_map_path = ds_cfg.get("speaker_map")
+        if spk_map_path:
+            with open(spk_map_path, encoding="utf-8") as _f:
+                speaker_map = json.load(_f)["mapping"]
 
     # Scan Files
     audio_files = sorted(list(config.input_dir.rglob("*.wav")) + list(config.input_dir.rglob("*.flac")))
@@ -75,12 +88,14 @@ def run_pipeline(config: PipelineConfig) -> int:
 
     for audio_path in tqdm.tqdm(audio_files, desc="Processing"):
         utt_id = audio_path.stem
-        # Improved speaker logic: Use the top-level directory name relative to input_dir
-        rel_path = audio_path.relative_to(config.input_dir)
-        if len(rel_path.parts) > 1:
-            spk_id = rel_path.parts[0]
+        
+        # Speaker logic: Map > Directory > DatasetName
+        if speaker_map and audio_path.name in speaker_map:
+            spk_id = speaker_map[audio_path.name]
+            if spk_id == "spk_noise": continue
         else:
-            spk_id = config.dataset_name # Fallback to dataset name for flat files
+            rel_path = audio_path.relative_to(config.input_dir)
+            spk_id = rel_path.parts[0] if len(rel_path.parts) > 1 else config.dataset_name
         
         utt_dir = config.output_dir / config.dataset_name / "train" / spk_id / utt_id
         if config.resume and (utt_dir / "meta.json").exists():
@@ -96,27 +111,37 @@ def run_pipeline(config: PipelineConfig) -> int:
             b_tokens = b_logits.argmax(dim=-1)
             
             # 2. Extract Voice State (8-dim + SSL)
-            # Need mel and f0 for estimator
             from tmrvc_core.audio import compute_mel
             mel = compute_mel(waveform_t.squeeze(1)).to(config.device)
-            f0 = torch.zeros(1, 1, mel.shape[-1], device=config.device) # Placeholder
+            f0 = torch.zeros(1, 1, mel.shape[-1], device=config.device)
             
-            # WavLM resample
             import torchaudio.transforms as T
             waveform_16k = T.Resample(SAMPLE_RATE, 16000).to(config.device)(waveform_t.squeeze(1))
             
             vs_dict = vs_estimator(waveform_16k, waveform_t.squeeze(1), mel, f0)
-            explicit_state = vs_dict["explicit_state"].cpu().numpy()[0]
-            ssl_state = vs_dict["ssl_state"].cpu().numpy()[0]
             
-            # 3. Transcribe & Align (for TTS)
+            # CRITICAL: Frame Alignment Verification
+            T_target = a_tokens.shape[-1]
+            explicit_state = vs_dict["explicit_state"].squeeze(0)
+            ssl_state = vs_dict["ssl_state"].squeeze(0)
+            
+            assert explicit_state.shape[0] == T_target, f"Explicit state frame mismatch: {explicit_state.shape[0]} != {T_target}"
+            
+            # Interpolate SSL (50Hz -> 100Hz)
+            ssl_state_interp = torch.nn.functional.interpolate(
+                ssl_state.unsqueeze(0).transpose(1, 2),
+                size=T_target,
+                mode="linear",
+                align_corners=False
+            ).transpose(1, 2).squeeze(0)
+            
+            explicit_state_np = explicit_state.cpu().numpy()
+            ssl_state_np = ssl_state_interp.cpu().numpy()
+            
+            # 3. Transcribe
             segments, _ = whisper.transcribe(str(audio_path), language=config.language)
             text = "".join(seg.text for seg in segments).strip()
             
-            phoneme_ids = None
-            durations = None
-            # Text alignment is skipped here. Use `run_mfa_align` pipeline separately.
-
             # 4. Extract Speaker Embed
             with torch.no_grad():
                 spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
@@ -126,23 +151,21 @@ def run_pipeline(config: PipelineConfig) -> int:
             utt_dir.mkdir(parents=True, exist_ok=True)
             np.save(utt_dir / "codec_tokens.npy", a_tokens.cpu().numpy()[0])
             np.save(utt_dir / "control_tokens.npy", b_tokens.cpu().numpy()[0])
-            np.save(utt_dir / "explicit_state.npy", explicit_state)
-            np.save(utt_dir / "ssl_state.npy", ssl_state)
+            np.save(utt_dir / "explicit_state.npy", explicit_state_np)
+            np.save(utt_dir / "ssl_state.npy", ssl_state_np)
             np.save(utt_dir / "spk_embed.npy", spk_embed)
-            if phoneme_ids is not None:
-                np.save(utt_dir / "phoneme_ids.npy", np.array(phoneme_ids))
-                np.save(utt_dir / "durations.npy", np.array(durations))
+            np.save(utt_dir / "waveform.npy", waveform.numpy())
             
-            meta = UtteranceMeta(
-                utterance_id=utt_id,
-                speaker_id=spk_id,
-                duration_sec=waveform.shape[-1] / SAMPLE_RATE,
-                text=text,
-                language_id=LANGUAGE_IDS.get(config.language, 0),
-                voice_state_mean=explicit_state.mean(axis=0).tolist(),
-                has_alignment=phoneme_ids is not None
-            )
-            (utt_dir / "meta.json").write_text(json.dumps(asdict(meta), ensure_ascii=False, indent=2))
+            meta = {
+                "utterance_id": utt_id,
+                "speaker_id": spk_id,
+                "duration_sec": waveform.shape[-1] / SAMPLE_RATE,
+                "text": text,
+                "language_id": LANGUAGE_IDS.get(config.language, 0),
+                "n_frames": T_target,
+                "f0_mean": 150.0 # Default fallback
+            }
+            (utt_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
         except Exception as e:
             logger.warning("Failed to process %s: %s", audio_path, e)

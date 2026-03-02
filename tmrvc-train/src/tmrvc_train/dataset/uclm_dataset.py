@@ -12,9 +12,11 @@ class DisentangledUCLMDataset(Dataset):
         self.cache_dir = Path(cache_dir)
         self.max_frames = max_frames
         self.utterances = []
+        self.speaker_to_id = {}
+        self.id_to_speaker = {}
 
         # Scan for utterance meta.json files
-        for meta_path in self.cache_dir.rglob("meta.json"):
+        for meta_path in sorted(self.cache_dir.rglob("meta.json")):
             if "train" not in str(meta_path):
                 continue
 
@@ -33,8 +35,17 @@ class DisentangledUCLMDataset(Dataset):
 
                 if all((utt_dir / req).exists() for req in required_files):
                     self.utterances.append({"meta": meta, "path": utt_dir})
+                    
+                    # Registry speaker if not present
+                    spk_id = meta.get("speaker_id") or utt_dir.parent.name
+                    if spk_id not in self.speaker_to_id:
+                        int_id = len(self.speaker_to_id)
+                        self.speaker_to_id[spk_id] = int_id
+                        self.id_to_speaker[int_id] = spk_id
             except Exception:
                 continue
+        
+        print(f"[info] DisentangledUCLMDataset: loaded {len(self.utterances)} utterances, {len(self.speaker_to_id)} speakers.")
 
     def __len__(self) -> int:
         return len(self.utterances)
@@ -51,7 +62,6 @@ class DisentangledUCLMDataset(Dataset):
         spk_embed = np.load(utt_dir / "spk_embed.npy")  # [192]
 
         # Truncate or pad to max_frames for batching simplicity
-        # (In a real scenario we'd use a collate_fn to pad dynamically)
         T = codec_tokens.shape[-1]
         if T > self.max_frames:
             start = np.random.randint(0, T - self.max_frames)
@@ -59,29 +69,25 @@ class DisentangledUCLMDataset(Dataset):
             explicit_state = explicit_state[start : start + self.max_frames, :]
             ssl_state = ssl_state[start : start + self.max_frames, :]
 
-        # Target tokens
         target_a = torch.from_numpy(codec_tokens).long()
 
-        # Load Control tokens (B_t)
         if (utt_dir / "control_tokens.npy").exists():
             target_b = torch.from_numpy(np.load(utt_dir / "control_tokens.npy")).long()
+            if target_b.shape[-1] > target_a.shape[-1]:
+                target_b = target_b[:, :target_a.shape[-1]]
         else:
-            # Fallback for legacy cache without B_t
             target_b = torch.zeros((4, target_a.shape[1]), dtype=torch.long)
 
-        # Load F0 and create f0_condition [T, 2]
         f0_condition = None
         if (utt_dir / "f0.npy").exists():
-            f0 = np.load(utt_dir / "f0.npy").squeeze()  # [T]
+            f0 = np.load(utt_dir / "f0.npy").squeeze()
             f0_mean = meta.get("f0_mean", 150.0)
-            # log2(f0 / mean) normalization
             f0_norm = np.log2((f0 + 1e-8) / f0_mean)
             f0_norm = np.clip(f0_norm, -2.0, 2.0)
-
-            # f0_condition: [f0_norm, pitch_shift]
-            # pitch_shift is 0 during training
             f0_cond_np = np.stack([f0_norm, np.zeros_like(f0_norm)], axis=-1)
             f0_condition = torch.from_numpy(f0_cond_np).float()
+            if f0_condition.shape[0] > target_a.shape[1]:
+                f0_condition = f0_condition[:target_a.shape[1], :]
 
         phoneme_ids = None
         durations = None
@@ -94,14 +100,18 @@ class DisentangledUCLMDataset(Dataset):
         if phoneme_ids is not None:
             phoneme_lens = torch.tensor(len(phoneme_ids)).long()
 
+        # Dynamic speaker ID mapping
+        spk_str = meta.get("speaker_id") or utt_dir.parent.name
+        spk_int = self.speaker_to_id.get(spk_str, 0)
+
         return {
-            "source_a_t": target_a.clone(),  # For VC mode
+            "source_a_t": target_a.clone(),
             "target_a": target_a,
             "target_b": target_b,
             "explicit_state": torch.from_numpy(explicit_state).float(),
             "ssl_state": torch.from_numpy(ssl_state).float(),
             "speaker_embed": torch.from_numpy(spk_embed).float(),
-            "speaker_id": torch.tensor(meta.get("speaker_id_int", 0)).long(),
+            "speaker_id": torch.tensor(spk_int).long(),
             "phoneme_ids": phoneme_ids,
             "phoneme_lens": phoneme_lens,
             "durations": durations,
