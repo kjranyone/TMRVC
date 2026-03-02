@@ -4,16 +4,23 @@
 Processes each utterance in the feature cache:
 1. Loads text from meta.json
 2. Converts text → phonemes via G2P
-3. Saves phoneme_ids.npy or token_ids.npy and durations.npy alongside existing features
+3. Saves phoneme_ids.npy and durations.npy alongside existing features
 
-For datasets without MFA alignment, uses a heuristic equal-duration split.
-For datasets with MFA TextGrid files, loads actual alignments.
+MFA Integration:
+Loads actual alignments from Montreal Forced Aligner (MFA) TextGrid files.
+Maintains strict frame parity with UCLM v2 (100Hz).
 
 Usage::
 
-    python scripts/run_forced_alignment.py --cache-dir data/cache --dataset jsut --language ja
-    python scripts/run_forced_alignment.py --cache-dir data/cache --dataset ljspeech --language en
-    python scripts/run_forced_alignment.py --cache-dir data/cache --dataset vctk --language en --textgrid-dir data/alignments/vctk
+    # Strict MFA mode (Recommended)
+    python scripts/annotate/run_forced_alignment.py \
+        --cache-dir data/cache --dataset vctk --language en \
+        --textgrid-dir data/alignments/vctk
+
+    # Heuristic mode (Fallback only)
+    python scripts/annotate/run_forced_alignment.py \
+        --cache-dir data/cache --dataset ljspeech --language en \
+        --allow-heuristic
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import logging
 from pathlib import Path
 
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +65,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--frontend",
         choices=["phoneme", "tokenizer"],
-        default="tokenizer",
-        help="Text frontend mode (default: tokenizer).",
+        default="phoneme",
+        help="Text frontend mode (default: phoneme).",
+    )
+    parser.add_argument(
+        "--allow-heuristic",
+        action="store_true",
+        help="Allow equal-duration heuristic if TextGrid is missing (NOT recommended).",
     )
     parser.add_argument(
         "--textgrid-dir",
         type=Path,
         default=None,
-        help="Directory of MFA TextGrid files. If provided, uses actual alignments.",
+        help="Directory of MFA TextGrid files. Required for accurate TTS.",
     )
     parser.add_argument(
         "--overwrite",
@@ -93,11 +106,12 @@ def process_utterance_g2p(
     utt_dir: Path,
     language: str,
     overwrite: bool = False,
+    allow_heuristic: bool = False,
 ) -> bool:
-    """Process a single utterance: G2P → phoneme_ids + heuristic durations.
+    """Process a single utterance: G2P → phoneme_ids + heuristic durations."""
+    if not allow_heuristic:
+        return False
 
-    Returns True if processed, False if skipped.
-    """
     phone_path = utt_dir / "phoneme_ids.npy"
     dur_path = utt_dir / "durations.npy"
 
@@ -128,58 +142,12 @@ def process_utterance_g2p(
     np.save(phone_path, phoneme_ids)
     np.save(dur_path, durations)
 
-    # Update meta with language_id
+    # Update meta
     meta["language_id"] = result.language_id
     meta["text_frontend"] = "phoneme"
+    meta["alignment_type"] = "heuristic"
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-
-    return True
-
-
-def process_utterance_tokenizer(
-    utt_dir: Path,
-    language: str,
-    overwrite: bool = False,
-) -> bool:
-    """Process a single utterance with tokenizer frontend.
-
-    Saves ``token_ids.npy`` and heuristic ``durations.npy``.
-    """
-    token_path = utt_dir / "token_ids.npy"
-    dur_path = utt_dir / "durations.npy"
-
-    if token_path.exists() and dur_path.exists() and not overwrite:
-        return False
-
-    meta_path = utt_dir / "meta.json"
-    if not meta_path.exists():
-        return False
-
-    with open(meta_path, encoding="utf-8") as f:
-        meta = json.load(f)
-
-    text = meta.get("text", "")
-    if not text:
-        return False
-
-    n_frames = meta.get("n_frames", 0)
-    if n_frames <= 0:
-        return False
-
-    from tmrvc_data.text_tokenizer import text_to_tokens
-
-    result = text_to_tokens(text, language=language)
-    token_ids = result.token_ids.numpy()
-    durations = _equal_duration_split(len(token_ids), n_frames)
-
-    np.save(token_path, token_ids)
-    np.save(dur_path, durations)
-
-    meta["language_id"] = result.language_id
-    meta["text_frontend"] = "tokenizer"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
+        json.dump(meta, f, indent=2)
 
     return True
 
@@ -190,10 +158,7 @@ def process_utterance_textgrid(
     language: str,
     overwrite: bool = False,
 ) -> bool:
-    """Process a single utterance using MFA TextGrid alignment.
-
-    Returns True if processed, False if skipped.
-    """
+    """Process a single utterance using MFA TextGrid alignment."""
     phone_path = utt_dir / "phoneme_ids.npy"
     dur_path = utt_dir / "durations.npy"
 
@@ -211,35 +176,56 @@ def process_utterance_textgrid(
         meta = json.load(f)
 
     n_frames = meta.get("n_frames", 0)
+    if n_frames <= 0:
+        return False
 
     from tmrvc_data.alignment import load_textgrid_durations
     from tmrvc_data.g2p import BOS_ID, EOS_ID, PHONE2ID, UNK_ID
 
-    alignment = load_textgrid_durations(textgrid_path, total_frames=n_frames)
+    try:
+        alignment = load_textgrid_durations(textgrid_path, total_frames=n_frames)
+    except Exception as e:
+        logger.error("Failed to parse TextGrid %s: %s", textgrid_path, e)
+        return False
 
     # Convert MFA phonemes to our vocabulary IDs
     # Wrap with BOS/EOS
     ids = [BOS_ID]
-    durs = [0]  # BOS has 0 duration
+    durs = [0]  # BOS/EOS have 0 duration in our UCLM v2 spec
     for phone, dur in zip(alignment.phonemes, alignment.durations):
-        ids.append(PHONE2ID.get(phone, UNK_ID))
+        # MFA sometimes uses different labels for silence
+        if phone in ("sil", "sp", ""):
+            p_id = PHONE2ID.get("<sil>", UNK_ID)
+        else:
+            p_id = PHONE2ID.get(phone, UNK_ID)
+            if p_id == UNK_ID:
+                logger.warning("Unknown phoneme '%s' in %s", phone, textgrid_path.name)
+        
+        ids.append(p_id)
         durs.append(int(dur))
+    
     ids.append(EOS_ID)
-    durs.append(0)  # EOS has 0 duration
+    durs.append(0)
 
     phoneme_ids = np.array(ids, dtype=np.int64)
     durations = np.array(durs, dtype=np.int64)
+
+    # Final sanity check: durations.sum() must equal n_frames
+    if durations.sum() != n_frames:
+        logger.error("Frame parity error in %s: sum=%d, expected=%d", 
+                     utt_dir.name, durations.sum(), n_frames)
+        return False
 
     np.save(phone_path, phoneme_ids)
     np.save(dur_path, durations)
 
     # Update meta
     lang_map = {"ja": 0, "en": 1, "zh": 2, "ko": 3}
-    lang_id = lang_map.get(language, 0)
-    meta["language_id"] = lang_id
+    meta["language_id"] = lang_map.get(language, 0)
     meta["text_frontend"] = "phoneme"
+    meta["alignment_type"] = "mfa"
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
+        json.dump(meta, f, indent=2)
 
     return True
 
@@ -272,18 +258,24 @@ def main() -> None:
             args.dataset, args.split, entry["speaker_id"], entry["utterance_id"],
         )
 
-        if args.frontend == "tokenizer":
-            ok = process_utterance_tokenizer(utt_dir, args.language, args.overwrite)
-        elif args.textgrid_dir:
-            # Try to find matching TextGrid
+        ok = False
+        if args.textgrid_dir:
+            # Try to find matching TextGrid: speaker/utt.TextGrid or utt.TextGrid
             tg_path = args.textgrid_dir / entry["speaker_id"] / f"{entry['utterance_id']}.TextGrid"
             if not tg_path.exists():
                 tg_path = args.textgrid_dir / f"{entry['utterance_id']}.TextGrid"
-            ok = process_utterance_textgrid(
-                utt_dir, tg_path, args.language, args.overwrite,
-            )
+            
+            if tg_path.exists():
+                ok = process_utterance_textgrid(utt_dir, tg_path, args.language, args.overwrite)
+            elif args.allow_heuristic:
+                ok = process_utterance_g2p(utt_dir, args.language, args.overwrite, allow_heuristic=True)
+            else:
+                logger.error("TextGrid missing for %s. Use --allow-heuristic if needed.", entry["utterance_id"])
         else:
-            ok = process_utterance_g2p(utt_dir, args.language, args.overwrite)
+            if not args.allow_heuristic:
+                logger.error("No --textgrid-dir provided and --allow-heuristic is disabled. Cannot process.")
+                break
+            ok = process_utterance_g2p(utt_dir, args.language, args.overwrite, allow_heuristic=True)
 
         if ok:
             processed += 1

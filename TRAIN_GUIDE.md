@@ -42,6 +42,26 @@ uv run python scripts/data/prepare_datasets.py --sample-ratio 0.01 --device cuda
 | `waveform.npy` | [1, T*240] | 24kHz 正規化済み波形 |
 | `meta.json` | - | テキスト、話者ID、統計情報 |
 
+### 1.3 TTS用アライメントの実行 (MFA統合)
+
+VC学習には不要ですが、TTS学習を行う場合は正確な音素単位のアライメントが必須です。
+
+```bash
+# 1. Montreal Forced Aligner で TextGrid を生成
+# (事前に MFA のインストールと acoustic model のダウンロードが必要)
+mfa align data/raw/vctk/wav48 english_us_arpa english_us_arpa data/alignments/vctk
+
+# 2. 生成された TextGrid をキャッシュに注入
+uv run python scripts/annotate/run_forced_alignment.py \
+    --cache-dir data/cache \
+    --dataset vctk \
+    --language en \
+    --textgrid-dir data/alignments/vctk
+```
+
+- **MFA統合の重要性**: ヒューリスティックな均等割り（`--allow-heuristic`）は品質を著しく低下させるため、論文実装レベルの学習には MFA の使用を強く推奨します。
+- **BOS/EOS**: 注入時に自動的に `<bos>`, `<eos>` トークンが前後に追加されます。
+
 ---
 
 ## 2. モデル学習 (Training)
