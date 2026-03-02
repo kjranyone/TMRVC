@@ -42,8 +42,10 @@ class UCLMCodecWrapper(nn.Module):
             ckpt = torch.load(checkpoint_path, map_location=self.device)
             self._model.load_state_dict(ckpt.get("model", ckpt))
         else:
-            logger.warning("No Codec checkpoint provided; using random weights for extraction.")
-        
+            logger.warning(
+                "No Codec checkpoint provided; using random weights for extraction."
+            )
+
         self._model.eval()
 
     @torch.no_grad()
@@ -63,12 +65,12 @@ class UCLMCodecWrapper(nn.Module):
         # Ensure 3D: [B, 1, T]
         if waveform.dim() == 2:
             waveform = waveform.unsqueeze(1)
-        
+
         waveform = waveform.to(self.device)
-        
-        # EmotionAwareCodec.encode returns (a_tokens, b_logits, states)
-        a_tokens, b_logits, _ = self._model.encode(waveform)
-        
+
+        # EmotionAwareCodec.encode returns (a_tokens, b_logits, states, a_logits)
+        a_tokens, b_logits, _, _ = self._model.encode(waveform)
+
         return a_tokens, b_logits
 
     @torch.no_grad()
@@ -80,27 +82,28 @@ class UCLMCodecWrapper(nn.Module):
     ) -> torch.Tensor:
         """Decode tokens back to waveform."""
         audio, _ = self._model.decode(
-            a_tokens.to(self.device), 
-            b_tokens.to(self.device), 
-            voice_state.to(self.device)
+            a_tokens.to(self.device),
+            b_tokens.to(self.device),
+            voice_state.to(self.device),
         )
         return audio
 
     def tokenize_file(self, audio_path: Path | str) -> dict[str, torch.Tensor]:
         import torchaudio
+
         waveform, sr = torchaudio.load(str(audio_path))
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
             waveform = resampler(waveform)
-        
+
         if waveform.shape[0] > 1:
             waveform = waveform.mean(0, keepdim=True)
-            
+
         a_tokens, b_logits = self.encode(waveform.unsqueeze(0))
         b_tokens = b_logits.argmax(dim=-1)
-        
+
         return {
             "a_tokens": a_tokens.cpu(),
             "b_tokens": b_tokens.cpu(),
-            "duration_sec": waveform.shape[-1] / self.sample_rate
+            "duration_sec": waveform.shape[-1] / self.sample_rate,
         }

@@ -44,14 +44,15 @@ class VCTKAdapter(DatasetAdapter):
 
     name = "vctk"
 
-    def iter_utterances(
-        self, root: Path, split: str = "train"
-    ) -> Iterator[Utterance]:
+    def iter_utterances(self, root: Path, split: str = "train") -> Iterator[Utterance]:
         wav_dir = root / "wav48_silence_trimmed"
         if not wav_dir.exists():
             wav_dir = root / "wav48"
         if not wav_dir.exists():
-            raise FileNotFoundError(f"VCTK wav directory not found under {root}")
+            if any(p.is_dir() and p.name.startswith("p") for p in root.iterdir()):
+                wav_dir = root
+            else:
+                raise FileNotFoundError(f"VCTK wav directory not found under {root}")
 
         # Detect format: 0.92 uses *_mic1.flac, older uses *.wav
         use_092 = wav_dir.name == "wav48_silence_trimmed"
@@ -103,9 +104,7 @@ class JVSAdapter(DatasetAdapter):
 
     name = "jvs"
 
-    def iter_utterances(
-        self, root: Path, split: str = "train"
-    ) -> Iterator[Utterance]:
+    def iter_utterances(self, root: Path, split: str = "train") -> Iterator[Utterance]:
         for spk_dir in sorted(root.iterdir()):
             if not spk_dir.is_dir() or not spk_dir.name.startswith("jvs"):
                 continue
@@ -146,9 +145,7 @@ class LibriTTSRAdapter(DatasetAdapter):
 
     name = "libritts_r"
 
-    def iter_utterances(
-        self, root: Path, split: str = "train"
-    ) -> Iterator[Utterance]:
+    def iter_utterances(self, root: Path, split: str = "train") -> Iterator[Utterance]:
         split_dirs = {
             "train": ["train-clean-100", "train-clean-360", "train-other-500"],
             "dev": ["dev-clean", "dev-other"],
@@ -208,14 +205,13 @@ class TsukuyomiAdapter(DatasetAdapter):
         cleaned = re.sub(r"[^0-9A-Za-z_\-]+", "_", value).strip("_")
         return cleaned or "unknown"
 
-    def iter_utterances(
-        self, root: Path, split: str = "train"
-    ) -> Iterator[Utterance]:
+    def iter_utterances(self, root: Path, split: str = "train") -> Iterator[Utterance]:
         if not root.exists():
             raise FileNotFoundError(f"Tsukuyomi root not found: {root}")
 
         audio_files = sorted(
-            p for p in root.rglob("*")
+            p
+            for p in root.rglob("*")
             if p.is_file() and p.suffix.lower() in self._AUDIO_EXTS
         )
         if not audio_files:
@@ -291,14 +287,13 @@ class GenericAdapter(DatasetAdapter):
         cleaned = re.sub(r"[^0-9A-Za-z_\-]+", "_", value).strip("_")
         return cleaned or "unknown"
 
-    def iter_utterances(
-        self, root: Path, split: str = "train"
-    ) -> Iterator[Utterance]:
+    def iter_utterances(self, root: Path, split: str = "train") -> Iterator[Utterance]:
         if not root.exists():
             raise FileNotFoundError(f"Root directory not found: {root}")
 
         audio_files = sorted(
-            p for p in root.rglob("*")
+            p
+            for p in root.rglob("*")
             if p.is_file() and p.suffix.lower() in self._AUDIO_EXTS
         )
         if not audio_files:

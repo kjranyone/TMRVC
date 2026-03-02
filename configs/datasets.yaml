@@ -8,6 +8,6 @@ datasets:
     raw_dir: data/raw/wav48_silence_trimmed
   jvs:
     type: jvs
-    enabled: true
+    enabled: false
     language: ja
     raw_dir: data/raw/jvs_corpus
