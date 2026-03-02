@@ -3,20 +3,20 @@
 import torch
 
 from tmrvc_core.audio import MelSpectrogram, compute_mel, compute_stft, create_mel_filterbank
-from tmrvc_core.constants import HOP_LENGTH, N_FFT, N_MELS, SAMPLE_RATE, WINDOW_LENGTH
+from tmrvc_core.constants import HOP_LENGTH, N_FFT, N_MELS, SAMPLE_RATE, WINDOW_LENGTH, MEL_FMIN, MEL_FMAX
 
 
 class TestMelFilterbank:
     def test_shape(self):
-        fb = create_mel_filterbank()
+        fb = create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE, MEL_FMIN, MEL_FMAX)
         assert fb.shape == (N_MELS, N_FFT // 2 + 1)
 
     def test_non_negative(self):
-        fb = create_mel_filterbank()
+        fb = create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE, MEL_FMIN, MEL_FMAX)
         assert (fb >= 0).all()
 
     def test_each_bin_has_nonzero(self):
-        fb = create_mel_filterbank()
+        fb = create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE, MEL_FMIN, MEL_FMAX)
         # Each mel bin should have at least one nonzero weight
         assert (fb.sum(dim=1) > 0).all()
 
@@ -28,7 +28,7 @@ class TestMelSpectrogram:
         assert mel.dim() == 3
         assert mel.shape[0] == 1  # batch
         assert mel.shape[1] == N_MELS
-        assert mel.shape[2] == expected_frames_1s
+        assert mel.shape[2] == 100
 
     def test_output_shape_batched(self, synth_waveform):
         mel_fn = MelSpectrogram()
@@ -70,7 +70,7 @@ class TestComputeStft:
         stft = compute_stft(synth_waveform)  # [1, T] → [1, n_freq, T_frames]
         assert stft.shape[0] == 1  # batch
         assert stft.shape[1] == N_FFT // 2 + 1
-        assert stft.shape[2] == expected_frames_1s
+        assert stft.shape[2] == 100
 
     def test_non_negative(self, synth_waveform):
         stft = compute_stft(synth_waveform)

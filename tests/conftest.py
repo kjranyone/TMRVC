@@ -16,7 +16,7 @@ from tmrvc_core.constants import (
     N_MELS,
     SAMPLE_RATE,
 )
-from tmrvc_core.types import FeatureSet
+from tmrvc_core.types import UCLMFeatureSet
 
 
 @pytest.fixture
@@ -50,17 +50,16 @@ def expected_frames_1s() -> int:
     # torch.stft uses n_fft (not window_length) for frame count:
     # n_frames = (padded_len - N_FFT) // HOP_LENGTH + 1
     padded = SAMPLE_RATE + (WINDOW_LENGTH - HOP_LENGTH)
-    return (padded - N_FFT) // HOP_LENGTH + 1
-
 
 @pytest.fixture
-def mock_feature_set() -> FeatureSet:
+def mock_feature_set() -> UCLMFeatureSet:
     """A FeatureSet with random data, 100 frames (1 second)."""
     n_frames = 100
-    return FeatureSet(
-        mel=torch.randn(N_MELS, n_frames),
-        content=torch.randn(D_MODEL, n_frames),
-        f0=torch.randn(1, n_frames),
+    return UCLMFeatureSet(
+        codec_tokens_a=torch.zeros(8, n_frames, dtype=torch.long),
+        codec_tokens_b=torch.zeros(4, n_frames, dtype=torch.long),
+        voice_state_explicit=torch.randn(n_frames, 8),
+        voice_state_ssl=torch.randn(n_frames, 128),
         spk_embed=torch.randn(D_SPEAKER),
         utterance_id="test_utt_001",
         speaker_id="test_spk_001",

@@ -62,5 +62,5 @@ def test_yaml_matches_python():
     assert cfg["hop_length"] == constants.HOP_LENGTH
     assert cfg["n_fft"] == constants.N_FFT
     assert cfg["n_mels"] == constants.N_MELS
-    assert cfg["d_content"] == constants.D_CONTENT
+    assert cfg["d_model"] == constants.D_MODEL
     assert cfg["d_speaker"] == constants.D_SPEAKER
