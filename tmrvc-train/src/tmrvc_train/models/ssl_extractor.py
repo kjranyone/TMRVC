@@ -87,7 +87,7 @@ class WavLMSSLExtractor(nn.Module):
         self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             model_name, cache_dir=cache_dir
         )
-        self.wavlm = Wav2Vec2Model.from_pretrained(model_name, cache_dir=cache_dir)
+        self.wavlm = Wav2Vec2Model.from_pretrained(model_name, cache_dir=cache_dir, local_files_only=True)
         self.wavlm_hidden = self.wavlm.config.hidden_size
 
         self.projection = SSLProjection(self.wavlm_hidden, d_ssl)

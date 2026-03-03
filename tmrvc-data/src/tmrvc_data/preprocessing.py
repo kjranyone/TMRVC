@@ -200,3 +200,164 @@ def preprocess_audio(
     if trim:
         waveform = trim_silence(waveform, sr)
     return waveform, sr
+
+
+# ---------------------------------------------------------------------------
+# Single utterance preprocessing (for pipeline)
+# ---------------------------------------------------------------------------
+
+
+def preprocess_single_utterance(
+    utt,
+    cache_dir,
+    dataset: str,
+    split: str,
+    device: str,
+    language: str = "ja",
+    models: dict = None,
+) -> bool:
+    """Process a single utterance and save to cache.
+
+    This function extracts all UCLM v2 features for one utterance:
+    - Dual-stream tokens (A + B)
+    - Voice state (explicit + SSL)
+    - Speaker embedding
+    - ASR transcription
+
+    Args:
+        utt: Utterance object from dataset adapter
+        cache_dir: Cache directory path
+        dataset: Dataset name
+        split: Dataset split (train/val/test)
+        device: Device for computation (cuda/cpu)
+        language: Language for ASR
+        models: Pre-initialized models dict (optional)
+
+    Returns:
+        True if successful, False if skipped/failed
+    """
+    from pathlib import Path
+    import torchaudio.transforms as T
+    from faster_whisper import WhisperModel
+
+    from tmrvc_core.audio import compute_mel
+    from tmrvc_core.constants import SAMPLE_RATE
+    from tmrvc_core.types import UCLMFeatureSet
+    from tmrvc_data.cache import FeatureCache
+    from tmrvc_data.codec import UCLMCodecWrapper
+    from tmrvc_data.voice_state import SSLVoiceStateEstimator
+    from tmrvc_data.speaker import SpeakerEncoder
+
+    cache_dir = Path(cache_dir)
+    cache = FeatureCache(cache_dir)
+
+    # Check if already cached (idempotency)
+    if cache.exists(dataset, split, utt.speaker_id, utt.utterance_id):
+        logger.debug("Already cached: %s", utt.utterance_id)
+        return True
+
+    # Duration check
+    info = sf.info(str(utt.audio_path))
+    if info.duration < 0.1 or info.duration > 30.0:
+        logger.debug(
+            "Skipping %s due to duration (%.2fs)",
+            utt.utterance_id,
+            info.duration,
+        )
+        return False
+
+    # Initialize models if not provided
+    if models is None:
+        codec = UCLMCodecWrapper(None, device=device)
+        vs_estimator = SSLVoiceStateEstimator(device=device)
+        spk_encoder = SpeakerEncoder(device=device)
+        compute_type = "float16" if device == "cuda" else "int8"
+        whisper = WhisperModel(
+            "large-v3-turbo", device=device, compute_type=compute_type
+        )
+    else:
+        codec = models["codec"]
+        vs_estimator = models["vs_estimator"]
+        spk_encoder = models["spk_encoder"]
+        whisper = models["whisper"]
+
+    # Load and process audio
+    waveform, sr = preprocess_audio(str(utt.audio_path), target_sr=SAMPLE_RATE)
+    waveform_t = waveform.unsqueeze(0).to(device)
+
+    # Extract features
+    a_tokens, b_logits = codec.encode(waveform_t)
+    b_tokens = b_logits.argmax(dim=-1)
+
+    mel = compute_mel(waveform_t.squeeze(1)).to(device)
+    f0 = torch.zeros(1, 1, mel.shape[-1], device=device)
+
+    waveform_16k = T.Resample(SAMPLE_RATE, 16000).to(device)(waveform_t.squeeze(1))
+    vs_dict = vs_estimator(waveform_16k, waveform_t.squeeze(1), mel, f0)
+
+    segments, _ = whisper.transcribe(str(utt.audio_path), language=language)
+    text = "".join(seg.text for seg in segments).strip()
+
+    spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
+
+    # Frame alignment verification (CRITICAL)
+    T_target = a_tokens.shape[-1]
+    T_mel = mel.shape[-1]
+
+    assert T_mel == T_target, (
+        f"Frame mismatch: mel={T_mel}, codec={T_target}. "
+        f"This indicates a bug in MelSpectrogram or codec implementation."
+    )
+
+    explicit_state = vs_dict["explicit_state"].detach().cpu()
+    if explicit_state.dim() == 3:
+        explicit_state = explicit_state.squeeze(0)
+    T_explicit = explicit_state.shape[0]
+
+    assert T_explicit == T_target, (
+        f"Frame mismatch: explicit_state={T_explicit}, codec={T_target}. "
+        f"This indicates a bug in VoiceStateEstimator implementation."
+    )
+    explicit_state = explicit_state.transpose(0, 1)
+
+    ssl_state = vs_dict["ssl_state"].detach().cpu()
+    if ssl_state.dim() == 3:
+        ssl_state = ssl_state.squeeze(0)
+
+    ssl_state = (
+        torch.nn.functional.interpolate(
+            ssl_state.unsqueeze(0).transpose(1, 2),
+            size=T_target,
+            mode="linear",
+            align_corners=False,
+        )
+        .transpose(1, 2)
+        .squeeze(0)
+    )
+    ssl_state = ssl_state.transpose(0, 1)
+
+    b_tokens_aligned = b_tokens.detach().cpu().squeeze(0)
+    T_b = b_tokens_aligned.shape[-1]
+    assert T_b == T_target, (
+        f"Frame mismatch: b_tokens={T_b}, codec={T_target}. "
+        f"This indicates a bug in codec implementation."
+    )
+
+    # Save to cache
+    features = UCLMFeatureSet(
+        codec_tokens_a=a_tokens.detach().cpu().squeeze(0),
+        codec_tokens_b=b_tokens_aligned,
+        voice_state_explicit=explicit_state,
+        voice_state_ssl=ssl_state,
+        spk_embed=spk_embed.detach().cpu().squeeze(0),
+        phoneme_ids=None,
+        durations=None,
+        text=text,
+        utterance_id=utt.utterance_id,
+        speaker_id=utt.speaker_id,
+        n_frames=T_target,
+        waveform=waveform.detach(),
+    )
+
+    cache.save(features, dataset, split)
+    return True

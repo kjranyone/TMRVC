@@ -60,7 +60,7 @@ class ContentVecExtractor:
             return
         from transformers import HubertModel
 
-        self._model = HubertModel.from_pretrained("lengyue233/content-vec-best")
+        self._model = HubertModel.from_pretrained("lengyue233/content-vec-best", local_files_only=True)
         self._model.eval().to(self.device)
         logger.info("ContentVec model loaded on %s", self.device)
 
@@ -132,7 +132,7 @@ class WavLMExtractor:
             return
         from transformers import WavLMModel
 
-        self._model = WavLMModel.from_pretrained("microsoft/wavlm-large")
+        self._model = WavLMModel.from_pretrained("microsoft/wavlm-large", local_files_only=True)
         self._model.eval().to(self.device)
         logger.info(
             "WavLM-large model loaded on %s (layer %d)", self.device, self.layer

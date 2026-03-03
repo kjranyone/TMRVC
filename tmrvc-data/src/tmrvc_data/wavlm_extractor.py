@@ -56,7 +56,7 @@ class WavLMFeatureExtractor(nn.Module):
             ) from e
 
         logger.info(f"Loading WavLM model: {model_name}")
-        self.wavlm = WavLMModel.from_pretrained(model_name)
+        self.wavlm = WavLMModel.from_pretrained(model_name, local_files_only=True)
 
         if freeze:
             for param in self.wavlm.parameters():
@@ -145,8 +145,11 @@ class WavLMFeatureExtractor(nn.Module):
             # Audio too short for WavLM (< 320 samples at 16kHz).
             # Return zeros aligned to mel frame count.
             return torch.zeros(
-                features.shape[0], features.shape[1], T_mel,
-                device=features.device, dtype=features.dtype,
+                features.shape[0],
+                features.shape[1],
+                T_mel,
+                device=features.device,
+                dtype=features.dtype,
             )
 
         if T_feat != T_mel:
@@ -192,12 +195,14 @@ class ContentVecFeatureExtractor(nn.Module):
         logger.info(f"Loading ContentVec model: {model_name}")
 
         try:
-            self.model = HubertModel.from_pretrained(model_name)
+            self.model = HubertModel.from_pretrained(model_name, local_files_only=True)
         except Exception:
             logger.warning(
                 f"Failed to load {model_name}, falling back to hubert-base-ls960"
             )
-            self.model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
+            self.model = HubertModel.from_pretrained(
+                "facebook/hubert-base-ls960", local_files_only=True
+            )
 
         if freeze:
             for param in self.model.parameters():

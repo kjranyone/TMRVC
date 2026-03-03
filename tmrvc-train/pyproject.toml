@@ -14,10 +14,13 @@ dependencies = [
     "torch",
     "numpy",
     "tqdm",
+    "pyyaml",
     "tmrvc-core",
+    "tmrvc-data",
 ]
 
 [project.scripts]
 tmrvc-train-uclm = "tmrvc_train.cli.train_uclm:main"
 tmrvc-train-codec = "tmrvc_train.cli.train_codec:main"
 tmrvc-finetune-encodec = "tmrvc_train.cli.finetune_encodec:main"
+tmrvc-train-pipeline = "tmrvc_train.cli.train_pipeline:main"
