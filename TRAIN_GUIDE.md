@@ -19,7 +19,7 @@ data/raw/my_dataset/
 
 この状態から、パイプラインが以下の情報を自動的に補完します：
 - **話者ID**: デフォルトではフォルダ名から推定しますが、フォルダ分けがない場合はファイル全体を同一話者、または `cluster_speakers.py` を用いた自動話者分離が可能です。
-- **テキスト**: `tmrvc-preprocess` 内の Whisper ASR が自動的に文字起こしを行います。
+- **テキスト**: `tmrvc-train-pipeline` 内の Whisper ASR が自動的に文字起こしを行います。
 - **音響特徴量**: モデルが自動的に SSL 特徴量や Codec トークンを抽出します。
 
 ### 0.2 推奨コーパスと活用法
@@ -55,36 +55,29 @@ datasets:
 
 ---
 
-## 1. データ前処理 (Data Preparation)
+## 1. 統合パイプライン (tmrvc-train-pipeline)
 
-TMRVCの前処理は、**「音響抽出 → テキスト正規化 → 強制アライメント」**の3フェーズで構成されます。各スクリプトは `--skip-existing` フラグをサポートしており、中断・再開が可能な冪等（Idempotent）な設計となっています。
+TMRVC v2 では、**再現性のある学習**を保証するために、単一のCLIコマンド `tmrvc-train-pipeline` で前処理から学習までを一括実行します。
 
-### Phase A: 音響・制御特徴量の一括抽出
-全ての wav ファイルから Codec トークン、WavLM 特徴量、話者埋め込みを一括抽出します。
+### 1.1 基本的な使い方
+
 ```bash
-uv run python scripts/data/prepare_datasets.py --device cuda --skip-existing
+tmrvc-train-pipeline \
+  --dataset vctk \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --workers 2 \
+  --seed 42
 ```
 
-### Phase B: 正解テキストの注入 (Metadata Normalization)
-Whisper ASR の誤変換を避け、論文品質の整合性を確保するため、公式の台本テキストをキャッシュに上書きします。
-```bash
-# VCTK, JVS, つくよみちゃんの公式台本をキャッシュに自動適用
-uv run python scripts/annotate/inject_text_to_cache.py
-```
-
-### Phase C: 強制アライメント (TTS Alignment)
-注入された正解テキストと音声波形を同期させ、音素単位のデュレーションを確定させます。
-```bash
-# 言語ごとに MFA アライメントを実行
-# (例: つくよみちゃんの場合)
-uv run python scripts/annotate/run_forced_alignment.py \
-    --cache-dir data/cache --dataset tsukuyomi --language ja \
-    --textgrid-dir data/alignments/tsukuyomi
-```
+この1コマンドで以下が実行されます：
+1. **前処理**: GPU並列、発話単位分散、冪等性保証
+2. **学習**: UCLMトレーニング、チェックポイント自動保存
+3. **メタデータ保存**: Git hash, 乱数シード, 設定ファイル
 
 ### 1.2 パフォーマンス・チューニングと並列度の決定
 
-前処理パイプラインは VRAM を主に消費します。以下のリソース消費表に基づき、ご自身の GPU メモリ容量（VRAM）に収まる範囲で並列ワーカー数を決定してください。
+前処理パイプラインは VRAM を主に消費します。以下のリソース消費表に基づき、ご自身の GPU メモリ容量（VRAM）に収まる範囲で `--workers` 数を決定してください。
 
 #### モデル別 VRAM 消費量 (目安)
 
@@ -105,40 +98,141 @@ $$並列ワーカー数 = \lfloor \frac{GPU VRAM (GB) - 1.0}{4.0} \rfloor$$
 *   **VRAM 22GB の場合**: マージンを引いて **5並列** が最適です。
 *   **VRAM 24GB (RTX 3090/4090) の場合**: **5〜6並列** が可能です。
 
-#### 並列実行の実行方法
-`scripts/parallel_preprocess.sh` を編集し、計算したワーカー数を設定して実行してください。
+#### 並列実行例
 
 ```bash
-# ワーカー数を環境に合わせて編集
-./scripts/parallel_preprocess.sh
+# RTX 4090 (24GB) の場合 - 5並列
+tmrvc-train-pipeline \
+  --dataset vctk \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --workers 5 \
+  --seed 42
+
+# RTX 3060 (12GB) の場合 - 2並列
+tmrvc-train-pipeline \
+  --dataset jvs \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --workers 2 \
+  --seed 42
 ```
 
-### 1.3 TTS用アライメントの詳細 (MFA)
+### 1.3 再現性保証
 
-VC学習には不要ですが、TTS学習を行う場合は正確な音素単位のアライメントが必須です。
+`tmrvc-train-pipeline` は論文レベルの再現性を保証します：
 
-```bash
-# 1. Montreal Forced Aligner で TextGrid を生成
-mfa align data/raw/vctk/wav48 english_us_arpa english_us_arpa data/alignments/vctk
+#### 1. メタデータ記録
+実験ディレクトリに `experiment.yaml` が自動生成されます：
 
-# 2. 生成された TextGrid をキャッシュに注入
-uv run python scripts/annotate/run_forced_alignment.py \
-    --cache-dir data/cache \
-    --dataset vctk \
-    --language en \
-    --textgrid-dir data/alignments/vctk
+```yaml
+experiment_id: vctk_20260303_123456
+dataset: vctk
+created_at: "2026-03-03T12:34:56"
+git_hash: abc123def456
+git_branch: main
+python_version: "3.12.0"
+config:
+  language: en
+  train_steps: 100000
+seed: 42
+workers: 2
+status: completed
 ```
 
-- **MFA統合の重要性**: ヒューリスティックな均等割り（`--allow-heuristic`）は品質を著しく低下させるため、論文実装レベルの学習には MFA の使用を強く推奨します。
-- **BOS/EOS**: 注入時に自動的に `<bos>`, `<eos>` トークンが前後に追加されます。
+#### 2. 乱数シード固定
+全ての乱数シードが固定されます：
+- `random.seed(42)`
+- `np.random.seed(42)`
+- `torch.manual_seed(42)`
+- `torch.cuda.manual_seed_all(42)`
+
+#### 3. エラー記録と再実行
+失敗した発話は `errors.json` に記録されます：
+
+```json
+[
+  {
+    "utterance_id": "vctk_p225_001",
+    "error_type": "RuntimeError",
+    "error_message": "CUDA out of memory",
+    "stage": "preprocessing",
+    "timestamp": "2026-03-03T12:45:00"
+  }
+]
+```
+
+### 1.4 出力ディレクトリ構造
+
+```
+experiments/
+└── vctk_20260303_123456/          # 実験ID (自動生成)
+    ├── experiment.yaml             # メタデータ (git hash, seed, config)
+    ├── errors.json                 # 失敗発話リスト (再実行用)
+    ├── train_config.yaml           # 学習設定
+    ├── cache/                      # 前処理キャッシュ
+    │   └── vctk/train/
+    ├── checkpoints/                # 学習チェックポイント
+    └── logs/                       # ログファイル
+```
 
 ---
 
-## 2. モデル学習 (Training)
+## 2. 高度な使い方
 
-学習は大きく分けて2つのステージ（CodecとUCLM本体）で行われます。
+### 2.1 既存キャッシュを使用して学習のみ実行
 
-### 2.1 Stage 1: Emotion-Aware Codec学習
+前処理が完了している場合、`--skip-preprocess` で学習のみ実行できます：
+
+```bash
+tmrvc-train-pipeline \
+  --dataset vctk \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --skip-preprocess \
+  --seed 42
+```
+
+### 2.2 カスタム実験名を指定
+
+```bash
+tmrvc-train-pipeline \
+  --dataset vctk \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --experiment-name vctk_baseline_v1 \
+  --workers 3
+```
+
+### 2.3 設定ファイルのカスタマイズ
+
+`configs/train_uclm.yaml` で学習パラメータをカスタマイズできます：
+
+```yaml
+language: en
+train_steps: 100000
+batch_size: 16
+learning_rate: 1e-4
+adapter_type: vctk
+```
+
+使用例：
+
+```bash
+tmrvc-train-pipeline \
+  --dataset vctk \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --config configs/train_uclm.yaml
+```
+
+---
+
+## 3. 個別コンポーネントの実行 (上級者向け)
+
+統合パイプラインではなく、個別のコンポーネントを実行することも可能です。
+
+### 3.1 Stage 1: Emotion-Aware Codec学習
 
 音声のトークン化と復元を行う基盤モデルを学習します。
 
@@ -158,7 +252,7 @@ tmrvc-train-codec \
 - **Loss**: Multi-scale STFT loss + Control Stream Cross-Entropy
 - **出力**: `codec_final.pt`
 
-### 2.2 Stage 2: Unified UCLM学習
+### 3.2 Stage 2: Unified UCLM学習
 
 TTSとVCを同時にこなす統合トランスフォーマーを学習します。
 
@@ -180,11 +274,30 @@ tmrvc-train-uclm \
     - **TTS Task**: `Phonemes → content → A_t, B_t`
 - **Loss**: CE (A_t, B_t) + VQ Bottleneck + Adversarial Disentanglement (GRL) + Duration Prediction (MSE)
 
+### 3.3 TTS用アライメントの詳細 (MFA)
+
+VC学習には不要ですが、TTS学習を行う場合は正確な音素単位のアライメントが必須です。
+
+```bash
+# 1. Montreal Forced Aligner で TextGrid を生成
+mfa align data/raw/vctk/wav48 english_us_arpa english_us_arpa data/alignments/vctk
+
+# 2. 生成された TextGrid をキャッシュに注入
+uv run python scripts/annotate/run_forced_alignment.py \
+    --cache-dir data/cache \
+    --dataset vctk \
+    --language en \
+    --textgrid-dir data/alignments/vctk
+```
+
+- **MFA統合の重要性**: ヒューリスティックな均等割り（`--allow-heuristic`）は品質を著しく低下させるため、論文実装レベルの学習には MFA の使用を強く推奨します。
+- **BOS/EOS**: 注入時に自動的に `<bos>`, `<eos>` トークンが前後に追加されます。
+
 ---
 
-## 3. モデルの検証と利用
+## 4. モデルの検証と利用
 
-### 3.1 統合エンジンでのテスト
+### 4.1 統合エンジンでのテスト
 
 学習したチェックポイントを `UCLMEngine` にロードして動作確認します。
 
@@ -195,7 +308,7 @@ uv run python scripts/demo/tts_demo.py \
     --text "これはUCLM v2の統合テストです。"
 ```
 
-### 3.2 ONNX エクスポート
+### 4.2 ONNX エクスポート
 
 RustエンジンやVSTプラグインで利用するために ONNX 形式へ変換します。
 
@@ -208,9 +321,50 @@ tmrvc-export \
 
 ---
 
-## 4. トラブルシューティング
+## 5. トラブルシューティング
 
 - **ImportError (定数不足)**: `tmrvc_core/constants.py` が最新の `configs/constants.yaml` と同期しているか確認してください。
 - **Shape Mismatch**: キャッシュ生成時の `hop_length` (240) とモデルのストライド設定が一致しているか確認してください。
 - **OOM**: `--batch-size` または `--max-frames` (デフォルト400) を下げて調整してください。
 - **Index Out of Bounds**: 古いキャッシュを削除して、新しいフレームアライメント（`pad_length=784`）で再生成してください。
+- **パイプラインの中断**: `tmrvc-train-pipeline` は冪等性を保証しているため、中断しても再実行すればキャッシュ済み発話をスキップして継続できます。
+
+---
+
+## 6. 推奨ワークフロー
+
+### 初回実行
+
+```bash
+# 1. データセットを登録
+vim configs/datasets.yaml
+
+# 2. パイプライン実行
+tmrvc-train-pipeline \
+  --dataset vctk \
+  --raw-dir data/raw \
+  --output-dir experiments \
+  --workers 5 \
+  --seed 42 \
+  --config configs/train_uclm.yaml
+
+# 3. 結果確認
+ls experiments/vctk_*/
+cat experiments/vctk_*/experiment.yaml
+```
+
+### 実験管理
+
+```bash
+# 実験一覧
+ls experiments/
+
+# 特定実験の詳細
+cat experiments/vctk_20260303_123456/experiment.yaml
+
+# エラー確認
+cat experiments/vctk_20260303_123456/errors.json
+
+# ログ確認
+tail -f experiments/vctk_20260303_123456/logs/*.log
+```

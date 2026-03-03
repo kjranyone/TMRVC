@@ -69,8 +69,11 @@ class FeatureCache:
             "text": features.text,
             "language_id": features.language_id,
         }
-        with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
+        
+        meta_tmp = utt_dir / "meta.json.tmp"
+        with open(meta_tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
+        meta_tmp.replace(utt_dir / "meta.json")
 
         return utt_dir
 

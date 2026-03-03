@@ -1,14 +1,14 @@
 #!/bin/bash
-# Parallel VCTK preprocessing - 4 workers
+# Parallel VCTK preprocessing - 3 workers
 
 SPEAKERS=$(ls data/raw/wav48_silence_trimmed/ | grep "^p[0-9]" | sort)
 TOTAL=$(echo "$SPEAKERS" | wc -l)
-CHUNK_SIZE=$((($TOTAL + 3) / 4))
+CHUNK_SIZE=$((($TOTAL + 2) / 3))
 
 echo "Total speakers: $TOTAL"
 echo "Chunk size: $CHUNK_SIZE"
 
-# Split into 4 groups
+# Split into 3 groups
 echo "$SPEAKERS" | split -l $CHUNK_SIZE -d - /tmp/speaker_list_
 
 # Worker function
@@ -124,13 +124,13 @@ for utt in tqdm.tqdm(utterances, desc=f'Worker $id'):
         print(f'Error {utt.utterance_id}: {e}')
         continue
 
-print(f'Worker $id done')
+print(f'Worker $id done (skipped {skipped} cached)')
 " >> logs/preprocess_worker_$id.log 2>&1 &
     fi
 }
 
-# Start 4 workers
-for i in 0 1 2 3; do
+# Start 3 workers
+for i in 0 1 2; do
     run_worker $i
 done
 

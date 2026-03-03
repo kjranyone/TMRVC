@@ -54,6 +54,43 @@ TMRVC/
 | `tmrvc-export` | UCLM/Codec の ONNX エクスポート |
 | `tmrvc-gui` | Research Studio GUI の起動 |
 
+## Parallel Preprocessing
+
+大規模データセットの前処理はGPU並列実行で高速化可能。
+
+### VRAM消費量 (ワーカー1つあたり)
+
+| コンポーネント | モデル | VRAM |
+|:---|:---|:---|
+| Whisper ASR | large-v3-turbo | ~1.6 GB |
+| SSL Estimator | WavLM Large | ~1.3 GB |
+| Codec | Emotion-Aware | ~0.4 GB |
+| Speaker Encoder | CAM++ | ~0.2 GB |
+| Overhead | PyTorch/System | ~0.5 GB |
+| **合計** | - | **~4.0 GB** |
+
+### 並列度の計算式
+
+```
+並列ワーカー数 = floor((GPU VRAM - 1.0) / 4.0)
+```
+
+- RTX 2080 Ti (22GB): 3並列 (約15GB使用)
+- RTX 3090/4090 (24GB): 5並列
+
+### 実行方法
+
+```bash
+# 並列前処理 (話者単位で分割)
+./scripts/parallel_preprocess.sh
+
+# 進捗確認
+watch -n 30 'find data/cache -name "meta.json" | wc -l'
+
+# ログ確認
+tail -f logs/preprocess_worker_*.log
+```
+
 ## Critical Constraints
 
 1. **Dual-Stream Token Sync**: Acoustic (`A_t`) と Control (`B_t`) は常に同期して予測されなければならない。
