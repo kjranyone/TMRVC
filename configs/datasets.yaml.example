@@ -1,0 +1,42 @@
+# TMRVC Dataset Configuration Template
+#
+# This file defines datasets for training.
+# Copy this to datasets.yaml and customize.
+#
+# Usage:
+#   python scripts/config_generator.py --init
+#   python scripts/config_generator.py --add-dataset
+
+cache_dir: data/cache
+split: train
+
+datasets:
+  # Example: VCTK corpus
+  # vctk:
+  #   type: vctk
+  #   enabled: true
+  #   language: en
+  #   raw_dir: data/raw/wav48_silence_trimmed
+
+  # Example: JVS corpus (Japanese)
+  # jvs:
+  #   type: jvs
+  #   enabled: false
+  #   language: ja
+  #   raw_dir: data/raw/jvs_corpus
+
+  # Example: Tsukuyomi corpus
+  # tsukuyomi:
+  #   type: tsukuyomi
+  #   enabled: true
+  #   language: ja
+  #   raw_dir: "data/raw/tsukuyomi/corpus1/01 WAV（収録時の音量のまま）"
+
+  # Example: Generic folder with auto speaker clustering
+  # my_voices:
+  #   type: generic
+  #   enabled: true
+  #   language: ja
+  #   raw_dir: data/raw/my_voices
+  #   # Run: python scripts/eval/cluster_speakers.py --input data/raw/my_voices --device cuda
+  #   # to generate _speaker_map.json before training
