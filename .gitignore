@@ -30,6 +30,7 @@ tmrvc-engine/include/tmrvc/constants.h
 /data/
 /checkpoints/
 /models/
+/experiments/
 
 # ============================================================
 # Scratch directory (throwaway files)
