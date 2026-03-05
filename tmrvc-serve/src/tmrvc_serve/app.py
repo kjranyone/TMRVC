@@ -34,6 +34,57 @@ _characters: dict[str, CharacterProfile] = {}
 _context_predictor = None
 
 
+def _load_persisted_characters() -> None:
+    global _characters
+    from pathlib import Path
+    import json
+    
+    char_json = Path("configs/characters.json")
+    if not char_json.exists():
+        return
+    
+    try:
+        with open(char_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        for cid, p in data.items():
+            speaker_file = Path(p["speaker_file"]) if p.get("speaker_file") else None
+            _characters[cid] = CharacterProfile(
+                name=p.get("name", cid),
+                personality=p.get("personality", ""),
+                voice_description=p.get("voice_description", ""),
+                language=p.get("language", "ja"),
+                speaker_file=speaker_file,
+            )
+        logger.info("Loaded %d character(s) from %s", len(_characters), char_json)
+    except Exception as e:
+        logger.error("Failed to load characters from %s: %s", char_json, e)
+
+
+def _save_persisted_characters() -> None:
+    from pathlib import Path
+    import json
+    
+    char_json = Path("configs/characters.json")
+    char_json.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        data = {}
+        for cid, p in _characters.items():
+            data[cid] = {
+                "name": p.name,
+                "speaker_file": str(p.speaker_file) if p.speaker_file else None,
+                "adaptation_level": "standard", # Default for now
+                "personality": p.personality,
+                "voice_description": p.voice_description,
+                "language": p.language
+            }
+        with open(char_json, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error("Failed to save characters to %s: %s", char_json, e)
+
+
 def get_engine() -> UCLMEngine:
     if _engine is None:
         raise HTTPException(status_code=503, detail="UCLM engine not initialized.")
@@ -47,6 +98,9 @@ def init_app(
     api_key: str | None = None,
 ) -> None:
     global _engine, _context_predictor
+
+    # Load persisted characters from configs/characters.json
+    _load_persisted_characters()
 
     if uclm_checkpoint and codec_checkpoint:
         try:

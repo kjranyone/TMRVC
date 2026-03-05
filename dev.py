@@ -15,8 +15,11 @@ import yaml
 
 CONFIGS_DIR = Path("configs")
 DATASETS_YAML = CONFIGS_DIR / "datasets.yaml"
+CHARACTERS_JSON = CONFIGS_DIR / "characters.json"
 EXPERIMENTS_DIR = Path("experiments")
 CHECKPOINTS_DIR = Path("checkpoints")
+MODELS_DIR = Path("models")
+CHARACTERS_DIR = MODELS_DIR / "characters"
 
 
 def clear_screen() -> None:
@@ -34,8 +37,72 @@ def print_menu() -> None:
     print("6) 設定ファイル初期化")
     print("7) 学習成果物を確定 (latest更新 + 整合性スモーク)")
     print("8) Codec学習 (最新cacheから)")
-    print("9) 推論サーバー起動 (tmrvc-serve)")
+    print("9) キャラクター管理 (Few-shot Enrollment)")
+    print("10) システム整合性チェック (テスト & 静的解析)")
+    print("11) 推論サーバー起動 (tmrvc-serve)")
     print()
+
+
+def cmd_run_serve() -> None:
+    print("\n--- 推論サーバー起動 ---")
+    uclm_ckpt = CHECKPOINTS_DIR / "uclm" / "uclm_latest.pt"
+    codec_ckpt = CHECKPOINTS_DIR / "codec" / "codec_latest.pt"
+    
+    if not uclm_ckpt.exists():
+        print(f"WARNING: {uclm_ckpt} が見つかりません。")
+    if not codec_ckpt.exists():
+        print(f"WARNING: {codec_ckpt} が見つかりません。")
+        
+    device = select_device()
+    host = input_default("ホスト", "127.0.0.1")
+    port = input_default("ポート番号", "8000")
+    api_key = input_default("Anthropic API Key (context予測用, 空欄可)", os.environ.get("ANTHROPIC_API_KEY", ""))
+    use_reload = input_default("オートリロードを有効にしますか? (y/n)", "n").lower() == "y"
+    use_verbose = input_default("詳細ログを出力しますか? (y/n)", "n").lower() == "y"
+    
+    cmd = [
+        "uv", "run", "tmrvc-serve",
+        "--uclm-checkpoint", str(uclm_ckpt),
+        "--codec-checkpoint", str(codec_ckpt),
+        "--device", device,
+        "--host", host,
+        "--port", port
+    ]
+    
+    if api_key:
+        cmd.extend(["--api-key", api_key])
+    if use_reload:
+        cmd.append("--reload")
+    if use_verbose:
+        cmd.append("--verbose")
+    
+    print(f"\nサーバーを起動します: http://{host}:{port}")
+    print("Ctrl+C で停止します。\n")
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        print("\nサーバーを停止しました。")
+
+
+def cmd_system_check() -> None:
+    print("\n" + "="*60)
+    print("  システム整合性チェックを実行します")
+    print("="*60)
+    
+    print("\n[1/2] 静的解析 (Ruff)...")
+    ruff_ok = run_checked(["uv", "run", "ruff", "check", "."])
+    
+    print("\n[2/2] 統合テスト (Pytest)...")
+    # Run only serve and core tests as a quick smoke test
+    pytest_ok = run_checked(["uv", "run", "pytest", "tests/serve", "tests/core"])
+    
+    print("-" * 60)
+    if ruff_ok and pytest_ok:
+        print("✅ すべてのチェックを通過しました。")
+    else:
+        print("❌ エラーが検出されました。ログを確認してください。")
+    
+    input("\nEnterで戻る...")
 
 
 def input_default(prompt: str, default: str = "") -> str:
@@ -89,6 +156,139 @@ def select_workers(device: str) -> int:
     _, _, recommended = info
     workers = input_default("並列度 (workers)", str(recommended))
     return int(workers)
+
+
+def load_character_profiles() -> dict:
+    if not CHARACTERS_JSON.exists():
+        return {}
+    try:
+        with open(CHARACTERS_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_character_profiles(profiles: dict) -> None:
+    CHARACTERS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    with open(CHARACTERS_JSON, "w", encoding="utf-8") as f:
+        json.dump(profiles, f, indent=2, ensure_ascii=False)
+
+
+def cmd_manage_characters() -> None:
+    while True:
+        clear_screen()
+        print("=== キャラクター管理 (Few-shot Enrollment) ===")
+        profiles = load_character_profiles()
+        
+        if not profiles:
+            print("\n登録されているキャラクターはありません。")
+        else:
+            print(f"\n{'ID':<15} {'Name':<20} {'Adaptation':<10} {'Path'}")
+            print("-" * 70)
+            for cid, p in profiles.items():
+                level = p.get("adaptation_level", "unknown")
+                path = p.get("speaker_file", "none")
+                print(f"{cid:<15} {p.get('name', ''):<20} {level:<10} {path}")
+
+        print("\n1) 新規キャラクター作成 (Enrollment)")
+        print("2) キャラクター削除")
+        print("b) 戻る")
+        
+        choice = input("\n選択: ").strip().lower()
+        
+        if choice == "b":
+            break
+        elif choice == "1":
+            _enroll_character()
+        elif choice == "2":
+            _delete_character()
+
+
+def _enroll_character() -> None:
+    print("\n--- 新規キャラクター作成 ---")
+    char_id = input("キャラクターID (例: my_char): ").strip()
+    if not char_id:
+        return
+    
+    profiles = load_character_profiles()
+    if char_id in profiles:
+        print(f"ERROR: ID '{char_id}' は既に存在します。")
+        input("Enterで戻る...")
+        return
+
+    name = input("キャラクター名 (表示用): ").strip() or char_id
+    audio_path = input("参照音声パス (ファイルまたはディレクトリ): ").strip()
+    if not audio_path or not Path(audio_path).exists():
+        print("ERROR: 音声パスが見つかりません。")
+        input("Enterで戻る...")
+        return
+
+    level = input_default("適応レベル (light/standard)", "standard")
+    
+    CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
+    output_file = CHARACTERS_DIR / f"{char_id}.tmrvc_speaker"
+    
+    codec_ckpt = _find_codec_checkpoint()
+    
+    cmd = [
+        "uv", "run", "tmrvc-enroll",
+        "--name", name,
+        "--level", level,
+        "--output", str(output_file)
+    ]
+    
+    if Path(audio_path).is_dir():
+        cmd.extend(["--audio-dir", audio_path])
+    else:
+        cmd.extend(["--audio", audio_path])
+        
+    if level != "light" and codec_ckpt:
+        cmd.extend(["--codec-checkpoint", str(codec_ckpt)])
+
+    print(f"\nEnrollmentを実行中: {char_id}...")
+    if run_checked(cmd):
+        # 成功したらJSONに登録
+        profiles[char_id] = {
+            "name": name,
+            "speaker_file": str(output_file),
+            "adaptation_level": level,
+            "personality": "",
+            "voice_description": "",
+            "language": "ja"
+        }
+        save_character_profiles(profiles)
+        print(f"\nキャラクター '{char_id}' を作成し、登録しました。")
+    
+    input("\nEnterで戻る...")
+
+
+def _delete_character() -> None:
+    char_id = input("\n削除するキャラクターID: ").strip()
+    if not char_id:
+        return
+    
+    profiles = load_character_profiles()
+    if char_id not in profiles:
+        print(f"ERROR: ID '{char_id}' が見つかりません。")
+        input("Enterで戻る...")
+        return
+    
+    confirm = input(f"本当にキャラクター '{char_id}' を削除しますか? (y/n): ").lower()
+    if confirm == "y":
+        p = profiles.pop(char_id)
+        save_character_profiles(profiles)
+        
+        # ファイルも消すか確認
+        sp_file = Path(p.get("speaker_file", ""))
+        if sp_file.exists():
+            rm_file = input(f"実体ファイル '{sp_file.name}' も削除しますか? (y/n): ").lower()
+            if rm_file == "y":
+                sp_file.unlink()
+                print("ファイルも削除しました。")
+        
+        print(f"キャラクター '{char_id}' の登録を削除しました。")
+    
+    input("Enterで戻る...")
 
 
 def load_datasets() -> dict:
@@ -289,21 +489,6 @@ def _find_codec_checkpoint() -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _find_uclm_checkpoint_for_serve(enabled: list[str]) -> Path | None:
-    preferred = CHECKPOINTS_DIR / "uclm" / "uclm_latest.pt"
-    if preferred.exists():
-        return preferred
-
-    exp_dir, ckpt = find_latest_uclm_checkpoint_for_enabled_datasets(enabled)
-    if exp_dir is not None and ckpt is not None:
-        return ckpt
-
-    candidates = list(EXPERIMENTS_DIR.glob("*/checkpoints/uclm_final.pt"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
-
-
 def _run_serve_health_smoke(
     uclm_ckpt: Path,
     codec_ckpt: Path,
@@ -435,70 +620,6 @@ def cmd_train_codec_from_latest_cache(preferred_device: str | None = None) -> bo
     promoted = _promote_codec_checkpoint(codec_final)
     print(f"Codec latest 更新: {promoted}")
     return True
-
-
-def cmd_run_serve() -> None:
-    enabled = get_enabled_datasets()
-    uclm_ckpt = _find_uclm_checkpoint_for_serve(enabled)
-    if uclm_ckpt is None:
-        print("UCLM checkpoint が見つかりません。先に学習成果物を確定してください。")
-        return
-
-    codec_ckpt = _find_codec_checkpoint()
-    if codec_ckpt is None:
-        manual = input_default("Codec checkpoint パス", "")
-        if not manual:
-            print("Codec checkpoint 未指定のため起動を中断します。")
-            return
-        codec_ckpt = Path(manual)
-        if not codec_ckpt.exists():
-            print(f"指定された codec checkpoint が存在しません: {codec_ckpt}")
-            return
-
-    host = input_default("Host", "127.0.0.1")
-    port = input_default("Port", "8000")
-    device = select_device()
-    enable_reload = input_default("自動リロード (y/n)", "n").lower() in {
-        "y",
-        "yes",
-        "1",
-        "true",
-    }
-    verbose = input_default("詳細ログ (y/n)", "n").lower() in {
-        "y",
-        "yes",
-        "1",
-        "true",
-    }
-
-    cmd = [
-        "uv",
-        "run",
-        "tmrvc-serve",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--uclm-checkpoint",
-        str(uclm_ckpt),
-        "--codec-checkpoint",
-        str(codec_ckpt),
-        "--device",
-        str(device),
-    ]
-    if enable_reload:
-        cmd.append("--reload")
-    if verbose:
-        cmd.append("--verbose")
-
-    print("\n推論サーバーを起動します (Ctrl+C で停止)。")
-    print(" ".join(cmd))
-    try:
-        subprocess.run(cmd, check=True)
-    except KeyboardInterrupt:
-        print("\nサーバーを停止しました。")
-    except subprocess.CalledProcessError as e:
-        print(f"\nサーバー起動に失敗しました (exit={e.returncode})")
 
 
 def cmd_full_training() -> None:
@@ -683,7 +804,7 @@ def main() -> None:
 
     while True:
         print_menu()
-        choice = input("選択 [1-9, q=終了]: ").strip()
+        choice = input("選択 [1-11, q=終了]: ").strip()
 
         if choice == "q" or choice == "quit":
             break
@@ -697,7 +818,9 @@ def main() -> None:
             "6": cmd_init_configs,
             "7": cmd_finalize_training_outputs,
             "8": cmd_train_codec_from_latest_cache,
-            "9": cmd_run_serve,
+            "9": cmd_manage_characters,
+            "10": cmd_system_check,
+            "11": cmd_run_serve,
         }
 
         handler = handlers.get(choice)

@@ -70,8 +70,8 @@ class AudioEngine(QThread):
         # Load speaker
         if self._speaker_path.suffix == ".tmrvc_speaker":
             from tmrvc_export.speaker_file import read_speaker_file
-            spk_np, _, _, _ = read_speaker_file(self._speaker_path)
-            self._spk_t = torch.from_numpy(spk_np).float().unsqueeze(0)
+            speaker = read_speaker_file(self._speaker_path)
+            self._spk_t = torch.from_numpy(speaker.spk_embed).float().unsqueeze(0)
         else:
             self._spk_t = torch.from_numpy(np.load(self._speaker_path)).float().unsqueeze(0)
 

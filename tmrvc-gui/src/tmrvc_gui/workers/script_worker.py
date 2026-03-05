@@ -35,7 +35,7 @@ class ScriptWorker(BaseWorker):
 
         from tmrvc_core.constants import SAMPLE_RATE
         from tmrvc_core.dialogue_types import StyleParams
-        from tmrvc_core.text_utils import text_to_phonemes
+        from tmrvc_data.g2p import text_to_phonemes
         from tmrvc_data.script_parser import load_script_from_string
         from tmrvc_serve.uclm_engine import UCLMEngine
 
@@ -71,8 +71,8 @@ class ScriptWorker(BaseWorker):
                 # Support .tmrvc_speaker and .npy
                 if str(char_profile.speaker_file).endswith(".tmrvc_speaker"):
                     from tmrvc_export.speaker_file import read_speaker_file
-                    spk_np, _, _, _ = read_speaker_file(char_profile.speaker_file)
-                    speaker_embeds[char_id] = torch.from_numpy(spk_np).float().unsqueeze(0)
+                    speaker = read_speaker_file(char_profile.speaker_file)
+                    speaker_embeds[char_id] = torch.from_numpy(speaker.spk_embed).float().unsqueeze(0)
                 else:
                     embed = np.load(str(char_profile.speaker_file))
                     speaker_embeds[char_id] = torch.from_numpy(embed).float().unsqueeze(0)

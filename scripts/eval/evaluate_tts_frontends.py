@@ -19,7 +19,8 @@ import torch
 
 from tmrvc_core.constants import SAMPLE_RATE
 from tmrvc_core.dialogue_types import StyleParams
-from tmrvc_core.text_utils import analyze_inline_stage_directions, text_to_phonemes
+from tmrvc_core.text_utils import analyze_inline_stage_directions
+from tmrvc_data.g2p import text_to_phonemes
 from tmrvc_data.script_parser import load_script
 from tmrvc_serve.uclm_engine import UCLMEngine
 
@@ -73,8 +74,8 @@ def main(argv: list[str] | None = None) -> None:
     speaker_embeds = {}
     for char_id, profile in script_obj.characters.items():
         if profile.speaker_file and Path(profile.speaker_file).exists():
-            spk_embed, _, _, _ = read_speaker_file(profile.speaker_file)
-            speaker_embeds[char_id] = torch.from_numpy(spk_embed).float().unsqueeze(0)
+            speaker = read_speaker_file(profile.speaker_file)
+            speaker_embeds[char_id] = torch.from_numpy(speaker.spk_embed).float().unsqueeze(0)
         else:
             speaker_embeds[char_id] = torch.zeros(1, 192)
 

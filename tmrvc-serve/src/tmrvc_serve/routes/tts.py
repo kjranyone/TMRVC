@@ -35,7 +35,8 @@ router = APIRouter()
 @router.post("/tts", response_model=TTSResponse)
 async def generate_tts(req: TTSRequest) -> TTSResponse:
     from tmrvc_serve.app import get_engine, _characters, _context_predictor
-    from tmrvc_core.text_utils import analyze_inline_stage_directions, text_to_phonemes
+    from tmrvc_core.text_utils import analyze_inline_stage_directions
+    from tmrvc_data.g2p import text_to_phonemes
 
     engine = get_engine()
 
@@ -64,12 +65,12 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
     style = _apply_inline_stage_overlay(style, inline_stage.style_overlay)
     
     # 3. G2P: text -> phoneme IDs
-    phoneme_ids = text_to_phonemes(spoken_text, language=character.language)
-    phonemes_t = torch.tensor(phoneme_ids).long().unsqueeze(0)
+    g2p_result = text_to_phonemes(spoken_text, language=character.language)
+    phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
 
     # 4. Load speaker embedding
     spk_embed = _load_speaker_embed(character)
-    spk_t = torch.from_numpy(spk_embed).float().unsqueeze(0)
+    spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
 
     # 5. Unified Synthesis (UCLM)
     audio_t, metrics = engine.tts(

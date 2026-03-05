@@ -7,11 +7,11 @@ Usage::
 
     # Standard level (in-context reference tokens)
     tmrvc-enroll --audio-dir data/voice/ --output models/speaker.tmrvc_speaker \\
-        --level standard --codec-checkpoint checkpoints/codec/best.pt
+        --level standard --codec-checkpoint checkpoints/codec/codec_latest.pt
 
-    # Full level (LoRA fine-tuning) - NOT YET IMPLEMENTED
+    # Full level (LoRA fine-tuning)
     tmrvc-enroll --audio-dir data/voice/ --output models/speaker.tmrvc_speaker \\
-        --level full --token-model checkpoints/token.pt --finetune-steps 200
+        --level full --token-model checkpoints/uclm/uclm_latest.pt --finetune-steps 200
 """
 
 from __future__ import annotations
@@ -62,13 +62,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--codec-checkpoint",
         type=Path,
         default=None,
-        help="StreamingCodec checkpoint for reference token extraction (standard/full).",
+        help="Codec checkpoint for reference token extraction (standard/full).",
     )
     parser.add_argument(
         "--token-model",
         type=Path,
         default=None,
-        help="Token model checkpoint for LoRA fine-tuning (full only).",
+        help="UCLM model checkpoint for LoRA fine-tuning (full only).",
     )
     parser.add_argument(
         "--finetune-steps",
@@ -160,7 +160,7 @@ def extract_ssl_state(audio_paths: list[Path], device: str) -> np.ndarray | None
     """
     try:
         import torch
-        from tmrvc_train.models.ssl_extractor import WavLMSSLExtractor
+        from tmrvc_train.models import WavLMSSLExtractor
     except ImportError:
         logger.warning("WavLMSSLExtractor not available, skipping ssl_state extraction")
         return None
@@ -243,19 +243,24 @@ def extract_reference_tokens(
     max_frames: int,
     device: str,
 ) -> np.ndarray:
-    """Extract reference tokens using StreamingCodec."""
+    """Extract reference tokens using EmotionAwareCodec."""
     import torch
 
-    from tmrvc_train.models.streaming_codec import StreamingCodec, CodecConfig
+    from tmrvc_train.models import EmotionAwareCodec
+    from tmrvc_core.constants import N_CODEBOOKS
 
     ckpt = torch.load(codec_checkpoint, map_location=device, weights_only=False)
+    codec_state = ckpt.get("model", ckpt)
 
-    codec = StreamingCodec(CodecConfig())
-
-    if "state_dict" in ckpt:
-        codec.load_state_dict(ckpt["state_dict"])
+    codec = EmotionAwareCodec()
+    
+    # Handle state_dict keys if they have 'encoder.' or 'decoder.' prefix
+    if any(k.startswith("encoder.") or k.startswith("decoder.") for k in codec_state.keys()):
+        codec.load_state_dict(codec_state, strict=False)
     else:
-        codec.load_state_dict(ckpt)
+        # Compatibility: load into sub-modules
+        codec.encoder.load_state_dict({k.replace("encoder.", ""): v for k, v in codec_state.items() if k.startswith("encoder.")}, strict=False)
+        codec.decoder.load_state_dict({k.replace("decoder.", ""): v for k, v in codec_state.items() if k.startswith("decoder.")}, strict=False)
 
     codec = codec.to(device).eval()
 
@@ -266,24 +271,26 @@ def extract_reference_tokens(
             audio = load_audio(path)
             audio_tensor = torch.from_numpy(audio).unsqueeze(0).unsqueeze(0).to(device)
 
-            indices, _, _ = codec.encode(audio_tensor)
+            # EmotionAwareCodec.encode returns (a_tokens, b_logits, new_states, a_logits)
+            a_tokens, _, _, _ = codec.encode(audio_tensor)
 
-            indices_np = (
-                indices.squeeze(0).transpose(0, 1).cpu().numpy().astype(np.int32)
+            # a_tokens: [B, 8, T] -> [T, 8]
+            a_tokens_np = (
+                a_tokens.squeeze(0).transpose(0, 1).cpu().numpy().astype(np.int32)
             )
-            all_tokens.append(indices_np)
+            all_tokens.append(a_tokens_np)
 
             if sum(len(t) for t in all_tokens) >= max_frames:
                 break
 
     if not all_tokens:
         logger.warning("No tokens extracted, returning zeros")
-        return np.zeros((max_frames, 4), dtype=np.int32)
+        return np.zeros((max_frames, N_CODEBOOKS), dtype=np.int32)
 
     reference_tokens = np.concatenate(all_tokens, axis=0)[:max_frames]
 
-    if reference_tokens.shape[1] < 4:
-        padded = np.zeros((len(reference_tokens), 4), dtype=np.int32)
+    if reference_tokens.shape[1] < N_CODEBOOKS:
+        padded = np.zeros((len(reference_tokens), N_CODEBOOKS), dtype=np.int32)
         padded[:, : reference_tokens.shape[1]] = reference_tokens
         reference_tokens = padded
 
@@ -292,34 +299,44 @@ def extract_reference_tokens(
 
 def finetune_lora(
     token_model_path: Path,
-    reference_tokens: np.ndarray,
-    spk_embed: np.ndarray,
+    reference_audio_tokens: np.ndarray,
+    speaker_embed: np.ndarray,
     n_steps: int,
     device: str,
 ) -> np.ndarray:
-    """Fine-tune TokenModel with LoRA and return flattened delta."""
+    """Fine-tune UCLM with LoRA and return flattened delta."""
     import torch
 
-    from tmrvc_train.models.token_model import TokenModel, TokenModelConfig
-    from tmrvc_train.lora import finetune_token_model_lora
+    from tmrvc_train.models import DisentangledUCLM
+    from tmrvc_train.lora import finetune_uclm_lora
 
     ckpt = torch.load(token_model_path, map_location=device, weights_only=False)
+    uclm_state = ckpt.get("model", ckpt)
 
-    model = TokenModel(TokenModelConfig())
-    if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
-    elif "state_dict" in ckpt:
-        model.load_state_dict(ckpt["state_dict"])
-    else:
-        model.load_state_dict(ckpt)
+    # Estimate num_speakers from checkpoint
+    num_spk = 1000
+    key = "voice_state_enc.adversarial_classifier.2.weight"
+    if key in uclm_state:
+        num_spk = uclm_state[key].shape[0]
 
-    ref_tokens_tensor = torch.from_numpy(reference_tokens).long()
-    spk_embed_tensor = torch.from_numpy(spk_embed).float()
+    model = DisentangledUCLM(num_speakers=num_spk)
+    model.load_state_dict(uclm_state, strict=False)
 
-    delta_flat = finetune_token_model_lora(
+    ref_a_tensor = torch.from_numpy(reference_audio_tokens).long().unsqueeze(0).transpose(1, 2) # [1, 8, T]
+    # For few-shot tuning without reference control tokens, we might need a dummy or skip
+    ref_b_tensor = torch.zeros(1, 4, ref_a_tensor.shape[-1], dtype=torch.long)
+    
+    spk_embed_tensor = torch.from_numpy(speaker_embed).float().unsqueeze(0)
+    
+    # Dummy voice state for fine-tuning
+    voice_state = torch.zeros(1, ref_a_tensor.shape[-1], 8)
+
+    delta_flat = finetune_uclm_lora(
         model=model,
-        reference_tokens=ref_tokens_tensor,
-        spk_embed=spk_embed_tensor,
+        ref_audio_tokens=ref_a_tensor,
+        ref_control_tokens=ref_b_tensor,
+        speaker_embed=spk_embed_tensor,
+        voice_state=voice_state,
         n_steps=n_steps,
         lr=1e-4,
         device=device,
@@ -388,11 +405,11 @@ def main(argv: list[str] | None = None) -> None:
             )
             sys.exit(1)
         logger.info(
-            "Fine-tuning TokenModel with LoRA (%d steps)...", args.finetune_steps
+            "Fine-tuning UCLM with LoRA (%d steps)...", args.finetune_steps
         )
         lora_delta = finetune_lora(
             token_model_path=args.token_model,
-            reference_tokens=reference_tokens,
+            reference_audio_tokens=reference_tokens,
             spk_embed=spk_embed,
             n_steps=args.finetune_steps,
             device=args.device,

@@ -228,14 +228,18 @@ class UCLMEngine:
         ssl_state = torch.zeros(1, 1, 128, device=self.device)
         phoneme_lens = torch.tensor([phonemes.shape[1]], device=self.device)
         lang_id = torch.tensor([0], device=self.device)
+        target_length = 50
+        explicit_state = v_state.expand(-1, target_length, -1)
+        ssl_state_full = ssl_state.expand(-1, target_length, -1)
+        target_b = torch.zeros(1, 4, target_length, dtype=torch.long, device=self.device)
 
         out = self.uclm_core_model.forward_tts(
             phonemes=phonemes.to(self.device),
             phoneme_lens=phoneme_lens,
             language_ids=lang_id,
-            target_b=torch.zeros(1, 4, 1, dtype=torch.long, device=self.device),
-            explicit_state=v_state.expand(-1, 50, -1),
-            ssl_state=ssl_state.expand(-1, 50, -1),
+            target_b=target_b,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state_full,
             speaker_embed=speaker_embed.to(self.device),
             cfg_scale=cfg_scale,
         )
@@ -285,7 +289,7 @@ class UCLMEngine:
         return np.interp(x_new, x_old, audio).astype(np.float32)
 
     def prefetch_g2p(self, text: str, language: str) -> None:
-        from tmrvc_core.text_utils import text_to_phonemes
+        from tmrvc_data.g2p import text_to_phonemes
 
         _ = text_to_phonemes(text, language=language)
 
@@ -296,7 +300,7 @@ class UCLMEngine:
         self,
         text: str,
         language: str,
-        spk_embed: np.ndarray,
+        spk_embed: np.ndarray | torch.Tensor,
         z_prev: np.ndarray,
     ) -> np.ndarray:
         del text, language, spk_embed
@@ -318,11 +322,16 @@ class UCLMEngine:
         if cancel is not None and cancel.is_set():
             return
 
-        from tmrvc_core.text_utils import text_to_phonemes
+        from tmrvc_data.g2p import text_to_phonemes
 
-        phoneme_ids = text_to_phonemes(text, language=language)
-        phonemes_t = torch.tensor(phoneme_ids).long().unsqueeze(0)
-        spk_t = torch.from_numpy(spk_embed).float().unsqueeze(0)
+        g2p_result = text_to_phonemes(text, language=language)
+        phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+        if isinstance(spk_embed, torch.Tensor):
+            spk_t = spk_embed.to(dtype=torch.float32)
+        else:
+            spk_t = torch.from_numpy(np.asarray(spk_embed)).float()
+        if spk_t.dim() == 1:
+            spk_t = spk_t.unsqueeze(0)
 
         audio_t, _ = self.tts(
             phonemes=phonemes_t,

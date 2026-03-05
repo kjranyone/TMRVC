@@ -43,7 +43,7 @@ class TTSWorker(BaseWorker):
 
         from tmrvc_serve.uclm_engine import UCLMEngine
         from tmrvc_core.dialogue_types import StyleParams
-        from tmrvc_core.text_utils import text_to_phonemes
+        from tmrvc_data.g2p import text_to_phonemes
 
         engine = UCLMEngine(
             uclm_checkpoint=self.config.get("uclm_checkpoint"),
@@ -86,8 +86,8 @@ class TTSWorker(BaseWorker):
             # Support .tmrvc_speaker (contains meta) and .npy
             if spk_file.endswith(".tmrvc_speaker"):
                 from tmrvc_export.speaker_file import read_speaker_file
-                spk_embed_np, _, _, _ = read_speaker_file(Path(spk_file))
-                spk_t = torch.from_numpy(spk_embed_np).float().unsqueeze(0)
+                speaker = read_speaker_file(Path(spk_file))
+                spk_t = torch.from_numpy(speaker.spk_embed).float().unsqueeze(0)
             else:
                 spk_t = torch.from_numpy(np.load(spk_file)).float().unsqueeze(0)
         else:

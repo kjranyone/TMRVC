@@ -54,6 +54,10 @@ async def create_character(req: CharacterCreateRequest) -> CharacterInfo:
     )
     _characters[req.id] = profile
 
+    # Persist to disk
+    from tmrvc_serve.app import _save_persisted_characters
+    _save_persisted_characters()
+
     return CharacterInfo(
         id=req.id,
         name=req.name,

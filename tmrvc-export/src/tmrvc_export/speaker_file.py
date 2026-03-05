@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE, D_VOICE_STATE_SSL
+from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE, D_VOICE_STATE_SSL, N_CODEBOOKS
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +61,8 @@ class SpeakerFile:
     spk_embed: np.ndarray  # [192]
     f0_mean: float = 220.0  # Mean F0 frequency in Hz
     style_embed: np.ndarray | None = None  # [128]
-    reference_tokens: np.ndarray | None = None  # [T, 4]
-    lora_delta: np.ndarray | None = None  # [15872]
+    reference_tokens: np.ndarray | None = None  # [T, N_CODEBOOKS]
+    lora_delta: np.ndarray | None = None  # [LORA_DELTA_SIZE]
     ssl_state: np.ndarray | None = None  # [128] default SSL state from WavLM
     metadata: dict | None = None
 
@@ -93,8 +93,8 @@ def write_speaker_file(
         spk_embed: Speaker embedding array, shape ``(192,)``, float32. (required)
         f0_mean: Mean F0 frequency in Hz. Default 220.0.
         style_embed: Style embedding array, shape ``(128,)``, float32. (optional)
-        reference_tokens: Reference codec tokens, shape ``(T, 4)``, int32. (optional)
-        lora_delta: LoRA delta array, shape ``(15872,)``, float32. (optional)
+        reference_tokens: Reference codec tokens, shape ``(T, N_CODEBOOKS)``, int32. (optional)
+        lora_delta: LoRA delta array, shape ``(LORA_DELTA_SIZE,)``, float32. (optional)
         ssl_state: Default SSL state from WavLM, shape ``(128,)``, float32. (optional)
         metadata: Optional metadata dict.
 
@@ -116,7 +116,7 @@ def write_speaker_file(
         assert style_embed.dtype == np.float32
         flags |= FLAG_HAS_STYLE
     if reference_tokens is not None:
-        assert reference_tokens.ndim == 2 and reference_tokens.shape[1] == 4
+        assert reference_tokens.ndim == 2 and reference_tokens.shape[1] == N_CODEBOOKS
         assert reference_tokens.dtype == np.int32
         flags |= FLAG_HAS_REF_TOKENS
     if lora_delta is not None:
@@ -260,11 +260,11 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
     reference_tokens = None
     if flags & FLAG_HAS_REF_TOKENS:
         reference_tokens = (
-            np.frombuffer(data[offset : offset + ref_frames * 4 * 4], dtype=np.int32)
+            np.frombuffer(data[offset : offset + ref_frames * N_CODEBOOKS * 4], dtype=np.int32)
             .copy()
-            .reshape(ref_frames, 4)
+            .reshape(ref_frames, N_CODEBOOKS)
         )
-        offset += ref_frames * 4 * 4
+        offset += ref_frames * N_CODEBOOKS * 4
 
     # Extract lora_delta (optional)
     lora_delta = None

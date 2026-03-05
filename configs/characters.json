@@ -1,0 +1,10 @@
+{
+  "sample1": {
+    "name": "sample1",
+    "speaker_file": "models/characters/sample1.tmrvc_speaker",
+    "adaptation_level": "standard",
+    "personality": "",
+    "voice_description": "",
+    "language": "ja"
+  }
+}

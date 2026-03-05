@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> None:
     import soundfile as sf
     from tmrvc_core.constants import SAMPLE_RATE
     from tmrvc_core.dialogue_types import StyleParams
-    from tmrvc_core.text_utils import text_to_phonemes
+    from tmrvc_data.g2p import text_to_phonemes
     from tmrvc_data.script_parser import load_script
     from tmrvc_serve.uclm_engine import UCLMEngine
     from tmrvc_export.speaker_file import read_speaker_file
@@ -95,8 +95,8 @@ def main(argv: list[str] | None = None) -> None:
     speaker_embeds: dict[str, torch.Tensor] = {}
     for char_id, char_profile in script.characters.items():
         if char_profile.speaker_file and char_profile.speaker_file.exists():
-            spk_embed, _lora, _meta, _thumb = read_speaker_file(char_profile.speaker_file)
-            speaker_embeds[char_id] = torch.from_numpy(spk_embed).float().unsqueeze(0)
+            speaker = read_speaker_file(char_profile.speaker_file)
+            speaker_embeds[char_id] = torch.from_numpy(speaker.spk_embed).float().unsqueeze(0)
             logger.info("Loaded speaker: %s from %s", char_id, char_profile.speaker_file)
         else:
             from tmrvc_core.constants import D_SPEAKER

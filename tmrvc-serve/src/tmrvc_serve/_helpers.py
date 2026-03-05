@@ -94,8 +94,8 @@ def _load_speaker_embed(character: object) -> "torch.Tensor":
 
     if character.speaker_file and character.speaker_file.exists():
         from tmrvc_export.speaker_file import read_speaker_file
-        spk_embed, _lora, _meta, _thumb = read_speaker_file(character.speaker_file)
-        return torch.from_numpy(spk_embed).float()
+        speaker = read_speaker_file(character.speaker_file)
+        return torch.from_numpy(speaker.spk_embed).float()
 
     # Fallback: zero embedding
     logger.warning("No speaker file for '%s', using zero embedding", character.name)

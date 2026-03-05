@@ -42,7 +42,7 @@ def main() -> None:
 
     from tmrvc_core.constants import D_SPEAKER, SAMPLE_RATE
     from tmrvc_core.dialogue_types import StyleParams
-    from tmrvc_core.text_utils import text_to_phonemes
+    from tmrvc_data.g2p import text_to_phonemes
     from tmrvc_serve.uclm_engine import UCLMEngine
 
     logger.info("=== UCLM v2 TTS Demo ===")
