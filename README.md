@@ -58,6 +58,9 @@ uv sync --extra-index-url https://download.pytorch.org/whl/cu128
 
 # 推論サーバーの起動
 uv run tmrvc-serve --uclm-checkpoint checkpoints/uclm.pt --codec-checkpoint checkpoints/codec.pt
+
+# 開発用 GUI (TMRVC Research Studio) の起動
+uv run tmrvc-gui
 ```
 
 ## Training
