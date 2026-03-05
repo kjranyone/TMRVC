@@ -49,16 +49,14 @@ class ResidualVectorQuantizer(nn.Module):
 
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, D = z.shape
-        z_q = torch.zeros_like(z)
         indices = []
         logits_list = []
-        residual = z.view(B, T, self.n_codebooks, self.codebook_dim).clone()
-        
-        # We need a separate z_q_differentiable to allow gradients to flow back to the codebook
-        z_q_differentiable = torch.zeros_like(z)
-        
+        z_chunks = z.view(B, T, self.n_codebooks, self.codebook_dim)
+        residual_chunks = [z_chunks[:, :, i, :].clone() for i in range(self.n_codebooks)]
+        q_chunks = []
+
         for i, cb in enumerate(self.codebooks):
-            res_i = residual[:, :, i, :]
+            res_i = residual_chunks[i]
             # dist shape: [B, T, codebook_size]
             dist = (res_i**2).sum(-1, keepdim=True) + (cb.weight**2).sum(-1) - 2 * (res_i @ cb.weight.T)
             
@@ -68,13 +66,15 @@ class ResidualVectorQuantizer(nn.Module):
             idx = dist.argmin(-1)
             indices.append(idx)
             
-            # For gradient flow to codebook embeddings
+            # Keep quantized chunk in a list to avoid in-place writes on autograd-tracked views.
             q_diff = cb(idx)
-            z_q_differentiable.view(B, T, self.n_codebooks, self.codebook_dim)[:, :, i, :] = q_diff
+            q_chunks.append(q_diff)
             
             # For next step residual, use detached q to stop gradients from future codebooks
-            q_detached = q_diff.detach()
-            if i < self.n_codebooks - 1: residual[:, :, i+1, :] += (res_i - q_detached)
+            if i < self.n_codebooks - 1:
+                residual_chunks[i + 1] = residual_chunks[i + 1] + (res_i - q_diff.detach())
+
+        z_q_differentiable = torch.stack(q_chunks, dim=2).reshape(B, T, D)
             
         # Straight-Through Estimator (STE):
         # Forward pass uses z_q_differentiable, but backward pass flows gradient to both z and codebooks

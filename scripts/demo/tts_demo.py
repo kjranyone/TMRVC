@@ -87,7 +87,12 @@ def main() -> None:
     
     audio = audio_t.cpu().numpy()
     duration_sec = len(audio) / SAMPLE_RATE
-    logger.info("Generated %.2fs audio in %.0fms (RTF=%.2f)", duration_sec, total_ms, metrics.rtf)
+    logger.info(
+        "Generated %.2fs audio in %.0fms (RTF=%.2f)",
+        duration_sec,
+        total_ms,
+        float(metrics.get("rtf", 0.0)),
+    )
 
     # 4. Save WAV
     import soundfile as sf

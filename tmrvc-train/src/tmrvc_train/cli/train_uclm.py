@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections import Counter
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from tmrvc_train.models import DisentangledUCLM
@@ -16,6 +17,48 @@ from tmrvc_train.dataset import DisentangledUCLMDataset
 from tmrvc_train.trainer import UCLMTrainer
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_balanced_sample_weights(
+    utterances: list[dict],
+) -> list[float]:
+    """Compute per-sample weights balancing datasets and speakers within dataset."""
+    dataset_counts = Counter(u.get("dataset", "unknown") for u in utterances)
+    speaker_counts = Counter(
+        (u.get("dataset", "unknown"), u.get("speaker_id", "unknown"))
+        for u in utterances
+    )
+    weights: list[float] = []
+    for u in utterances:
+        ds = u.get("dataset", "unknown")
+        spk = u.get("speaker_id", "unknown")
+        w_ds = 1.0 / float(dataset_counts[ds])
+        w_spk = 1.0 / float(speaker_counts[(ds, spk)])
+        weights.append(w_ds * w_spk)
+    return weights
+
+
+def _build_sampler(
+    dataset: DisentangledUCLMDataset,
+    sampling_strategy: str,
+    seed: int,
+) -> WeightedRandomSampler | None:
+    if sampling_strategy == "shuffle":
+        return None
+    if sampling_strategy != "balanced":
+        raise ValueError(f"Unknown sampling_strategy: {sampling_strategy}")
+    if len(dataset) == 0:
+        return None
+
+    weights = _compute_balanced_sample_weights(dataset.utterances)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return WeightedRandomSampler(
+        weights=torch.tensor(weights, dtype=torch.double),
+        num_samples=len(dataset),
+        replacement=True,
+        generator=g,
+    )
 
 
 def collate_fn(batch):
@@ -40,7 +83,8 @@ def collate_fn(batch):
         
         collated["target_a"].append(nn.functional.pad(item["target_a"], (0, pad), value=-1))
         collated["target_b"].append(nn.functional.pad(item["target_b"], (0, pad), value=-1))
-        collated["source_a_t"].append(nn.functional.pad(item["source_a_t"], (0, pad), value=-1))
+        # source_a_t is fed to nn.Embedding, so it must remain a valid token id.
+        collated["source_a_t"].append(nn.functional.pad(item["source_a_t"], (0, pad), value=0))
         
         collated["explicit_state"].append(nn.functional.pad(item["explicit_state"].transpose(0, 1), (0, pad)).transpose(0, 1))
         collated["ssl_state"].append(nn.functional.pad(item["ssl_state"].transpose(0, 1), (0, pad)).transpose(0, 1))
@@ -75,10 +119,49 @@ def collate_fn(batch):
     return res
 
 
-def train_uclm(cache_dir, output_dir, batch_size, max_steps, device, lr):
+def train_uclm(
+    cache_dir,
+    output_dir,
+    batch_size,
+    max_steps,
+    device,
+    lr,
+    datasets: str | None = None,
+    seed: int = 42,
+    sampling_strategy: str = "balanced",
+):
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset = DisentangledUCLMDataset(cache_dir)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    include_datasets = None
+    if datasets:
+        include_datasets = [d.strip() for d in datasets.split(",") if d.strip()]
+    dataset = DisentangledUCLMDataset(
+        cache_dir, include_datasets=include_datasets
+    )
+    if len(dataset) == 0:
+        raise ValueError(
+            f"No training utterances found in cache_dir={cache_dir} datasets={include_datasets or 'ALL'}"
+        )
+
+    sampler = _build_sampler(dataset, sampling_strategy=sampling_strategy, seed=seed)
+    if sampler is None:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
+
+    dataset_counts = Counter(u.get("dataset", "unknown") for u in dataset.utterances)
+    logger.info(
+        "Training sampler=%s datasets=%s",
+        sampling_strategy,
+        dict(sorted(dataset_counts.items())),
+    )
     
     num_speakers = len(dataset.speaker_to_id)
     # Ensure at least 1 speaker even if dataset is empty
@@ -104,15 +187,33 @@ def train_uclm(cache_dir, output_dir, batch_size, max_steps, device, lr):
     torch.save({"model": model.state_dict()}, output_dir / "uclm_final.pt")
 
 
-def main():
+def main(argv: list[str] | None = None):
     p = argparse.ArgumentParser()
     p.add_argument("--cache-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("checkpoints/uclm"))
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--max-steps", type=int, default=10000)
+    p.add_argument(
+        "--max-steps",
+        "--train-steps",
+        dest="max_steps",
+        type=int,
+        default=10000,
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--device", default="cuda")
-    args = p.parse_args()
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--datasets",
+        default=None,
+        help="Comma-separated dataset names to include from cache (e.g., jvs,vctk).",
+    )
+    p.add_argument(
+        "--sampling-strategy",
+        choices=["balanced", "shuffle"],
+        default="balanced",
+        help="Sampling strategy for batches.",
+    )
+    args = p.parse_args(argv)
     
     logging.basicConfig(level=logging.INFO)
     train_uclm(**vars(args))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Iterator
 
@@ -20,6 +21,84 @@ from tmrvc_core.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "cuda" in msg and "out of memory" in msg
+
+
+def _transcribe_text_with_fallback(
+    audio_path: str | object,
+    whisper,
+    language: str,
+    device: str,
+    models: dict | None = None,
+) -> str:
+    """Run Whisper transcription with OOM fallback.
+
+    Strategy:
+    1. Keep current model/settings for quality.
+    2. On CUDA OOM, clear cache and retry with lower-memory GPU compute type.
+    3. If it still OOMs, fall back to CPU int8 for this worker.
+    """
+    from faster_whisper import WhisperModel
+
+    path = str(audio_path)
+    try:
+        segments, _ = whisper.transcribe(path, language=language)
+        return "".join(seg.text for seg in segments).strip()
+    except RuntimeError as e:
+        if not _is_cuda_oom_error(e) or device != "cuda":
+            raise
+
+        logger.warning(
+            "Whisper CUDA OOM on %s. Retrying with lower-memory settings.",
+            path,
+        )
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        try:
+            lowmem_whisper = None
+            if models is not None:
+                lowmem_whisper = models.get("_whisper_lowmem")
+            if lowmem_whisper is None:
+                lowmem_whisper = WhisperModel(
+                    "large-v3-turbo",
+                    device="cuda",
+                    compute_type="int8_float16",
+                )
+                if models is not None:
+                    models["_whisper_lowmem"] = lowmem_whisper
+                    models["whisper"] = lowmem_whisper
+            segments, _ = lowmem_whisper.transcribe(path, language=language)
+            return "".join(seg.text for seg in segments).strip()
+        except RuntimeError as e2:
+            if not _is_cuda_oom_error(e2):
+                raise
+
+            logger.warning(
+                "Whisper still OOM on GPU for %s. Falling back to CPU int8.",
+                path,
+            )
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            cpu_whisper = None
+            if models is not None:
+                cpu_whisper = models.get("_whisper_cpu")
+            if cpu_whisper is None:
+                cpu_whisper = WhisperModel(
+                    "large-v3-turbo",
+                    device="cpu",
+                    compute_type="int8",
+                )
+                if models is not None:
+                    models["_whisper_cpu"] = cpu_whisper
+
+            segments, _ = cpu_whisper.transcribe(path, language=language)
+            return "".join(seg.text for seg in segments).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +374,13 @@ def preprocess_single_utterance(
     waveform_16k = T.Resample(SAMPLE_RATE, 16000).to(device)(waveform_t.squeeze(1))
     vs_dict = vs_estimator(waveform_16k, waveform_t.squeeze(1), mel, f0)
 
-    segments, _ = whisper.transcribe(str(utt.audio_path), language=language)
-    text = "".join(seg.text for seg in segments).strip()
+    text = _transcribe_text_with_fallback(
+        audio_path=utt.audio_path,
+        whisper=whisper,
+        language=language,
+        device=device,
+        models=models,
+    )
 
     spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
 

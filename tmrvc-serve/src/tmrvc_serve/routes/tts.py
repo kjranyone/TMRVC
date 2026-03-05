@@ -94,7 +94,7 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
     style_used = vars(style).copy() if style else {}
     style_used["style_preset"] = req.style_preset
     style_used["spoken_text"] = spoken_text
-    style_used["metrics"] = vars(metrics)
+    style_used["metrics"] = metrics
 
     return TTSResponse(
         audio_base64=audio_b64,

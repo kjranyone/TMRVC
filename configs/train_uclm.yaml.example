@@ -1,0 +1,14 @@
+language: ja
+train_steps: 100000
+train_batch_size: 16
+train_device: cuda
+train_sampling_strategy: balanced
+
+quality_gate_enabled: true
+quality_gate_max_invalid_ratio: 0.0
+quality_gate_min_utterances_per_dataset: 1
+quality_gate_min_speakers_per_dataset: 1
+quality_gate_token_samples: 64
+
+rvq_vocab_size: 1024
+control_vocab_size: 64

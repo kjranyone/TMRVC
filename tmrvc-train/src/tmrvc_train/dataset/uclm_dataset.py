@@ -8,16 +8,37 @@ import json
 class DisentangledUCLMDataset(Dataset):
     """Dataset for Disentangled UCLM multi-task training (TTS & VC)."""
 
-    def __init__(self, cache_dir: str | Path, max_frames: int = 400):
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        max_frames: int = 400,
+        include_datasets: list[str] | None = None,
+    ):
         self.cache_dir = Path(cache_dir)
         self.max_frames = max_frames
+        self.include_datasets = (
+            set(include_datasets) if include_datasets is not None else None
+        )
         self.utterances = []
         self.speaker_to_id = {}
         self.id_to_speaker = {}
 
         # Scan for utterance meta.json files
         for meta_path in sorted(self.cache_dir.rglob("meta.json")):
-            if "train" not in str(meta_path):
+            try:
+                rel = meta_path.relative_to(self.cache_dir)
+                # Expected: <dataset>/train/<speaker>/<utt>/meta.json
+                dataset_name = rel.parts[0] if len(rel.parts) > 0 else None
+                split_name = rel.parts[1] if len(rel.parts) > 1 else None
+            except ValueError:
+                continue
+
+            if split_name != "train":
+                continue
+            if (
+                self.include_datasets is not None
+                and dataset_name not in self.include_datasets
+            ):
                 continue
 
             try:
@@ -34,18 +55,32 @@ class DisentangledUCLMDataset(Dataset):
                 ]
 
                 if all((utt_dir / req).exists() for req in required_files):
-                    self.utterances.append({"meta": meta, "path": utt_dir})
-                    
                     # Registry speaker if not present
                     spk_id = meta.get("speaker_id") or utt_dir.parent.name
+                    self.utterances.append(
+                        {
+                            "meta": meta,
+                            "path": utt_dir,
+                            "dataset": dataset_name,
+                            "speaker_id": spk_id,
+                        }
+                    )
+
                     if spk_id not in self.speaker_to_id:
                         int_id = len(self.speaker_to_id)
                         self.speaker_to_id[spk_id] = int_id
                         self.id_to_speaker[int_id] = spk_id
             except Exception:
                 continue
-        
-        print(f"[info] DisentangledUCLMDataset: loaded {len(self.utterances)} utterances, {len(self.speaker_to_id)} speakers.")
+
+        ds_info = (
+            ",".join(sorted(self.include_datasets))
+            if self.include_datasets is not None
+            else "ALL"
+        )
+        print(
+            f"[info] DisentangledUCLMDataset[{ds_info}]: loaded {len(self.utterances)} utterances, {len(self.speaker_to_id)} speakers."
+        )
 
     def __len__(self) -> int:
         return len(self.utterances)
@@ -101,7 +136,7 @@ class DisentangledUCLMDataset(Dataset):
             phoneme_lens = torch.tensor(len(phoneme_ids)).long()
 
         # Dynamic speaker ID mapping
-        spk_str = meta.get("speaker_id") or utt_dir.parent.name
+        spk_str = utt.get("speaker_id") or meta.get("speaker_id") or utt_dir.parent.name
         spk_int = self.speaker_to_id.get(spk_str, 0)
 
         return {

@@ -117,11 +117,12 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.uniform_(-1.0 / n_bins, 1.0 / n_bins)
 
     def forward(
-        self, z: torch.Tensor
+        self, z: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             z: [B, T, d_model]
+            mask: [B, T] valid-frame mask (True=valid), optional
         Returns:
             z_q: [B, T, d_model] quantized vectors
             loss: VQ commitment loss
@@ -148,9 +149,16 @@ class VectorQuantizer(nn.Module):
         z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
 
         # Loss: commitment loss (pulling encoder output to embeddings) + codebook loss
-        loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean(
-            (z_q - z.detach()) ** 2
-        )
+        if mask is None:
+            loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean(
+                (z_q - z.detach()) ** 2
+            )
+        else:
+            mask_f = mask.to(z.dtype).unsqueeze(-1)  # [B, T, 1]
+            denom = (mask_f.sum() * self.d_model).clamp_min(1.0)
+            loss_commit = (((z_q.detach() - z) ** 2) * mask_f).sum() / denom
+            loss_codebook = (((z_q - z.detach()) ** 2) * mask_f).sum() / denom
+            loss = loss_commit + self.beta * loss_codebook
 
         # Straight-through estimator
         z_q = z + (z_q - z).detach()
@@ -177,10 +185,13 @@ class VCEncoder(nn.Module):
 
         self.vq_bottleneck = VectorQuantizer(vq_bins, d_model)
 
-    def forward(self, source_a_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, source_a_t: torch.Tensor, source_mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             source_a_t: [B, 8, T] from EnCodec
+            source_mask: [B, T] valid-frame mask (True=valid), optional
         Returns:
             content_features: [B, T, d_model]
             vq_loss: scalar tensor
@@ -201,6 +212,6 @@ class VCEncoder(nn.Module):
         x = x.transpose(1, 2)
 
         # Apply Information Bottleneck
-        content_features, vq_loss, _ = self.vq_bottleneck(x)
+        content_features, vq_loss, _ = self.vq_bottleneck(x, mask=source_mask)
 
         return content_features, vq_loss

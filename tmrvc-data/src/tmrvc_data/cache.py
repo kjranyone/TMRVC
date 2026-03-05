@@ -10,9 +10,42 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from tmrvc_core.constants import HOP_LENGTH
 from tmrvc_core.types import UCLMFeatureSet
 
 logger = logging.getLogger(__name__)
+
+
+def _align_waveform_to_frame_count(
+    waveform: torch.Tensor, n_frames: int, hop_length: int = HOP_LENGTH
+) -> torch.Tensor:
+    """Align waveform samples to n_frames * hop_length (trim/pad tail)."""
+    target_samples = int(n_frames) * int(hop_length)
+
+    if waveform.dim() == 1:
+        wave = waveform.unsqueeze(0)
+    elif waveform.dim() == 2:
+        if waveform.shape[0] == 1:
+            wave = waveform
+        elif waveform.shape[1] == 1:
+            wave = waveform.transpose(0, 1)
+        else:
+            raise ValueError(
+                f"Expected mono waveform with one channel, got shape={tuple(waveform.shape)}."
+            )
+    else:
+        raise ValueError(
+            f"Expected waveform rank 1 or 2, got rank={waveform.dim()} shape={tuple(waveform.shape)}."
+        )
+
+    current_samples = int(wave.shape[-1])
+    if current_samples == target_samples:
+        return wave
+    if current_samples > target_samples:
+        return wave[..., :target_samples]
+
+    pad_samples = target_samples - current_samples
+    return torch.nn.functional.pad(wave, (0, pad_samples))
 
 
 class FeatureCache:
@@ -60,7 +93,10 @@ class FeatureCache:
         if features.durations is not None:
             np.save(utt_dir / "durations.npy", features.durations.numpy())
         if features.waveform is not None:
-            np.save(utt_dir / "waveform.npy", features.waveform.numpy())
+            waveform = _align_waveform_to_frame_count(
+                features.waveform.detach().cpu(), features.n_frames
+            )
+            np.save(utt_dir / "waveform.npy", waveform.numpy())
 
         meta = {
             "utterance_id": features.utterance_id,

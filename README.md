@@ -60,6 +60,28 @@ uv sync --extra-index-url https://download.pytorch.org/whl/cu128
 uv run tmrvc-serve --uclm-checkpoint checkpoints/uclm.pt --codec-checkpoint checkpoints/codec.pt
 ```
 
+## Training
+
+TMRVC は対話式メニューで簡単に学習を開始できます:
+
+```bash
+# 環境セットアップ
+uv sync
+
+# 設定ファイルの初期化 (初回のみ)
+uv run python scripts/config_generator.py --init
+
+# 対話式メニューの起動
+uv run dev.py
+```
+
+メニューから以下の操作が可能です:
+- データセットの追加・管理
+- 話者分離 (生のwavファイルから自動分類)
+- フル学習 / 既存キャッシュでの学習
+
+詳細は [TRAIN_GUIDE.md](TRAIN_GUIDE.md) を参照してください。
+
 ## License
 
 MIT

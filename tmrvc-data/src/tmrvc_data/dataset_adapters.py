@@ -105,8 +105,20 @@ class JVSAdapter(DatasetAdapter):
     name = "jvs"
 
     def iter_utterances(self, root: Path, split: str = "train") -> Iterator[Utterance]:
-        for spk_dir in sorted(root.iterdir()):
-            if not spk_dir.is_dir() or not spk_dir.name.startswith("jvs"):
+        if not root.exists():
+            raise FileNotFoundError(f"JVS root not found: {root}")
+
+        # Also support archive layout: <root>/jvs_ver1/jvs001/...
+        jvs_root = root
+        has_jvs_speakers = any(
+            p.is_dir() and re.fullmatch(r"jvs\d+", p.name) is not None
+            for p in jvs_root.iterdir()
+        )
+        if not has_jvs_speakers and (root / "jvs_ver1").is_dir():
+            jvs_root = root / "jvs_ver1"
+
+        for spk_dir in sorted(jvs_root.iterdir()):
+            if not spk_dir.is_dir() or re.fullmatch(r"jvs\d+", spk_dir.name) is None:
                 continue
             speaker_id = spk_dir.name
 

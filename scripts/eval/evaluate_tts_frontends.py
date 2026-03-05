@@ -101,11 +101,11 @@ def main(argv: list[str] | None = None) -> None:
             speaker=entry.speaker,
             text=entry.text,
             audio_path=str(out_wav),
-            duration_sec=metrics.output_duration_ms / 1000,
-            uclm_ms=metrics.uclm_ms,
-            decoder_ms=metrics.decoder_ms,
-            total_ms=metrics.total_ms,
-            rtf=metrics.rtf
+            duration_sec=len(audio) / SAMPLE_RATE,
+            uclm_ms=float(metrics.get("gen_time_ms", 0.0)),
+            decoder_ms=0.0,
+            total_ms=float(metrics.get("gen_time_ms", 0.0)),
+            rtf=float(metrics.get("rtf", 0.0)),
         )
         rows.append(row)
         logger.info("[%04d] RTF=%.3f, Total=%.1fms", idx, row.rtf, row.total_ms)

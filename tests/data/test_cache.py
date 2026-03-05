@@ -1,8 +1,9 @@
 """Tests for FeatureCache save/load roundtrip."""
 
+import numpy as np
 import torch
 
-from tmrvc_core.constants import D_SPEAKER, N_MELS
+from tmrvc_core.constants import D_SPEAKER, HOP_LENGTH, N_MELS
 from tmrvc_core.types import UCLMFeatureSet
 from tmrvc_data.cache import FeatureCache
 
@@ -69,3 +70,21 @@ class TestFeatureCache:
         cache = FeatureCache(tmp_cache_dir)
         result = cache.verify("nonexistent", "train")
         assert result["total"] == 0
+
+    def test_save_aligns_waveform_length_to_n_frames(self, tmp_cache_dir):
+        cache = FeatureCache(tmp_cache_dir)
+        n_frames = 10
+        fs = UCLMFeatureSet(
+            codec_tokens_a=torch.zeros(8, n_frames, dtype=torch.long),
+            codec_tokens_b=torch.zeros(4, n_frames, dtype=torch.long),
+            voice_state_explicit=torch.randn(n_frames, 8),
+            voice_state_ssl=torch.randn(n_frames, 128),
+            spk_embed=torch.randn(D_SPEAKER),
+            utterance_id="utt_wave_mismatch",
+            speaker_id="spk_wave_mismatch",
+            n_frames=n_frames,
+            waveform=torch.randn(1, n_frames * HOP_LENGTH + 37),
+        )
+        out_dir = cache.save(fs, "test_ds", "train")
+        waveform = torch.from_numpy(np.load(out_dir / "waveform.npy"))
+        assert waveform.shape == (1, n_frames * HOP_LENGTH)

@@ -30,7 +30,7 @@ class UCLMTrainer:
         
     def train_step(self, batch: dict) -> dict:
         self.model.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         
         # Move common tensors to device
         target_a = batch["target_a"].to(self.device)
@@ -57,12 +57,14 @@ class UCLMTrainer:
         
         if mode == "vc":
             source_a_t = batch["source_a_t"].to(self.device)
+            source_mask = (target_a[:, 0, :] != -1)
             out = self.model.forward_vc(
                 source_a_t=source_a_t,
                 target_b=target_b,
                 explicit_state=explicit_state,
                 ssl_state=ssl_state,
                 speaker_embed=speaker_embed,
+                source_mask=source_mask,
                 f0_condition=f0_condition,
                 cfg_scale=cfg_scale
             )

@@ -13,12 +13,28 @@ logger = logging.getLogger(__name__)
 _HINT_BLEND_WEIGHT = 0.35
 _SITUATION_BLEND_WEIGHT = 0.20
 _INLINE_STAGE_BLEND_WEIGHT = 0.60
-_BACKCHANNEL_TOKENS = frozenset({
-    "uh-huh", "yeah", "yes", "no", "okay", "ok",
-    "うん", "はい", "ええ", "そう", "そうだね",
-    "嗯", "好", "是", "对",
-    "응", "네", "그래",
-})
+_BACKCHANNEL_TOKENS = frozenset(
+    {
+        "uh-huh",
+        "yeah",
+        "yes",
+        "no",
+        "okay",
+        "ok",
+        "うん",
+        "はい",
+        "ええ",
+        "そう",
+        "そうだね",
+        "嗯",
+        "好",
+        "是",
+        "对",
+        "응",
+        "네",
+        "그래",
+    }
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,8 +90,32 @@ _STYLE_PRESET_TABLE: dict[str, StylePresetConfig] = {
 }
 
 
-def _clamp_style(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, v))
+def _clamp_unit(v: float) -> float:
+    return max(0.0, min(1.0, v))
+
+
+def _clamp_valence(v: float) -> float:
+    return max(-1.0, min(1.0, v))
+
+
+def _clamp_speed(v: float) -> float:
+    return max(0.5, min(2.0, v))
+
+
+def _merge_reasoning(*parts: str | None) -> str:
+    out: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        s = str(p).strip()
+        if s:
+            out.append(s)
+    return "; ".join(out)
+
+
+def _blend_style_values(base: float, overlay: float, overlay_weight: float) -> float:
+    w = max(0.0, min(1.0, overlay_weight))
+    return (1.0 - w) * base + w * overlay
 
 
 def _resolve_style_preset(
@@ -90,24 +130,24 @@ def _resolve_style_preset(
     src = base_style or StyleParams.neutral()
     result = StyleParams(
         emotion=cfg.emotion or src.emotion,
-        breathiness=_clamp_style(src.breathiness + cfg.delta_breathiness),
-        tension=_clamp_style(src.tension + cfg.delta_tension),
-        arousal=_clamp_style(src.arousal + cfg.delta_arousal),
-        valence=_clamp_style(src.valence + cfg.delta_valence, -1.0, 1.0),
-        roughness=_clamp_style(src.roughness + cfg.delta_roughness),
-        voicing=_clamp_style(src.voicing + cfg.delta_voicing),
-        energy=_clamp_style(src.energy + cfg.delta_energy),
-        speech_rate=_clamp_style(src.speech_rate * cfg.speech_rate_multiplier, 0.5, 2.0),
-    )
-    return result, cfg
-        pitch_range=_clamp_style(src.pitch_range + cfg.delta_pitch_range),
-        reasoning=(src.reasoning + "; " if src.reasoning else "") + f"preset={preset}",
+        breathiness=_clamp_unit(src.breathiness + cfg.delta_breathiness),
+        tension=_clamp_unit(src.tension + cfg.delta_tension),
+        arousal=_clamp_unit(src.arousal + cfg.delta_arousal),
+        valence=_clamp_valence(src.valence + cfg.delta_valence),
+        roughness=_clamp_unit(src.roughness + cfg.delta_roughness),
+        voicing=_clamp_unit(src.voicing + cfg.delta_voicing),
+        energy=_clamp_unit(src.energy + cfg.delta_energy),
+        speech_rate=_clamp_speed(src.speech_rate * cfg.speech_rate_multiplier),
+        pitch_range=src.pitch_range,
+        reasoning=_merge_reasoning(
+            src.reasoning, f"preset={preset}" if preset != "default" else None
+        ),
     )
     return result, cfg
 
 
 def _resolve_effective_speed(base_speed: float, cfg: StylePresetConfig) -> float:
-    return _clamp_speed(base_speed * cfg.speed_multiplier)
+    return _clamp_speed(base_speed * cfg.speech_rate_multiplier)
 
 
 def _resolve_sentence_pause(base_pause_ms: int, delta_ms: int) -> int:
@@ -122,45 +162,33 @@ def _apply_inline_stage_overlay(
     style: StyleParams | None,
     stage_overlay: object | None,
 ) -> StyleParams | None:
-    """Apply inline stage overlay using **additive** blending.
-
-    Unlike hint/situation blends (which interpolate two absolute styles),
-    the stage overlay values are *deltas from zero*.  Interpolation would
-    incorrectly drag all base parameters toward 0.  Instead we add
-    ``delta * weight`` to each base parameter.
-    """
+    """Apply inline stage overlay as additive deltas from neutral."""
     if not isinstance(stage_overlay, StyleParams):
         return style
-    if style is None:
-        # No base — treat deltas as absolute, scaled by weight.
-        w = _INLINE_STAGE_BLEND_WEIGHT
-        return StyleParams(
-            emotion=stage_overlay.emotion,
-            valence=_clamp_style(stage_overlay.valence * w),
-            arousal=_clamp_style(stage_overlay.arousal * w),
-            dominance=_clamp_style(stage_overlay.dominance * w),
-            speech_rate=_clamp_style(stage_overlay.speech_rate * w),
-            energy=_clamp_style(stage_overlay.energy * w),
-            pitch_range=_clamp_style(stage_overlay.pitch_range * w),
-            reasoning=_merge_reasoning(stage_overlay.reasoning, "inline_stage"),
-        )
 
+    base = style or StyleParams.neutral()
+    neutral = StyleParams.neutral()
     w = _INLINE_STAGE_BLEND_WEIGHT
-    # Inline stage emotion has explicit user intent — override even
-    # non-neutral base emotion when the stage direction sets one.
-    emotion = style.emotion
-    if stage_overlay.emotion != "neutral":
+
+    def d(name: str) -> float:
+        return float(getattr(stage_overlay, name) - getattr(neutral, name))
+
+    emotion = base.emotion
+    if stage_overlay.emotion != neutral.emotion:
         emotion = stage_overlay.emotion
 
     return StyleParams(
         emotion=emotion,
-        valence=_clamp_style(style.valence + stage_overlay.valence * w),
-        arousal=_clamp_style(style.arousal + stage_overlay.arousal * w),
-        dominance=_clamp_style(style.dominance + stage_overlay.dominance * w),
-        speech_rate=_clamp_style(style.speech_rate + stage_overlay.speech_rate * w),
-        energy=_clamp_style(style.energy + stage_overlay.energy * w),
-        pitch_range=_clamp_style(style.pitch_range + stage_overlay.pitch_range * w),
-        reasoning=_merge_reasoning(style.reasoning, stage_overlay.reasoning, "inline_stage"),
+        breathiness=_clamp_unit(base.breathiness + d("breathiness") * w),
+        tension=_clamp_unit(base.tension + d("tension") * w),
+        arousal=_clamp_unit(base.arousal + d("arousal") * w),
+        valence=_clamp_valence(base.valence + d("valence") * w),
+        roughness=_clamp_unit(base.roughness + d("roughness") * w),
+        voicing=_clamp_unit(base.voicing + d("voicing") * w),
+        energy=_clamp_unit(base.energy + d("energy") * w),
+        speech_rate=_clamp_speed(base.speech_rate + d("speech_rate") * w),
+        pitch_range=base.pitch_range + d("pitch_range") * w,
+        reasoning=_merge_reasoning(base.reasoning, stage_overlay.reasoning, "inline_stage"),
     )
 
 
@@ -176,9 +204,12 @@ def _blend_styles(
         assert overlay is not None
         return StyleParams(
             emotion=overlay.emotion,
-            valence=overlay.valence,
+            breathiness=overlay.breathiness,
+            tension=overlay.tension,
             arousal=overlay.arousal,
-            dominance=overlay.dominance,
+            valence=overlay.valence,
+            roughness=overlay.roughness,
+            voicing=overlay.voicing,
             speech_rate=overlay.speech_rate,
             energy=overlay.energy,
             pitch_range=overlay.pitch_range,
@@ -193,12 +224,33 @@ def _blend_styles(
 
     return StyleParams(
         emotion=emotion,
-        valence=_blend_style_values(base.valence, overlay.valence, overlay_weight),
-        arousal=_blend_style_values(base.arousal, overlay.arousal, overlay_weight),
-        dominance=_blend_style_values(base.dominance, overlay.dominance, overlay_weight),
-        speech_rate=_blend_style_values(base.speech_rate, overlay.speech_rate, overlay_weight),
-        energy=_blend_style_values(base.energy, overlay.energy, overlay_weight),
-        pitch_range=_blend_style_values(base.pitch_range, overlay.pitch_range, overlay_weight),
+        breathiness=_clamp_unit(
+            _blend_style_values(base.breathiness, overlay.breathiness, overlay_weight)
+        ),
+        tension=_clamp_unit(
+            _blend_style_values(base.tension, overlay.tension, overlay_weight)
+        ),
+        arousal=_clamp_unit(
+            _blend_style_values(base.arousal, overlay.arousal, overlay_weight)
+        ),
+        valence=_clamp_valence(
+            _blend_style_values(base.valence, overlay.valence, overlay_weight)
+        ),
+        roughness=_clamp_unit(
+            _blend_style_values(base.roughness, overlay.roughness, overlay_weight)
+        ),
+        voicing=_clamp_unit(
+            _blend_style_values(base.voicing, overlay.voicing, overlay_weight)
+        ),
+        speech_rate=_clamp_speed(
+            _blend_style_values(base.speech_rate, overlay.speech_rate, overlay_weight)
+        ),
+        energy=_clamp_unit(
+            _blend_style_values(base.energy, overlay.energy, overlay_weight)
+        ),
+        pitch_range=_blend_style_values(
+            base.pitch_range, overlay.pitch_range, overlay_weight
+        ),
         reasoning=_merge_reasoning(base.reasoning, overlay.reasoning, reason_tag),
     )
 
@@ -220,7 +272,7 @@ def _apply_dialogue_dynamics(
     prev_turn = history[-1]
     valence = style.valence
     arousal = style.arousal
-    dominance = style.dominance
+    tension = style.tension
     speech_rate = style.speech_rate
     energy = style.energy
     pitch_range = style.pitch_range
@@ -235,7 +287,7 @@ def _apply_dialogue_dynamics(
 
     if turn_changed and prev_turn.emotion in {"angry", "excited"}:
         arousal += 0.08
-        dominance += 0.08
+        tension += 0.10
         tags.append("carry_tension")
 
     if turn_changed and prev_turn.emotion in {"sad", "fearful", "whisper"}:
@@ -252,12 +304,15 @@ def _apply_dialogue_dynamics(
 
     return StyleParams(
         emotion=style.emotion,
-        valence=_clamp_style(valence),
-        arousal=_clamp_style(arousal),
-        dominance=_clamp_style(dominance),
-        speech_rate=_clamp_style(speech_rate),
-        energy=_clamp_style(energy),
-        pitch_range=_clamp_style(pitch_range),
+        breathiness=style.breathiness,
+        tension=_clamp_unit(tension),
+        arousal=_clamp_unit(arousal),
+        valence=_clamp_valence(valence),
+        roughness=style.roughness,
+        voicing=style.voicing,
+        speech_rate=_clamp_speed(speech_rate),
+        energy=_clamp_unit(energy),
+        pitch_range=pitch_range,
         reasoning=_merge_reasoning(style.reasoning, ",".join(tags) if tags else None),
     )
 

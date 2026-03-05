@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import random
 import sys
+import gc
+import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,7 @@ import numpy as np
 import torch
 
 from tmrvc_train.experiment import ExperimentManager
+from tmrvc_core.constants import HOP_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,8 @@ class TrainingPipeline:
         workers: int = 1,
         seed: int = 42,
         skip_preprocess: bool = False,
+        run_training: bool = True,
+        train_datasets: list[str] | None = None,
     ):
         self.experiment_dir = experiment_dir
         self.dataset = dataset
@@ -39,6 +44,8 @@ class TrainingPipeline:
         self.workers = workers
         self.seed = seed
         self.skip_preprocess = skip_preprocess
+        self.run_training = run_training
+        self.train_datasets = train_datasets
 
         self.experiment_manager = ExperimentManager(experiment_dir)
 
@@ -49,9 +56,14 @@ class TrainingPipeline:
 
         experiment_id = self.experiment_dir.name
 
+        metadata_dataset = (
+            ",".join(self.train_datasets)
+            if self.train_datasets is not None
+            else self.dataset
+        )
         metadata = self.experiment_manager.create_experiment(
             experiment_id=experiment_id,
-            dataset=self.dataset,
+            dataset=metadata_dataset,
             config=self.config,
             seed=self.seed,
             workers=self.workers,
@@ -73,6 +85,11 @@ class TrainingPipeline:
                     self.experiment_manager.update_status("preprocessing_failed")
                     return False
 
+            if not self.run_training:
+                self.experiment_manager.update_status("preprocessed")
+                return True
+
+            self._cleanup_cuda_memory()
             self.experiment_manager.update_status("training")
             success = self._run_training()
 
@@ -87,6 +104,19 @@ class TrainingPipeline:
             logger.exception("Pipeline failed: %s", e)
             self.experiment_manager.update_status("failed")
             return False
+
+    def _cleanup_cuda_memory(self) -> None:
+        """Best-effort cleanup between preprocessing and training."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(
+                "CUDA memory after cleanup: allocated=%.2f GB, reserved=%.2f GB",
+                allocated,
+                reserved,
+            )
 
     def _set_seed(self, seed: int) -> None:
         """Set random seeds for reproducibility."""
@@ -114,6 +144,9 @@ class TrainingPipeline:
 
         utterances = list(adapter.iter_utterances(self.raw_dir, "train"))
         logger.info("Found %d utterances in %s", len(utterances), self.dataset)
+        if not utterances:
+            logger.error("No utterances found for dataset=%s in raw_dir=%s", self.dataset, self.raw_dir)
+            return False
 
         if self.workers == 1:
             return self._preprocess_single_worker(utterances)
@@ -193,6 +226,9 @@ class TrainingPipeline:
         logger.info(
             "Preprocessing complete: %d processed, %d errors", processed, errors
         )
+        del models, codec, vs_estimator, spk_encoder, whisper
+        if device == "cuda":
+            torch.cuda.empty_cache()
         return errors < len(utterances) * 0.1
 
     def _preprocess_multi_worker(self, utterances: list) -> bool:
@@ -217,6 +253,7 @@ class TrainingPipeline:
 
         processed_total = 0
         errors_total = 0
+        all_error_logs = []
 
         with ProcessPoolExecutor(
             max_workers=self.workers, mp_context=mp.get_context("spawn")
@@ -266,20 +303,49 @@ class TrainingPipeline:
         from tmrvc_train.cli.train_uclm import main as train_uclm_main
 
         logger.info("Starting UCLM training...")
+        datasets_for_training = self.train_datasets or [self.dataset]
+        missing_dirs: list[Path] = []
+        empty_dirs: list[Path] = []
+        for dataset in datasets_for_training:
+            cache_train_dir = self.cache_dir / dataset / "train"
+            if not cache_train_dir.exists():
+                missing_dirs.append(cache_train_dir)
+                continue
+            if not any(cache_train_dir.rglob("meta.json")):
+                empty_dirs.append(cache_train_dir)
 
+        for p in missing_dirs:
+            logger.error("Cache directory not found: %s", p)
+        for p in empty_dirs:
+            logger.error("No cached utterances found under: %s", p)
+        if missing_dirs or empty_dirs:
+            return False
+
+        if not self._run_cache_quality_gate(datasets_for_training):
+            return False
+
+        config_path = self._write_train_config()
         train_args = [
-            "--dataset",
-            self.dataset,
             "--cache-dir",
             str(self.cache_dir),
             "--output-dir",
             str(self.experiment_dir / "checkpoints"),
-            "--config",
-            str(self._write_train_config()),
         ]
+        if datasets_for_training:
+            train_args.extend(["--datasets", ",".join(datasets_for_training)])
+        logger.info("Training config snapshot: %s", config_path)
 
+        train_args.extend(["--seed", str(self.seed)])
         if "train_steps" in self.config:
             train_args.extend(["--train-steps", str(self.config["train_steps"])])
+        if "train_batch_size" in self.config:
+            train_args.extend(["--batch-size", str(self.config["train_batch_size"])])
+        if "train_device" in self.config:
+            train_args.extend(["--device", str(self.config["train_device"])])
+        if "train_sampling_strategy" in self.config:
+            train_args.extend(
+                ["--sampling-strategy", str(self.config["train_sampling_strategy"])]
+            )
 
         try:
             train_uclm_main(train_args)
@@ -287,6 +353,165 @@ class TrainingPipeline:
         except Exception as e:
             logger.exception("Training failed: %s", e)
             return False
+
+    def _run_cache_quality_gate(self, datasets_for_training: list[str]) -> bool:
+        """Validate cache integrity and token ranges before training."""
+        if not bool(self.config.get("quality_gate_enabled", True)):
+            logger.info("Quality gate disabled by config.")
+            return True
+
+        max_invalid_ratio = float(self.config.get("quality_gate_max_invalid_ratio", 0.0))
+        min_valid_utterances = int(
+            self.config.get("quality_gate_min_utterances_per_dataset", 1)
+        )
+        min_speakers = int(self.config.get("quality_gate_min_speakers_per_dataset", 1))
+        token_samples = int(self.config.get("quality_gate_token_samples", 64))
+        rvq_vocab_size = int(self.config.get("rvq_vocab_size", 1024))
+        control_vocab_size = int(self.config.get("control_vocab_size", 64))
+
+        required = (
+            "meta.json",
+            "codec_tokens.npy",
+            "explicit_state.npy",
+            "ssl_state.npy",
+            "spk_embed.npy",
+        )
+
+        report: dict[str, Any] = {"datasets": {}, "status": "ok"}
+        ok = True
+        rng = random.Random(self.seed)
+
+        for dataset in datasets_for_training:
+            base = self.cache_dir / dataset / "train"
+            utt_dirs = [p for p in base.glob("*/*") if p.is_dir()]
+            total = len(utt_dirs)
+            valid_dirs: list[Path] = []
+            invalid_missing = 0
+            speakers: set[str] = set()
+
+            for utt_dir in utt_dirs:
+                if all((utt_dir / f).exists() for f in required):
+                    valid_dirs.append(utt_dir)
+                    speakers.add(utt_dir.parent.name)
+                else:
+                    invalid_missing += 1
+
+            valid = len(valid_dirs)
+            invalid_ratio = 0.0 if total == 0 else float(invalid_missing) / float(total)
+
+            token_errors = 0
+            waveform_length_errors = 0
+            waveform_checked = 0
+            if valid_dirs and token_samples > 0:
+                sample_count = min(token_samples, len(valid_dirs))
+                sampled = rng.sample(valid_dirs, sample_count)
+                for utt_dir in sampled:
+                    try:
+                        codec_tokens = np.load(utt_dir / "codec_tokens.npy")
+                        if (
+                            codec_tokens.size == 0
+                            or np.min(codec_tokens) < 0
+                            or np.max(codec_tokens) >= rvq_vocab_size
+                        ):
+                            token_errors += 1
+                            continue
+
+                        control_path = utt_dir / "control_tokens.npy"
+                        if control_path.exists():
+                            control_tokens = np.load(control_path)
+                            if (
+                                control_tokens.size == 0
+                                or np.min(control_tokens) < 0
+                                or np.max(control_tokens) >= control_vocab_size
+                            ):
+                                token_errors += 1
+                    except Exception:
+                        token_errors += 1
+
+            # Check waveform/sample alignment against n_frames for all entries that include waveform.npy.
+            # This is lightweight (header/meta reads only) and catches frame drift early.
+            for utt_dir in valid_dirs:
+                waveform_path = utt_dir / "waveform.npy"
+                if not waveform_path.exists():
+                    continue
+                waveform_checked += 1
+                try:
+                    with open(utt_dir / "meta.json", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    n_frames = int(meta.get("n_frames", -1))
+                    if n_frames < 0:
+                        waveform_length_errors += 1
+                        continue
+                    expected_samples = n_frames * int(HOP_LENGTH)
+                    waveform = np.load(waveform_path, mmap_mode="r")
+                    actual_samples = int(waveform.shape[-1])
+                    if actual_samples != expected_samples:
+                        waveform_length_errors += 1
+                except Exception:
+                    waveform_length_errors += 1
+
+            dataset_report = {
+                "total_entries": total,
+                "valid_entries": valid,
+                "invalid_missing_files": invalid_missing,
+                "invalid_ratio": invalid_ratio,
+                "unique_speakers": len(speakers),
+                "token_errors": token_errors,
+                "token_samples": min(token_samples, len(valid_dirs)),
+                "waveform_checked": waveform_checked,
+                "waveform_length_errors": waveform_length_errors,
+            }
+            report["datasets"][dataset] = dataset_report
+
+            if valid < min_valid_utterances:
+                logger.error(
+                    "Quality gate failed [%s]: valid_entries=%d < min=%d",
+                    dataset,
+                    valid,
+                    min_valid_utterances,
+                )
+                ok = False
+            if len(speakers) < min_speakers:
+                logger.error(
+                    "Quality gate failed [%s]: unique_speakers=%d < min=%d",
+                    dataset,
+                    len(speakers),
+                    min_speakers,
+                )
+                ok = False
+            if invalid_ratio > max_invalid_ratio:
+                logger.error(
+                    "Quality gate failed [%s]: invalid_ratio=%.4f > max=%.4f",
+                    dataset,
+                    invalid_ratio,
+                    max_invalid_ratio,
+                )
+                ok = False
+            if token_errors > 0:
+                logger.error(
+                    "Quality gate failed [%s]: token_errors=%d (sampled=%d)",
+                    dataset,
+                    token_errors,
+                    dataset_report["token_samples"],
+                )
+                ok = False
+            if waveform_length_errors > 0:
+                logger.error(
+                    "Quality gate failed [%s]: waveform_length_errors=%d (checked=%d, expected=n_frames*%d)",
+                    dataset,
+                    waveform_length_errors,
+                    waveform_checked,
+                    HOP_LENGTH,
+                )
+                ok = False
+
+        report["status"] = "ok" if ok else "failed"
+        report_path = self.experiment_dir / "quality_gate_report.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        logger.info("Quality gate report: %s", report_path)
+
+        return ok
 
     def _write_train_config(self) -> Path:
         """Write training configuration file."""
@@ -296,6 +521,7 @@ class TrainingPipeline:
 
         train_config = {
             "dataset": self.dataset,
+            "train_datasets": self.train_datasets or [self.dataset],
             "seed": self.seed,
             **self.config,
         }
@@ -384,6 +610,10 @@ def _worker_process_chunk(
 
         except Exception as e:
             print(f"Worker {worker_id} error on {utt.utterance_id}: {e}")
+            if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+                print(f"Worker {worker_id}: CUDA OOM detected, clearing cache and continuing...")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             import traceback
 
             traceback.print_exc()
@@ -397,4 +627,7 @@ def _worker_process_chunk(
             )
 
     print(f"Worker {worker_id} done: {processed} processed, {len(error_logs)} errors")
+    del models, codec, vs_estimator, spk_encoder, whisper
+    if device == "cuda":
+        torch.cuda.empty_cache()
     return processed, error_logs

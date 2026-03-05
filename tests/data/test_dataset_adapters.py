@@ -157,6 +157,24 @@ class TestJVSAdapter:
         utts = list(adapter.iter_utterances(tmp_path))
         assert len(utts) == 0
 
+    def test_supports_jvs_ver1_nested_root(self, tmp_path):
+        """Support layout: root/jvs_ver1/jvs001/..."""
+        import numpy as np
+        import soundfile as sf
+
+        wav_dir = tmp_path / "jvs_ver1" / "jvs001" / "nonpara30" / "wav24kHz16bit"
+        wav_dir.mkdir(parents=True)
+        sf.write(
+            str(wav_dir / "NONPARA30_001.wav"),
+            np.zeros(2400, dtype=np.float32),
+            24000,
+        )
+
+        adapter = JVSAdapter()
+        utts = list(adapter.iter_utterances(tmp_path))
+        assert len(utts) == 1
+        assert utts[0].speaker_id == "jvs_jvs001"
+
 
 class TestLibriTTSRAdapter:
     def test_train_split_layout(self, tmp_path):

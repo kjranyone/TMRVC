@@ -34,12 +34,12 @@ from tmrvc_serve.style_resolver import (
     _resolve_stage_speed,
     _resolve_style_preset,
 )
-from tmrvc_serve.tts_engine import FADEOUT_SAMPLES
 
 logger = logging.getLogger(__name__)
 
 _MAX_QUEUE_SIZE = 20
 _DIALOGUE_HISTORY_MAX = 24
+FADEOUT_SAMPLES = 240
 
 router = APIRouter()
 
@@ -285,7 +285,7 @@ async def chat_websocket(ws: WebSocket) -> None:
                 # Send style message (before audio, for avatar sync)
                 await _send(WSStyleMessage(
                     emotion=style_msg.emotion,
-                    vad=[style_msg.valence, style_msg.arousal, style_msg.dominance],
+                    vad=[style_msg.valence, style_msg.arousal, style_msg.energy],
                     reasoning=style_msg.reasoning,
                     seq=item.seq,
                 ).model_dump())

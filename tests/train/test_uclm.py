@@ -27,6 +27,23 @@ def test_vector_quantizer():
     assert loss.dim() == 0, "VQ loss should be scalar"
 
 
+def test_vector_quantizer_masked_loss_ignores_padded_frames():
+    B, T, d = 1, 6, 64
+    x = torch.randn(B, T, d)
+    mask = torch.tensor([[1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+    vq = VectorQuantizer(n_bins=64, d_model=d)
+
+    _, loss_masked, _ = vq(x, mask=mask)
+    _, loss_valid_only, _ = vq(x[:, :3, :], mask=None)
+
+    assert torch.allclose(loss_masked, loss_valid_only, atol=1e-6, rtol=1e-5)
+
+    zero_mask = torch.zeros(B, T, dtype=torch.bool)
+    _, loss_zero, _ = vq(x, mask=zero_mask)
+    assert torch.isfinite(loss_zero)
+    assert loss_zero.item() == 0.0
+
+
 def test_vc_encoder():
     B, n_cb, T = 2, 8, 50
     source_tokens = torch.randint(0, 1024, (B, n_cb, T))
@@ -60,6 +77,7 @@ def test_uclm_transformer():
 if __name__ == "__main__":
     test_voice_state_encoder()
     test_vector_quantizer()
+    test_vector_quantizer_masked_loss_ignores_padded_frames()
     test_vc_encoder()
     test_uclm_transformer()
     print("All UCLM model tests passed!")

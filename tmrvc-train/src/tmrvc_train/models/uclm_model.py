@@ -74,10 +74,11 @@ class DisentangledUCLM(nn.Module):
         explicit_state: torch.Tensor,
         ssl_state: torch.Tensor,
         speaker_embed: torch.Tensor,
+        source_mask: Optional[torch.Tensor] = None,
         f0_condition: Optional[torch.Tensor] = None,
         cfg_scale: float = 1.0,
     ) -> dict:
-        content_features, vq_loss = self.vc_encoder(source_a_t)
+        content_features, vq_loss = self.vc_encoder(source_a_t, source_mask=source_mask)
 
         v_out = self.voice_state_enc(explicit_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
@@ -85,10 +86,12 @@ class DisentangledUCLM(nn.Module):
         if f0_condition is not None:
             content_features = content_features + self.f0_proj(f0_condition)
 
-        # Shift target_b to use as context B_{t-1}
+        # Shift target_b to use as context B_{t-1}. target_b can include -1
+        # padding for CE ignore_index, but embeddings require non-negative ids.
         B, n_slots, T = target_b.shape
         b_ctx = torch.zeros_like(target_b)
         b_ctx[:, :, 1:] = target_b[:, :, :-1]
+        b_ctx = b_ctx.clamp_min(0)
 
         logits_a, logits_b = self.uclm_core.forward_no_cache(
             content_features, b_ctx, state_cond, speaker_embed, cfg_scale
@@ -143,10 +146,12 @@ class DisentangledUCLM(nn.Module):
         v_out = self.voice_state_enc(explicit_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
-        # Shift target_b to use as context B_{t-1}
+        # Shift target_b to use as context B_{t-1}. target_b can include -1
+        # padding for CE ignore_index, but embeddings require non-negative ids.
         B, n_slots, T = target_b.shape
         b_ctx = torch.zeros_like(target_b)
         b_ctx[:, :, 1:] = target_b[:, :, :-1]
+        b_ctx = b_ctx.clamp_min(0)
 
         logits_a, logits_b = self.uclm_core.forward_no_cache(
             content_features, b_ctx, state_cond, speaker_embed, cfg_scale

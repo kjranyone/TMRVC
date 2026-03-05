@@ -12,16 +12,15 @@ dependencies = [
     "librosa>=0.10",
     "soundfile>=0.12",
     "torchcrepe>=0.0.22",
+    "torchaudio>=2.0",
+    "hdbscan>=0.8.38",
+    "scikit-learn>=1.4",
 ]
 
 [project.optional-dependencies]
 tts = [
     "pyopenjtalk>=0.3",
     "phonemizer>=3.2",
-]
-cluster = [
-    "hdbscan>=0.8.38",
-    "scikit-learn>=1.4",
 ]
 asr = [
     "faster-whisper>=1.0",
