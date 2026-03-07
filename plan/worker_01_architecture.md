@@ -46,6 +46,7 @@ Worker 01 must freeze the canonical serializable state schema in one place.
   - pointer-state field names and types
   - `voice_state` / `delta_state` external contract
   - dialogue-context record types
+  - **`SpeakerProfile` schema (Timbre + Prompt tokens + Metadata) as defined in `docs/design/speaker-profile-spec.md`**
   - cache-state serialization contract needed by Python / Rust / ONNX / VST
 - `configs/constants.yaml` remains the single source of truth for constants that affect tensor layout or stepping semantics
 - model wrappers in train / serve / export may adapt this contract, but must not redefine it
@@ -71,6 +72,13 @@ RoPE integration must be specified together with pointer execution:
   - an equivalent pointer-conditioned masking / biasing scheme
 - define how repeated stall frames avoid drifting the effective text-position semantics
 - define how skip-protection and force-advance update the effective relative-position reference so cached text memory remains coherent
+
+**Reference design: VoiceStar PM-RoPE (arXiv:2505.19462).**
+VoiceStar's Progress-Monitoring RoPE embeds the text-speech alignment progress directly into the rotary position encoding, enabling the model to implicitly learn monotonic alignment without a separate pointer head. Worker 01 must evaluate PM-RoPE as:
+- a candidate implementation for the pointer + RoPE interaction rules above, or
+- at minimum, a documented comparison point for the chosen design
+
+If PM-RoPE or an equivalent progress-aware position encoding is adopted, it may simplify or replace the explicit `advance_logit` pointer head, and may provide a natural path toward the `latent_only` alignment-free recipe required by Worker 02's release exit criterion.
 
 ### Pointer State
 
@@ -215,6 +223,8 @@ Rationale:
 - a flattened schedule keeps the 10 ms frame contract simple and avoids sub-step latency
 - hierarchical/delayed prediction may be revisited as a future quality improvement, but must not be the initial v3 mainline to avoid scope creep
 
+**SOTA context:** Nearly all top-performing systems (CosyVoice 3, MiniMax-Speech, DiSTAR, Qwen3-TTS) use a 2-stage pipeline where AR generates coarse/semantic tokens and a non-AR module (flow matching, diffusion, or DiT) refines them into full acoustic detail. The flattened single-stage policy is a known quality ceiling trade-off accepted for initial v3 simplicity. The 2-stage upgrade path is defined in § Acoustic Refinement Roadmap below.
+
 Flattened policy details:
 
 - all codebook slots within one frame step are predicted in parallel by the transformer
@@ -241,6 +251,9 @@ Interaction rules:
 
 The `ProsodyPredictor` outputs `[B, d_prosody]`. When injecting into frame features via `DialogueContextProjector`, the projector must handle the 2D `[B, d_prosody]` input by broadcasting over the time dimension (unsqueeze to `[B, 1, d_prosody]`). The projector must also accept the 3D `[B, T, d_prosody]` form for future time-local planning without code changes.
 
+**Time-local prosody upgrade schedule:**
+Utterance-global prosody is insufficient for fine-grained drama-grade acting (mid-sentence emotion shifts, selective emphasis, trailing-off). SOTA systems (DiFlow-TTS, Flamed-TTS, Vevo) operate at token-level or segment-level prosody granularity. The upgrade to time-local `[B, T_plan, d_prosody]` must be evaluated at Stage B completion and scheduled for Stage C if drama acting quality gates are not met with the utterance-global form.
+
 **Prosody Predictor Requirement:**
 The architecture must include a **Flow-matching based Prosody Predictor** that predicts the `local_prosody_latent` from text tokens and dialogue context during inference.
 
@@ -261,6 +274,9 @@ To support SOTA zero-shot/few-shot voice cloning while maintaining drama-grade a
 - **Disentanglement Bottleneck:** To enforce this separation, the `Speaker Prompt Encoder` must incorporate an Information Bottleneck or Vector Quantization (VQ) layer, ensuring that attention mechanisms are restricted to low-frequency timbre components and cannot silently copy the prompt's prosody.
 
 Worker 01 must define the injection points for prompt tokens and ensure the attention masks (and bottleneck layers) prevent the prompt's neutral prosody from flattening the target utterance's dramatic intent.
+
+**Codec-level disentanglement (future investigation path):**
+DisCo-Speech (arXiv:2512.13251) demonstrates that resolving timbre-prosody entanglement at the codec/tokenizer level (tri-factor: content, prosody, timbre) can be more fundamental than model-level bottlenecks. Vevo (ICLR 2025, arXiv:2502.07243) achieves self-supervised disentanglement via VQ-VAE codebook size as information bottleneck. If model-level bottleneck proves insufficient for zero-shot disentanglement quality, codec-level factorization should be evaluated as a v3.1 or v4 path. This is not an initial v3 requirement.
 
 **SpeakerPromptEncoder modernization scope:** The `SpeakerPromptEncoder` is a lightweight utility module (2-layer encoder) and is explicitly excluded from the RoPE/GQA/SwiGLU modernization requirement. The modernized transformer backbone applies to `CodecTransformer` (the main decoder). The prompt encoder may adopt modern components later if prompt encoding becomes a quality bottleneck, but this is not a v3 initial mainline requirement.
 

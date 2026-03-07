@@ -47,8 +47,8 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - `cfg_scale`
    - `explicit_voice_state` (8-D preset or curve)
    - optional `delta_voice_state`
-   - `reference_audio` or precomputed `speaker_embed`
-   - `speaker_profile_id` (loading pre-exported speaker prompts)
+   - `reference_audio` (for on-the-fly extraction)
+   - **`speaker_profile_id` (loads the canonical `SpeakerProfile` from the Casting Gallery, see `docs/design/speaker-profile-spec.md`)**
    - optional `reference_text`
    - `language_id`
 4. Implement Low-Latency Streaming Protocol:
@@ -64,6 +64,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
 7. Add Zero-Shot / Few-Shot Voice Cloning API support:
    - accept `reference_audio` (base64 or file upload) and optional `reference_text` in the TTS request.
    - run the `Speaker Prompt Encoder` on the fly to extract `speaker_embed` and `prompt_kv_cache`.
+   - **Persist or retrieve these prompt features via the canonical `SpeakerProfile` contract managed in `models/characters/` (Casting Gallery).**
    - cache these prompt features across conversational turns for the same speaker to avoid redundant extraction.
 8. Define text-side cache contract:
    - text encoder outputs are computed once per request or once per turn boundary
@@ -117,6 +118,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - `POST /ui/eval/assignments/{assignment_id}/submit`
 14. Define few-shot runtime behavior:
    - when `reference_audio` is encoded
+   - how **`speaker_profile_id`** loads the precomputed embedding and prompt tokens from the Casting Gallery
    - how `speaker_embed` or prompt cache is reused across turns
    - how prompt encoding latency is measured separately from steady-state generation latency
    - how runtime logs enough metadata to reproduce external-baseline comparisons
@@ -200,7 +202,7 @@ The engine must be able to do:
 - expose enough runtime telemetry to inspect why a line sounded flat
 - keep text-side encoded context and attention cache stable across frame steps without O(N) recomputation
 - preserve the same state transition semantics in Python serve, Rust runtime, ONNX export, and VST parameter mapping
-- expose the active few-shot speaker-conditioning source (`reference_audio` derived or precomputed embedding) for debugging
+- expose the active few-shot speaker-conditioning source (**`speaker_profile_id`** or on-the-fly reference) for debugging
 - expose active guidance scale and cache policy for debugging
 - expose active CFG runtime mode (`off | full | lazy | distilled`) and refresh interval for debugging
 - expose stall / skip fallback counters and the active pointer-fallback reason

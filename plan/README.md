@@ -25,6 +25,79 @@ This directory is intended for parallel execution by multiple workers. Each work
 - online MAS/CTC or bootstrap labels may assist training only as auxiliary or transitional supervision; they must not become a permanent release dependency for pointer progression
 - Python / Rust / ONNX / VST must consume one shared serializable contract owned in `tmrvc-core`, not re-declare it independently
 - all human-operated workflows from dataset ingest/upload through curation, export, audition, and evaluation must be available from the WebUI without requiring CLI usage
+- all authoritative multi-user human workflows must go through one typed backend API boundary; filesystem-direct UI access is dev-only and is not the mainline contract
+- frame-indexed artifacts must use the same audio stepping contract as `tmrvc-core`: `sample_rate=24000`, `hop_length=240`, and `T = ceil(num_samples / hop_length)` with exact parity to validated frame-alignment tests
+
+
+## Release Tiers
+
+To prevent concept drift and scope collapse, this plan is split into two tiers.
+
+### Tier 1: v3 Mainline Release-Critical
+
+These items define whether `UCLM v3` exists as a coherent product direction.
+
+- causal pointer-driven TTS without MFA
+- shared pointer / cache / `voice_state` / `speaker_profile` schema in `tmrvc-core`
+- first-class 8-D physical control with trainable targets, masks, provenance, and validation
+- bounded dialogue-context path
+- few-shot speaker adaptation from a short reference clip under a reproducible contract
+- deterministic bootstrap-alignment artifact contract for transitional supervision
+- one authoritative WebUI/backend API surface for ingest, curation, generation, export, and evaluation
+- parity and latency validation across Python / Rust / ONNX / VST
+
+### Tier 2: Research Extensions
+
+These items are important, but they must not silently redefine or block Tier 1 sign-off.
+
+- backbone modernization such as `RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`
+- flow-matching prosody predictor variants beyond the minimum stable mainline path
+- CFG acceleration modes such as `lazy` and `distilled`
+- alternative vocoders / acoustic refinement stages
+- advanced quantization strategies beyond the proven deployment baseline
+
+Rule:
+
+- Tier 2 features may land only if they preserve Tier 1 contracts, pass the same parity gates, and retain a rollback path without invalidating the mainline pointer architecture
+
+
+## SOTA Landscape Awareness (2025-2026)
+
+This plan is informed by the dominant trends in SOTA TTS systems as of early 2026. The following architectural patterns are acknowledged and explicitly positioned against:
+
+### Dominant pattern: 2-stage AR + Non-AR
+
+Almost all top-performing systems (MiniMax-Speech, CosyVoice 3, DiSTAR, Qwen3-TTS, GLM-TTS, IndexTTS 2.5) use a two-stage pipeline:
+1. AR language model over discrete semantic/codec tokens
+2. Non-AR refinement (flow matching, diffusion, or DiT) for high-fidelity continuous acoustic generation
+
+TMRVC v3 initial mainline uses flattened single-stage codec prediction for simplicity and streaming compatibility. A 2-stage flow-matching acoustic refinement module is planned as the v3.1 quality upgrade path (see worker_01 § Acoustic Refinement Roadmap).
+
+### Relevant prior art for pointer alignment
+
+- **VoiceStar (arXiv:2505.19462)**: Progress-Monitoring RoPE (PM-RoPE) embeds text-speech alignment progress directly into position encoding. Validates the pointer + RoPE direction and provides a reference design for Worker 01.
+- **VALL-E R (arXiv:2406.07855)**: Monotonic alignment strategy in decoder-only codec LM. Demonstrates robustness gains from explicit alignment constraints in AR TTS.
+
+### Disentanglement state of the art
+
+- **Vevo (ICLR 2025, arXiv:2502.07243)**: Self-supervised progressive disentanglement of timbre/style/content via VQ-VAE information bottleneck.
+- **DisCo-Speech (arXiv:2512.13251)**: Codec-level tri-factor disentanglement (content, prosody, timbre). Resolves entanglement at the tokenizer rather than the model level.
+
+These approaches inform but do not replace TMRVC's model-level bottleneck design. Codec-level disentanglement is a future investigation path.
+
+### Scale reality
+
+SOTA systems train on 100K-5M hours of data with 0.5B-1.5B+ parameter LMs. TMRVC must define its target scale assumptions explicitly (see § Scale Assumptions below).
+
+
+## Scale Assumptions
+
+The plan must operate under explicit scale assumptions so architecture, data, and compute decisions are grounded.
+
+- **Target model scale (initial v3):** 100M-300M parameter UCLM core + auxiliary modules. Sub-1B total.
+- **Target data scale (initial v3):** 10K-100K hours curated data. The curation system is designed to maximize quality at this scale rather than competing on raw volume.
+- **Scaling strategy:** Quality-first at modest scale, with architecture designed to scale up without redesign. The 2-stage refinement upgrade path (v3.1) is the primary quality lever before scaling data.
+- **Non-goal for initial v3:** Matching 1M+ hour training runs or 1B+ parameter models. Competitive quality is pursued through architectural efficiency (pointer alignment, disentanglement, CFG, flow-matching prosody) rather than scale alone.
 
 
 ## Execution Reality
@@ -33,6 +106,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 - shared runtime and tensor contracts live in `tmrvc-core`
 - dataset and cache contracts live in `tmrvc-data`
 - the repository currently contains `tmrvc-gui` (PySide6 / Qt), but the v3 HITL control plane is a separate Gradio/WebUI mainline because multi-user audit, blind evaluation, and role separation are first-class requirements
+- `plan/arxiv_survey_2026_03.md` records the dated research survey used to justify Tier 1 vs Tier 2 boundaries; workers should update it when a new paper materially changes a design choice
 
 
 ## Target End State
@@ -58,6 +132,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 - runtime can express turn-taking tempo, hesitation, overlap pressure, and phrase-final release
 - **runtime can consume short reference-speaker evidence for few-shot speaker adaptation via prompt-cache**
 - waveform decoding quality is treated as a first-class bottleneck, with an explicit vocoder / codec-decoder quality plan
+- **v3.1 upgrade path: 2-stage acoustic refinement (flow matching / DiT) is the planned quality ceiling lift**
 - multilingual and code-switching inference is supported under a documented language-conditioning contract
 
 ### Tooling
@@ -293,7 +368,9 @@ Use this section as the handoff gate. A worker should not start coding until its
 - `docs/design/architecture.md`
 - `docs/design/unified-codec-lm.md`
 - `docs/design/external-baseline-registry.md`
+- `plan/arxiv_survey_2026_03.md`
 - shared pointer / `voice_state` / cache-state schema in `tmrvc-core`
+- shared `speaker_profile` and prompt-cache metadata schema in `tmrvc-core`
 - model and training code for pointer-based TTS
 - serving/runtime/export code for pointer-based TTS across Python, Rust, ONNX, and VST
 - updated `dev.py` plan and menus
@@ -310,11 +387,14 @@ Use this section as the handoff gate. A worker should not start coding until its
 - a v3 experiment can preprocess, train, finalize, and serve without MFA
 - main TTS path does not require `durations.npy`
 - if auxiliary alignment supervision is used during training, release sign-off still includes at least one alignment-free pointer configuration
-- canonical v3 control path keeps 8-D `voice_state` and `delta_state` first-class from train through runtime
+- canonical v3 control path keeps 8-D `voice_state` and `delta_state` first-class from data curation through train and runtime
+- 8-D `voice_state` targets, masks, confidences, and provenance survive export and are validated as usable supervision rather than UI-only controls
 - code clearly separates `v2 legacy` from `v3 pointer`
 - **Zero-shot speaker cloning works from a 3-10s reference clip with high similarity and disentangled prosody**
 - latency and correctness tests pass
 - Rust/ONNX/VST paths match the canonical runtime contract closely enough to pass parity gates
+- all human-facing workflows use one authoritative typed backend API surface; no mainline workflow depends on direct manifest file reads from the UI
+- all frame-indexed alignment artifacts use the same `24kHz`, `hop_length=240`, `T = ceil(N / 240)` convention as `tmrvc-core`
 - docs state the new default path unambiguously
 - expressive-quality claims are backed by reproducible evaluation
 - **Blind A/B evaluation against the fixed external baseline artifact is completed and documented**
