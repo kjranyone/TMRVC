@@ -89,11 +89,11 @@ Optional:
 8. Export dialogue context in a model-agnostic way:
    - raw context text, turn graph, and canonical text units are the default export
    - optional derived context embeddings may be materialized only as checkpoint-hashed caches and must be invalidatable
-8. Export ASR-derived alignment for bootstrap:
+9. Export ASR-derived alignment for bootstrap:
    - preserve token-level or word-level timestamps from Stage 4/5 for provenance
    - export `bootstrap_alignment.json` already projected onto canonical `phoneme_ids` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance, utilizing **Acoustic-Aware Heuristics** for precise boundary estimation.
    - ensure these labels are available to Worker 02 as a supervised `pointer_target_source`
-9. Define artifact package contract:
+10. Define artifact package contract:
    - every exported package must include:
      - `artifact_id`
      - `artifact_type`
@@ -107,13 +107,13 @@ Optional:
      - cache-ready training bundle
      - holdout evaluation bundle
      - pinned workshop take bundle
-10. Define artifact lifecycle and cleanup policy:
+11. Define artifact lifecycle and cleanup policy:
    - `ephemeral`
    - `durable`
    - `release_candidate`
    - who may delete each class
    - whether download URLs are time-limited
-11. Define export failure / retry semantics:
+12. Define export failure / retry semantics:
    - partial package cleanup rules
    - idempotent retry behavior keyed by manifest snapshot and export intent
    - WebUI-visible failure payload with actionable remediation

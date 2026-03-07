@@ -59,7 +59,9 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - pause / breath / non-verbal event coverage
    - cross-lingual speaker coverage
    - code-switch span coverage
-8. Define the loading contract for curated subsets:
+   - **Pitch Accent / Tone coverage (Critical for Japanese/Chinese naturalness)**
+
+8. **Japanese G2P Policy Requirement:** The `tmrvc_data/g2p.py` backend must parse and retain **Pitch Accent information** (e.g., Upstep, Downstep) from the OpenJTalk fullcontext labels. Stripping accent data to raw phonemes (`a, i, u`) is explicitly forbidden for the v3 mainline, as it destroys the ability to learn natural Japanese prosody.
    - consume `text`, `language`, and `phoneme_ids` from exported cache
    - consume `speaker_cluster` and `speaker_embedding` from metadata
    - consume raw conversation graph / context text as the canonical dialogue-context source

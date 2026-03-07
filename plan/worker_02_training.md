@@ -124,7 +124,7 @@ Worker 02 must implement and document the following curriculum:
     - dialogue-context conditioning batch fields
     - utterance-level style / acting labels when available
     - optional local prosody latent supervision
-    - **`style_guidance_embedding`** (for CFG-based acting control)
+    - (CFG-based acting control is achieved via `cfg_scale` scalar and conditioning dropout, not a dedicated embedding)
 13. Add anti-collapse training losses or diagnostics:
     - same-text different-context separation metric
     - prosody variance floor or diversity regularizer
@@ -167,6 +167,14 @@ The trainer must accept TTS examples with:
 - optional `acting_intent`
 - optional `prosody_targets` (for Flow-matching)
 - optional `acoustic_history_teacher` or equivalent teacher-forced codec/control history source
+
+## Alignment Learning Policy (Pointer Target Generation)
+
+To avoid learning a robotic, uniform-duration rhythm, the model must **NOT** use naive uniform temporal distribution (`target_length // L`) for pointer targets during early training.
+
+- **Stage 2 Requirement:** The trainer must use **Monotonic Alignment Search (MAS)** or a dynamic programming equivalent (e.g., Forward-Sum) to align `phoneme_features` with the actual acoustic features (`target_b` / `target_a`) dynamically.
+- The pointer head's target (`advance_targets`, `progress_targets`) must be derived from this MAS path, ensuring the model learns the natural variance in phoneme durations.
+- Uniform distribution is explicitly forbidden as a training target, as it guarantees prosody collapse.
 
 
 ## Training Policy For Pointer Supervision

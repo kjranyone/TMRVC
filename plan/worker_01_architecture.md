@@ -60,6 +60,8 @@ The UCLM v3 core must adopt SOTA LLM practices:
 - **Activation Function:** **SwiGLU** for better representational capacity.
 - **Normalization:** **RMSNorm** with pre-norm configuration for training stability.
 - **Training Acceleration:** Native **Flash Attention 2** support.
+- **Cross-Attention Layer:** To support global prosody planning and non-local text context, the decoder block must include a Cross-Attention layer against the full `phoneme_features` sequence, replacing or augmenting the naive uniform frame-level interpolation.
+- **Acoustic Autoregression:** The model must explicitly consume past emitted acoustic tokens (`a_ctx` from Stream A) in addition to control tokens (`b_ctx`), ensuring phase continuity and preventing waveform glitches during autoregressive generation.
 
 RoPE integration must be specified together with pointer execution:
 
@@ -352,13 +354,13 @@ prosody_latent = model.predict_prosody(
     speaker_embed=speaker_embed,
     style_prompt=..., # optional
 )
-
+```python
 # Decoding Phase
 out = model.forward_tts_pointer(
     phoneme_ids=...,
     language_ids=...,
     pointer_state=...,
-    acoustic_history=...,        # required autoregressive audio/control context (includes generated tokens)
+    acoustic_history=...,        # past a_ctx (Stream A) AND b_ctx (Stream B)
     prompt_kv_cache=prompt_kv_cache, # cached in-context prompt to avoid recomputation
     dialogue_context=...,        # [B, C_ctx, d_model]
     speaker_embed=speaker_embed,

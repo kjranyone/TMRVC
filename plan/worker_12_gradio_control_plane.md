@@ -201,6 +201,316 @@ Worker 12 must not guess backend routes. The following API groups must exist and
 - `POST /admin/policy`
 
 
+## API Payload Schemas
+
+Worker 12 must pin minimum request/response payloads so frontend and backend can evolve without drift.
+
+### `POST /ui/datasets/upload`
+
+Request:
+
+```json
+{
+  "idempotency_key": "uuid",
+  "dataset_name": "drama_corpus_01",
+  "source_kind": "browser_upload",
+  "legality": {
+    "license_class": "licensed",
+    "consent_scope": "training_and_eval",
+    "provenance_note": "studio contract 2026-02"
+  },
+  "owner_id": "user_admin",
+  "tags": ["jp", "drama"]
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "job_upload_123",
+  "dataset_id": "dataset_456",
+  "state": "queued",
+  "upload_url": null,
+  "message": "upload accepted"
+}
+```
+
+### `POST /ui/datasets/register`
+
+Request:
+
+```json
+{
+  "idempotency_key": "uuid",
+  "server_path": "/srv/datasets/raw/drama_corpus_01",
+  "dataset_name": "drama_corpus_01",
+  "legality": {
+    "license_class": "licensed",
+    "consent_scope": "training_and_eval"
+  },
+  "owner_id": "user_admin"
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "job_register_123",
+  "dataset_id": "dataset_456",
+  "state": "running"
+}
+```
+
+### `POST /ui/curation/runs`
+
+Request:
+
+```json
+{
+  "idempotency_key": "uuid",
+  "dataset_id": "dataset_456",
+  "pipeline_profile": "default_dialogue_v3",
+  "target_stages": ["ingest", "asr", "refinement", "selection"],
+  "priority": "normal",
+  "requested_by": "user_admin"
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "job_cur_123",
+  "run_id": "run_456",
+  "state": "queued",
+  "stage_name": "ingest"
+}
+```
+
+### `GET /ui/curation/records`
+
+Query / filter payload semantics:
+
+```json
+{
+  "dataset_id": "dataset_456",
+  "queue": "needs_audit",
+  "status": ["review", "blocked_human"],
+  "language": ["ja"],
+  "speaker_cluster": ["spk_042"],
+  "sort": {"field": "quality_score", "direction": "asc"},
+  "cursor": "opaque_cursor",
+  "page_size": 50
+}
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "record_id": "record_001",
+      "object_version": 12,
+      "status": "review",
+      "owner_id": "user_auditor",
+      "lock_state": "soft_locked",
+      "quality_score": 0.42,
+      "transcript": "...",
+      "language": "ja"
+    }
+  ],
+  "next_cursor": "opaque_cursor_2",
+  "total_estimate": 1204
+}
+```
+
+### `POST /ui/curation/records/{record_id}/action`
+
+Request:
+
+```json
+{
+  "object_version": 12,
+  "edit_session_id": "edit_789",
+  "action": "promote",
+  "promotion_bucket": "tts_mainline",
+  "transcript": "...fixed...",
+  "language": "ja",
+  "speaker_cluster": "spk_042",
+  "reason_note": "approved after transcript correction"
+}
+```
+
+Response:
+
+```json
+{
+  "record_id": "record_001",
+  "object_version": 13,
+  "status": "promoted",
+  "audit_event_id": "audit_001",
+  "conflict": null
+}
+```
+
+Conflict response:
+
+```json
+{
+  "error_code": "stale_version",
+  "record_id": "record_001",
+  "latest_object_version": 13,
+  "latest_owner_id": "user_other"
+}
+```
+
+### `POST /ui/workshop/generate`
+
+Request:
+
+```json
+{
+  "idempotency_key": "uuid",
+  "session_revision_id": "ws_rev_001",
+  "model_id": "uclm_v3_mainline",
+  "text": "セリフ本文",
+  "dialogue_context": ["前の発話1", "前の発話2"],
+  "speaker_profile_id": "spk_prof_123",
+  "language_id": "ja",
+  "cfg_mode": "lazy",
+  "cfg_scale": 1.6,
+  "take_count": 4,
+  "seed_mode": "sweep",
+  "voice_state": [0.0, 0.2, -0.1, 0.3, 0.0, 0.1, -0.2, 0.4],
+  "controls": {
+    "pace": 0.95,
+    "hold_bias": 0.2,
+    "boundary_bias": 0.15
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "job_gen_123",
+  "session_id": "ws_456",
+  "state": "running",
+  "expected_take_count": 4
+}
+```
+
+### `POST /ui/workshop/sessions`
+
+Request:
+
+```json
+{
+  "session_id": "ws_456",
+  "base_revision_id": "ws_rev_001",
+  "title": "episode3_line12_alt",
+  "text": "セリフ本文",
+  "dialogue_context": ["前の発話1", "前の発話2"],
+  "speaker_profile_id": "spk_prof_123",
+  "model_id": "uclm_v3_mainline",
+  "pinned_take_ids": ["take_01", "take_03"],
+  "reason_note": "director shortlist"
+}
+```
+
+Response:
+
+```json
+{
+  "session_id": "ws_456",
+  "new_revision_id": "ws_rev_002",
+  "saved_at": "2026-03-07T12:34:56Z"
+}
+```
+
+### `POST /ui/eval/sessions`
+
+Request:
+
+```json
+{
+  "idempotency_key": "uuid",
+  "protocol_version": "eval_v3_001",
+  "baseline_id": "external_baseline_2026_02",
+  "sample_set_id": "heldout_pack_123",
+  "assignment_policy": {
+    "raters_per_item": 5,
+    "duplicate_qc_rate": 0.1
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "session_id": "eval_001",
+  "state": "queued_assignment",
+  "assignment_count": 120
+}
+```
+
+### `POST /ui/eval/assignments/{assignment_id}/submit`
+
+Request:
+
+```json
+{
+  "assignment_version": 3,
+  "responses": [
+    {
+      "item_id": "item_001",
+      "naturalness": 4,
+      "dramatic_appropriateness": 5,
+      "preference": "B",
+      "confidence": 3
+    }
+  ],
+  "free_text_note": "line 4 had slight over-hold"
+}
+```
+
+Response:
+
+```json
+{
+  "assignment_id": "assign_001",
+  "submitted_at": "2026-03-07T12:34:56Z",
+  "receipt_id": "receipt_001",
+  "qc_flags": []
+}
+```
+
+### `GET /ui/jobs/{job_id}`
+
+Response:
+
+```json
+{
+  "job_id": "job_gen_123",
+  "job_type": "workshop_generate",
+  "state": "running",
+  "stage_name": "decode_take_2",
+  "progress_percent": 55,
+  "retry_count": 0,
+  "retryable": true,
+  "failure_code": null,
+  "failure_message": null,
+  "next_human_action": null,
+  "updated_at": "2026-03-07T12:34:56Z"
+}
+```
+
+
 ## Frontend Module Layout
 
 The Gradio app should be split into explicit modules so page logic does not collapse into one monolith:
@@ -227,6 +537,103 @@ The Gradio app should be split into explicit modules so page logic does not coll
   - typed wrapper for all `/ui/*` and `/admin/*` routes
 
 Worker 12 must define page modules early so future UI work does not re-encode business rules in ad hoc callbacks.
+
+
+## Page Component Trees
+
+Each page must expose a stable component tree so implementation can be split across parallel PRs.
+
+### `Upload` component tree
+
+- `UploadPage`
+  - `UploadSourceSelector`
+  - `UploadDropzone`
+  - `LegalityMetadataForm`
+  - `ProvenanceEditor`
+  - `DuplicateWarningPanel`
+  - `UploadJobTable`
+  - `UploadJobDetailDrawer`
+
+### `Datasets` component tree
+
+- `DatasetsPage`
+  - `DatasetTable`
+  - `DatasetHealthCards`
+  - `SplitLeakagePanel`
+  - `CurationRunToolbar`
+  - `CurationRunTimeline`
+  - `ExportActionPanel`
+  - `DatasetDetailDrawer`
+
+### `Curation Queue` component tree
+
+- `CurationQueuePage`
+  - `SavedFilterBar`
+  - `QueueTable`
+  - `RecordInspector`
+  - `WaveformPanel`
+  - `TranscriptEditor`
+  - `SpeakerLanguageEditor`
+  - `ContextPanel`
+  - `ReviewActionBar`
+  - `AuditHistoryPanel`
+
+### `Drama Workshop` component tree
+
+- `DramaWorkshopPage`
+  - `TextScriptEditor`
+  - `ContextHistoryPanel`
+  - `CastingGalleryPanel`
+  - `ControlPresetPanel`
+  - `VoiceStateControlGrid`
+  - `GenerationToolbar`
+  - `TakeBoard`
+  - `TakeComparePanel`
+  - `SessionSaveBar`
+
+### `Evaluation Arena` component tree
+
+- `EvaluationArenaPage`
+  - `AssignmentHeader`
+  - `BlindPlayerPanel`
+  - `RatingForm`
+  - `QCNoticePanel`
+  - `AssignmentProgressBar`
+  - `SubmissionReceiptPanel`
+
+### `Admin` component tree
+
+- `AdminPage`
+  - `ModelSlotTable`
+  - `RuntimeContractViewer`
+  - `TelemetryPanel`
+  - `PolicyEditor`
+  - `AuditSearchPanel`
+  - `StuckJobsPanel`
+
+
+## Component to API Mapping
+
+Every stateful UI component must declare its backend dependency up front.
+
+| Component | Primary API | Secondary API / Event Stream |
+|---|---|---|
+| `UploadDropzone` | `POST /ui/datasets/upload` | `GET /ui/jobs/{job_id}`, `GET /ui/jobs/{job_id}/events` |
+| `LegalityMetadataForm` | `POST /ui/datasets/upload`, `POST /ui/datasets/register` | `GET /ui/datasets/{dataset_id}` |
+| `DatasetTable` | `GET /ui/datasets` | `GET /ui/datasets/{dataset_id}` |
+| `CurationRunToolbar` | `POST /ui/curation/runs`, `POST /ui/curation/runs/{run_id}/resume`, `POST /ui/curation/runs/{run_id}/stop` | `GET /ui/jobs/{job_id}/events` |
+| `QueueTable` | `GET /ui/curation/records` | none |
+| `TranscriptEditor` | `POST /ui/curation/records/{record_id}/action` | conflict response contract |
+| `ReviewActionBar` | `POST /ui/curation/records/{record_id}/action` | `GET /admin/audit` |
+| `CastingGalleryPanel` | `POST /ui/workshop/casting_gallery` | `GET /ui/workshop/sessions/{session_id}` |
+| `GenerationToolbar` | `POST /ui/workshop/generate` | `GET /ui/jobs/{job_id}`, `GET /ui/jobs/{job_id}/events` |
+| `TakeBoard` | `POST /ui/workshop/takes/{take_id}/pin`, `POST /ui/workshop/takes/{take_id}/export` | `GET /ui/jobs/{job_id}/events` |
+| `SessionSaveBar` | `POST /ui/workshop/sessions` | `GET /ui/workshop/sessions/{session_id}` |
+| `BlindPlayerPanel` | `GET /ui/eval/assignments/{assignment_id}` | none |
+| `RatingForm` | `POST /ui/eval/assignments/{assignment_id}/submit` | duplicate-QC flag payload |
+| `ModelSlotTable` | `GET /admin/models`, `POST /admin/load_model` | `GET /admin/health`, `GET /admin/telemetry` |
+| `RuntimeContractViewer` | `GET /admin/runtime_contract` | none |
+| `PolicyEditor` | `POST /admin/policy` | `GET /admin/audit` |
 
 
 ## Screen Interaction Contracts
@@ -507,6 +914,53 @@ Worker 12 is not complete when screens merely render. It is complete only when:
 4. a rater can finish a blinded assignment without seeing system or baseline identity
 5. an admin can reconstruct who changed what and why for every audit-critical object
 6. browser refresh or reconnect does not lose job visibility or corrupt critical state
+
+
+## PR / Delivery Breakdown
+
+Worker 12 implementation should be split into reviewable PRs rather than one large drop.
+
+### PR 1: App Shell and API Client
+
+- add `app.py` navigation shell
+- add `api_client.py`
+- add auth/session scaffolding
+- add shared job polling / event subscription helpers
+
+### PR 2: Upload and Dataset Operations
+
+- implement `UploadPage`
+- implement `DatasetsPage`
+- wire upload/register/run/resume/stop/export actions
+- ship dataset health summary cards
+
+### PR 3: Curation Queue
+
+- implement queue table and saved filters
+- implement record inspector and editors
+- implement optimistic-lock handling and audit timeline rendering
+
+### PR 4: Drama Workshop
+
+- implement generation toolbar and take board
+- implement casting gallery
+- implement session revision save / load
+- implement compare player and export actions
+
+### PR 5: Evaluation Arena
+
+- implement blind assignment player
+- implement rating form and QC behavior
+- implement submission receipt and admin export view
+
+### PR 6: Admin and Audit
+
+- implement model-slot management
+- implement runtime contract viewer
+- implement policy editor
+- implement stuck-job and audit inspection panels
+
+Each PR must include contract tests for the routes it consumes so the UI does not silently drift from Worker 04.
 
 
 ## Delivery Slices
