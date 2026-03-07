@@ -7,7 +7,8 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
 
 ## Primary Files
 
-- `tmrvc-train/src/tmrvc_train/dataset/uclm_dataset.py`
+- `tmrvc-data/src/tmrvc_data/uclm_dataset.py`
+- `tmrvc-data/src/tmrvc_data/tts_dataset.py`
 - `tmrvc-train/src/tmrvc_train/cli/train_uclm.py`
 - `tmrvc-data/src/tmrvc_data/g2p.py`
 - `tmrvc-data/src/tmrvc_data/alignment.py`
@@ -25,6 +26,7 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
 - expressive supervision coverage is measurable before training starts
 - local-model pseudo-annotation pipeline is defined for raw short-utterance corpora
 - multilingual and code-switch readiness is measurable before training starts
+- bootstrap alignment projection from ASR timestamps into canonical phoneme space is deterministic and measurable
 
 
 ## Concrete Tasks
@@ -60,7 +62,8 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
 8. Define the loading contract for curated subsets:
    - consume `text`, `language`, and `phoneme_ids` from exported cache
    - consume `speaker_cluster` and `speaker_embedding` from metadata
-   - consume `dialogue_context_embeddings` if pre-encoded
+   - consume raw conversation graph / context text as the canonical dialogue-context source
+   - allow optional derived context caches only when versioned by encoder/checkpoint hash
    - consume `quality_score` for dynamic batch filtering
 9. Define quality filtering policy for the data loader:
    - allow runtime thresholding based on `quality_score`
@@ -90,6 +93,11 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - preserve normalized text alongside canonical phoneme ids
    - allow byte-level or grapheme-level fallback artifacts when G2P confidence is too low
    - mark fallback mode explicitly in metadata so training/validation can stratify on it
+14. Define canonical bootstrap-alignment projection artifacts:
+   - preserve raw ASR token/word timestamps for provenance
+   - deterministically project those timestamps onto canonical `phoneme_ids`
+   - export `bootstrap_alignment.json` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance
+   - fail validation if projection skips, reorders, or ambiguously duplicates canonical text units
 
 
 ## Important Design Decision
@@ -171,6 +179,25 @@ Worker 03 must define a safety path for multilingual and code-switch instability
   - silently emitting large `UNK` spans without preserving enough text to recover later
 
 This fallback is a Stage B-or-later safety valve, not permission to abandon the canonical phoneme contract in initial mainline training.
+
+
+## Bootstrap Alignment Projection Policy
+
+Bootstrap alignment is transitional supervision, not a hidden replacement for the pointer model.
+
+- canonical source:
+  - normalized text
+  - canonical `phoneme_ids`
+  - ASR token/word timestamps retained for provenance
+- required derived artifact:
+  - `bootstrap_alignment.json` already indexed in canonical phoneme space
+  - projection must use **Acoustic-Aware Phoneme Boundary Heuristics** (e.g., energy flux or spectral changes) rather than naive uniform time-splitting, to provide sharper initial targets for pointer learning.
+- ownership split:
+  - Worker 03 defines deterministic projection and validation rules
+  - Worker 10 exports the validated artifact
+  - Worker 02 consumes it and may densify it to frame-level loss targets
+- forbidden behavior:
+  - handing Worker 02 raw ASR timestamps and leaving phoneme projection implicit
 
 
 ## Alias Mapping Specification
@@ -278,6 +305,8 @@ Fail / warn policy:
 - do not leave transcript-supervised but non-normalized records ambiguous; they are not mainline-trainable until canonical text units exist
 - do not claim multilingual readiness from utterance-level language labels alone if code-switching is in scope
 - do not silently hide G2P instability behind `UNK`; preserve normalized text and fallback markers
+- do not make model-coupled pre-encoded dialogue embeddings part of the canonical dataset contract
+- do not export bootstrap alignment that is not already projected into canonical phoneme-index space
 
 
 ## Handoff Contract
@@ -302,3 +331,5 @@ Fail / warn policy:
 - cross-file speaker clustering field presence test
 - multilingual/code-switch report field-completeness test
 - G2P fallback reporting test
+- bootstrap-alignment projection determinism test
+- canonical context-graph fields present even when no derived context cache is exported

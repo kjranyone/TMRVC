@@ -35,6 +35,7 @@ Each sample should be scored on:
 - language consistency
 - duration sanity
 - separation damage estimate
+- separation confidence
 - style / event extraction completeness
 - audio technical quality
 
@@ -82,6 +83,15 @@ Not all promoted data belong in the same training path.
 
 1. Define score weights and threshold config.
 2. Define bucket-specific promotion policy.
+   - initial mainline rule:
+     - separation-derived waveforms are annotation aids, not default waveform teachers
+   - `vc_prior` may consume labels or metadata recovered from separation, but not separated waveform teachers in the initial mainline
+   - any future use of separated waveforms as teachers must live in an explicit research / ablation bucket gated by:
+     - high `separation_confidence`
+     - low `waveform_artifact_score`
+     - speaker/timbre preservation pass
+     - explicit human approval
+   - `tts_mainline` does not auto-adopt separation-derived waveform teachers in the initial mainline
 3. Define anti-contamination rules:
    - holdout must not leak into train
 4. Encode legality gates into promotion policy.
@@ -102,6 +112,8 @@ Not all promoted data belong in the same training path.
 - do not use one scalar score without rejection reasons
 - do not promote mixed-quality data into one main bucket
 - do not treat VC-usable data as automatically TTS-usable
+- do not let high separation confidence bypass waveform-artifact or timbre-damage checks
+- do not let separated waveforms silently enter initial mainline teacher sets
 - do not let workers invent bucket thresholds ad hoc
 - do not leave human override rules implicit if the UI exposes promotion controls
 

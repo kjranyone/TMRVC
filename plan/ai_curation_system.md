@@ -114,6 +114,23 @@ The curation system must produce:
 
 ## Stage Intent
 
+### Stage-to-Worker Mapping
+
+| Stage | Stage Name | Owning Worker |
+|-------|-----------|---------------|
+| 0 | Ingest | Worker 07 |
+| 1 | Cleanup | Worker 07 |
+| 2 | Separation / Enhancement | Worker 08 |
+| 3 | Speaker Structure Recovery | Worker 08 |
+| 4 | Transcript Recovery | Worker 08 |
+| 5 | Transcript Refinement | Worker 08 |
+| 6 | Prosody / Event Recovery | Worker 08 |
+| 7 | Quality Scoring | Worker 09 |
+| 8 | Promotion / Review / Rejection | Worker 09 |
+| 9 | Export | Worker 10 |
+
+Worker 11 validates all stages. Worker 12 provides the HITL interface for stages 7-9.
+
 ### Ingest
 
 Intent:

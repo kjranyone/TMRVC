@@ -24,6 +24,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 - v2 legacy behavior may remain, but only as compatibility or ablation mode.
 - online MAS/CTC or bootstrap labels may assist training only as auxiliary or transitional supervision; they must not become a permanent release dependency for pointer progression
 - Python / Rust / ONNX / VST must consume one shared serializable contract owned in `tmrvc-core`, not re-declare it independently
+- all human-operated workflows from dataset ingest/upload through curation, export, audition, and evaluation must be available from the WebUI without requiring CLI usage
 
 
 ## Execution Reality
@@ -31,7 +32,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 - plans must target the existing monorepo structure first
 - shared runtime and tensor contracts live in `tmrvc-core`
 - dataset and cache contracts live in `tmrvc-data`
-- the existing control plane is `tmrvc-gui` (PySide6 / Qt); worker 12 extends that surface rather than assuming a greenfield UI stack
+- the repository currently contains `tmrvc-gui` (PySide6 / Qt), but the v3 HITL control plane is a separate Gradio/WebUI mainline because multi-user audit, blind evaluation, and role separation are first-class requirements
 
 
 ## Target End State
@@ -39,7 +40,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 ### Training
 
 - dataset can train TTS without `durations.npy`
-- trainer supports pointer loss and alignment loss
+- trainer supports pointer loss and optional auxiliary alignment regularization
 - model can learn online text progression
 - classifier-free guidance compatible training is built into the mainline conditioning path
 - codec/token hierarchy is explicit rather than treated as one undifferentiated token stream
@@ -63,6 +64,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 
 - `dev.py` separates `v2 legacy` and `v3 pointer`
 - docs and test suites reflect v3 as the default forward path
+- human operators do not need `dev.py` or any CLI for normal ingest / review / evaluation workflows
 
 
 ## Worker Split
@@ -98,7 +100,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 - `worker_11_curation_validation.md`
   - curation system evaluation and acceptance
 - `worker_12_gradio_control_plane.md`
-  - GUI control plane, interactive drama workshop, and HITL evaluation arena on top of the existing `tmrvc-gui`
+  - Gradio/WebUI control plane for interactive drama workshop, HITL evaluation, and auditable human workflows
 
 ## Recommended Execution Order
 
@@ -137,7 +139,7 @@ This directory is intended for parallel execution by multiple workers. Each work
 
 - worker 01 blocks worker 02 and worker 04 on interface names
 - worker 03 blocks worker 02 on dataset batch contract
-- worker 02 blocks worker 04 on checkpoint schema
+- worker 02 blocks worker 04 on checkpoint schema and blocks worker 12 on training artifacts and evaluation data
 - worker 04 blocks worker 05 and worker 12 on final CLI/API/Admin flags and blocks worker 06 on runtime/export parity targets
 - worker 06 depends on all workers for final integration
 - worker 07 blocks worker 08, worker 09, and worker 10 on manifest contract
@@ -148,23 +150,22 @@ This directory is intended for parallel execution by multiple workers. Each work
 ### Core v3 Path
 
 ```text
-worker_01_architecture
-        | \
-        |  \
-        v   v
-worker_03_dataset_alignment   worker_04_serving
-        |                      ^ |
-        v                      | v
-worker_02_training ------------|--> worker_12_gradio
-        |                            (UI Control Plane)
-        v
-worker_06_validation
+worker_01_architecture   worker_03_dataset_alignment
+        |   \                      |
+        |    \                     |
+        v     +-------+    +------+
+worker_04_serving     |    |
+        |             v    v
+        |       worker_02_training ---> worker_12_gradio
+        |             |                 (WebUI Control Plane)
+        v             v
+     worker_06_validation
 ```
 
-- `worker_01` fixes the canonical model/runtime contract.
-- `worker_03` defines what training batches and cache records look like.
-- `worker_02` builds the trainable v3 path on top of those contracts.
-- `worker_04` consumes the final model/checkpoint/runtime contract across Python serve, Rust engine, ONNX export, and VST.
+- `worker_01` and `worker_03` may start in parallel: `worker_01` fixes the model/runtime contract; `worker_03` fixes the dataset/batch contract.
+- `worker_02` depends on both `worker_01` (pointer/state interfaces) and `worker_03` (batch/cache schema).
+- `worker_04` consumes the final model/checkpoint/runtime contract across Python serve, Rust engine, ONNX export, and VST. It also depends on `worker_02` for checkpoint schema.
+- `worker_12` depends on `worker_02` (training artifacts) and `worker_04` (runtime/admin APIs).
 - `worker_06` is the final proof layer for the integrated v3 path.
 
 ### AI Curation Path
@@ -291,6 +292,7 @@ Use this section as the handoff gate. A worker should not start coding until its
 
 - `docs/design/architecture.md`
 - `docs/design/unified-codec-lm.md`
+- `docs/design/external-baseline-registry.md`
 - shared pointer / `voice_state` / cache-state schema in `tmrvc-core`
 - model and training code for pointer-based TTS
 - serving/runtime/export code for pointer-based TTS across Python, Rust, ONNX, and VST

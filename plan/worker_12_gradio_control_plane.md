@@ -13,7 +13,7 @@ The WebUI is the "cockpit" where humans make the final calls on acting quality a
 - `tmrvc-gui/src/tmrvc_gui/app.py` (Gradio entrypoint)
 - `tmrvc-gui/src/tmrvc_gui/components/` (Reusable Gradio blocks)
 - `tmrvc-serve/src/tmrvc_serve/routes/admin.py` (UI-specific management APIs)
-- `docs/design/gui-design.md`
+- `plan/worker_12_gradio_control_plane.md` (authoritative UI contract)
 
 ## Required Outcomes
 
@@ -90,6 +90,460 @@ The UI must not assume one super-user does every step.
   - whether double approval is required for `tts_mainline`
   - which actions are audit-critical
 
+
+## Screen Map
+
+The initial WebUI must be split into the following top-level screens:
+
+1. `Upload`
+   - browser upload of raw audio assets
+   - server-side dataset registration
+   - legality / provenance assignment
+   - upload-job and ingest-job status
+2. `Datasets`
+   - dataset list
+   - health metrics
+   - split overview
+   - curation-run launch / resume / stop controls
+3. `Curation Queue`
+   - manifest browser
+   - review queue
+   - transcript / language / speaker correction
+   - promotion / rejection actions with audit notes
+4. `Drama Workshop`
+   - TTS generation
+   - take generation and comparison
+   - speaker casting gallery
+   - control sweeps and saveable sessions
+5. `Evaluation Arena`
+   - blind A/B session launch
+   - rater assignment
+   - rating form
+   - QC monitoring and result export
+6. `Admin`
+   - model load / unload
+   - runtime contract inspection
+   - policy settings
+   - telemetry and audit viewer
+
+
+## Role Access Matrix
+
+Minimum page-level access policy:
+
+| Role | Upload | Datasets | Curation Queue | Drama Workshop | Evaluation Arena | Admin |
+|---|---|---|---|---|---|---|
+| `annotator` | view | view | edit assigned records | no | no | no |
+| `auditor` | view | view | review / promote / reject by policy | view | no | no |
+| `director` | no | view | view | full | view own review sessions | no |
+| `rater` | no | no | no | no | assigned blind sessions only | no |
+| `admin` | full | full | full | full | full | full |
+
+Worker 12 must also define record-level permission checks so page access alone is not the only gate.
+
+
+## WebUI API Contract
+
+Worker 12 must not guess backend routes. The following API groups must exist and be documented.
+
+### Dataset / Upload APIs
+
+- `POST /ui/datasets/upload`
+  - multipart upload of raw audio or archive
+- `POST /ui/datasets/register`
+  - register existing server-side path
+- `GET /ui/datasets`
+  - list datasets and ingest status
+- `GET /ui/datasets/{dataset_id}`
+  - dataset metadata and health summary
+
+### Curation Orchestration APIs
+
+- `POST /ui/curation/runs`
+  - create or start curation run
+- `POST /ui/curation/runs/{run_id}/resume`
+- `POST /ui/curation/runs/{run_id}/stop`
+- `GET /ui/curation/runs/{run_id}`
+  - run status, stage progress, failures
+- `GET /ui/curation/records`
+  - filtered manifest query
+- `POST /ui/curation/records/{record_id}/action`
+  - review / promote / reject / edit with audit note
+
+### Workshop / Generation APIs
+
+- `POST /ui/workshop/generate`
+  - create one or many takes
+- `POST /ui/workshop/takes/{take_id}/pin`
+- `POST /ui/workshop/takes/{take_id}/export`
+- `POST /ui/workshop/sessions`
+  - save session state
+- `GET /ui/workshop/sessions/{session_id}`
+- `POST /ui/workshop/casting_gallery`
+  - save speaker profile
+
+### Evaluation APIs
+
+- `POST /ui/eval/sessions`
+  - create blinded evaluation session
+- `GET /ui/eval/assignments/{assignment_id}`
+- `POST /ui/eval/assignments/{assignment_id}/submit`
+- `GET /ui/eval/sessions/{session_id}/results`
+
+### Admin / Policy APIs
+
+- `GET /admin/health`
+- `GET /admin/telemetry`
+- `POST /admin/load_model`
+- `GET /admin/models`
+- `GET /admin/runtime_contract`
+- `GET /admin/audit`
+- `POST /admin/policy`
+
+
+## Frontend Module Layout
+
+The Gradio app should be split into explicit modules so page logic does not collapse into one monolith:
+
+- `tmrvc_gui/app.py`
+  - bootstraps auth/session wiring, shared API client, and top-level navigation
+- `tmrvc_gui/pages/upload.py`
+  - upload form, legality metadata editor, upload-job progress
+- `tmrvc_gui/pages/datasets.py`
+  - dataset table, health dashboards, split manager, curation run controls
+- `tmrvc_gui/pages/curation_queue.py`
+  - review queue, manifest editor, waveform/transcript inspector
+- `tmrvc_gui/pages/drama_workshop.py`
+  - generation form, take board, compare player, casting gallery
+- `tmrvc_gui/pages/evaluation_arena.py`
+  - blind assignment player, scoring form, rater QC, export actions
+- `tmrvc_gui/pages/admin.py`
+  - model admin, runtime contract viewer, telemetry, audit browser
+- `tmrvc_gui/components/`
+  - reusable `audio_player`, `waveform_view`, `record_editor`, `take_card`, `audit_timeline`, `status_badge`
+- `tmrvc_gui/state/`
+  - lightweight session cache, optimistic-lock tokens, saved filter helpers
+- `tmrvc_gui/api_client.py`
+  - typed wrapper for all `/ui/*` and `/admin/*` routes
+
+Worker 12 must define page modules early so future UI work does not re-encode business rules in ad hoc callbacks.
+
+
+## Screen Interaction Contracts
+
+Each top-level screen must publish its minimal operator flow, primary objects, and blocking conditions.
+
+### `Upload`
+
+- primary objects:
+  - `upload_job`
+  - `dataset`
+- operator flow:
+  1. choose files or archive
+  2. assign legality / provenance / owner metadata
+  3. submit upload
+  4. monitor checksum, unpack, and registration progress
+  5. confirm resulting dataset record
+- blocking conditions:
+  - unknown legality state
+  - duplicate dataset fingerprint without admin override
+  - failed checksum / archive validation
+
+### `Datasets`
+
+- primary objects:
+  - `dataset`
+  - `curation_run`
+  - `split_assignment`
+- operator flow:
+  1. inspect health summary
+  2. fix missing metadata or split-gate issues
+  3. launch / resume / stop curation
+  4. inspect run stage progress and failures
+  5. export approved subsets
+- blocking conditions:
+  - unresolved legality issue
+  - holdout leakage warning not explicitly acknowledged
+  - curation run already owned by another active operator when manual intervention is required
+
+### `Curation Queue`
+
+- primary objects:
+  - `manifest_record`
+  - `review_action`
+  - `audit_event`
+- operator flow:
+  1. load assigned queue or saved filter
+  2. inspect audio, transcript, diarization, context
+  3. edit transcript / language / speaker fields
+  4. approve, reject, or send back for refinement with note
+  5. release lock and move to next record
+- blocking conditions:
+  - stale edit token
+  - missing rationale for audit-critical action
+  - conflicting active editor unless admin override is recorded
+
+### `Drama Workshop`
+
+- primary objects:
+  - `workshop_session`
+  - `speaker_profile`
+  - `take`
+- operator flow:
+  1. select text, actor, and context
+  2. choose control preset or manual 8-D values
+  3. generate one or many takes
+  4. compare, rank, pin, annotate
+  5. export winning take or save session for later
+- blocking conditions:
+  - runtime contract mismatch with saved session version
+  - requested model unavailable
+  - generation quota or GPU admission denied
+
+### `Evaluation Arena`
+
+- primary objects:
+  - `eval_session`
+  - `eval_assignment`
+  - `rating_submission`
+- operator flow:
+  1. admin creates blinded session
+  2. rater receives assignment
+  3. rater listens, scores, and submits
+  4. system performs QC checks
+  5. admin exports locked result bundle
+- blocking conditions:
+  - assignment expired or already submitted
+  - duplicate QC item unanswered
+  - baseline registry mismatch with Worker 06 pinned artifact set
+
+### `Admin`
+
+- primary objects:
+  - `runtime_contract`
+  - `model_slot`
+  - `policy_snapshot`
+  - `audit_query`
+- operator flow:
+  1. inspect health and telemetry
+  2. load / unload models
+  3. view runtime contract and policy version
+  4. inspect audit trail and stuck jobs
+  5. apply policy changes with rationale
+- blocking conditions:
+  - dirty runtime state incompatible with hot-swap
+  - policy change missing rationale
+  - model artifact missing validation signature
+
+
+## State Model
+
+The WebUI must persist at least the following entities:
+
+- `dataset`
+  - source, legality, upload status, health summary
+- `upload_job`
+  - file count, bytes, progress, failure reason
+- `curation_run`
+  - stage, progress, retry count, operator
+- `manifest_filter_state`
+  - saved filters for reviewers
+- `speaker_profile`
+  - prompt asset, speaker embedding, metadata, owner
+- `workshop_session`
+  - text, controls, context, selected actor, active model
+- `take`
+  - waveform artifact, seed, cfg, pacing controls, ranking, export status
+- `eval_session`
+  - protocol version, baseline id, prompt set, assignment policy
+- `eval_assignment`
+  - rater, sample order, duplicate items, completion state
+- `audit_event`
+  - actor, action, object, before, after, rationale
+
+
+## Long-Running Job Contract
+
+The WebUI must treat upload, curation, export, and evaluation materialization as first-class jobs rather than one request/response callbacks.
+
+- canonical job states:
+  - `queued`
+  - `running`
+  - `blocked_human`
+  - `failed_retryable`
+  - `failed_terminal`
+  - `completed`
+  - `canceled`
+- every job payload must include:
+  - `job_id`
+  - `job_type`
+  - `state`
+  - `progress_percent`
+  - `stage_name`
+  - `owner_role`
+  - `owner_id`
+  - `started_at`
+  - `updated_at`
+  - `retry_count`
+  - `retryable`
+  - `failure_code`
+  - `failure_message`
+  - `next_human_action`
+- Worker 12 must support:
+  - poll mode via `GET`
+  - event mode via SSE or WebSocket
+  - page restore after browser refresh using persisted `job_id`
+
+The UI must never lose visibility into a job because a browser tab was closed.
+
+
+## Concurrency and Locking Policy
+
+WebUI state must stay correct under multiple simultaneous operators.
+
+- reviewable objects (`manifest_record`, `policy_snapshot`, `eval_assignment`) require optimistic locking
+- edit forms must submit:
+  - `object_version`
+  - `edit_session_id`
+  - `last_seen_at`
+- server must return explicit lock outcomes:
+  - `accepted`
+  - `stale_version`
+  - `locked_by_other`
+  - `policy_forbidden`
+- `manifest_record` editing policy:
+  - soft lock on open
+  - idle timeout releases soft lock
+  - admin may force-take with audit note
+- `eval_assignment` policy:
+  - single active rater session
+  - no reassignment after first scored item unless session is voided with reason
+- `workshop_session` policy:
+  - collaborative viewing is allowed
+  - write operations create a new session revision rather than mutating another user's pinned run in place
+
+
+## Notifications and Failure Recovery
+
+The WebUI must expose actionable failure handling instead of raw tracebacks.
+
+- user-visible notification classes:
+  - `info`
+  - `success`
+  - `warning`
+  - `action_required`
+  - `error`
+- every `failed_retryable` job must surface:
+  - human-readable cause
+  - retry button if policy allows
+  - last successful stage
+  - recommended owner role for resolution
+- every `failed_terminal` job must surface:
+  - immutable failure snapshot
+  - linked audit event
+  - escalation path to admin
+- browser refresh or reconnect must restore:
+  - current page filters
+  - selected record or session
+  - active audio compare selection
+  - in-flight job cards
+
+
+## Artifact Lifecycle
+
+Worker 12 must distinguish temporary audition assets from durable release artifacts.
+
+- `take` retention classes:
+  - `ephemeral`
+  - `pinned`
+  - `exported`
+- `ephemeral` takes may be GC'd after TTL
+- `pinned` takes require owner and note
+- `exported` takes require provenance snapshot:
+  - model id
+  - runtime contract version
+  - seed
+  - guidance mode
+  - voice-state controls
+  - speaker profile id or prompt hash
+- dataset export bundles and evaluation result bundles must show:
+  - artifact id
+  - creation time
+  - source dataset / eval session
+  - retention policy
+  - download status
+
+
+## Audit Event Contract
+
+Every UI-originated critical action must persist this minimum schema:
+
+```json
+{
+  "event_id": "uuid",
+  "actor_role": "auditor",
+  "actor_id": "user_123",
+  "action": "promote_record",
+  "object_type": "manifest_record",
+  "object_id": "record_456",
+  "before_state": {...},
+  "after_state": {...},
+  "reason_note": "approved after transcript fix",
+  "session_id": "ui_session_789",
+  "timestamp": "2026-03-07T12:34:56Z"
+}
+```
+
+This schema must be shared with Worker 07 / Worker 11 so audit reconstruction is lossless.
+
+
+## Definition of Done
+
+Worker 12 is not complete when screens merely render. It is complete only when:
+
+1. a human can upload raw assets and register a dataset without shell access
+2. a reviewer can edit and promote records with conflict-safe locking and durable audit events
+3. a director can generate, compare, and export takes entirely from the browser
+4. a rater can finish a blinded assignment without seeing system or baseline identity
+5. an admin can reconstruct who changed what and why for every audit-critical object
+6. browser refresh or reconnect does not lose job visibility or corrupt critical state
+
+
+## Delivery Slices
+
+Worker 12 should ship in the following slices:
+
+### Slice A: Operations MVP
+
+- `Upload`
+- `Datasets`
+- `Curation Queue`
+- minimal `Admin`
+
+Goal:
+- dataset upload / registration
+- curation run control
+- review / promote / reject
+- export trigger
+
+### Slice B: Workshop MVP
+
+- `Drama Workshop`
+- `Casting Gallery`
+- take generation / compare / pin
+
+Goal:
+- browser-only audition workflow for directors
+
+### Slice C: Evaluation MVP
+
+- `Evaluation Arena`
+- rater assignment
+- QC and result export
+
+Goal:
+- release-signoff blind evaluation without CLI
+
 ## Human Workflow Contract
 
 The UI must cover the full human loop:
@@ -133,3 +587,8 @@ Each step must record:
 - Concurrent user test for the Evaluation Arena (simple multi-user check).
 - audit-trail persistence test for approval and rating actions
 - role-gating smoke test for `annotator` / `auditor` / `director` / `admin`
+- upload-job resume test after browser reconnect
+- optimistic-lock conflict test for manifest record editing
+- workshop-session revision test for concurrent pin / save actions
+- artifact-retention test for `ephemeral` vs `pinned` vs `exported` takes
+- failure-recovery test that retryable jobs surface actionable UI state

@@ -61,6 +61,15 @@ The UCLM v3 core must adopt SOTA LLM practices:
 - **Normalization:** **RMSNorm** with pre-norm configuration for training stability.
 - **Training Acceleration:** Native **Flash Attention 2** support.
 
+RoPE integration must be specified together with pointer execution:
+
+- freeze how decoder-side attention interprets stalled or advanced pointer positions against RoPE-encoded text memory
+- define whether cross-attention uses:
+  - pointer-relative positional bias, or
+  - an equivalent pointer-conditioned masking / biasing scheme
+- define how repeated stall frames avoid drifting the effective text-position semantics
+- define how skip-protection and force-advance update the effective relative-position reference so cached text memory remains coherent
+
 ### Pointer State
 
 Per batch item:
@@ -80,6 +89,14 @@ Worker 01 must also freeze the invariants:
 - `progress_value` clamp/reset behavior is explicit
 - EOS / stop behavior at the final text unit is explicit
 - recovery behavior after pathological prolonged hold is explicit and serializable
+- force-advance semantics are explicit:
+  - how `progress_value` is reset or clipped
+  - how `acoustic_history` continuity is preserved to avoid audible discontinuity
+  - how the runtime marks `forced_advance` in telemetry and serialized state
+- the advance decision rule is numeric and deterministic:
+  - thresholding / comparison method for `advance_logit` or `advance_prob`
+  - tie-break behavior at equality or near-equality
+  - parity-safe handling of denormals / rounding across Python and Rust
 
 ### Pointer Outputs
 
@@ -87,10 +104,13 @@ Model forward output must support:
 
 - `logits_a`
 - `logits_b`
-- `advance_logit`
+- `advance_logit` (canonical key name for pointer advance logits; `pointer_logits` must not be used as the primary key)
 - `progress_delta`
-- optional `boundary_confidence`
+- optional `boundary_confidence` (must be model-predicted, not a dummy zero tensor)
 - optional `legacy_log_durations`
+- `hidden_states` (for downstream diagnostics and diversity loss)
+
+The streaming forward path (`forward_streaming`) must also produce `advance_logit` and `progress_delta` via the pointer head. Omitting the pointer head from streaming makes pointer-driven runtime progression impossible.
 
 ### Acting Control Inputs
 
@@ -99,12 +119,14 @@ The architecture must reserve explicit inputs for:
 - `explicit_voice_state` (`[B, T, 8]` or `[B, 8]`)
 - `delta_voice_state` (`[B, T, 8]` or `[B, 8]`)
 - optional `ssl_voice_state`
-- **`style_guidance_embedding`** (for CFG-based acting control)
+- `cfg_scale` (scalar guidance weight applied at the transformer level; replaces a dedicated `style_guidance_embedding` input)
 - dialogue context embedding
 - utterance-level acting intent
 - local prosody latent
 - turn-taking pressure or interruption pressure
 - phrase-boundary / breath tendency
+
+CFG-based acting control is achieved by scaling between conditional and unconditional forward passes using `cfg_scale`, not by injecting a separate style guidance embedding. The unconditional pass is produced by zeroing out `explicit_voice_state`, `ssl_voice_state`, `speaker_embed`, and `dialogue_context` conditioning inputs during the forward pass.
 
 `state_cond` may remain as an internal fused representation, but it must not be the only documented public conditioning contract.
 
@@ -129,14 +151,26 @@ Initial v3 mainline must preserve the project rule that explicit 8-D physical co
 
 `dialogue_context` in v3 mainline is text-side context, not raw waveform.
 
-- representation: encoded previous-turn text/context embeddings with turn-role markers
-- shape: `[B, C_ctx, d_model]`
+- canonical multi-turn representation: encoded previous-turn text/context embeddings with turn-role markers
+- canonical shape: `[B, C_ctx, d_model]`
+- reduced form after pooling: `[B, d_model]`
 - contents:
   - previous turn text tokens after text encoder
   - speaker/role embedding per turn
   - optional scene/context tag embedding
 
+The multi-turn `[B, C_ctx, d_model]` form is the canonical API-boundary contract. Internal projectors (e.g. `DialogueContextProjector`) may pool or reduce to `[B, d_model]` before injection into frame features. Both forms must be supported: the 3D form for full context fidelity, and the 2D pooled form as a convenience shorthand.
+
 This keeps the runtime causal and bounded in VRAM. Raw prior audio is not the default dialogue-context modality.
+
+VC semantic-context policy:
+
+- VC does not adopt the TTS pointer loop by default
+- VC must still expose a semantic-context path combining:
+  - semantic features extracted from source audio, and
+  - optional text / dialogue context from surrounding turns
+- Worker 01 must document the fusion site, such as bounded cross-attention from VC semantic features into dialogue-context memory
+- this path must remain causal and must not force offline look-ahead into the VC runtime
 
 Canonical export policy:
 
@@ -167,14 +201,43 @@ Training and runtime must use the same conceptual state machine:
 
 Worker 01 must freeze this state-transition contract so Worker 04 does not invent a different runtime loop.
 
+### Codec / Token Hierarchy
+
+Worker 01 must explicitly choose the initial mainline token schedule instead of leaving `n_codebooks` implicit.
+
+**Frozen initial v3 policy: flattened per-frame multi-codebook prediction.**
+
+Rationale:
+
+- the existing codebase predicts `n_codebooks=8` acoustic tokens (stream A) and `n_slots=4` control tokens (stream B) per frame simultaneously
+- a flattened schedule keeps the 10 ms frame contract simple and avoids sub-step latency
+- hierarchical/delayed prediction may be revisited as a future quality improvement, but must not be the initial v3 mainline to avoid scope creep
+
+Flattened policy details:
+
+- all codebook slots within one frame step are predicted in parallel by the transformer
+- pointer advancement couples to frame progression only (one frame = one pointer step opportunity)
+- CFG applies at the frame level across all codebook slots simultaneously
+- waveform-decoder quality gates evaluate full-frame codec token tuples, not individual codebook slots
+
+Interaction rules:
+
+- pointer pacing: coupled to frame steps only
+- CFG: applied to the full logits output per frame
+- waveform-decoder quality: evaluated on complete frame-level token tuples
+
 ### Local Prosody Latent and Prosody Predictor
 
 `local_prosody_latent` is separate from `dialogue_context`.
 
 - purpose: local delivery shape within the current utterance
 - shape:
-  - utterance-global form: `[B, d_prosody]`, or
-  - time-local planning form: `[B, T_plan, d_prosody]`
+  - utterance-global form: `[B, d_prosody]` (canonical for initial v3)
+  - time-local planning form: `[B, T_plan, d_prosody]` (future extension)
+
+**Frozen initial v3 policy: utterance-global `[B, d_prosody]`.**
+
+The `ProsodyPredictor` outputs `[B, d_prosody]`. When injecting into frame features via `DialogueContextProjector`, the projector must handle the 2D `[B, d_prosody]` input by broadcasting over the time dimension (unsqueeze to `[B, 1, d_prosody]`). The projector must also accept the 3D `[B, T, d_prosody]` form for future time-local planning without code changes.
 
 **Prosody Predictor Requirement:**
 The architecture must include a **Flow-matching based Prosody Predictor** that predicts the `local_prosody_latent` from text tokens and dialogue context during inference.
@@ -186,8 +249,6 @@ The architecture must include a **Flow-matching based Prosody Predictor** that p
   - Predictor generates the latent in a single ODE-step (or N-step for higher quality).
   - Optional: Manual override or sampling for diversity.
 
-Worker 01 must document which form is canonical for initial v3 implementation and define the interface for the Prosody Predictor.
-
 ### Speaker Prompting and Timbre-Prosody Disentanglement (Zero-Shot / Few-Shot)
 
 To support SOTA zero-shot/few-shot voice cloning while maintaining drama-grade acting, the architecture must abandon static speaker IDs in favor of an **In-Context Prompting** paradigm, combined with explicit disentanglement.
@@ -195,8 +256,27 @@ To support SOTA zero-shot/few-shot voice cloning while maintaining drama-grade a
 - **Acoustic & Text Prompting:** The model must accept `prompt_codec_tokens` (and optionally `prompt_text_tokens`) representing a 3-10 second reference audio clip. This serves as the in-context acoustic conditioning for the Codec LM.
 - **Speaker Encoder (Global Timbre):** A dedicated `Speaker Encoder` (e.g., integrating pre-trained WavLM/Wespeaker or a custom neural feature extractor) to extract a highly robust continuous `speaker_embed` from the prompt audio.
 - **Disentanglement Constraint:** The model must explicitly disentangle *Timbre* from *Prosody*. When cloning a voice from a neutral read speech prompt, the model must borrow only the timbre from the `speaker_embed` and `prompt_codec_tokens`, while allowing the `dialogue_context` and the `Prosody Predictor` to override the acting/prosody.
+- **Disentanglement Bottleneck:** To enforce this separation, the `Speaker Prompt Encoder` must incorporate an Information Bottleneck or Vector Quantization (VQ) layer, ensuring that attention mechanisms are restricted to low-frequency timbre components and cannot silently copy the prompt's prosody.
 
-Worker 01 must define the injection points for prompt tokens and ensure the attention masks prevent the prompt's neutral prosody from flattening the target utterance's dramatic intent.
+Worker 01 must define the injection points for prompt tokens and ensure the attention masks (and bottleneck layers) prevent the prompt's neutral prosody from flattening the target utterance's dramatic intent.
+
+**SpeakerPromptEncoder modernization scope:** The `SpeakerPromptEncoder` is a lightweight utility module (2-layer encoder) and is explicitly excluded from the RoPE/GQA/SwiGLU modernization requirement. The modernized transformer backbone applies to `CodecTransformer` (the main decoder). The prompt encoder may adopt modern components later if prompt encoding becomes a quality bottleneck, but this is not a v3 initial mainline requirement.
+
+### Waveform Decoder / Vocoder
+
+The architecture must plan for the waveform decoder as a first-class quality bottleneck.
+
+- initial v3 policy:
+  - the codec decoder (inverse RVQ + neural vocoder) is the primary waveform generation path
+  - decoder quality is evaluated as part of the end-to-end TTS quality gate, not assumed from token-level metrics alone
+- candidates for enhancement (future):
+  - `Vocos` (fast neural vocoder)
+  - `HiFi-GAN` variants
+  - codec-native decoders from `Encodec` / `DAC`
+- streaming budget:
+  - waveform decoding must complete within the 10 ms frame budget for real-time use
+  - if an enhanced decoder exceeds this budget, a fast fallback path must exist
+- Worker 04 must define the runtime decoder selection policy and Worker 06 must include waveform artifact metrics in the quality gate
 
 ## Concrete Tasks
 
@@ -243,6 +323,8 @@ Worker 01 must define the injection points for prompt tokens and ensure the atte
      - expressive VC may consume a pacing-control analogue or pointer-conditioned semantic plan
    - explicit non-goal for initial v3:
      - do not force VC onto the TTS pointer path if it adds latency or architectural bloat without a validated benefit
+   - required semantic-context path:
+     - define how VC semantic features cross-attend to optional dialogue/text context
 15. Specify anti-collapse expectations:
    - same text under different context must not map to a single delivery due to dialogue-context and prosody-latent variation.
    - Zero-shot prompting must not flatten the acting; same text under different context must still vary despite using the exact same speaker prompt.
@@ -251,6 +333,7 @@ Worker 01 must define the injection points for prompt tokens and ensure the atte
 17. Freeze the canonical public API boundary:
    - training/model API accepts raw state inputs (`explicit_voice_state`, `delta_voice_state`, optional `ssl_voice_state`)
    - export/runtime wrappers may consume or emit fused `state_cond`, but only if the mapping to raw state inputs is documented and tested
+18. Define RoPE / pointer interaction rules for cross-attention and cached text memory.
 
 
 ## Proposed API Shape
@@ -289,13 +372,15 @@ out = model.forward_tts_pointer(
 
 Notes:
 
-- `frame_horizon` is allowed only for bounded training windows or offline evaluation.
+- `frame_horizon` is allowed only for bounded training windows or offline evaluation. In the implementation, this is passed as `target_length` which must be `Optional[int]` (default `None`). When `None`, the model derives the frame count from `target_b.shape[-1]` during training or runs open-ended during inference.
 - mainline runtime must not require a precomputed target length.
 - serving/runtime APIs must drive termination from pointer state and EOS conditions.
-- `acoustic_history` is not optional in the causal decoding contract, even if a wrapper builds it from cache state.
-- `dialogue_context` is text-side context embedding in the initial v3 contract; raw audio context must not be implied silently.
+- `acoustic_history` is not optional in the causal decoding contract, even if a wrapper builds it from cache state. The implementation must actually consume this input, not accept and ignore it.
+- `prompt_kv_cache` must be consumed by the model when provided (e.g., prepended to the transformer's key/value sequences). The implementation must not accept and silently ignore it.
+- `dialogue_context` is text-side context embedding in the initial v3 contract; raw audio context must not be implied silently. The canonical shape is `[B, C_ctx, d_model]` but `[B, d_model]` (pooled) is also accepted.
 - `predict_prosody` and `encode_speaker_prompt` must be efficient. `prompt_kv_cache` enables retaining the zero-shot voice across long conversational turns without re-encoding the reference audio.
 - `state_cond` is an internal/export-facing fused representation, not the canonical model-level public input contract.
+- `n_codebooks` scheduling policy is frozen as flattened per-frame prediction (see Codec / Token Hierarchy section).
 
 Expected output keys:
 
@@ -303,10 +388,11 @@ Expected output keys:
 {
     "logits_a": ...,
     "logits_b": ...,
-    "advance_logit": ...,
+    "advance_logit": ...,       # canonical key (not "pointer_logits")
     "progress_delta": ...,
-    "boundary_confidence": ...,
-    "next_pointer_state": ...,
+    "boundary_confidence": ..., # must be model-predicted, not dummy zeros
+    "hidden_states": ...,       # for diagnostics and diversity loss
+    "next_pointer_state": ...,  # populated at inference time
 }
 ```
 
@@ -347,3 +433,5 @@ Before handing off:
 - shape test for dialogue-context and prosody-conditioning inputs
 - state-transition contract test for teacher-forced versus autoregressive loop compatibility
 - contract test that exported `state_cond` wrapper matches the canonical raw-state API
+- force-advance state-transition test covering `progress_value` reset and `acoustic_history` continuity semantics
+- codec-hierarchy schedule contract test for the chosen `n_codebooks` policy

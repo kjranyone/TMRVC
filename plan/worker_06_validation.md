@@ -17,6 +17,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - `tmrvc-train/src/tmrvc_train/pipeline.py`
 - `docs/design/architecture.md`
 - `docs/design/unified-codec-lm.md`
+- `docs/design/external-baseline-registry.md`
 
 
 ## Required Outcomes
@@ -28,8 +29,9 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - explicit pass/fail criteria
 - **Explicit proof protocol for drama-grade acting (Acting Alignment Score)**
 - **Objective diversity and controllability metrics**
-- **Explicit proof protocol for few-shot adaptation against external SOTA baselines (e.g., Qwen3-TTS)**
+- **Explicit proof protocol for few-shot adaptation against a fixed external baseline artifact**
 - explicit validation protocol for pseudo-annotated corpora
+- baseline artifact/version/settings and statistical test procedure are frozen before sign-off
 
 
 ## Concrete Tasks
@@ -47,7 +49,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
    - pointer-state sanity
    - checkpoint schema validity
    - **Human Sign-off:** mandatory preference/MOS audit via UI
-   - **External Parity:** mandatory blind A/B preference test against fixed external SOTA (e.g., Qwen3-TTS)
+   - **External Parity:** mandatory blind A/B preference test against the fixed pinned baseline artifact
 3. Add latency benchmarks:
    - per-step runtime
    - steady-state streaming memory
@@ -60,7 +62,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
    - turn-taking tempo/context sensitivity
    - VC similarity and intelligibility
    - **Acting Alignment Score (Correlation with scene/dialogue intent)**
-   - **Few-shot speaker similarity and disentanglement (Timbre vs Prosody) against fixed external SOTA**
+   - **Few-shot speaker similarity and disentanglement (Timbre vs Prosody) against the fixed pinned baseline artifact**
 6. Define acceptance thresholds for merging v3 mainline.
 7. Add drama-acting evaluation protocol:
    - same text, different context responsiveness
@@ -69,25 +71,35 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
    - explicit 8-D `voice_state` responsiveness
    - pause / hesitation / release realism
    - human preference against v2 legacy baseline
-   - **Human preference against external SOTA (Qwen3-TTS class)**
-8. Add pseudo-annotation validation protocol:
+   - **Human preference against the fixed pinned external baseline**
+8. Add disentanglement leakage checks:
+   - `prosody_transfer_leakage_score` comparing prompt-side pitch/duration contours against generated contours when text/context differ
+   - fail if generated prosody tracks reference prosody too strongly under cross-context prompting
+9. Add pseudo-annotation validation protocol:
    - ASR spot-check accuracy
    - text normalization audit
    - speaker clustering purity spot-check
    - pseudo-label confidence calibration
    - quality-score threshold selection
-9. Add separation-aided annotation validation:
+10. Add separation-aided annotation validation:
    - compare raw vs separated ASR quality
    - compare diarization purity before/after separation
    - compare artifact rate on sampled clips
    - reject separation front-end if annotation benefit is smaller than waveform damage
-10. Add explicit regression checks for known open issues:
+11. Add multilingual regression protocol:
+   - after adding or reweighting a language, re-run frozen held-out tests for existing languages
+   - block promotion if existing-language intelligibility or speaker similarity regresses beyond threshold
+12. Add explicit regression checks for known open issues:
    - batch vs frame-by-frame CausalConv1d numerical drift
    - `tmrvc-train-codec` `collate_fn` contract verification
-11. Freeze external baseline policy:
+13. Freeze external baseline policy:
    - at least one strong public baseline is mandatory
-   - baseline name, checkpoint, prompt length, and inference settings must be fixed in the evaluation spec
-   - current recommended baseline: `Qwen3-TTS` or a stronger public successor if it clearly supersedes it
+   - baseline name, exact artifact or checkpoint, prompt length, tokenizer or text-normalization settings, and inference settings must be fixed in the evaluation spec
+   - baseline changes require an explicit version bump to the evaluation protocol; "or newer successor" is forbidden in sign-off criteria
+14. Freeze human-evaluation statistics policy:
+   - pre-register sample count, rater count, duplicate-rate QC, and hypothesis test
+   - report confidence intervals in addition to `p` values
+   - name the exact statistical test used for merge sign-off
 
 
 ## Suggested Acceptance Criteria
@@ -102,7 +114,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - human evaluation against v2 legacy shows either:
   - win rate `>= 55%`, or
   - statistically significant preference with `p < 0.05`
-- **Human evaluation against external SOTA (Qwen3-TTS class):**
+- **Human evaluation against the fixed pinned external baseline:**
   - target: competitive parity or measurable trade-off superiority in acting/controllability
   - **Guardrail:** SOTA claims cannot be validated using only the internal `v2 legacy` baseline.
 - **Automated Acting Alignment:**
@@ -131,6 +143,8 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
     - boundary hold frequency
 - parity:
   - PyTorch vs ONNX and Python vs Rust paths must remain within the predefined tolerance on pointer outputs and state transitions
+- force-advance parity:
+  - Python and Rust must agree on forced-advance trigger timing and post-trigger state updates within the predefined tolerance
 - few-shot speaker adaptation:
   - evaluate with fixed short reference durations and matched prompts
   - speaker similarity and intelligibility must be at least competitive with the fixed external baseline, or any deficit must be offset by a documented win in latency, controllability, or dialogue acting
@@ -143,6 +157,8 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
   - must satisfy the bucket thresholds defined in `plan/ai_curation_system.md`
 - separation adoption:
   - allowed only when annotation uplift is larger than measured artifact cost on the validation sample
+- multilingual regression:
+  - adding a new language or code-switch mapping must not push existing held-out languages below the documented regression threshold
 
 
 ## Metric Definition Requirements
@@ -172,6 +188,9 @@ Worker 06 must freeze explicit formulas or scripts for the following before fina
 - **`timbre_prosody_disentanglement_score`**
   - measure the variance of prosody metrics (F0, duration) for the same speaker-prompt under different dialogue-contexts.
   - target: High prosody variance despite identical timbre-prompt.
+- `prosody_transfer_leakage_score`
+  - measure prompt-prosody leakage by correlating reference-prompt pitch/duration contours with generated contours when target text/context differ.
+  - target: low leakage under cross-context prompting while retaining speaker similarity.
 - `external_baseline_delta`
   - initial recommendation:
     - report the directional gap between TMRVC and the fixed public baseline on the same protocol
@@ -184,6 +203,7 @@ The exact metric implementation may mature, but sign-off cannot rely on undefine
 - do not use only unit tests; include at least one end-to-end smoke per mode
 - do not accept quality claims without reproducible scripts or checklists
 - **do not claim SOTA status based only on improvement over v2 legacy; external baseline comparison is mandatory.**
+- do not leave the external baseline movable at sign-off time; the artifact/version must be pinned before the run starts
 - do not sign off if v3 still requires hidden legacy duration artifacts
 - do not sign off if Python, Rust, or ONNX paths disagree on the runtime contract
 - do not sign off if expressive claims are based only on anecdotal samples
@@ -207,6 +227,7 @@ The exact metric implementation may mature, but sign-off cannot rely on undefine
 - evaluation checklist
 - final integration report template
 - reproducible expressive-evaluation script or score sheet
+- external-baseline registry entry used for release sign-off
 - pseudo-annotation audit checklist
 - separation-front-end comparison checklist
 - parity test report for Python / Rust / ONNX paths

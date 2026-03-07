@@ -119,7 +119,7 @@ No quality claim is accepted unless it is backed by reproducible evidence.
 At minimum:
 
 1. paired preference test against `v2 legacy`
-2. **Blind A/B preference test against SOTA external baselines (e.g., Qwen3-TTS)**
+2. **Blind A/B preference test against the fixed pinned external baseline artifact**
 3. same-line different-context appropriateness test
 4. actor-control responsiveness test for:
    - `pace`
@@ -136,7 +136,7 @@ At minimum:
 - controls change duration but not acting quality
 - expressive settings produce noise or instability
 - context changes are overwhelmed by speaker/style defaults
-- **Few-shot similarity is significantly lower than external SOTA (Qwen3-TTS class)**
+- **Few-shot similarity is significantly lower than the fixed pinned external baseline**
 
 ## 7. Acceptance bar
 

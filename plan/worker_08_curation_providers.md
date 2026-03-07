@@ -107,6 +107,8 @@ Use local extractors and classifiers for:
    - diarization uplift
    - cross-file speaker-clustering purity
    - separation artifact rate
+   - speaker / timbre preservation after separation
+   - waveform artifact score for any separated waveform proposed as a teacher signal
 7. Define transcript-refinement policy:
    - when to fuse multiple ASR hypotheses
    - when to accept one provider as dominant

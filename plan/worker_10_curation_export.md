@@ -21,6 +21,9 @@ Curation is not finished when labels exist. It is finished when the promoted sub
 - provenance survives export
 - `dev.py` can launch curation and export flows
 - mainline training can distinguish curated provenance classes
+- bootstrap alignment export is already projected into canonical phoneme space
+- dialogue-context export remains model-agnostic by default
+- export and packaging flows required by humans are triggerable from the WebUI without shell access
 
 ## Export Targets
 
@@ -77,12 +80,47 @@ Optional:
    - resume curation
    - export promoted subset
    - show curation summary
-6. Define how later training quality gates read curation provenance and legality.
-7. Implement pre-encoding of dialogue context:
-   - optionally run the Text Encoder on preceding turns and export embeddings (`.npy`) to avoid runtime bottlenecks during training.
+6. Add WebUI-facing export actions:
+   - materialize promoted subset
+   - package holdout evaluation bundle
+   - download or register exported artifacts for downstream training/eval
+   - return structured payloads with artifact ids, download urls, and provenance summary
+7. Define how later training quality gates read curation provenance and legality.
+8. Export dialogue context in a model-agnostic way:
+   - raw context text, turn graph, and canonical text units are the default export
+   - optional derived context embeddings may be materialized only as checkpoint-hashed caches and must be invalidatable
 8. Export ASR-derived alignment for bootstrap:
-   - export token-level or word-level timestamps from Stage 4/5 as a `bootstrap_alignment.json` or equivalent.
-   - ensure these labels are available to Worker 02 as a `pointer_target_source`.
+   - preserve token-level or word-level timestamps from Stage 4/5 for provenance
+   - export `bootstrap_alignment.json` already projected onto canonical `phoneme_ids` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance, utilizing **Acoustic-Aware Heuristics** for precise boundary estimation.
+   - ensure these labels are available to Worker 02 as a supervised `pointer_target_source`
+9. Define artifact package contract:
+   - every exported package must include:
+     - `artifact_id`
+     - `artifact_type`
+     - `created_at`
+     - `source_dataset_ids`
+     - `manifest_snapshot_id`
+     - `policy_version`
+     - `provenance_summary`
+     - `retention_class`
+   - package formats must be explicit for:
+     - cache-ready training bundle
+     - holdout evaluation bundle
+     - pinned workshop take bundle
+10. Define artifact lifecycle and cleanup policy:
+   - `ephemeral`
+   - `durable`
+   - `release_candidate`
+   - who may delete each class
+   - whether download URLs are time-limited
+11. Define export failure / retry semantics:
+   - partial package cleanup rules
+   - idempotent retry behavior keyed by manifest snapshot and export intent
+   - WebUI-visible failure payload with actionable remediation
+12. Define browser-safe artifact handoff:
+   - download for human operators
+   - server-side registration for training/eval jobs
+   - checksum display and verification status in WebUI
 
 ## Guardrails
 
@@ -90,8 +128,13 @@ Optional:
 - do not export review items into train buckets
 - do not make export depend on legacy MFA artifacts
 - do not drop conversation graph fields needed for dialogue-conditioned training
+- do not make model-dependent context embeddings the canonical export contract
+- do not export bootstrap alignment that still requires downstream phoneme projection guesswork
+- do not make shell access a prerequisite for exporting, packaging, or downloading curated outputs
+- do not produce opaque artifact directories that the WebUI cannot describe or audit
 
 ## Handoff Contract
 
 - training workers can ingest curated subsets cleanly
 - validation workers can trace evaluation failures back to curation history
+- worker 12 can present export/download state without inventing artifact metadata
