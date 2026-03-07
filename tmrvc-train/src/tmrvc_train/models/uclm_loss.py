@@ -169,6 +169,133 @@ def control_response_score(
     return 1.0 - (6.0 * d_sq) / (n * (n * n - 1))
 
 
+def flow_matching_prosody_loss(
+    predictor: "torch.nn.Module",
+    phoneme_features: torch.Tensor,
+    target_prosody: torch.Tensor,
+    dialogue_context: torch.Tensor | None = None,
+    speaker_embed: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute flow-matching prosody loss via the predictor's own method.
+
+    Args:
+        predictor: A :class:`ProsodyPredictor` instance (flow-matching based).
+        phoneme_features: [B, L, d_model] text encoder output.
+        target_prosody: [B, d_prosody] ground-truth prosody latent.
+        dialogue_context: [B, D_ctx] optional dialogue context.
+        speaker_embed: [B, d_model] optional speaker embedding.
+    Returns:
+        Scalar MSE loss between predicted and true velocity field.
+    """
+    return predictor.flow_matching_loss(
+        phoneme_features, target_prosody, dialogue_context, speaker_embed
+    )
+
+
+def timbre_prosody_contrastive_loss(
+    speaker_embeds: torch.Tensor,
+    prosody_latents: torch.Tensor,
+    context_groups: torch.Tensor | None = None,
+    margin: float = 0.2,
+) -> torch.Tensor:
+    """Contrastive loss pushing prosody apart for same speaker under different contexts.
+
+    For pairs of samples that share the same speaker (identified via
+    ``context_groups``), their prosody latents should be dissimilar — the
+    speaker timbre is already captured by the speaker embedding, so prosody
+    should encode *different* expressive variation.
+
+    Args:
+        speaker_embeds: [B, D_spk] speaker embeddings.
+        prosody_latents: [B, D_pro] prosody latent vectors.
+        context_groups: [B] integer group ids. Pairs with the same group id
+            are considered same-speaker pairs whose prosody should differ.
+            If None, returns 0.
+        margin: minimum cosine distance between prosody of same-speaker pairs.
+
+    Returns:
+        Scalar contrastive loss (0 if no valid pairs).
+    """
+    if context_groups is None:
+        return torch.tensor(0.0, device=prosody_latents.device)
+
+    prosody_norm = F.normalize(prosody_latents, dim=-1)
+    B = prosody_norm.shape[0]
+    loss = torch.tensor(0.0, device=prosody_norm.device)
+    n_pairs = 0
+
+    for i in range(B):
+        for j in range(i + 1, B):
+            if context_groups[i] == context_groups[j]:
+                cos_sim = (prosody_norm[i] * prosody_norm[j]).sum()
+                # Push cosine similarity below (1 - margin)
+                pair_loss = F.relu(cos_sim - (1.0 - margin))
+                loss = loss + pair_loss
+                n_pairs += 1
+
+    if n_pairs > 0:
+        loss = loss / n_pairs
+    return loss
+
+
+@torch.jit.script
+def monotonic_alignment_search(log_probs: torch.Tensor) -> torch.Tensor:
+    """Monotonic Alignment Search (MAS) implementation.
+
+    Finds the most likely monotonic path between phonemes and frames.
+    Implementation based on VITS (Kim et al., 2021).
+
+    Args:
+        log_probs: [B, L, T] log-likelihood matrix where L is phoneme count
+            and T is acoustic frame count.
+
+    Returns:
+        path: [B, L, T] binary mask representing the optimal path.
+    """
+    B, L, T = log_probs.shape
+    device = log_probs.device
+    
+    # Calculate cumulative log probabilities using dynamic programming
+    # v_prev[i] stores the max log prob to reach state i at current frame t
+    v = torch.zeros((B, L, T), device=device)
+    
+    # Initialize first frame
+    v[:, 0, 0] = log_probs[:, 0, 0]
+    for i in range(1, L):
+        v[:, i, 0] = -1e9  # Impossible to start at phoneme i > 0
+        
+    for t in range(1, T):
+        # State 0: can only come from state 0
+        v[:, 0, t] = v[:, 0, t-1] + log_probs[:, 0, t]
+        
+        # States 1 to L-1
+        for i in range(1, L):
+            # Monotonic constraint: can come from same state i (hold)
+            # or previous state i-1 (advance)
+            v_prev_hold = v[:, i, t-1]
+            v_prev_adv = v[:, i-1, t-1]
+            v[:, i, t] = torch.max(v_prev_hold, v_prev_adv) + log_probs[:, i, t]
+            
+    # Backtrack to find the optimal path
+    path = torch.zeros((B, L, T), device=device)
+    curr_phoneme = torch.full((B,), L - 1, dtype=torch.long, device=device)
+    
+    for t in range(T - 1, -1, -1):
+        for b in range(B):
+            idx = curr_phoneme[b]
+            path[b, idx, t] = 1.0
+            
+            if t > 0:
+                # Decide whether to stay or go back to i-1
+                if idx > 0:
+                    v_hold = v[b, idx, t-1]
+                    v_adv = v[b, idx-1, t-1]
+                    if v_adv > v_hold:
+                        curr_phoneme[b] -= 1
+                        
+    return path
+
+
 def alignment_loss_placeholder(
     phoneme_features: torch.Tensor,
     frame_features: torch.Tensor,
@@ -226,10 +353,19 @@ def uclm_loss(
     lambda_diversity: float = 0.05,
     lambda_voice_state: float = 0.0,
     lambda_delta_voice_state: float = 0.0,
+    lambda_prosody: float = 0.0,
+    lambda_contrastive: float = 0.0,
     voice_state_pred: torch.Tensor | None = None,
     voice_state_target: torch.Tensor | None = None,
     delta_voice_state_pred: torch.Tensor | None = None,
     delta_voice_state_target: torch.Tensor | None = None,
+    prosody_predictor: "torch.nn.Module | None" = None,
+    phoneme_features: torch.Tensor | None = None,
+    target_prosody: torch.Tensor | None = None,
+    prosody_dialogue_context: torch.Tensor | None = None,
+    prosody_speaker_embed: torch.Tensor | None = None,
+    speaker_embeds: torch.Tensor | None = None,
+    prosody_latents: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the multi-task loss for Disentangled UCLM (v3)."""
     B, n_cb, T, vocab_a = logits_a.shape
@@ -304,6 +440,23 @@ def uclm_loss(
         loss_dvs = voice_state_supervision_loss(delta_voice_state_pred, delta_voice_state_target, frame_mask)
         total_loss = total_loss + lambda_delta_voice_state * loss_dvs
         components["loss_delta_voice_state"] = loss_dvs
+
+    # Flow-matching prosody loss
+    if lambda_prosody > 0 and prosody_predictor is not None and phoneme_features is not None and target_prosody is not None:
+        loss_prosody = flow_matching_prosody_loss(
+            prosody_predictor, phoneme_features, target_prosody,
+            prosody_dialogue_context, prosody_speaker_embed,
+        )
+        total_loss = total_loss + lambda_prosody * loss_prosody
+        components["loss_prosody"] = loss_prosody
+
+    # Timbre-prosody contrastive loss
+    if lambda_contrastive > 0 and speaker_embeds is not None and prosody_latents is not None:
+        loss_contrastive = timbre_prosody_contrastive_loss(
+            speaker_embeds, prosody_latents, context_groups,
+        )
+        total_loss = total_loss + lambda_contrastive * loss_contrastive
+        components["loss_contrastive"] = loss_contrastive
 
     components["loss"] = total_loss
     return components
