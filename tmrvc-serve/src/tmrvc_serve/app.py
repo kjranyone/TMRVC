@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="TMRVC TTS/VC Server",
-    description="Real-time Unified TTS/VC using UCLM v2 architecture.",
+    description="Real-time Unified TTS/VC using UCLM v3 pointer-based architecture.",
     version="0.2.0",
 )
 
@@ -134,6 +134,7 @@ from tmrvc_serve.routes.tts import router as tts_router
 from tmrvc_serve.routes.ws_chat import router as ws_router
 from tmrvc_serve.routes.vc_streaming import router as vc_router
 from tmrvc_serve.routes.auth import router as auth_router
+from tmrvc_serve.routes.admin import router as admin_router
 
 app.include_router(health_router)
 app.include_router(characters_router)
@@ -141,6 +142,7 @@ app.include_router(tts_router)
 app.include_router(ws_router)
 app.include_router(vc_router)
 app.include_router(auth_router)
+app.include_router(admin_router)
 
 
 # Helper for style prediction (async)

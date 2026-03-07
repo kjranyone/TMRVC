@@ -1,419 +1,185 @@
-# TMRVC UCLM v2 Training Guide
+# TMRVC Training Guide
 
-UCLM v2モデル（Unified Codec Language Model）の学習パイプライン全体を解説します。
-TMRVCは、単一のトランスフォーマー・アーキテクチャでTTSとVCの両方を実現します。
+この文書は、現行 mainline である `UCLM v3` の学習フローをまとめたものです。前提は次のとおりです。
 
-## 0.0 codecとは何か（重要）
+- TTS / VC は単一の UCLM backbone で学習する
+- TTS の主経路は `pointer-based internal alignment`
+- `MFA` や `durations.npy` は mainline では必須にしない
+- dual-stream token contract (`A_t / B_t`) は維持する
 
-TMRVCにおける `codec` は、音声波形を離散トークンへ変換し、再び波形へ戻す中核コンポーネントです。
+## 1. 学習成果物
 
-- **Encode側**: 波形 → `A_t`（音響トークン, 8 codebooks）/ `B_t`（制御トークン, 4 slots）
-- **Decode側**: `A_t` + `B_t` + VoiceState 条件 → 波形
-- **UCLMとの関係**: UCLM本体は「次の `A_t/B_t` を予測」するモデルであり、最終音声の復元には codec が必須です。
+運用に必要な主成果物は次の 2 つです。
 
-実運用では、最低でも以下2つの checkpoint を揃えます。
 - `checkpoints/uclm/uclm_latest.pt`
 - `checkpoints/codec/codec_latest.pt`
 
-## 0. 推奨される学習データと構造
+`UCLM` は token 予測器、`codec` は波形と token の相互変換器です。片方だけでは実運用できません。
 
-TMRVC は、特別なアノテーションや複雑なフォルダ分けがされていない「生の wav ファイル群」からでも学習を開始できます。
+## 2. データ要件
 
-### 0.1 最小構成のデータセット
-もっともシンプルな開始方法は、一つのフォルダにすべての wav ファイルを投入することです。
+### 2.1 データセット単位の原則
 
-```
-data/raw/my_dataset/
-  ├── sample1.wav
-  ├── sample2.wav
-  └── ...
-```
+- 1 dataset = 1 language
+- dataset ごとに `raw_dir` を分ける
+- 話者別フォルダでも単一フォルダでもよい
+- テキストがある方が TTS 学習は安定する
 
-この状態から、パイプラインが以下の情報を自動的に補完します：
-- **話者ID**: デフォルトではフォルダ名から推定しますが、フォルダ分けがない場合はファイル全体を同一話者、または `cluster_speakers.py` を用いた自動話者分離が可能です。
-- **テキスト**: `tmrvc-train-pipeline` 内の Whisper ASR が自動的に文字起こしを行います。
-- **音響特徴量**: モデルが自動的に SSL 特徴量や Codec トークンを抽出します。
+### 2.2 TTS 監督
 
-### 0.2 推奨コーパスと活用法
+mainline の TTS 監督は次を使います。
 
-高品質な UCLM v2 モデルを構築するために、以下の標準コーパスの併用を強く推奨します。自前データが少ない場合でも、これらと混ぜて学習することで汎化性能が向上します。
+- `text`: 発話テキスト
+- `phoneme_ids.npy` または同等の text units
+- 音声側の `codec_tokens.npy`, `control_tokens.npy`, `explicit_state.npy`, `ssl_state.npy`
 
-| コーパス名 | 言語 | 内容 | 推奨用途 |
-| :--- | :--- | :--- | :--- |
-| **JVS Corpus** | 日本語 | 100話者の高品質音声 | 日本語の基本発音・表現の学習 |
-| **VCTK** | 英語 | 110話者の多様なアクセント | 英語の基本発音・話者性の学習 |
-| **Tsukuyomi** | 日本語 | 1話者の高品質音声 | 日本語の安定した音質・韻律の学習 |
-| **LibriTTS-R** | 英語 | 大規模朗読音声 | 表現豊かな読み上げの学習 |
+使わないもの:
 
-### 0.3 データセットの登録 (`configs/datasets.yaml`)
+- `MFA` 前提の forced alignment
+- `durations.npy` 必須設計
+- TextGrid を品質の中心に置く運用
 
-自前データを学習に含めるには、以下のように設定ファイルに記述します。
+`phoneme_ids.npy` は言語別 G2P または grapheme backend から作ります。英語系は `phonemizer + espeak-ng`、日本語は `pyopenjtalk` を使います。
 
-```yaml
-datasets:
-  # 自前のフォルダ分けなしwavデータ
-  my_private_data:
-    type: generic
-    enabled: true
-    language: ja
-    raw_dir: data/raw/my_wav_folder
+## 3. cache スキーマ
 
-  # 標準コーパス (併用を推奨)
-  vctk:
-    type: vctk
-    enabled: true
-    raw_dir: data/raw/wav48_silence_trimmed
-```
+標準 cache は以下を持ちます。
 
----
+| ファイル | 必須 | 役割 |
+|---|---|---|
+| `codec_tokens.npy` | yes | acoustic tokens `[8, T]` |
+| `control_tokens.npy` | yes | control tokens `[4, T]` |
+| `explicit_state.npy` | yes | 8-dim physical voice state `[T, 8]` |
+| `ssl_state.npy` | yes | frame-level latent state `[T, D]` |
+| `spk_embed.npy` | yes | speaker embedding |
+| `meta.json` | yes | text, language, frame stats |
+| `phoneme_ids.npy` | tts | text unit ids |
 
-## 1. 統合パイプライン (tmrvc-train-pipeline)
+互換用 legacy artifact:
 
-TMRVC v2 では、**再現性のある学習**を保証するために、単一のCLIコマンド `tmrvc-train-pipeline` で前処理から学習までを一括実行します。
+- `durations.npy`
+- `TextGrid`
 
-### 1.1 基本的な使い方
+これらは比較実験や旧経路の検証では読めますが、mainline 学習の必須条件ではありません。
 
-`--dataset` を省略すると、`configs/datasets.yaml` で `enabled: true` の dataset 全件が対象になります。
+## 4. dev.py ベースの標準フロー
+
+### 4.1 初回セットアップ
 
 ```bash
-tmrvc-train-pipeline \
-  --dataset vctk \
-  --output-dir experiments \
-  --workers 2 \
-  --seed 42
-```
-
-この1コマンドで以下が実行されます：
-1. **前処理**: GPU並列、発話単位分散、冪等性保証
-2. **学習**: UCLMトレーニング、チェックポイント自動保存
-3. **メタデータ保存**: Git hash, 乱数シード, 設定ファイル
-
-### 1.2 パフォーマンス・チューニングと並列度の決定
-
-前処理パイプラインは VRAM を主に消費します。以下のリソース消費表に基づき、ご自身の GPU メモリ容量（VRAM）に収まる範囲で `--workers` 数を決定してください。
-
-#### モデル別 VRAM 消費量 (目安)
-
-| コンポーネント | モデル | VRAM 消費 (FP16) | 役割 |
-| :--- | :--- | :--- | :--- |
-| **Whisper ASR** | large-v3-turbo | **~1.6 GB** | テキスト書き起こし |
-| **SSL Estimator** | WavLM Large | **~1.3 GB** | SSL音声状態の抽出 |
-| **Codec** | Emotion-Aware | **~0.4 GB** | A_t, B_t トークン抽出 |
-| **Speaker Encoder**| CAM++ | **~0.2 GB** | 話者埋め込みの抽出 |
-| **その他/Overhead**| PyTorch/System | **~0.5 GB** | テンソル演算・キャッシュ |
-| **合計 (1ワーカー)** | - | **約 4.0 GB** | - |
-
-#### 並列度の計算式
-$$並列ワーカー数 = \lfloor \frac{GPU VRAM (GB) - 1.0}{4.0} \rfloor$$
-*(システム用マージン 1GB を差し引いて計算)*
-
-*   **VRAM 12GB の場合**: マージンを引いて **2並列** が推奨です。
-*   **VRAM 22GB の場合**: マージンを引いて **5並列** が最適です。
-*   **VRAM 24GB (RTX 3090/4090) の場合**: **5〜6並列** が可能です。
-
-#### 並列実行例
-
-```bash
-# RTX 4090 (24GB) の場合 - 5並列
-tmrvc-train-pipeline \
-  --dataset vctk \
-  --output-dir experiments \
-  --workers 5 \
-  --seed 42
-
-# RTX 3060 (12GB) の場合 - 2並列
-tmrvc-train-pipeline \
-  --dataset jvs \
-  --output-dir experiments \
-  --workers 2 \
-  --seed 42
-```
-
-### 1.3 再現性保証
-
-`tmrvc-train-pipeline` は論文レベルの再現性を保証します：
-
-#### 1. メタデータ記録
-実験ディレクトリに `experiment.yaml` が自動生成されます：
-
-```yaml
-experiment_id: vctk_20260303_123456
-dataset: vctk
-created_at: "2026-03-03T12:34:56"
-git_hash: abc123def456
-git_branch: main
-python_version: "3.12.0"
-config:
-  language: en
-  train_steps: 100000
-seed: 42
-workers: 2
-status: completed
-```
-
-#### 2. 乱数シード固定
-全ての乱数シードが固定されます：
-- `random.seed(42)`
-- `np.random.seed(42)`
-- `torch.manual_seed(42)`
-- `torch.cuda.manual_seed_all(42)`
-
-#### 3. エラー記録と再実行
-失敗した発話は `errors.json` に記録されます：
-
-```json
-[
-  {
-    "utterance_id": "vctk_p225_001",
-    "error_type": "RuntimeError",
-    "error_message": "CUDA out of memory",
-    "stage": "preprocessing",
-    "timestamp": "2026-03-03T12:45:00"
-  }
-]
-```
-
-### 1.4 出力ディレクトリ構造
-
-```
-experiments/
-└── vctk_20260303_123456/          # 実験ID (自動生成)
-    ├── experiment.yaml             # メタデータ (git hash, seed, config)
-    ├── errors.json                 # 失敗発話リスト (再実行用)
-    ├── train_config.yaml           # 学習設定
-    ├── quality_gate_report.json    # 品質ゲート結果
-    ├── cache/                      # 前処理キャッシュ
-    │   └── vctk/train/
-    ├── checkpoints/                # 学習チェックポイント
-    └── logs/                       # ログファイル
-```
-
-### 1.5 Quality Gate（学習前の品質検証）
-
-`tmrvc-train-pipeline` は学習開始前に cache 品質検証（quality gate）を実行します。  
-このゲートは「壊れたキャッシュで学習を進めない」ための停止条件です。
-
-主な検証項目:
-- 必須ファイル欠損率（`meta.json`, `codec_tokens.npy`, `explicit_state.npy`, `ssl_state.npy`, `spk_embed.npy`）
-- datasetごとの最小有効発話数
-- datasetごとの最小話者数
-- token範囲異常（`codec_tokens` / `control_tokens` の語彙範囲）
-
-設定キー（`configs/train_uclm.yaml.example`）:
-- `quality_gate_enabled`
-- `quality_gate_max_invalid_ratio`
-- `quality_gate_min_utterances_per_dataset`
-- `quality_gate_min_speakers_per_dataset`
-- `quality_gate_token_samples`
-
-レポート:
-- `experiments/<exp_id>/quality_gate_report.json`
-
-`dev.py` メニュー `7` の表示で `quality_gate: missing` になる場合:
-- 旧実験（quality gate導入前）を参照している
-- quality gateを無効化して実行した
-- パイプラインが学習前に停止し、レポート未生成
-
----
-
-## 2. 高度な使い方
-
-### 2.1 既存キャッシュを使用して学習のみ実行
-
-前処理が完了している場合、`--skip-preprocess` で学習のみ実行できます：
-
-```bash
-tmrvc-train-pipeline \
-  --dataset vctk \
-  --output-dir experiments \
-  --skip-preprocess \
-  --seed 42
-```
-
-### 2.2 カスタム実験名を指定
-
-```bash
-tmrvc-train-pipeline \
-  --dataset vctk \
-  --output-dir experiments \
-  --experiment-name vctk_baseline_v1 \
-  --workers 3
-```
-
-### 2.3 設定ファイルのカスタマイズ
-
-`configs/train_uclm.yaml.example` をベースに学習パラメータをカスタマイズできます：
-
-```bash
-cp configs/train_uclm.yaml.example configs/train_uclm.yaml
-```
-
-```yaml
-language: en
-train_steps: 100000
-train_batch_size: 16
-train_device: cuda
-train_sampling_strategy: balanced
-quality_gate_enabled: true
-quality_gate_max_invalid_ratio: 0.0
-```
-
-使用例：
-
-```bash
-tmrvc-train-pipeline \
-  --dataset vctk \
-  --output-dir experiments \
-  --config configs/train_uclm.yaml
-```
-
----
-
-## 3. 個別コンポーネントの実行 (上級者向け)
-
-統合パイプラインではなく、個別のコンポーネントを実行することも可能です。
-
-### 3.1 Stage 1: Emotion-Aware Codec学習
-
-音声のトークン化と復元を行う基盤モデルを学習します。
-
-必要データ（`--cache-dir` 配下）:
-- 最低限必須（学習実行に必須）:
-  - `<utt>/waveform.npy`（24kHz波形）
-  - `<utt>/codec_tokens.npy`（`[8, T]`, 値域 `0..1023`）
-- 品質上ほぼ必須（欠損時は0埋めになり劣化要因）:
-  - `<utt>/control_tokens.npy`（`[4, T]`, 値域 `0..63`）
-  - `<utt>/explicit_state.npy`（`[T, 8]`）
-
-`dev.py` 運用では、通常 `1) キャッシュ削除 + フル学習` で上記cacheを生成し、続けて `8) Codec学習` を実行します。
-
-#### VRAMチューニング (Stage 1)
-- **消費目安**: Base 2GB + (0.4GB × BatchSize)
-- **22GB環境の例**: `--batch-size 48` (約21.2GB消費) が最大効率です。
-
-```bash
-tmrvc-train-codec \
-    --cache-dir data/cache \
-    --output-dir checkpoints/codec \
-    --batch-size 48 \
-    --max-steps 50000 \
-    --device cuda
-```
-
-- **Loss**: Multi-scale STFT loss + Control Stream Cross-Entropy
-- **出力**: `codec_final.pt`
-
-### 3.2 Stage 2: Unified UCLM学習
-
-TTSとVCを同時にこなす統合トランスフォーマーを学習します。
-
-#### VRAMチューニング (Stage 2)
-- **消費目安**: Base 6GB + (0.8GB × BatchSize)
-- **22GB環境の例**: `--batch-size 16〜20` が安定稼働のラインです。
-
-```bash
-tmrvc-train-uclm \
-    --cache-dir data/cache \
-    --output-dir checkpoints/uclm \
-    --batch-size 16 \
-    --max-steps 100000 \
-    --device cuda
-```
-
-- **学習内容**:
-    - **VC Task**: `A_src_t → content → A_t, B_t`
-    - **TTS Task**: `Phonemes → content → A_t, B_t`
-- **Loss**: CE (A_t, B_t) + VQ Bottleneck + Adversarial Disentanglement (GRL) + Duration Prediction (MSE)
-
-### 3.3 TTS用アライメントの詳細 (MFA)
-
-VC学習には不要ですが、TTS学習を行う場合は正確な音素単位のアライメントが必須です。
-
-```bash
-# 1. Montreal Forced Aligner で TextGrid を生成
-mfa align data/raw/vctk/wav48 english_us_arpa english_us_arpa data/alignments/vctk
-
-# 2. 生成された TextGrid をキャッシュに注入
-uv run python scripts/annotate/run_forced_alignment.py \
-    --cache-dir data/cache \
-    --dataset vctk \
-    --language en \
-    --textgrid-dir data/alignments/vctk
-```
-
-- **MFA統合の重要性**: ヒューリスティックな均等割り（`--allow-heuristic`）は品質を著しく低下させるため、論文実装レベルの学習には MFA の使用を強く推奨します。
-- **BOS/EOS**: 注入時に自動的に `<bos>`, `<eos>` トークンが前後に追加されます。
-
----
-
-## 4. モデルの検証と利用
-
-### 4.1 統合エンジンでのテスト
-
-学習したチェックポイントを `UCLMEngine` にロードして動作確認します。
-
-```bash
-uv run python scripts/demo/tts_demo.py \
-    --uclm-checkpoint checkpoints/uclm/uclm_latest.pt \
-    --codec-checkpoint checkpoints/codec/codec_latest.pt \
-    --text "これはUCLM v2の統合テストです。"
-```
-
-### 4.2 ONNX エクスポート
-
-RustエンジンやVSTプラグインで利用するために ONNX 形式へ変換します。
-
-```bash
-# Codec ONNX export
-tmrvc-export-codec \
-    --checkpoint checkpoints/codec/codec_latest.pt \
-    --output-dir models/fp32
-```
-
----
-
-## 5. トラブルシューティング
-
-- **ImportError (定数不足)**: `tmrvc_core/constants.py` が最新の `configs/constants.yaml` と同期しているか確認してください。
-- **Shape Mismatch**: キャッシュ生成時の `hop_length` (240) とモデルのストライド設定が一致しているか確認してください。
-- **OOM**: `--batch-size` または `--max-frames` (デフォルト400) を下げて調整してください。
-- **Index Out of Bounds**: 古いキャッシュを削除して、新しいフレームアライメント（`pad_length=784`）で再生成してください。
-- **パイプラインの中断**: `tmrvc-train-pipeline` は冪等性を保証しているため、中断しても再実行すればキャッシュ済み発話をスキップして継続できます。
-
----
-
-## 6. 推奨ワークフロー
-
-### 初回実行
-
-```bash
-# 1. データセットを登録
-vim configs/datasets.yaml
-
-# 2. devメニュー起動
+uv sync --extra-index-url https://download.pytorch.org/whl/cu128
+sudo apt-get update && sudo apt-get install -y espeak-ng
 uv run python dev.py
-# 3. 1) キャッシュ削除 + フル学習 を実行
-# 4. 学習後に 7) 学習成果物を確定 を実行
-#    (1/2 完了後は自動実行される。失敗時のみ手動再実行)
-#    codec が自動検出できない場合は、プロンプトで codec checkpoint パスを入力
-
-# 5. 結果確認
-ls experiments/*/checkpoints/uclm_final.pt
-ls -l checkpoints/uclm/uclm_latest.pt
 ```
 
-### 実験管理
+### 4.2 推奨順序
+
+1. `6` 設定初期化
+2. `4` データセット追加
+3. `14` v3 ポインタ: フル学習 (MFA不要)
+4. `8` Codec 学習
+5. `7` 学習成果物を確定
+6. `11` 推論サーバー起動
+
+`14` が v3 mainline の推奨フローです。MFA を必要とせず、前処理→学習を一括実行します。
+
+### 4.3 再学習
+
+前処理済み cache を再利用する場合:
+
+1. `15` v3 ポインタ: 既存キャッシュで学習
+2. `7` 成果物を確定
+3. `11` 推論サーバー起動
+
+### 4.4 v2 Legacy フロー
+
+MFA ベースの duration 学習が必要な場合は `1` (v2 legacy フル学習) を使用してください。
+
+## 5. CLI ベースの実行
+
+### 5.1 v3 ポインタモード統合パイプライン (推奨)
 
 ```bash
-# 実験一覧
-ls experiments/
-
-# 特定実験の詳細
-cat experiments/vctk_20260303_123456/experiment.yaml
-
-# エラー確認
-cat experiments/vctk_20260303_123456/errors.json
-
-# ログ確認
-tail -f experiments/vctk_20260303_123456/logs/*.log
+uv run tmrvc-train-pipeline \
+  --output-dir experiments \
+  --workers 2 \
+  --seed 42 \
+  --tts-mode pointer
 ```
+
+### 5.2 既存 cache で v3 ポインタ学習のみ
+
+```bash
+uv run tmrvc-train-pipeline \
+  --output-dir experiments \
+  --cache-dir experiments/<exp_id>/cache \
+  --skip-preprocess \
+  --train-device cuda \
+  --seed 42 \
+  --tts-mode pointer
+```
+
+### 5.3 v2 Legacy (MFA duration モード)
+
+```bash
+uv run tmrvc-train-pipeline \
+  --output-dir experiments \
+  --workers 2 \
+  --seed 42 \
+  --tts-mode legacy_duration
+```
+
+### 5.4 codec 学習
+
+```bash
+uv run tmrvc-train-codec \
+  --cache-dir experiments/<exp_id>/cache \
+  --output-dir checkpoints/codec \
+  --device cuda
+```
+
+## 6. Quality Gate
+
+学習前に cache 品質を検査します。主な検査対象は次のとおりです。
+
+- 必須 artifact の欠損率
+- token range 異常
+- dataset ごとの最小 utterance / speaker 数
+- waveform length と `n_frames * hop_length` の整合
+- TTS text coverage
+
+legacy alignment coverage は mainline fail 条件ではなく、別指標として扱います。
+
+## 7. G2P と言語依存
+
+### 7.1 日本語
+
+- backend: `pyopenjtalk`
+- dataset `language: ja`
+
+### 7.2 英語
+
+- backend: `phonemizer`
+- system dependency: `espeak-ng`
+- dataset `language: en`
+
+### 7.3 多言語運用
+
+多言語コーパスであっても、`datasets.yaml` の 1 entry は単一言語に分割してください。language ごとに backend と text normalization が異なるため、混在運用は mainline 品質を崩します。
+
+## 8. legacy 経路
+
+`dev.py` の `12` と `13` は legacy alignment utilities です。
+
+- 比較実験
+- 旧 checkpoint 再現
+- デバッグ
+
+には使えますが、mainline 仕様ではありません。新規学習での標準フローとしては扱いません。
+
+## 9. 次に参照すべき文書
+
+- 設計入口: `docs/design/architecture.md`
+- モデル仕様: `docs/design/unified-codec-lm.md`
+- データ準備: `docs/design/dataset-preparation-flow.md`
+- 実装計画: `plan/README.md`

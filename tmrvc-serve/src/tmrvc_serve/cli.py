@@ -1,4 +1,4 @@
-"""``tmrvc-serve`` — Start the Unified UCLM v2 API server.
+"""``tmrvc-serve`` — Start the Unified UCLM v3 API server.
 
 Usage::
 

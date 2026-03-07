@@ -1,4 +1,4 @@
-"""UCLM Engine: contract-friendly unified inference for TTS and VC."""
+"""UCLM Engine: contract-friendly unified inference for TTS and VC (v3)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from tmrvc_train.models import (
     DisentangledUCLM,
     EmotionAwareDecoder,
     EmotionAwareEncoder,
+    PointerState,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,10 +44,48 @@ class EngineState:
     prev_voice_state: torch.Tensor = field(
         default_factory=lambda: torch.zeros(1, 1, 8)
     )
+    prompt_speaker_embed: Optional[torch.Tensor] = None
+    prompt_features: Optional[torch.Tensor] = None
+    prompt_encoding_time_ms: float = 0.0
+
+
+@dataclass
+class PointerInferenceState:
+    """Runtime pointer state for v3 causal TTS inference."""
+
+    text_index: int = 0
+    progress: float = 0.0
+    total_phonemes: int = 0
+    frames_generated: int = 0
+    stall_frames: int = 0
+    max_stall: int = 100
+    max_frames_per_unit: int = 50
+    skip_protection_threshold: float = 0.3
+    frames_on_current_unit: int = 0
+    forced_advance_count: int = 0
+    skip_protection_count: int = 0
+
+    @property
+    def finished(self) -> bool:
+        return self.text_index >= self.total_phonemes
+
+    def to_dict(self) -> dict:
+        return {
+            "text_index": self.text_index,
+            "progress": self.progress,
+            "total_phonemes": self.total_phonemes,
+            "frames_generated": self.frames_generated,
+            "stall_frames": self.stall_frames,
+            "max_frames_per_unit": self.max_frames_per_unit,
+            "skip_protection_threshold": self.skip_protection_threshold,
+            "frames_on_current_unit": self.frames_on_current_unit,
+            "forced_advance_count": self.forced_advance_count,
+            "skip_protection_count": self.skip_protection_count,
+        }
 
 
 class UCLMEngine:
-    """Orchestrates split models for inference."""
+    """Orchestrates split models for inference (v3)."""
 
     def __init__(
         self,
@@ -54,9 +93,11 @@ class UCLMEngine:
         codec_checkpoint: Path | str | None = None,
         device: str = "cpu",
         d_model: int = 512,
+        tts_mode: str = "pointer",
     ):
         self.device = torch.device(device)
         self.d_model = d_model
+        self.tts_mode = tts_mode
         self._uclm_checkpoint = Path(uclm_checkpoint) if uclm_checkpoint else None
         self._codec_checkpoint = Path(codec_checkpoint) if codec_checkpoint else None
 
@@ -74,7 +115,7 @@ class UCLMEngine:
 
     @property
     def scene_state_available(self) -> bool:
-        return False
+        return self._loaded and self.uclm_core_model is not None and hasattr(self.uclm_core_model, "context_projector")
 
     def _require_loaded(self) -> None:
         if not self._loaded:
@@ -87,19 +128,13 @@ class UCLMEngine:
         uclm_path: Path | str | None = None,
         codec_path: Path | str | None = None,
     ) -> None:
-        """Load models from checkpoints.
-
-        Paths are optional to keep compatibility with `app.py` init flow.
-        """
+        """Load models from checkpoints."""
         uclm_ckpt_path = Path(uclm_path) if uclm_path is not None else self._uclm_checkpoint
         codec_ckpt_path = (
             Path(codec_path) if codec_path is not None else self._codec_checkpoint
         )
         if uclm_ckpt_path is None or codec_ckpt_path is None:
             raise ValueError("Both UCLM and codec checkpoints are required.")
-
-        self._uclm_checkpoint = uclm_ckpt_path
-        self._codec_checkpoint = codec_ckpt_path
 
         uclm_ckpt = torch.load(
             uclm_ckpt_path, map_location=self.device, weights_only=False
@@ -139,12 +174,7 @@ class UCLMEngine:
         self.vc_enc = self.uclm_core_model.vc_encoder
         self.voice_state_enc = self.uclm_core_model.voice_state_enc
         self._loaded = True
-        logger.info("Loaded UCLM/codec checkpoints on %s", self.device)
-
-    def load_from_combined_checkpoint(self, checkpoint: Path | str) -> None:
-        """Backward-compatible fallback for legacy callers."""
-        ckpt_path = Path(checkpoint)
-        self.load_models(uclm_path=ckpt_path, codec_path=ckpt_path)
+        logger.info("Loaded UCLM v3 checkpoints on %s", self.device)
 
     @torch.no_grad()
     def vc_frame(
@@ -159,7 +189,6 @@ class UCLMEngine:
         self._require_loaded()
 
         a_src_t, b_logits_src, new_enc_states = self.codec_enc(audio_frame, state.enc_states)
-
         content_features, _ = self.vc_enc(a_src_t)
 
         v_state = (
@@ -168,29 +197,20 @@ class UCLMEngine:
             .unsqueeze(0)
             .unsqueeze(0)
         )
-        delta_state = v_state - state.prev_voice_state
         ssl_state = torch.zeros(1, 1, 128, device=self.device)
 
-        v_out = self.voice_state_enc(v_state, ssl_state, delta_state)
+        v_out = self.voice_state_enc(v_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
-        logits_a, logits_b, new_kv = self.uclm_core(
+        logits_a, logits_b, new_kv, _ = self.uclm_core(
             content_features, state.ctx_b, speaker_embed, state_cond, cfg_scale, state.kv_caches
         )
 
         if temperature > 0:
             probs_a = F.softmax(logits_a[:, :, -1, :] / temperature, dim=-1)
             probs_b = F.softmax(logits_b[:, :, -1, :] / temperature, dim=-1)
-            a_t = (
-                torch.stack([torch.multinomial(probs_a[:, i, :], 1) for i in range(8)], dim=1)
-                .squeeze(-1)
-                .unsqueeze(-1)
-            )
-            b_t = (
-                torch.stack([torch.multinomial(probs_b[:, i, :], 1) for i in range(4)], dim=1)
-                .squeeze(-1)
-                .unsqueeze(-1)
-            )
+            a_t = torch.stack([torch.multinomial(probs_a[:, i, :], 1) for i in range(8)], dim=1).squeeze(-1).unsqueeze(-1)
+            b_t = torch.stack([torch.multinomial(probs_b[:, i, :], 1) for i in range(4)], dim=1).squeeze(-1).unsqueeze(-1)
         else:
             a_t = logits_a[:, :, -1, :].argmax(dim=-1, keepdim=True)
             b_t = logits_b[:, :, -1, :].argmax(dim=-1, keepdim=True)
@@ -207,6 +227,35 @@ class UCLMEngine:
         return audio_out.squeeze(), new_state
 
     @torch.no_grad()
+    def encode_speaker_prompt(
+        self,
+        reference_audio: torch.Tensor | None = None,
+        reference_codec_tokens: torch.Tensor | None = None,
+        speaker_embed: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Encode reference audio for few-shot speaker adaptation.
+
+        Returns:
+            (refined_speaker_embed, prompt_features, encoding_time_ms)
+        """
+        self._require_loaded()
+        t0 = time.perf_counter()
+
+        if reference_codec_tokens is not None and hasattr(self.uclm_core_model, 'speaker_prompt_encoder'):
+            refined_embed, prompt_feats = self.uclm_core_model.encode_speaker_prompt(
+                reference_codec_tokens.to(self.device),
+                speaker_embed.to(self.device) if speaker_embed is not None else None,
+            )
+        elif speaker_embed is not None:
+            refined_embed = speaker_embed.to(self.device)
+            prompt_feats = None
+        else:
+            raise ValueError("Either reference_codec_tokens or speaker_embed must be provided")
+
+        encoding_time = (time.perf_counter() - t0) * 1000.0
+        return refined_embed, prompt_feats, encoding_time
+
+    @torch.no_grad()
     def tts(
         self,
         phonemes: torch.Tensor,
@@ -214,140 +263,241 @@ class UCLMEngine:
         style: StyleParams,
         cfg_scale: float = 1.5,
         temperature: float = 0.8,
+        language_id: int = 0,
+        pace: float = 1.0,
+        hold_bias: float = 0.0,
+        boundary_bias: float = 0.0,
+        max_frames: int = 1500,
+        dialogue_context: torch.Tensor | None = None,
+        acting_intent: torch.Tensor | None = None,
+        phrase_pressure: float = 0.0,
+        breath_tendency: float = 0.0,
+        reference_audio_base64: str | None = None,
+        reference_text: str | None = None,
+        max_frames_per_unit: int = 50,
     ) -> Tuple[torch.Tensor, dict]:
-        """Full end-to-end TTS generation."""
+        """Full causal pointer-based TTS generation (v3).
+
+        Speaker embed priority resolution:
+            ``speaker_embed`` is the global timbre anchor and wins for identity.
+            ``prompt_codec_tokens`` (via reference audio) may only refine local
+            texture within the timbre envelope.  If both disagree,
+            ``speaker_embed`` takes priority for speaker identity.
+
+        Args:
+            phonemes: [1, L] phoneme token ids.
+            speaker_embed: [1, d_speaker] speaker embedding.
+            style: StyleParams for voice state conditioning.
+            cfg_scale: classifier-free guidance scale.
+            temperature: sampling temperature.
+            language_id: language identifier.
+            pace: speech pace multiplier.
+            hold_bias: bias toward holding current phoneme.
+            boundary_bias: bias toward phoneme boundaries.
+            max_frames: maximum number of frames to generate.
+            dialogue_context: optional [1, D_ctx] scene/dialogue embedding.
+            acting_intent: optional [1, D_act] acting intent vector.
+            phrase_pressure: interruption/urgency pressure (-1 to 1).
+            breath_tendency: tendency to insert breathing pauses (-1 to 1).
+            max_frames_per_unit: maximum frames allowed on a single text unit
+                before forced advance (default 50).
+        """
+        if self.tts_mode == "legacy_duration":
+            return self._tts_legacy_duration(
+                phonemes=phonemes,
+                speaker_embed=speaker_embed,
+                style=style,
+                cfg_scale=cfg_scale,
+                temperature=temperature,
+                language_id=language_id,
+                pace=pace,
+                max_frames=max_frames,
+            )
         self._require_loaded()
         t0 = time.perf_counter()
 
-        v_state = (
-            torch.tensor(style.to_vector(), device=self.device)
-            .float()
-            .unsqueeze(0)
-            .unsqueeze(0)
-        )
-        ssl_state = torch.zeros(1, 1, 128, device=self.device)
-        phoneme_lens = torch.tensor([phonemes.shape[1]], device=self.device)
-        lang_id = torch.tensor([0], device=self.device)
-        target_length = 50
-        explicit_state = v_state.expand(-1, target_length, -1)
-        ssl_state_full = ssl_state.expand(-1, target_length, -1)
-        target_b = torch.zeros(1, 4, target_length, dtype=torch.long, device=self.device)
+        v_state = torch.tensor(style.to_vector(), device=self.device).float().view(1, 1, -1)
+        num_phonemes = phonemes.shape[1]
+        phoneme_ids = phonemes.to(self.device)
+        speaker_embed = speaker_embed.to(self.device)
+        lang_id = torch.tensor([language_id], device=self.device).expand(1, num_phonemes)
 
-        out = self.uclm_core_model.forward_tts(
-            phonemes=phonemes.to(self.device),
-            phoneme_lens=phoneme_lens,
-            language_ids=lang_id,
-            target_b=target_b,
-            explicit_state=explicit_state,
-            ssl_state=ssl_state_full,
-            speaker_embed=speaker_embed.to(self.device),
-            cfg_scale=cfg_scale,
-        )
+        ptr = PointerInferenceState(total_phonemes=num_phonemes, max_frames_per_unit=max_frames_per_unit)
+        kv_caches = None
+        ctx_b = torch.zeros(1, 4, 1, dtype=torch.long, device=self.device)
 
-        logits_a, logits_b = out["logits_a"], out["logits_b"]
-        t_frames = logits_a.shape[2]
+        # Pre-compute text features once before the generation loop
+        phoneme_lens = torch.tensor([num_phonemes], device=self.device)
+        all_phoneme_features = self.uclm_core_model.text_encoder(
+            phoneme_ids, lang_id, phoneme_lens
+        ).transpose(1, 2)
 
-        if temperature > 0:
-            probs_a = F.softmax(logits_a / temperature, dim=-1)
-            a_list = []
-            for t in range(t_frames):
-                at = torch.stack(
-                    [torch.multinomial(probs_a[:, i, t, :], 1) for i in range(8)],
-                    dim=1,
+        # Move optional expressive inputs to device once
+        _dlg_ctx = dialogue_context.to(self.device) if dialogue_context is not None else None
+        _act_int = acting_intent.to(self.device) if acting_intent is not None else None
+
+        a_tokens, b_tokens = [], []
+
+        for t in range(max_frames):
+            if ptr.finished:
+                break
+
+            # Index into cached text features by pointer position
+            content_features = all_phoneme_features[:, ptr.text_index : ptr.text_index + 1, :]
+
+            out = self.uclm_core_model.forward_streaming(
+                content_features=content_features,
+                b_ctx=ctx_b,
+                speaker_embed=speaker_embed,
+                state_cond=v_state,
+                cfg_scale=cfg_scale,
+                kv_caches=kv_caches,
+                dialogue_context=_dlg_ctx,
+                acting_intent=_act_int,
+            )
+            
+            logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
+            hidden_states = out["hidden_states"]
+            
+            p_adv_logit, p_delta = self.uclm_core_model.pointer_head(hidden_states)
+            # Combine all pacing controls:
+            # - hold_bias: negative = hold longer, positive = advance sooner
+            # - boundary_bias: positive = encourage boundary transitions
+            # - phrase_pressure: positive = urgency (faster), negative = restrained
+            # - breath_tendency: positive = more likely to pause at boundaries
+            p_adv_prob = torch.sigmoid(
+                p_adv_logit
+                - hold_bias
+                + boundary_bias
+                + (pace - 1.0) * 2.0
+                + phrase_pressure * 1.5
+                - breath_tendency * 0.5
+            )
+            
+            if temperature > 0:
+                at = torch.stack([torch.multinomial(F.softmax(logits_a[:, i, 0, :] / temperature, dim=-1), 1) for i in range(8)], dim=1).squeeze(-1)
+                bt = torch.stack([torch.multinomial(F.softmax(logits_b[:, i, 0, :] / temperature, dim=-1), 1) for i in range(4)], dim=1).squeeze(-1)
+            else:
+                at = logits_a[:, :, 0, :].argmax(dim=-1)
+                bt = logits_b[:, :, 0, :].argmax(dim=-1)
+                
+            a_tokens.append(at.unsqueeze(-1))
+            b_tokens.append(bt.unsqueeze(-1))
+            ctx_b = bt.unsqueeze(-1)
+
+            # --- Pointer state-transition with failure handling ---
+            ptr.frames_on_current_unit += 1
+            progress_delta = p_delta.item() / max(0.1, 1.0 / (pace + 1e-6))
+            ptr.progress += progress_delta
+            adv_prob_val = p_adv_prob.item()
+
+            # Compute boundary_confidence as sigmoid of the raw advance logit
+            boundary_confidence = torch.sigmoid(p_adv_logit).item()
+
+            advanced = False
+
+            # Forced advance: stuck too long on one text unit
+            if ptr.frames_on_current_unit >= ptr.max_frames_per_unit:
+                logger.warning(
+                    "Forced advance at text_index=%d after %d frames on unit",
+                    ptr.text_index, ptr.frames_on_current_unit,
                 )
-                a_list.append(at)
-            a_t = torch.cat(a_list, dim=-1)
+                ptr.text_index += 1
+                ptr.progress = 0.0
+                ptr.frames_on_current_unit = 0
+                ptr.stall_frames = 0
+                ptr.forced_advance_count += 1
+                advanced = True
+            # Skip-protection: both signals fire but boundary_confidence is low
+            elif adv_prob_val > 0.5 and ptr.progress >= 1.0:
+                if boundary_confidence >= ptr.skip_protection_threshold:
+                    ptr.text_index += 1
+                    ptr.progress = 0.0
+                    ptr.frames_on_current_unit = 0
+                    ptr.stall_frames = 0
+                    advanced = True
+                else:
+                    ptr.skip_protection_count += 1
+            # Normal advance on either signal
+            elif adv_prob_val > 0.5 or ptr.progress >= 1.0:
+                ptr.text_index += 1
+                ptr.progress = 0.0
+                ptr.frames_on_current_unit = 0
+                ptr.stall_frames = 0
+                advanced = True
 
-            probs_b = F.softmax(logits_b / temperature, dim=-1)
-            b_list = []
-            for t in range(t_frames):
-                bt = torch.stack(
-                    [torch.multinomial(probs_b[:, i, t, :], 1) for i in range(4)],
-                    dim=1,
-                )
-                b_list.append(bt)
-            b_t = torch.cat(b_list, dim=-1)
-        else:
-            a_t = logits_a.argmax(dim=-1)
-            b_t = logits_b.argmax(dim=-1)
+            if not advanced:
+                ptr.stall_frames += 1
+            else:
+                ptr.stall_frames = 0
 
+            ptr.frames_generated += 1
+
+            # Secondary safeguard: legacy stall detection
+            if ptr.stall_frames > ptr.max_stall:
+                logger.warning("Pointer stalled at text_index=%d (secondary safeguard), forcing advance", ptr.text_index)
+                ptr.text_index += 1
+                ptr.progress = 0.0
+                ptr.frames_on_current_unit = 0
+                ptr.stall_frames = 0
+                ptr.forced_advance_count += 1
+
+        if not a_tokens:
+            return torch.zeros(0), {}
+
+        a_t, b_t = torch.cat(a_tokens, dim=-1), torch.cat(b_tokens, dim=-1)
+        t_frames = a_t.shape[-1]
         audio_out, _ = self.codec_dec(a_t, b_t, v_state.expand(-1, t_frames, -1), [])
 
         gen_time = time.perf_counter() - t0
         rtf = gen_time / (audio_out.shape[-1] / SAMPLE_RATE)
-        return audio_out.squeeze(), {"rtf": float(rtf), "gen_time_ms": float(gen_time * 1000.0)}
+        return audio_out.squeeze(), {
+            "rtf": float(rtf),
+            "gen_time_ms": float(gen_time * 1000.0),
+            "pointer_state": ptr.to_dict(),
+            "prompt_encoding_time_ms": 0.0,
+            "stall_events": 0,
+            "forced_advance_count": ptr.forced_advance_count,
+            "skip_protection_count": ptr.skip_protection_count,
+        }
 
-    @staticmethod
-    def _apply_speed(audio: np.ndarray, speed: float) -> np.ndarray:
-        if speed <= 0:
-            return audio
-        if abs(speed - 1.0) < 1e-3 or audio.size < 2:
-            return audio
-        x_old = np.linspace(0.0, 1.0, num=audio.size, endpoint=True, dtype=np.float64)
-        new_len = max(1, int(round(audio.size / speed)))
-        x_new = np.linspace(0.0, 1.0, num=new_len, endpoint=True, dtype=np.float64)
-        return np.interp(x_new, x_old, audio).astype(np.float32)
-
-    def prefetch_g2p(self, text: str, language: str) -> None:
-        from tmrvc_data.g2p import text_to_phonemes
-
-        _ = text_to_phonemes(text, language=language)
-
-    def initial_scene_state(self) -> np.ndarray:
-        return np.zeros((1,), dtype=np.float32)
-
-    def update_scene_state(
+    def _tts_legacy_duration(
         self,
-        text: str,
-        language: str,
-        spk_embed: np.ndarray | torch.Tensor,
-        z_prev: np.ndarray,
-    ) -> np.ndarray:
-        del text, language, spk_embed
-        return z_prev
+        phonemes: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        style: StyleParams,
+        cfg_scale: float = 1.5,
+        temperature: float = 0.8,
+        language_id: int = 0,
+        pace: float = 1.0,
+        max_frames: int = 1500,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Legacy duration-based TTS fallback.
 
-    def synthesize_sentences(
-        self,
-        text: str,
-        language: str,
-        spk_embed: np.ndarray,
-        style: StyleParams | None,
-        speed: float = 1.0,
-        cancel=None,
-        sentence_pause_ms: int = 120,
-        auto_style: bool = True,
-    ):
-        """Compatibility generator used by `/ws/chat` route."""
+        This path uses a DurationPredictor to determine phoneme durations
+        instead of the v3 pointer mechanism. Currently a stub — raises
+        NotImplementedError until a DurationPredictor is integrated.
+        """
+        raise NotImplementedError(
+            "Legacy duration-based TTS is not available. "
+            "DurationPredictor has not been integrated into the serving engine. "
+            "Use tts_mode='pointer' (the default) for v3 pointer-based synthesis."
+        )
+
+    def synthesize_sentences(self, text: str, language: str, spk_embed: np.ndarray, style: StyleParams | None, speed: float = 1.0, cancel=None, sentence_pause_ms: int = 120, auto_style: bool = True):
         del auto_style
-        if cancel is not None and cancel.is_set():
-            return
-
+        if cancel is not None and cancel.is_set(): return
         from tmrvc_data.g2p import text_to_phonemes
-
         g2p_result = text_to_phonemes(text, language=language)
         phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
-        if isinstance(spk_embed, torch.Tensor):
-            spk_t = spk_embed.to(dtype=torch.float32)
-        else:
-            spk_t = torch.from_numpy(np.asarray(spk_embed)).float()
-        if spk_t.dim() == 1:
-            spk_t = spk_t.unsqueeze(0)
-
-        audio_t, _ = self.tts(
-            phonemes=phonemes_t,
-            speaker_embed=spk_t,
-            style=style or StyleParams.neutral(),
-        )
+        spk_t = torch.from_numpy(np.asarray(spk_embed)).float().to(self.device) if not isinstance(spk_embed, torch.Tensor) else spk_embed.to(self.device)
+        if spk_t.dim() == 1: spk_t = spk_t.unsqueeze(0)
+        audio_t, _ = self.tts(phonemes=phonemes_t, speaker_embed=spk_t, style=style or StyleParams.neutral(), language_id=g2p_result.language_id)
         audio = audio_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
-        audio = self._apply_speed(audio, speed)
-
-        chunk_size = int(0.1 * SAMPLE_RATE)  # 100 ms
+        chunk_size = int(0.1 * SAMPLE_RATE)
         for i in range(0, audio.size, chunk_size):
-            if cancel is not None and cancel.is_set():
-                return
+            if cancel is not None and cancel.is_set(): return
             yield audio[i : i + chunk_size]
-
         if sentence_pause_ms > 0 and cancel is not None and not cancel.is_set():
             pause = np.zeros(int(SAMPLE_RATE * sentence_pause_ms / 1000), dtype=np.float32)
-            for i in range(0, pause.size, chunk_size):
-                yield pause[i : i + chunk_size]
+            for i in range(0, pause.size, chunk_size): yield pause[i : i + chunk_size]

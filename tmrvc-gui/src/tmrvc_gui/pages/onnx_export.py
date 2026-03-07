@@ -1,4 +1,4 @@
-"""ONNX export page for UCLM v2 components."""
+"""ONNX export page for UCLM components."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# Unified UCLM v2 ONNX components
+# Unified UCLM ONNX components
 ONNX_MODELS: list[str] = [
     "uclm",
     "codec",
@@ -32,7 +32,7 @@ ONNX_MODELS: list[str] = [
 
 
 class OnnxExportPage(QWidget):
-    """ONNX model export and quantization for UCLM v2."""
+    """ONNX model export and quantization for UCLM."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -43,7 +43,7 @@ class OnnxExportPage(QWidget):
         layout.setSpacing(8)
 
         # --- Export configuration ---
-        export_group = QGroupBox("UCLM v2 Export Configuration")
+        export_group = QGroupBox("UCLM Export Configuration")
         export_form = QFormLayout(export_group)
 
         # Checkpoint selector

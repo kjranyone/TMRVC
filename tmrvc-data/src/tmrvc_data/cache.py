@@ -1,4 +1,4 @@
-"""Feature cache: save/load individual .npy files for UCLM v2."""
+"""Feature cache: save/load individual .npy files for UCLM."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def _align_waveform_to_frame_count(
 
 
 class FeatureCache:
-    """Disk-backed feature cache for UCLM v2.
+    """Disk-backed feature cache for UCLM.
 
     Layout::
 

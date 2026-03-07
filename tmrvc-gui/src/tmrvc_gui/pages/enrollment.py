@@ -1,4 +1,4 @@
-"""Speaker Enrollment Page — UCLM v2 Personalization (LoRA)."""
+"""Speaker Enrollment Page — UCLM Personalization (LoRA)."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class _EnrollmentWorker(QThread):
-    """Background worker for UCLM v2 Speaker Enrollment & LoRA Fine-tuning."""
+    """Background worker for UCLM Speaker Enrollment & LoRA Fine-tuning."""
 
     finished = Signal(str)
     error = Signal(str)
@@ -161,7 +161,7 @@ class EnrollmentPage(QWidget):
         layout.addWidget(group_ref)
 
         # Config
-        group_cfg = QGroupBox("UCLM v2 Personalization")
+        group_cfg = QGroupBox("UCLM Personalization")
         form = QFormLayout(group_cfg)
         self.level_combo = QComboBox()
         self.level_combo.addItems(["Light (Embed only)", "Full (LoRA Adaptation)"])

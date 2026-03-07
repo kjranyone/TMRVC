@@ -297,7 +297,7 @@ def preprocess_single_utterance(
 ) -> bool:
     """Process a single utterance and save to cache.
 
-    This function extracts all UCLM v2 features for one utterance:
+    This function extracts all UCLM features for one utterance:
     - Dual-stream tokens (A + B)
     - Voice state (explicit + SSL)
     - Speaker embedding

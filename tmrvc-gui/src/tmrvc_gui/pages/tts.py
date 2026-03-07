@@ -1,7 +1,8 @@
-"""TTS page: text-to-speech generation with character/style control (UCLM v2)."""
+"""TTS page: text-to-speech generation with character/style control (UCLM)."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -12,8 +13,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -21,6 +25,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+VOICE_STATE_DIMS = [
+    "Pitch",
+    "Formant",
+    "Breathiness",
+    "Tension",
+    "Nasality",
+    "Creakiness",
+    "Loudness",
+    "Rate",
+]
 
 
 EMOTION_OPTIONS = [
@@ -33,7 +48,7 @@ class TTSPage(QWidget):
     """Text-to-speech generation page.
 
     Provides text input, character/speaker selection, physical style sliders
-    (UCLM v2), and generates audio via the unified UCLMEngine.
+    (UCLM), and generates audio via the unified UCLMEngine.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -41,11 +56,27 @@ class TTSPage(QWidget):
         self._worker = None
         self._last_audio: "numpy.ndarray | None" = None
         self._last_sr: int = 24000
+        self._compare_b_audio: "numpy.ndarray | None" = None
+        self._compare_b_sr: int = 24000
+        self._gallery: list[dict] = []
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
+
+        # --- Session buttons (toolbar area) ---
+        session_row = QHBoxLayout()
+        self.btn_save_session = QPushButton("Save Session")
+        self.btn_save_session.clicked.connect(self._on_save_session)
+        session_row.addWidget(self.btn_save_session)
+
+        self.btn_load_session = QPushButton("Load Session")
+        self.btn_load_session.clicked.connect(self._on_load_session)
+        session_row.addWidget(self.btn_load_session)
+
+        session_row.addStretch()
+        layout.addLayout(session_row)
 
         top_row = QHBoxLayout()
 
@@ -67,7 +98,7 @@ class TTSPage(QWidget):
         left_col.addWidget(input_group)
 
         # Character / model selection
-        model_group = QGroupBox("Character & Model (UCLM v2)")
+        model_group = QGroupBox("Character & Model (UCLM)")
         model_form = QFormLayout(model_group)
 
         self.language_combo = QComboBox()
@@ -105,6 +136,71 @@ class TTSPage(QWidget):
         model_form.addRow("Codec checkpoint:", codec_row)
 
         left_col.addWidget(model_group)
+
+        # Voice cloning section
+        clone_group = QGroupBox("Voice Cloning")
+        clone_layout = QVBoxLayout(clone_group)
+
+        ref_row = QHBoxLayout()
+        self.ref_audio_edit = QLineEdit()
+        self.ref_audio_edit.setPlaceholderText("Reference audio file for cloning...")
+        ref_row.addWidget(self.ref_audio_edit)
+        btn_browse_ref = QPushButton("Browse...")
+        btn_browse_ref.clicked.connect(self._on_browse_ref_audio)
+        ref_row.addWidget(btn_browse_ref)
+        clone_layout.addLayout(ref_row)
+
+        self.btn_extract_speaker = QPushButton("Extract Speaker")
+        self.btn_extract_speaker.clicked.connect(self._on_extract_speaker)
+        clone_layout.addWidget(self.btn_extract_speaker)
+
+        left_col.addWidget(clone_group)
+
+        # --- Casting Gallery section ---
+        gallery_group = QGroupBox("Casting Gallery")
+        gallery_layout = QVBoxLayout(gallery_group)
+
+        self.gallery_list = QListWidget()
+        self.gallery_list.setMaximumHeight(120)
+        gallery_layout.addWidget(self.gallery_list)
+
+        gallery_btn_row = QHBoxLayout()
+
+        self.btn_gallery_save = QPushButton("Save to Gallery")
+        self.btn_gallery_save.clicked.connect(self._on_gallery_save)
+        gallery_btn_row.addWidget(self.btn_gallery_save)
+
+        self.btn_gallery_load = QPushButton("Load from Gallery")
+        self.btn_gallery_load.clicked.connect(self._on_gallery_load)
+        gallery_btn_row.addWidget(self.btn_gallery_load)
+
+        self.btn_gallery_export = QPushButton("Export Profile")
+        self.btn_gallery_export.clicked.connect(self._on_gallery_export)
+        gallery_btn_row.addWidget(self.btn_gallery_export)
+
+        self.btn_gallery_import = QPushButton("Import Profile")
+        self.btn_gallery_import.clicked.connect(self._on_gallery_import)
+        gallery_btn_row.addWidget(self.btn_gallery_import)
+
+        self.btn_gallery_delete = QPushButton("Delete")
+        self.btn_gallery_delete.clicked.connect(self._on_gallery_delete)
+        gallery_btn_row.addWidget(self.btn_gallery_delete)
+
+        gallery_layout.addLayout(gallery_btn_row)
+
+        left_col.addWidget(gallery_group)
+
+        # Dialogue context
+        ctx_group = QGroupBox("Dialogue Context")
+        ctx_layout = QVBoxLayout(ctx_group)
+        self.dialogue_context_edit = QTextEdit()
+        self.dialogue_context_edit.setPlaceholderText(
+            "Enter preceding dialogue lines for context-aware generation..."
+        )
+        self.dialogue_context_edit.setMaximumHeight(80)
+        ctx_layout.addWidget(self.dialogue_context_edit)
+        left_col.addWidget(ctx_group)
+
         top_row.addLayout(left_col, stretch=2)
 
         # --- Right: Style controls ---
@@ -146,6 +242,37 @@ class TTSPage(QWidget):
         style_form.addRow("Energy:", self.energy_slider)
 
         right_col.addWidget(style_group)
+
+        # 8-D Voice State sliders
+        voice_state_group = QGroupBox("8-D Voice State")
+        voice_state_form = QFormLayout(voice_state_group)
+
+        self.voice_state_sliders: list[QSlider] = []
+        for dim_name in VOICE_STATE_DIMS:
+            slider = self._make_slider(dim_name, -100, 100, 0)
+            voice_state_form.addRow(f"{dim_name}:", slider)
+            self.voice_state_sliders.append(slider)
+
+        right_col.addWidget(voice_state_group)
+
+        # CFG scale slider
+        cfg_group = QGroupBox("Classifier-Free Guidance")
+        cfg_form = QFormLayout(cfg_group)
+        self.cfg_scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.cfg_scale_slider.setRange(10, 50)
+        self.cfg_scale_slider.setValue(10)
+        self.cfg_scale_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.cfg_scale_slider.setTickInterval(10)
+        self.cfg_scale_label = QLabel("1.0")
+        self.cfg_scale_slider.valueChanged.connect(
+            lambda v: self.cfg_scale_label.setText(f"{v / 10.0:.1f}")
+        )
+        cfg_row = QHBoxLayout()
+        cfg_row.addWidget(self.cfg_scale_slider)
+        cfg_row.addWidget(self.cfg_scale_label)
+        cfg_form.addRow("CFG Scale:", cfg_row)
+        right_col.addWidget(cfg_group)
+
         top_row.addLayout(right_col, stretch=1)
 
         layout.addLayout(top_row)
@@ -167,6 +294,11 @@ class TTSPage(QWidget):
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._on_save)
         action_row.addWidget(self.btn_save)
+
+        self.btn_compare = QPushButton("Compare")
+        self.btn_compare.setToolTip("Compare A vs B parameter sets side-by-side")
+        self.btn_compare.clicked.connect(self._on_compare)
+        action_row.addWidget(self.btn_compare)
 
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
@@ -243,12 +375,17 @@ class TTSPage(QWidget):
         self.btn_generate.setEnabled(False)
         self.btn_cancel.setEnabled(True)
 
+        voice_state = [
+            self._slider_value(s) for s in self.voice_state_sliders
+        ]
+
         config = {
             "text": text,
             "language": self._get_language(),
             "uclm_checkpoint": uclm_ckpt,
             "codec_checkpoint": codec_ckpt,
             "speaker_file": self.speaker_edit.text().strip() or None,
+            "reference_audio": self.ref_audio_edit.text().strip() or None,
             "speed": self.speed_spin.value(),
             "emotion": EMOTION_OPTIONS[self.emotion_combo.currentIndex()],
             "breathiness": self._slider_value(self.breathiness_slider),
@@ -258,6 +395,9 @@ class TTSPage(QWidget):
             "roughness": self._slider_value(self.roughness_slider),
             "voicing": self._slider_value(self.voicing_slider),
             "energy": self._slider_value(self.energy_slider),
+            "voice_state": voice_state,
+            "cfg_scale": self.cfg_scale_slider.value() / 10.0,
+            "dialogue_context": self.dialogue_context_edit.toPlainText().strip() or None,
         }
 
         from tmrvc_gui.workers.tts_worker import TTSWorker
@@ -305,3 +445,232 @@ class TTSPage(QWidget):
             self.append_log(f"Saved to {path}")
         except Exception as e:
             self.append_log(f"ERROR: Save failed: {e}")
+
+    def _on_browse_ref_audio(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Reference Audio", "",
+            "Audio Files (*.wav *.flac *.mp3 *.ogg);;All Files (*)",
+        )
+        if path:
+            self.ref_audio_edit.setText(path)
+
+    def _on_extract_speaker(self) -> None:
+        ref_path = self.ref_audio_edit.text().strip()
+        if not ref_path:
+            self.append_log("ERROR: No reference audio selected for speaker extraction.")
+            return
+        self.append_log(f"Extracting speaker embedding from: {ref_path}")
+        # Delegate to worker / engine when available
+        self.append_log("Speaker extraction queued (requires running engine).")
+
+    def _on_compare(self) -> None:
+        """Generate with current params as A, then play last audio as B for comparison."""
+        if self._last_audio is None:
+            self.append_log("No previous audio (B) to compare. Generate at least once first.")
+            return
+        self.append_log("Generating A with current parameters for A/B comparison...")
+        self._compare_b_audio = self._last_audio
+        self._compare_b_sr = self._last_sr
+        self._on_generate()
+
+    def _play_compare(self) -> None:
+        """Play A then B sequentially for side-by-side comparison."""
+        try:
+            import numpy as np
+            import sounddevice as sd
+
+            if self._last_audio is None or self._compare_b_audio is None:
+                self.append_log("ERROR: Need both A and B audio for comparison.")
+                return
+            silence = np.zeros(int(self._last_sr * 0.5), dtype=self._last_audio.dtype)
+            combined = np.concatenate([self._last_audio, silence, self._compare_b_audio])
+            sd.play(combined, self._last_sr)
+            self.append_log("Playing A ... [pause] ... B")
+        except Exception as e:
+            self.append_log(f"ERROR: Compare playback failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Casting Gallery slots
+    # ------------------------------------------------------------------
+
+    def _on_gallery_save(self) -> None:
+        """Save current speaker prompt to gallery with a user-given name."""
+        name, ok = QInputDialog.getText(self, "Save to Gallery", "Profile name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        profile_path = self.speaker_edit.text().strip()
+        entry = {"name": name, "profile_path": profile_path}
+        self._gallery.append(entry)
+        self._refresh_gallery_list()
+        self.append_log(f"Saved profile '{name}' to gallery.")
+
+    def _on_gallery_load(self) -> None:
+        """Load selected gallery profile into the active speaker state."""
+        row = self.gallery_list.currentRow()
+        if row < 0 or row >= len(self._gallery):
+            self.append_log("No gallery profile selected.")
+            return
+        entry = self._gallery[row]
+        self.speaker_edit.setText(entry.get("profile_path", ""))
+        self.append_log(f"Loaded gallery profile: {entry.get('name', '')}")
+
+    def _on_gallery_export(self) -> None:
+        """Export selected gallery profile as a .tmrvc_speaker file."""
+        row = self.gallery_list.currentRow()
+        if row < 0 or row >= len(self._gallery):
+            self.append_log("No gallery profile selected for export.")
+            return
+        entry = self._gallery[row]
+        default_name = f"{entry.get('name', 'profile')}.tmrvc_speaker"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Profile", default_name,
+            "Speaker Profile (*.tmrvc_speaker);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(entry, f, indent=2, ensure_ascii=False)
+            self.append_log(f"Exported profile to {path}")
+        except Exception as e:
+            self.append_log(f"ERROR: Export failed: {e}")
+
+    def _on_gallery_import(self) -> None:
+        """Import a .tmrvc_speaker file into the gallery."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Profile", "",
+            "Speaker Profile (*.tmrvc_speaker);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                entry = json.load(f)
+            if not isinstance(entry, dict):
+                self.append_log("ERROR: Invalid profile format.")
+                return
+            if "name" not in entry:
+                entry["name"] = Path(path).stem
+            if "profile_path" not in entry:
+                entry["profile_path"] = path
+            self._gallery.append(entry)
+            self._refresh_gallery_list()
+            self.append_log(f"Imported profile: {entry.get('name', '')}")
+        except Exception as e:
+            self.append_log(f"ERROR: Import failed: {e}")
+
+    def _on_gallery_delete(self) -> None:
+        """Remove selected profile from the gallery."""
+        row = self.gallery_list.currentRow()
+        if row < 0 or row >= len(self._gallery):
+            self.append_log("No gallery profile selected for deletion.")
+            return
+        removed = self._gallery.pop(row)
+        self._refresh_gallery_list()
+        self.append_log(f"Deleted gallery profile: {removed.get('name', '')}")
+
+    def _refresh_gallery_list(self) -> None:
+        """Refresh the gallery QListWidget from internal storage."""
+        self.gallery_list.clear()
+        for entry in self._gallery:
+            name = entry.get("name", "Unnamed")
+            profile_path = entry.get("profile_path", "")
+            description = f"{name} - {profile_path}" if profile_path else name
+            self.gallery_list.addItem(QListWidgetItem(description))
+
+    # ------------------------------------------------------------------
+    # Session persistence
+    # ------------------------------------------------------------------
+
+    def _collect_session_data(self) -> dict:
+        """Collect all current UI state into a serializable dict."""
+        voice_state_values = [s.value() for s in self.voice_state_sliders]
+        return {
+            "text": self.text_edit.toPlainText(),
+            "language_index": self.language_combo.currentIndex(),
+            "speaker_file": self.speaker_edit.text(),
+            "uclm_checkpoint": self.uclm_ckpt_edit.text(),
+            "codec_checkpoint": self.codec_ckpt_edit.text(),
+            "ref_audio": self.ref_audio_edit.text(),
+            "dialogue_context": self.dialogue_context_edit.toPlainText(),
+            "emotion_index": self.emotion_combo.currentIndex(),
+            "speed": self.speed_spin.value(),
+            "breathiness": self.breathiness_slider.value(),
+            "tension": self.tension_slider.value(),
+            "arousal": self.arousal_slider.value(),
+            "valence": self.valence_slider.value(),
+            "roughness": self.roughness_slider.value(),
+            "voicing": self.voicing_slider.value(),
+            "energy": self.energy_slider.value(),
+            "voice_state": voice_state_values,
+            "cfg_scale": self.cfg_scale_slider.value(),
+            "gallery": self._gallery,
+        }
+
+    def _restore_session_data(self, data: dict) -> None:
+        """Restore UI state from a session dict."""
+        self.text_edit.setPlainText(data.get("text", ""))
+        idx = data.get("language_index", 0)
+        if 0 <= idx < self.language_combo.count():
+            self.language_combo.setCurrentIndex(idx)
+        self.speaker_edit.setText(data.get("speaker_file", ""))
+        self.uclm_ckpt_edit.setText(data.get("uclm_checkpoint", ""))
+        self.codec_ckpt_edit.setText(data.get("codec_checkpoint", ""))
+        self.ref_audio_edit.setText(data.get("ref_audio", ""))
+        self.dialogue_context_edit.setPlainText(data.get("dialogue_context", ""))
+
+        emo_idx = data.get("emotion_index", 0)
+        if 0 <= emo_idx < self.emotion_combo.count():
+            self.emotion_combo.setCurrentIndex(emo_idx)
+
+        self.speed_spin.setValue(data.get("speed", 1.0))
+        self.breathiness_slider.setValue(data.get("breathiness", 0))
+        self.tension_slider.setValue(data.get("tension", 0))
+        self.arousal_slider.setValue(data.get("arousal", 0))
+        self.valence_slider.setValue(data.get("valence", 0))
+        self.roughness_slider.setValue(data.get("roughness", 0))
+        self.voicing_slider.setValue(data.get("voicing", 100))
+        self.energy_slider.setValue(data.get("energy", 0))
+
+        voice_state = data.get("voice_state", [])
+        for i, val in enumerate(voice_state):
+            if i < len(self.voice_state_sliders):
+                self.voice_state_sliders[i].setValue(val)
+
+        self.cfg_scale_slider.setValue(data.get("cfg_scale", 10))
+
+        self._gallery = data.get("gallery", [])
+        self._refresh_gallery_list()
+
+    def _on_save_session(self) -> None:
+        """Save the current session state as a JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Session", "tts_session.json",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            session = self._collect_session_data()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(session, f, indent=2, ensure_ascii=False)
+            self.append_log(f"Session saved to {path}")
+        except Exception as e:
+            self.append_log(f"ERROR: Session save failed: {e}")
+
+    def _on_load_session(self) -> None:
+        """Load a session state from a JSON file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Session", "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._restore_session_data(data)
+            self.append_log(f"Session loaded from {path}")
+        except Exception as e:
+            self.append_log(f"ERROR: Session load failed: {e}")

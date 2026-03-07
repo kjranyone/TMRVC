@@ -1,4 +1,8 @@
-"""Text feature utilities for UCLM TTS mode.
+"""Text feature utilities for UCLM TTS (legacy duration expansion).
+
+.. deprecated:: v3
+    Legacy component retained for v2 checkpoint compatibility and ablation.
+    The mainline v3 path uses pointer-based uniform distribution instead.
 
 Expands phoneme-level features to frame-level using durations.
 """
@@ -49,12 +53,14 @@ def expand_phonemes_to_frames(
             frame_idx += dur
 
     if target_length is not None and frame_features.shape[1] < target_length:
-        # Zero-pad to target length (mathematically consistent with explicit_state padding)
+        # Pad to target length
         pad_len = target_length - frame_features.shape[1]
-        padding = torch.zeros(B, pad_len, d, device=device)
-        frame_features = torch.cat([frame_features, padding], dim=1)
+        frame_features = torch.cat(
+            [frame_features, frame_features[:, -1:, :].expand(-1, pad_len, -1)],
+            dim=1,
+        )
     elif target_length is not None and frame_features.shape[1] > target_length:
-        # Trim to target length (rare, only if durations sum > audio frames)
+        # Trim to target length
         frame_features = frame_features[:, :target_length, :]
 
     return frame_features

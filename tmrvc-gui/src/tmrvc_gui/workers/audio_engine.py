@@ -1,4 +1,4 @@
-"""Python streaming voice-conversion engine using UCLM v2."""
+"""Python streaming voice-conversion engine using UCLM."""
 
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ from tmrvc_core.dialogue_types import StyleParams
 from tmrvc_serve.uclm_engine import UCLMEngine, EngineState
 from tmrvc_gui.workers.ring_buffer import RING_BUFFER_CAPACITY, RingBuffer
 
-# UCLM v2 uses 10ms frames (240 samples @ 24kHz)
+# UCLM uses 10ms frames (240 samples @ 24kHz)
 FRAME_SIZE = 240
 
 
 class AudioEngine(QThread):
-    """Python streaming voice-conversion engine using UCLM v2."""
+    """Python streaming voice-conversion engine using UCLM."""
 
     level_updated = Signal(float, float)
     timing_updated = Signal(float)

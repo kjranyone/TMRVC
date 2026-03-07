@@ -1,4 +1,4 @@
-"""LoRA (Low-Rank Adaptation) for UCLM v2 fine-tuning.
+"""LoRA (Low-Rank Adaptation) for UCLM fine-tuning.
 
 Implements LoRA for speaker adaptation in the UCLM architecture.
 Applied to Transformer attention projections.

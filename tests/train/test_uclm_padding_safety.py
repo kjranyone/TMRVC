@@ -46,21 +46,22 @@ def test_forward_vc_accepts_padded_target_b_context():
     assert out["logits_b"].shape == (B, 4, T, 64)
 
 
-def test_forward_tts_accepts_padded_target_b_context():
+def test_forward_tts_pointer_accepts_padded_target_b_context():
     B, L, T = 2, 6, 16
     model = DisentangledUCLM(d_model=256, n_heads=4, n_layers=2, vq_bins=64)
 
     target_b = torch.randint(0, 64, (B, 4, T), dtype=torch.long)
     target_b[:, :, -3:] = -1
 
-    out = model.forward_tts(
-        phonemes=torch.randint(0, 256, (B, L), dtype=torch.long),
-        phoneme_lens=torch.full((B,), L, dtype=torch.long),
+    out = model.forward_tts_pointer(
+        phoneme_ids=torch.randint(0, 256, (B, L), dtype=torch.long),
         language_ids=torch.zeros((B,), dtype=torch.long),
-        target_b=target_b,
+        pointer_state=None,
+        speaker_embed=torch.randn(B, 192),
         explicit_state=torch.randn(B, T, 8),
         ssl_state=torch.randn(B, T, 128),
-        speaker_embed=torch.randn(B, 192),
+        target_b=target_b,
+        target_length=T,
     )
     assert out["logits_a"].shape == (B, 8, T, 1024)
     assert out["logits_b"].shape == (B, 4, T, 64)

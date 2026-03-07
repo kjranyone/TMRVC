@@ -1,4 +1,4 @@
-"""TTS generation worker: synthesizes audio from text using UCLM v2."""
+"""TTS generation worker: synthesizes audio from text using UCLM."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class TTSWorker(BaseWorker):
-    """Background worker for UCLM v2 TTS audio generation.
+    """Background worker for UCLM TTS audio generation.
 
     Config dict keys:
     - text: str
@@ -95,7 +95,7 @@ class TTSWorker(BaseWorker):
             spk_t = torch.zeros(1, D_SPEAKER)
             self.log_message.emit("Warning: No speaker file, using zero embedding")
 
-        self.log_message.emit("Synthesizing (UCLM v2)...")
+        self.log_message.emit("Synthesizing (UCLM)...")
         t1 = time.perf_counter()
 
         audio_t, metrics = engine.tts(

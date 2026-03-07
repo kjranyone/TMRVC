@@ -1,7 +1,10 @@
-"""DurationPredictor: predict phoneme durations for TTS.
+"""DurationPredictor: predict phoneme durations for TTS (legacy).
+
+.. deprecated:: v3
+    Legacy component retained for v2 checkpoint compatibility and ablation.
+    The mainline v3 path uses pointer-based text progression instead.
 
 Converts phoneme-level text features to log-durations (number of frames).
-Used for length regulation in UCLM TTS mode.
 """
 
 from __future__ import annotations

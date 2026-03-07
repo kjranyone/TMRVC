@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch TTS generation from YAML scripts using UCLM v2.
+"""Batch TTS generation from YAML scripts using UCLM.
 
 Reads a YAML script file with character profiles and dialogue entries,
 then generates audio files for each entry using the unified UCLM pipeline.
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Batch generate audio using UCLM v2.",
+        description="Batch generate audio using UCLM.",
     )
     p.add_argument("script", type=Path, help="YAML script file path")
     p.add_argument(

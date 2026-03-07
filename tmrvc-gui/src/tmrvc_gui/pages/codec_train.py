@@ -18,7 +18,7 @@ from tmrvc_gui.widgets.metric_plot import MetricPlotWidget
 
 
 class CodecTrainPage(QWidget):
-    """Monitor Emotion-Aware Codec training (Token Spec v2)."""
+    """Monitor Emotion-Aware Codec training (Token Spec)."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

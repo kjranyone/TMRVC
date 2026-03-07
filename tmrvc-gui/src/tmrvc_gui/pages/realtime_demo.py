@@ -1,4 +1,4 @@
-"""Real-time voice conversion demo page using UCLM v2."""
+"""Real-time voice conversion demo page using UCLM."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class RealtimeDemoPage(QWidget):
-    """Real-time VC demo using unified UCLM v2 engine."""
+    """Real-time VC demo using unified UCLM engine."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -62,7 +62,7 @@ class RealtimeDemoPage(QWidget):
         top_row.addWidget(device_group)
 
         # --- Model configuration ---
-        model_group = QGroupBox("Model Configuration (UCLM v2)")
+        model_group = QGroupBox("Model Configuration (UCLM)")
         model_form = QFormLayout(model_group)
 
         # UCLM Checkpoint

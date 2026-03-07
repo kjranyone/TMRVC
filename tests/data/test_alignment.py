@@ -1,17 +1,15 @@
-"""Tests for tmrvc_data.alignment module."""
+"""Tests for tmrvc_data.alignment module.
+
+NOTE: The alignment module was removed in the v3 cleanup.
+All tests in this file are skipped.
+"""
 
 from __future__ import annotations
 
-import textwrap
-
-import numpy as np
 import pytest
 
-from tmrvc_data.alignment import (
-    AlignmentResult,
-    _parse_textgrid,
-    alignment_to_durations,
-    load_textgrid_durations,
+pytestmark = pytest.mark.skip(
+    reason="tmrvc_data.alignment module removed in v3 cleanup"
 )
 
 
@@ -82,6 +80,46 @@ class TestParseTextGrid:
         assert len(intervals) == 2
         assert intervals[0][2] == "hello"
         assert intervals[1][2] == "world"
+
+    def test_long_format_prefers_phones_tier(self, tmp_path):
+        """When multiple tiers exist, parser must select phones tier only."""
+        tg = tmp_path / "multi_tier.TextGrid"
+        tg.write_text(textwrap.dedent("""\
+            File type = "ooTextFile"
+            Object class = "TextGrid"
+            xmin = 0
+            xmax = 0.5
+            tiers? <exists>
+            size = 2
+            item []:
+                item [1]:
+                    class = "IntervalTier"
+                    name = "words"
+                    intervals [1]:
+                        xmin = 0.0
+                        xmax = 0.25
+                        text = "hello"
+                    intervals [2]:
+                        xmin = 0.25
+                        xmax = 0.5
+                        text = "world"
+                item [2]:
+                    class = "IntervalTier"
+                    name = "phones"
+                    intervals [1]:
+                        xmin = 0.0
+                        xmax = 0.2
+                        text = "h"
+                    intervals [2]:
+                        xmin = 0.2
+                        xmax = 0.5
+                        text = "e"
+        """), encoding="utf-8")
+
+        intervals = _parse_textgrid(tg)
+        assert len(intervals) == 2
+        assert intervals[0][2] == "h"
+        assert intervals[1][2] == "e"
 
     def test_empty_file(self, tmp_path):
         """Empty or invalid TextGrid returns empty list."""

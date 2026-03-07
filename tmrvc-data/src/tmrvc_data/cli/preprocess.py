@@ -1,4 +1,4 @@
-"""``tmrvc-preprocess`` — UCLM v2 full preprocessing pipeline.
+"""``tmrvc-preprocess`` — UCLM full preprocessing pipeline.
 
 Unified extraction of dual-stream tokens, voice state, and TTS alignment.
 """
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmrvc-preprocess",
-        description="Extract UCLM v2 features from raw audio to cache.",
+        description="Extract UCLM features from raw audio to cache.",
     )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--raw-dir", required=True, type=Path)
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> None:
     cache = FeatureCache(args.cache_dir)
 
     # Load models
-    logger.info("Loading UCLM v2 extraction models on %s...", args.device)
+    logger.info("Loading UCLM extraction models on %s...", args.device)
     codec = UCLMCodecWrapper(args.codec_checkpoint, device=args.device)
     vs_estimator = SSLVoiceStateEstimator(device=args.device)
     spk_encoder = SpeakerEncoder(device=args.device)
@@ -156,7 +156,7 @@ def main(argv: list[str] | None = None) -> None:
 
             phoneme_ids, durations = None, None
             # Note: TTS alignment (phonemes, durations) is deferred to a specialized
-            # MFA pipeline. This script focuses on UCLM v2 acoustic/control feature extraction.
+            # MFA pipeline. This script focuses on UCLM acoustic/control feature extraction.
 
             spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UCLM v2 TTS end-to-end demo.
+"""UCLM TTS end-to-end demo.
 
 Verifies the unified dual-stream pipeline: 
 text → G2P → UCLMEngine (TTS Mode) → Dual Stream Tokens → Codec Decoder → WAV
@@ -23,7 +23,7 @@ def main() -> None:
             if hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8")
 
-    parser = argparse.ArgumentParser(description="UCLM v2 TTS Demo")
+    parser = argparse.ArgumentParser(description="UCLM TTS Demo")
     parser.add_argument("--text", default="こんにちは、世界！テスト音声です。")
     parser.add_argument("--language", default="ja", choices=["ja", "en", "zh", "ko"])
     parser.add_argument("--output", default="tts_demo_uclm.wav", help="Output WAV path")
@@ -45,7 +45,7 @@ def main() -> None:
     from tmrvc_data.g2p import text_to_phonemes
     from tmrvc_serve.uclm_engine import UCLMEngine
 
-    logger.info("=== UCLM v2 TTS Demo ===")
+    logger.info("=== UCLM TTS Demo ===")
     logger.info("Text: %s", args.text)
     logger.info("Emotion: %s", args.emotion)
 

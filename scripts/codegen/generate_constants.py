@@ -64,7 +64,7 @@ _RUNTIME_KEYS = {
     "d_f0_predictor",
     "d_content_synthesizer",
     "n_languages",
-    # UCLM Token Spec v2
+    # UCLM Token Spec
     "n_codebooks",
     "rvq_vocab_size",
     "control_vocab_size",

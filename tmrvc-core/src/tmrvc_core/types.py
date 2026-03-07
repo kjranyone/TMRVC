@@ -1,4 +1,4 @@
-"""Shared data types for the TMRVC pipeline (UCLM v2)."""
+"""Shared data types for the TMRVC pipeline (UCLM)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class Utterance:
 
 @dataclass
 class FeatureSet:
-    """Unified cached features for UCLM v2 (dual-stream)."""
+    """Unified cached features for UCLM (dual-stream)."""
     codec_tokens_a: torch.Tensor  # [8, T]
     codec_tokens_b: torch.Tensor  # [4, T]
     voice_state_explicit: torch.Tensor  # [8, T]

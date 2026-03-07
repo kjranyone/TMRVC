@@ -26,6 +26,8 @@ from tmrvc_gui.pages.server import ServerPage
 from tmrvc_gui.pages.style_editor import StyleEditorPage
 from tmrvc_gui.pages.token_train import TokenTrainPage
 from tmrvc_gui.pages.tts import TTSPage
+from tmrvc_gui.pages.curation import CurationPage
+from tmrvc_gui.pages.admin_dashboard import AdminDashboardPage
 
 _TABS: list[tuple[str, type[QWidget]]] = [
     ("Remote Client", RemoteClientPage),
@@ -36,10 +38,12 @@ _TABS: list[tuple[str, type[QWidget]]] = [
     ("Speaker Enrollment", EnrollmentPage),
     ("Realtime VC (UCLM)", RealtimeDemoPage),
     ("ONNX Export", OnnxExportPage),
-    ("TTS (UCLM v2)", TTSPage),
+    ("TTS (UCLM)", TTSPage),
     ("Batch Script", ScriptPage),
     ("Physical Style Editor", StyleEditorPage),
     ("Inference Server", ServerPage),
+    ("Curation Auditor", CurationPage),
+    ("System Admin", AdminDashboardPage),
 ]
 
 

@@ -1,13 +1,134 @@
-"""Tests for Phoneme mapping and MFA alignment parity."""
+"""Tests for Phoneme mapping, MFA alignment parity, and data model contracts.
+
+.. deprecated:: v3
+    Legacy alignment tests below are skipped. The alignment module is legacy v2 tooling.
+    Non-legacy tests (CurationRecord, pseudo_annotation) run normally.
+"""
 
 import numpy as np
 import pytest
 import torch
 
-from tmrvc_data.alignment import load_textgrid_durations, alignment_to_durations
-from tmrvc_data.g2p import text_to_phonemes, PHONE2ID, UNK_ID, BOS_ID, EOS_ID
+
+# ---------------------------------------------------------------------------
+# Non-legacy tests (always run)
+# ---------------------------------------------------------------------------
 
 
+class TestCurationRecordFields:
+    """Verify CurationRecord has expected speaker clustering fields."""
+
+    def test_speaker_cluster_field_exists(self):
+        from tmrvc_data.curation.models import CurationRecord
+        rec = CurationRecord(
+            record_id="test_001",
+            source_path="/tmp/test.wav",
+            audio_hash="abc123",
+        )
+        assert hasattr(rec, "speaker_cluster")
+        assert rec.speaker_cluster is None
+
+    def test_diarization_confidence_field_exists(self):
+        from tmrvc_data.curation.models import CurationRecord
+        rec = CurationRecord(
+            record_id="test_002",
+            source_path="/tmp/test.wav",
+            audio_hash="def456",
+            speaker_cluster="spk_0",
+            diarization_confidence=0.95,
+        )
+        assert rec.diarization_confidence == 0.95
+
+    def test_speaker_fields_in_to_dict(self):
+        from tmrvc_data.curation.models import CurationRecord
+        rec = CurationRecord(
+            record_id="test_003",
+            source_path="/tmp/test.wav",
+            audio_hash="ghi789",
+            speaker_cluster="spk_1",
+            diarization_confidence=0.88,
+        )
+        d = rec.to_dict()
+        assert "speaker_cluster" in d
+        assert "diarization_confidence" in d
+        assert d["speaker_cluster"] == "spk_1"
+        assert d["diarization_confidence"] == 0.88
+
+
+class TestPseudoAnnotationQualitySummary:
+    """Verify quality_summary returns expected keys."""
+
+    def test_quality_summary_empty_results(self):
+        from tmrvc_data.pseudo_annotation import quality_summary
+        summary = quality_summary([])
+        expected_keys = {
+            "total_segments",
+            "total_duration_sec",
+            "mean_asr_confidence",
+            "mean_quality_score",
+            "mean_snr_db",
+            "speaker_counts",
+            "language_counts",
+            "event_stats",
+        }
+        assert set(summary.keys()) == expected_keys
+        assert summary["total_segments"] == 0
+
+    def test_quality_summary_with_results(self):
+        from tmrvc_data.pseudo_annotation import (
+            PseudoAnnotationResult,
+            quality_summary,
+        )
+        results = [
+            PseudoAnnotationResult(
+                start_sec=0.0,
+                end_sec=1.5,
+                text="hello",
+                asr_confidence=0.9,
+                speaker_cluster=0,
+                quality_score=0.85,
+                snr_db=25.0,
+                detected_language="en",
+            ),
+            PseudoAnnotationResult(
+                start_sec=2.0,
+                end_sec=3.0,
+                text="world",
+                asr_confidence=0.8,
+                speaker_cluster=1,
+                quality_score=0.7,
+                snr_db=20.0,
+                detected_language="en",
+            ),
+        ]
+        summary = quality_summary(results)
+        assert summary["total_segments"] == 2
+        assert summary["total_duration_sec"] > 0
+        assert "speaker_counts" in summary
+        assert "language_counts" in summary
+        assert "event_stats" in summary
+        assert summary["mean_asr_confidence"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Legacy tests (skipped in v3)
+# ---------------------------------------------------------------------------
+
+try:
+    from tmrvc_data.alignment import load_textgrid_durations, alignment_to_durations
+except ImportError:
+    load_textgrid_durations = None
+    alignment_to_durations = None
+
+try:
+    from tmrvc_data.g2p import text_to_phonemes, PHONE2ID, UNK_ID, BOS_ID, EOS_ID
+except ImportError:
+    text_to_phonemes = None
+    PHONE2ID = {}
+    UNK_ID = BOS_ID = EOS_ID = 0
+
+
+@pytest.mark.skip(reason="Legacy v2 alignment tests — alignment module removed in v3")
 class TestPhonemeAlignmentParity:
     def test_g2p_to_id_mapping(self):
         """Ensure G2P output can be mapped to IDs correctly."""

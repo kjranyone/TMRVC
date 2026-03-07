@@ -1,4 +1,4 @@
-"""UCLM v2 Training page: monitor dual-stream token model training."""
+"""UCLM Training page: monitor dual-stream token model training."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from tmrvc_gui.widgets.metric_plot import MetricPlotWidget
 
 
 class TokenTrainPage(QWidget):
-    """Monitor and control UCLM v2 (dual-stream) training."""
+    """Monitor and control UCLM (dual-stream) training."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -29,7 +29,7 @@ class TokenTrainPage(QWidget):
         layout.setSpacing(8)
 
         # --- Status & Control ---
-        status_group = QGroupBox("UCLM v2 Training Status")
+        status_group = QGroupBox("UCLM Training Status")
         status_layout = QHBoxLayout(status_group)
 
         info_form = QFormLayout()

@@ -1,8 +1,10 @@
-"""POST /tts and POST /tts/stream endpoints (UCLM v2)."""
+"""POST /tts, POST /tts/stream, and POST /tts/stream/sse endpoints (UCLM v3 pointer mode)."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import torch
 
@@ -72,16 +74,32 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
     spk_embed = _load_speaker_embed(character)
     spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
 
-    # 5. Unified Synthesis (UCLM)
+    # 5. Convert optional embedding lists to tensors
+    dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0) if req.dialogue_context is not None else None
+    act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0) if req.acting_intent is not None else None
+
+    # Few-shot speaker adaptation: reference audio encoding
+    # (Placeholder: actual codec encoding from raw audio will be added when the
+    # full Speaker Prompt Encoder pipeline is integrated)
+
+    # 6. Unified Synthesis (UCLM)
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
         speaker_embed=spk_t,
-        style=style
+        style=style,
+        language_id=g2p_result.language_id,
+        pace=req.pace,
+        hold_bias=req.hold_bias,
+        boundary_bias=req.boundary_bias,
+        phrase_pressure=req.phrase_pressure,
+        breath_tendency=req.breath_tendency,
+        dialogue_context=dlg_ctx,
+        acting_intent=act_int,
     )
     
     audio = audio_t.cpu().numpy()
 
-    # 6. Post-processing
+    # 7. Post-processing
     audio = _append_silence(
         audio,
         leading_ms=inline_stage.leading_silence_ms,
@@ -107,14 +125,13 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
 
 @router.post("/tts/stream")
 async def stream_tts(req: TTSStreamRequest) -> StreamingResponse:
-    """Streaming TTS endpoint (Batch fallback for UCLM v2 initial implementation)."""
-    # For now, UCLM v2 synthesis is fast enough to return as a single chunk 
-    # while we implement full causal streaming for TTS.
+    """Streaming TTS endpoint (batch fallback while full causal streaming is implemented)."""
+    # Batch fallback: returns the full audio as a single chunk while
+    # full causal streaming is being implemented.
     res = await generate_tts(req)
-    
-    import base64
+
     audio_bytes = base64.b64decode(res.audio_base64)
-    
+
     async def _yield_once():
         yield audio_bytes
 
@@ -124,5 +141,113 @@ async def stream_tts(req: TTSStreamRequest) -> StreamingResponse:
         headers={
             "X-Sample-Rate": str(SAMPLE_RATE),
             "X-Sample-Format": "float32",
+        },
+    )
+
+
+@router.post("/tts/stream/sse")
+async def stream_tts_sse(req: TTSStreamRequest) -> StreamingResponse:
+    """Server-Sent Events streaming TTS endpoint.
+
+    Uses batch fallback (generate full audio, then chunk into SSE events).
+    The inner loop is structured so that real causal streaming can replace
+    the batch generation later without changing the SSE event contract.
+
+    Events emitted:
+        ``event: audio``  — base64-encoded PCM float32 chunk.
+        ``event: pointer`` — JSON pointer telemetry snapshot.
+        ``event: done``   — JSON final metrics.
+    """
+    from tmrvc_serve.app import get_engine, _characters, _context_predictor
+    from tmrvc_core.text_utils import analyze_inline_stage_directions
+    from tmrvc_data.g2p import text_to_phonemes
+
+    engine = get_engine()
+
+    character = _characters.get(req.character_id)
+    if character is None:
+        raise HTTPException(status_code=404, detail=f"Character '{req.character_id}' not found.")
+
+    # --- Resolve style and phonemes (mirrors /tts) ---
+    inline_stage = analyze_inline_stage_directions(req.text, language=character.language)
+    spoken_text = inline_stage.spoken_text
+
+    history = _to_dialogue_turns(req.context)
+    style = await _predict_style_from_inputs(
+        character=character,
+        text=spoken_text,
+        emotion=req.emotion,
+        history=history,
+        situation=req.situation,
+        hint=req.hint,
+        speaker=req.character_id,
+        context_predictor=_context_predictor,
+    )
+
+    style, preset_cfg = _resolve_style_preset(style, req.style_preset)
+    style = _apply_inline_stage_overlay(style, inline_stage.style_overlay)
+
+    g2p_result = text_to_phonemes(spoken_text, language=character.language)
+    phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+
+    spk_embed = _load_speaker_embed(character)
+    spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
+
+    dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0) if req.dialogue_context is not None else None
+    act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0) if req.acting_intent is not None else None
+
+    # --- Batch synthesis (will be replaced by causal streaming) ---
+    audio_t, metrics = engine.tts(
+        phonemes=phonemes_t,
+        speaker_embed=spk_t,
+        style=style,
+        language_id=g2p_result.language_id,
+        pace=req.pace,
+        hold_bias=req.hold_bias,
+        boundary_bias=req.boundary_bias,
+        phrase_pressure=req.phrase_pressure,
+        breath_tendency=req.breath_tendency,
+        dialogue_context=dlg_ctx,
+        acting_intent=act_int,
+    )
+
+    audio = audio_t.cpu().numpy().astype(np.float32)
+    audio = _append_silence(
+        audio,
+        leading_ms=inline_stage.leading_silence_ms,
+        trailing_ms=inline_stage.trailing_silence_ms,
+    )
+
+    # --- Chunk audio into SSE events ---
+    chunk_samples = int(SAMPLE_RATE * req.chunk_duration_ms / 1000)
+    pointer_state = metrics.get("pointer_state", {})
+
+    async def _sse_generator():
+        total_chunks = max(1, (len(audio) + chunk_samples - 1) // chunk_samples)
+
+        for i in range(0, len(audio), chunk_samples):
+            chunk = audio[i : i + chunk_samples]
+            chunk_b64 = base64.b64encode(chunk.tobytes()).decode("ascii")
+            yield f"event: audio\ndata: {chunk_b64}\n\n"
+
+            # Interleave pointer telemetry (interpolated position)
+            chunk_idx = i // chunk_samples
+            progress_frac = (chunk_idx + 1) / total_chunks
+            tel = dict(pointer_state)
+            tel["stream_progress"] = round(progress_frac, 4)
+            yield f"event: pointer\ndata: {json.dumps(tel)}\n\n"
+
+            # Yield control to the event loop between chunks
+            await asyncio.sleep(0)
+
+        # Final done event
+        yield f"event: done\ndata: {json.dumps(metrics)}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
         },
     )

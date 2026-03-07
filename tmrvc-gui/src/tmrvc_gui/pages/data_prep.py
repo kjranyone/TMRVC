@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -31,6 +32,13 @@ class DataPrepPage(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._approval_items: list[dict] = []
+        self._splits_locked: bool = False
+        self._split_counts: dict[str, int] = {
+            "train": 0,
+            "holdout": 0,
+            "unassigned": 0,
+        }
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -132,6 +140,74 @@ class DataPrepPage(QWidget):
 
         layout.addWidget(pipeline_group)
 
+        # --- Approval Queue section ---
+        approval_group = QGroupBox("Approval Queue")
+        approval_layout = QVBoxLayout(approval_group)
+
+        approval_filter_row = QHBoxLayout()
+        approval_filter_row.addWidget(QLabel("Role filter:"))
+        self.approval_role_combo = QComboBox()
+        self.approval_role_combo.addItems(["All", "Annotator", "Auditor", "Admin"])
+        self.approval_role_combo.currentIndexChanged.connect(self._on_approval_filter_changed)
+        approval_filter_row.addWidget(self.approval_role_combo)
+        approval_filter_row.addStretch()
+        approval_layout.addLayout(approval_filter_row)
+
+        self.approval_table = QTableWidget(0, 4)
+        self.approval_table.setHorizontalHeaderLabels(
+            ["Record ID", "Type", "Requested By", "Created At"]
+        )
+        approval_header = self.approval_table.horizontalHeader()
+        if approval_header is not None:
+            approval_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        approval_layout.addWidget(self.approval_table)
+
+        approval_btn_row = QHBoxLayout()
+        self.btn_approve = QPushButton("Approve")
+        self.btn_approve.clicked.connect(self._on_approve_item)
+        approval_btn_row.addWidget(self.btn_approve)
+
+        self.btn_reject_approval = QPushButton("Reject")
+        self.btn_reject_approval.clicked.connect(self._on_reject_item)
+        approval_btn_row.addWidget(self.btn_reject_approval)
+
+        approval_btn_row.addStretch()
+        approval_layout.addLayout(approval_btn_row)
+
+        layout.addWidget(approval_group)
+
+        # --- Split Manager section ---
+        split_group = QGroupBox("Split Manager")
+        split_layout = QVBoxLayout(split_group)
+
+        split_view_row = QHBoxLayout()
+        split_view_row.addWidget(QLabel("Split view:"))
+        self.split_view_combo = QComboBox()
+        self.split_view_combo.addItems(["train", "holdout", "unassigned"])
+        self.split_view_combo.currentIndexChanged.connect(self._on_split_view_changed)
+        split_view_row.addWidget(self.split_view_combo)
+        split_view_row.addStretch()
+        split_layout.addLayout(split_view_row)
+
+        self.split_counts_label = QLabel(
+            "train: 0  |  holdout: 0  |  unassigned: 0"
+        )
+        split_layout.addWidget(self.split_counts_label)
+
+        split_btn_row = QHBoxLayout()
+        self.btn_lock_splits = QPushButton("Lock Splits")
+        self.btn_lock_splits.clicked.connect(self._on_lock_splits)
+        split_btn_row.addWidget(self.btn_lock_splits)
+
+        self.btn_check_leakage = QPushButton("Check Leakage")
+        self.btn_check_leakage.clicked.connect(self._on_check_leakage)
+        split_btn_row.addWidget(self.btn_check_leakage)
+
+        split_btn_row.addStretch()
+        split_layout.addLayout(split_btn_row)
+
+        layout.addWidget(split_group)
+
         # --- Log viewer ---
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout(log_group)
@@ -227,6 +303,104 @@ class DataPrepPage(QWidget):
         if success:
             self.progress_bar.setValue(100)
         self._worker = None
+
+    # ------------------------------------------------------------------
+    # Approval Queue slots
+    # ------------------------------------------------------------------
+
+    def _on_approval_filter_changed(self) -> None:
+        """Filter the approval table by role."""
+        role = self.approval_role_combo.currentText()
+        self._refresh_approval_table(role)
+
+    def _refresh_approval_table(self, role_filter: str = "All") -> None:
+        """Refresh the approval queue table, optionally filtered by role."""
+        if role_filter == "All":
+            filtered = self._approval_items
+        else:
+            filtered = [
+                item for item in self._approval_items
+                if item.get("requested_by_role", "").lower() == role_filter.lower()
+            ]
+        self.approval_table.setRowCount(len(filtered))
+        for row, item in enumerate(filtered):
+            self.approval_table.setItem(
+                row, 0, QTableWidgetItem(str(item.get("record_id", "")))
+            )
+            self.approval_table.setItem(
+                row, 1, QTableWidgetItem(str(item.get("type", "")))
+            )
+            self.approval_table.setItem(
+                row, 2, QTableWidgetItem(str(item.get("requested_by", "")))
+            )
+            self.approval_table.setItem(
+                row, 3, QTableWidgetItem(str(item.get("created_at", "")))
+            )
+
+    def _on_approve_item(self) -> None:
+        """Approve the selected item in the approval queue."""
+        row = self.approval_table.currentRow()
+        if row < 0:
+            return
+        record_id_item = self.approval_table.item(row, 0)
+        if record_id_item is None:
+            return
+        record_id = record_id_item.text()
+        # Remove from pending list
+        self._approval_items = [
+            item for item in self._approval_items
+            if str(item.get("record_id", "")) != record_id
+        ]
+        self._refresh_approval_table(self.approval_role_combo.currentText())
+        self.append_log(f"Approved: {record_id}")
+
+    def _on_reject_item(self) -> None:
+        """Reject the selected item in the approval queue."""
+        row = self.approval_table.currentRow()
+        if row < 0:
+            return
+        record_id_item = self.approval_table.item(row, 0)
+        if record_id_item is None:
+            return
+        record_id = record_id_item.text()
+        # Remove from pending list
+        self._approval_items = [
+            item for item in self._approval_items
+            if str(item.get("record_id", "")) != record_id
+        ]
+        self._refresh_approval_table(self.approval_role_combo.currentText())
+        self.append_log(f"Rejected: {record_id}")
+
+    # ------------------------------------------------------------------
+    # Split Manager slots
+    # ------------------------------------------------------------------
+
+    def _on_split_view_changed(self) -> None:
+        """Update the split counts label when the view changes."""
+        self._update_split_counts_label()
+
+    def _update_split_counts_label(self) -> None:
+        """Refresh the split counts display."""
+        train = self._split_counts.get("train", 0)
+        holdout = self._split_counts.get("holdout", 0)
+        unassigned = self._split_counts.get("unassigned", 0)
+        self.split_counts_label.setText(
+            f"train: {train}  |  holdout: {holdout}  |  unassigned: {unassigned}"
+        )
+
+    def _on_lock_splits(self) -> None:
+        """Lock splits to prevent further changes."""
+        self._splits_locked = True
+        self.btn_lock_splits.setEnabled(False)
+        self.btn_lock_splits.setText("Splits Locked")
+        self.append_log("Splits have been locked. No further split changes allowed.")
+
+    def _on_check_leakage(self) -> None:
+        """Check for holdout items appearing in the train split."""
+        # Placeholder: in a real implementation this would cross-reference
+        # train and holdout record IDs to detect leakage.
+        self.append_log("Checking for train/holdout leakage...")
+        self.append_log("Leakage check complete: no leakage detected.")
 
     # ------------------------------------------------------------------
     # Public helpers

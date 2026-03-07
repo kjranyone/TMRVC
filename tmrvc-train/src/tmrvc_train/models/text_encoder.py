@@ -1,4 +1,4 @@
-"""TextEncoder: phoneme-based Transformer encoder for TTS (UCLM v2)."""
+"""TextEncoder: phoneme-based Transformer encoder for TTS."""
 
 from __future__ import annotations
 

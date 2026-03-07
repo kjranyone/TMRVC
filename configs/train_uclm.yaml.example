@@ -1,4 +1,12 @@
 language: ja
+tts_mode: pointer
+pointer_loss_weight: 0.5
+progress_loss_weight: 0.2
+alignment_loss_type: none
+pointer_target_source: heuristic_bootstrap
+legacy_duration_loss_weight: 0.0
+voice_state_loss_weight: 0.0
+delta_voice_state_loss_weight: 0.0
 train_steps: 100000
 train_batch_size: 16
 train_device: cuda

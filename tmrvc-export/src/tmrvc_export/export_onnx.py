@@ -1,4 +1,4 @@
-"""UCLM v2 ONNX Export: Compliant with onnx-contract.md Section 3."""
+"""UCLM ONNX Export: Compliant with onnx-contract.md Section 3."""
 
 from __future__ import annotations
 
@@ -113,11 +113,11 @@ def export_uclm_core(model: CodecTransformer, path: Path):
         opset_version=OPSET_VERSION
     )
 
-def export_all_v2(models_dict: dict, output_dir: Path):
+def export_all(models_dict: dict, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if "codec_encoder" in models_dict:
         export_codec_encoder(models_dict["codec_encoder"], output_dir / "codec_encoder.onnx")
     
     # ... more export calls for each contract model ...
-    logger.info(f"UCLM v2 models exported to {output_dir}")
+    logger.info(f"UCLM models exported to {output_dir}")

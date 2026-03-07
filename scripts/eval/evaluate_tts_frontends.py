@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate UCLM v2 TTS engine performance and quality.
+"""Evaluate UCLM TTS engine performance and quality.
 
 Generates audio and metrics from a YAML script using the unified UCLMEngine.
 """
@@ -41,7 +41,7 @@ class EvalRow:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate UCLM v2 performance.")
+    parser = argparse.ArgumentParser(description="Evaluate UCLM performance.")
     parser.add_argument("script", type=Path, help="YAML script path.")
     parser.add_argument("--output-dir", type=Path, default=Path("eval_uclm"), help="Output directory.")
     parser.add_argument("--uclm-checkpoint", type=Path, default="checkpoints/uclm/uclm_latest.pt")

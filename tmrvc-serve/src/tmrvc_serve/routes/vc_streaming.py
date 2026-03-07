@@ -39,7 +39,7 @@ _engine_pool: VCEnginePool | None = None
 def get_engine_pool() -> VCEnginePool:
     global _engine_pool
     if _engine_pool is None:
-        # Default paths for UCLM v2
+        # Default checkpoint paths
         uclm_path = Path("checkpoints/uclm/uclm_latest.pt")
         codec_path = Path("checkpoints/codec/codec_latest.pt")
         
@@ -87,7 +87,7 @@ async def vc_stream(
     websocket: WebSocket,
     api_key: str | None = Query(None, description="API key for authentication"),
 ):
-    """Real-time VC streaming with session isolation (UCLM v2).
+    """Real-time VC streaming with session isolation.
 
     Protocol:
     1. Client sends: [192 float32 spk_embed]

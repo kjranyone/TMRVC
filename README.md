@@ -1,89 +1,90 @@
-# TMRVC — Unified Codec Language Model for Real-time TTS & VC
+# TMRVC — Unified Codec Language Model for Real-time TTS & VC (UCLM v3)
 
-TMRVC は、Unified Codec Language Model (UCLM) v2 を核とした、リアルタイム TTS（音声合成）および高精度 VC（音声変換）を実現する統合音声生成プロジェクトです。CPU のみで end-to-end 50ms 以下のストリーミング推論を実現します。
+TMRVC は、単一の codec language model で TTS と VC を統合するリアルタイム音声生成システムです。`UCLM v3` アーキテクチャに基づき、`10 ms` 因果生成、`A_t / B_t` の dual-stream token 生成、`MFA 非依存` の内部アライメント学習を実現しています。
 
-## Features
+## 現行アーキテクチャ (UCLM v3)
 
-- **Unified Core**: TTS と VC を単一のトランスフォーマー・アーキテクチャで統合。
-- **Dual-Stream Token Spec v2**: 音響トークン (`A_t`) と制御トークン (`B_t`) を同時に生成し、豊かな表現力を実現。
-- **8-dim Physical Voice State**: 息漏れ、緊張度などの物理的なパラメータによる直接的な演技制御。
-- **Low Latency**: 10ms hop 単位の因果的処理により、極低遅延なストリーミングを実現 (~25ms nominal)。
-- **CPU-only Inference**: ONNX Runtime を用いた効率的な推論。GPU 不要。
-- **LoRA Personalization**: 数秒の参照音声から LoRA を用いた高速な話者適応。
+- `10 ms causal core`: 未来参照なしで毎フレーム生成する
+- `Unified TTS / VC`: テキスト条件と音声条件を同一 backbone で扱う
+- `Internal alignment`: TTS は外部 forced alignment (MFA) ではなくポインタベースで text progression を学習する
+- `Dual-stream token contract`: acoustic tokens `A_t` と control tokens `B_t` を同期生成する
+- `Physical-first control`: 8 次元の voice state と prosody latent を優先し、抽象ラベル依存を避ける
 
-## Architecture (UCLM v2)
+## システム概要
 
-```
-[Input]
-  TTS Mode: Text → Phonemes → TextEncoder ──┐
-                                            │
-  VC Mode:  Audio → CodecEncoder → VCEncoder ┼─→ [UCLM Transformer] ─→ [Dual Heads] ─→ [Codec Decoder] ─→ Audio
-                                            │      (A_t, B_t)
-[Control]                                   │
-  Voice State: 8-dim Physical + SSL Context ─┘
-  Speaker:     Global Embed + LoRA
-```
+```text
+TTS:
+  text -> normalizer / g2p / grapheme backend -> text units
+       -> TextEncoder -> UCLM Core -> A_t / B_t -> Codec Decoder -> audio
+                         |-> pointer head (internal alignment)
 
-## Repository Structure
+VC:
+  source audio -> Codec Encoder + causal semantic encoder
+               -> UCLM Core -> A_t / B_t -> Codec Decoder -> audio
 
-```
-TMRVC/
-├── configs/              # Shared constants (UCLM v2 Spec)
-├── docs/design/          # Technical specifications
-├── tmrvc-core/           # Common types & constants
-├── tmrvc-data/           # Dataset & Preprocessing
-├── tmrvc-train/          # UCLM v2 Training & Model definitions
-├── tmrvc-export/         # ONNX Export & Quantization
-├── tmrvc-serve/          # Unified FastAPI Server (WebSocket)
-├── tmrvc-gui/            # PySide6 Development GUI
-├── tmrvc-engine-rs/      # Rust Streaming Engine
-└── tmrvc-vst/            # VST3 Plugin
+Shared conditions:
+  speaker embedding
+  explicit voice state (8-dim)
+  ssl state / prosody latent
+  pacing controls (pace / hold / boundary bias)
 ```
 
-## CLI Commands
+## セットアップ
+
+```bash
+uv sync --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+英語系 G2P を使う場合は `phonemizer` のバックエンドが必要です。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y espeak-ng
+```
+
+## データセット原則
+
+- 1 dataset = 1 language で運用する
+- mainline の TTS 学習に `MFA` や `durations.npy` は不要です
+- 必要なのは発話テキストと、そこから生成される text units のみです
+
+## 学習フロー
+
+`dev.py` を使用して、対話的に学習を進めることができます。
+
+```bash
+uv run python dev.py
+```
+
+### 推奨フロー
+
+| 番号 | 役割 | 主な出力 |
+|---|---|---|
+| `6` | 設定初期化 | `configs/datasets.yaml` |
+| `4` | データセット追加 | dataset 定義更新 |
+| `1` | フル学習 | cache + `uclm_final.pt` |
+| `8` | Codec 学習 | `codec_final.pt` |
+| `7` | 成果物確定 | `uclm_latest.pt`, `codec_latest.pt` |
+| `11` | 推論サーバー起動 | FastAPI server |
+
+## CLI
 
 | Command | Description |
-|---------|-------------|
-| `tmrvc-train-uclm` | UCLM モデルのマルチタスク学習 (TTS+VC) |
-| `tmrvc-train-codec` | Emotion-Aware Codec の学習 |
-| `tmrvc-serve` | 統合推論サーバーの起動 |
-| `tmrvc-export` | ONNX へのエクスポート・量子化 |
-| `tmrvc-gui` | 開発用 GUI の起動 |
+|---|---|
+| `tmrvc-preprocess` | 特徴量キャッシュ生成 |
+| `tmrvc-train-pipeline` | 前処理から UCLM 学習までの統合実行 |
+| `tmrvc-train-uclm` | UCLM v3 モデル学習 (pointer mode) |
+| `tmrvc-train-codec` | Emotion-Aware Codec 学習 |
+| `tmrvc-serve` | 統合推論サーバー起動 |
+| `tmrvc-export` | ONNX エクスポート |
+| `tmrvc-gui` | 開発・デモ用 GUI (UCLM v3 対応) |
 
-## Quick Start (Python)
+## ドキュメント
 
-```bash
-# uv を用いた環境構築
-uv sync --extra-index-url https://download.pytorch.org/whl/cu128
-
-# 推論サーバーの起動
-uv run tmrvc-serve --uclm-checkpoint checkpoints/uclm.pt --codec-checkpoint checkpoints/codec.pt
-
-# 開発用 GUI (TMRVC Research Studio) の起動
-uv run tmrvc-gui
-```
-
-## Training
-
-TMRVC は対話式メニューで簡単に学習を開始できます:
-
-```bash
-# 環境セットアップ
-uv sync
-
-# 設定ファイルの初期化 (初回のみ)
-uv run python scripts/config_generator.py --init
-
-# 対話式メニューの起動
-uv run dev.py
-```
-
-メニューから以下の操作が可能です:
-- データセットの追加・管理
-- 話者分離 (生のwavファイルから自動分類)
-- フル学習 / 既存キャッシュでの学習
-
-詳細は [TRAIN_GUIDE.md](TRAIN_GUIDE.md) を参照してください。
+- 全体入口: `docs/README.md`
+- 学習ガイド: `TRAIN_GUIDE.md`
+- 設計資料: `docs/design/architecture.md`
+- 実装計画: `plan/README.md`
 
 ## License
 

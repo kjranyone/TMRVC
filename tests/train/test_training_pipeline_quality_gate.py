@@ -99,7 +99,8 @@ def test_quality_gate_fails_on_waveform_length_mismatch(tmp_path: Path):
     cache = tmp_path / "cache"
     utt = _write_valid_cache_entry(cache, "jvs", "jvs_spk1", "utt1")
     # n_frames=8 in meta -> expected 8 * 240 = 1920 samples.
-    np.save(utt / "waveform.npy", np.zeros((1, 1921), dtype=np.float32))
+    # Severe mismatch (> 1 frame) should fail.
+    np.save(utt / "waveform.npy", np.zeros((1, 2161), dtype=np.float32))
 
     p = TrainingPipeline(
         experiment_dir=exp,
@@ -114,3 +115,25 @@ def test_quality_gate_fails_on_waveform_length_mismatch(tmp_path: Path):
         train_datasets=["jvs"],
     )
     assert not p._run_training()
+
+
+def test_quality_gate_allows_subframe_waveform_tail_remainder(tmp_path: Path):
+    exp = tmp_path / "exp"
+    cache = tmp_path / "cache"
+    utt = _write_valid_cache_entry(cache, "jvs", "jvs_spk1", "utt1")
+    # n_frames=8 in meta -> expected 1920. +1 sample tail remainder should pass.
+    np.save(utt / "waveform.npy", np.zeros((1, 1921), dtype=np.float32))
+
+    p = TrainingPipeline(
+        experiment_dir=exp,
+        dataset="jvs",
+        raw_dir=tmp_path,
+        cache_dir=cache,
+        config={"train_steps": 1, "quality_gate_token_samples": 8},
+        workers=1,
+        seed=42,
+        skip_preprocess=True,
+        run_training=True,
+        train_datasets=["jvs"],
+    )
+    assert p._run_training()

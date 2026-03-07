@@ -1,82 +1,262 @@
-# Unified Codec Language Model (UCLM) v2
+# Unified Codec Language Model
 
-## 1. Abstract
+この文書は、TMRVC mainline の `UCLM v3` を定義する。目的は、`A_t / B_t` dual-stream contract を維持したまま、TTS を `internal alignment + causal pointer` に移行し、VC を低遅延 causal semantic conditioning で統合することである。
 
-**Unified Codec Language Model (UCLM)** は、テキスト読み上げ (TTS) と音声変換 (VC) を単一のニューラル・アーキテクチャで実現する統合音声生成モデルである。従来の分離されたパイプラインとは異なり、UCLM はすべての音声生成タスクを「条件付けされたコーデック・トークン変換」として定義し、極低遅延なリアルタイム生成を可能にする。
+## 1. 生成問題の定式化
 
-Key Features:
-1. **Unified Architecture**: 同一のトランスフォーマー・バックボーンで TTS と VC を実行。
-2. **Dual-Stream Token Spec v2**: 音響トークン (`A_t`) と制御トークン (`B_t`) の同時生成。
-3. **8-dim Physical Voice State**: 息漏れ、緊張度などの物理パラメータによる直接的な表現制御。
-4. **Real-time Core**: 10ms フレーム単位の因果的（Causal）推論。
+各 frame `t` に対して、UCLM は次を推定する。
 
----
-
-## 2. アーキテクチャ
-
-### 2.1 統一定式化
-
-TTS と VC は、以下の確率分布のサンプリングとして統合される：
-
-```
-P(A_t, B_t | input, speaker, voice_state_t, past_context)
+```text
+P(A_t, B_t, G_t | C_t, S, V_t, H_t)
 ```
 
-- **Acoustic stream `A_t`**: `[B, 8]`, RVQ IDs `0..1023`
-- **Control stream `B_t`**: `[B, 4]=[op, type, dur, int]`
-- **Frame unit**: 10ms (`240 samples @ 24kHz`)
+- `A_t`: acoustic tokens
+- `B_t`: control tokens
+- `G_t`: pointer-related outputs
+- `C_t`: 条件コンテキスト
+  - TTS: text encoder features + pointer state
+  - VC: causal semantic features
+- `S`: speaker embedding
+- `V_t`: explicit / ssl / prosody conditions
+- `H_t`: causal history and KV cache
 
-### 2.2 構成要素
+## 2. 入力表現
 
-1.  **Modality Encoders**:
-    - `TextEncoder`: 音素 ID を連続的な特徴量に変換。
-    - `VCEncoder`: ソース音声トークンを VQ Bottleneck を通じて抽象化。
-2.  **VoiceStateEncoder**:
-    - 8次元の物理パラメータと SSL (WavLM) 潜在空間を統合。
-    - GRL (Gradient Reversal Layer) により、内容や話者情報を排除。
-3.  **Codec Transformer**:
-    - 因果的アテンションを用いたデュアルヘッド・トランスフォーマー。
-    - `A_t` と `B_t` をパラレルまたはインターリーブで予測。
-4.  **Emotion-Aware Codec Decoder**:
-    - トークン列から高品質な 24kHz 波形を復元。
+### 2.1 TTS 条件
 
----
+- normalized text
+- text units (`phoneme_ids` または grapheme ids)
+- pointer state
+  - `unit_index`
+  - `in_unit_progress`
+  - `finished`
 
-## 3. 入出力仕様
+### 2.2 VC 条件
 
-### 3.1 制御パラメータ (8-dim Voice State)
+- source codec tokens
+- causal semantic encoder output
+- target speaker embedding
+- target style / voice state
 
-| Dim | Name | Range | Description |
-|---|---|---|---|
-| 0 | Breathiness | [0, 1] | 息漏れの多さ |
-| 1 | Tension | [0, 1] | 声帯の緊張度 |
-| 2 | Arousal | [0, 1] | 覚醒度・エネルギー |
-| 3 | Valence | [-1, 1] | 感情の正負（快・不快） |
-| 4 | Roughness | [0, 1] | 声の掠れ・ざらつき |
-| 5 | Voicing | [0, 1] | 有声性の強さ |
-| 6 | Energy | [0, 1] | 全体的な音量感 |
-| 7 | Speech Rate | [0.5, 2.0] | 発話速度 |
+### 2.3 共通条件
 
----
+- `speaker_embed`
+- `explicit_state`
+- `ssl_state`
+- `prosody_latent`
+- external controls: `pace`, `hold_bias`, `boundary_bias`
 
-## 4. 学習戦略
+## 3. 出力
 
-### 4.1 マルチタスク学習
+### 3.1 Token heads
 
-TTS と VC のタスクをランダムにサンプリングして同時学習する。
+- `logits_a`: acoustic token logits
+- `logits_b`: control token logits
 
-- **TTS Task**: `target_A, target_B` をテキストから予測。
-- **VC Task**: `target_A, target_B` をソース音声のトークンから予測。
-- **Adversarial Loss**: GRL を用いて話者情報の分離を強化。
-- **CFG Dropout**: 15% の確率で条件をドロップし、推論時の Classifier-Free Guidance を可能にする。
+### 3.2 Pointer head
 
----
+- `advance_logit`: 次の text unit に進む確率
+- `progress_delta`: 現在 unit 内進行量の更新
+- optional `prosody_delta`: 局所的 phrasing 補助
 
-## 5. 推論プロトコル
+### 3.3 互換出力
 
-### 5.1 リアルタイム・ストリーミング
+legacy 比較のために duration branch を残す場合でも、mainline の一次出力は pointer head である。
 
-1.  10ms 単位で入力を受け取り、KV キャッシュを更新。
-2.  `A_t`, `B_t` をサンプリング（Greedy または Top-p）。
-3.  直ちにデコーダへ渡し、240 サンプルの音声を出力。
-4.  理論上のアルゴリズム遅延：10ms。
+## 4. TTS 推論
+
+TTS は duration 展開を事前に完了させず、1 frame ごとに pointer を更新する。
+
+```text
+for each 10 ms step:
+  1. current text unit を pointer state から参照
+  2. TextEncoder feature と条件埋め込みを UCLM に入力
+  3. A_t / B_t / advance_logit / progress_delta を得る
+  4. advance or hold を決定し pointer state を更新
+  5. Codec Decoder で waveform を復元
+```
+
+この設計により、文脈に応じた間、食い気味、溜め、語尾処理を online に変化させられる。
+
+## 5. 学習
+
+### 5.1 共通損失
+
+- `loss_a`: acoustic token CE
+- `loss_b`: control token CE
+- `loss_state`: 必要に応じた state reconstruction / consistency loss
+
+### 5.2 TTS 損失
+
+- `loss_pointer`: advance / hold の分類損失
+- `loss_progress`: progress 回帰
+- `loss_alignment`: MAS / CTC 系内部アライメント損失
+
+`durations.npy` を中心教師にしない。legacy ablation でだけ duration loss を残してよい。
+
+### 5.3 VC 損失
+
+- token reconstruction
+- speaker preservation
+- content preservation
+- low-latency consistency
+
+## 6. データ契約
+
+TTS サンプルで必要なのは:
+
+- text
+- text units
+- audio-side frame artifacts
+
+必要ではないもの:
+
+- MFA-generated TextGrid
+- phoneme duration table
+
+## 7. 実装境界
+
+### 7.1 mainline
+
+- pointer-based TTS
+- internal alignment
+- causal serving
+- no hard MFA dependency
+
+### 7.2 legacy
+
+- duration predictor
+- TextGrid injection
+- MFA batch utilities
+
+legacy は mainline 仕様に干渉してはならない。
+
+## v3 Pointer Contract
+
+本セクションは `forward_tts_pointer()` の正式な入出力仕様と、関連モジュールの動作を定義する。
+
+### `forward_tts_pointer()` シグネチャ
+
+```python
+def forward_tts_pointer(
+    self,
+    phoneme_ids: torch.Tensor,        # [B, L] phoneme token ids
+    language_ids: torch.Tensor,        # [B, L] language token ids
+    pointer_state: PointerState | None,# streaming 推論用 pointer state
+    speaker_embed: torch.Tensor,       # [B, d_speaker]
+    explicit_state: torch.Tensor,      # [B, T, d_explicit]
+    ssl_state: torch.Tensor,           # [B, T, d_ssl]
+    target_b: torch.Tensor,            # [B, n_codebooks, T] ground-truth codec tokens
+    target_length: int,                # 生成する acoustic frame 数
+    f0_condition: torch.Tensor | None = None,      # [B, T, 2]
+    cfg_scale: float = 1.0,
+    dialogue_context: torch.Tensor | None = None,  # [B, D_ctx]
+    acting_intent: torch.Tensor | None = None,     # [B, D_act]
+    prosody_latent: torch.Tensor | None = None,    # [B, T, D_pro]
+) -> dict
+```
+
+### 出力 dict
+
+| Key | Shape | Description |
+|---|---|---|
+| `logits_a` | `[B, n_codebooks, T, vocab_a]` | acoustic token logits |
+| `logits_b` | `[B, n_slots, T, vocab_b]` | control token logits |
+| `pointer_logits` | `[B, T, 1]` | advance/hold logit |
+| `progress_delta` | `[B, T, 1]` | phoneme 内進行度 (sigmoid, 0-1) |
+| `adv_logits` | varies or `None` | adversarial logits from VoiceStateEncoder |
+| `hidden_states` | `[B, T, d_model]` | transformer hidden states |
+
+### DialogueContextProjector
+
+`DialogueContextProjector` は dialogue_context, acting_intent, prosody_latent を受け取り、それぞれを `d_model` 次元に線形射影して content features に加算する。
+
+- `dialogue_context` (`[B, D_ctx]`): `dialogue_proj` で `[B, d_model]` に射影し、`unsqueeze(1)` で `[B, 1, d_model]` として T 方向にブロードキャスト加算。
+- `acting_intent` (`[B, D_act]`): `acting_proj` で同様に `[B, 1, d_model]` にブロードキャスト加算。
+- `prosody_latent` (`[B, T, D_pro]`): `prosody_proj` で `[B, T, d_model]` に射影して加算。T が content features と異なる場合は `F.interpolate(mode="nearest")` でリサイズ。
+
+入力が `None` の場合は寄与ゼロ (加算をスキップ)。
+
+### PointerHead
+
+`PointerHead` は transformer hidden states (`[B, T, d_model]`) を受け取り、dual projection で 2 つの出力を生成する。
+
+- **`advance_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1)` — advance/hold の生ロジットを出力 (`[B, T, 1]`)。
+- **`progress_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1) -> Sigmoid` — 現在 phoneme 内の進行度を `[0, 1]` で出力 (`[B, T, 1]`)。
+
+## Few-Shot Speaker Adaptation Contract
+
+本セクションは v3 の few-shot voice cloning に関する契約を定義する。
+
+### `encode_speaker_prompt()` API
+
+```python
+def encode_speaker_prompt(
+    prompt_audio: torch.Tensor,   # reference waveform
+    prompt_text: str | None,      # optional transcript for alignment hint
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        speaker_embed: [B, d_model] — refined speaker embedding
+        prompt_kv_cache: [B, n_layers, 2, n_heads, T_prompt, d_head] — reusable KV cache
+    """
+```
+
+### prompt_kv_cache Reuse
+
+`prompt_kv_cache` は会話ターンをまたいで再利用できる。同一話者による連続発話では、リファレンス音声の再エンコードを省略し、キャッシュされた KV を `forward_tts_pointer()` に直接渡す。これにより multi-turn 対話の推論コストを大幅に削減する。
+
+### Timbre-Prosody Disentanglement
+
+speaker prompt は timbre のみを提供する。韻律は以下から独立に制御される:
+
+- `ProsodyPredictor`: テキストとコンテキストから VAE-style で予測
+- `dialogue_context` / `acting_intent`: DialogueContextProjector 経由で conditioning
+- `explicit_state`: 8 次元の物理パラメータによる直接制御
+
+この分離により、同一話者で異なる感情・演技スタイルの音声を生成できる。
+
+### Cross-Lingual Few-Shot
+
+prompt の言語と target text の言語が異なっていてよい。Speaker Prompt Encoder の timbre bottleneck は言語非依存な音色表現を抽出するため、日本語リファレンスから英語音声を生成する (またはその逆の) cross-lingual few-shot が可能である。
+
+## Updated `forward_tts_pointer()` Signature
+
+v3 で追加されたパラメータを含む完全なシグネチャ:
+
+```python
+def forward_tts_pointer(
+    self,
+    phoneme_ids: torch.Tensor,        # [B, L] phoneme token ids
+    language_ids: torch.Tensor,        # [B, L] language token ids
+    pointer_state: PointerState | None,# streaming 推論用 pointer state
+    speaker_embed: torch.Tensor,       # [B, d_speaker]
+    explicit_state: torch.Tensor,      # [B, T, d_explicit]
+    ssl_state: torch.Tensor,           # [B, T, d_ssl]
+    target_b: torch.Tensor,            # [B, n_codebooks, T] ground-truth codec tokens
+    target_length: int,                # 生成する acoustic frame 数
+    f0_condition: torch.Tensor | None = None,      # [B, T, 2]
+    cfg_scale: float = 1.0,
+    dialogue_context: torch.Tensor | None = None,  # [B, D_ctx]
+    acting_intent: torch.Tensor | None = None,     # [B, D_act]
+    prosody_latent: torch.Tensor | None = None,    # [B, T, D_pro]
+    # --- v3 additions ---
+    prompt_kv_cache: torch.Tensor | None = None,   # [B, n_layers, 2, n_heads, T_prompt, d_head]
+    acoustic_history: torch.Tensor | None = None,  # [B, n_codebooks, T_hist]
+    token_language_ids: torch.Tensor | None = None, # [B, L] per-token language ids
+) -> dict
+```
+
+### Updated v3 Output Dict
+
+| Key | Shape | Description |
+|---|---|---|
+| `logits_a` | `[B, n_codebooks, T, vocab_a]` | acoustic token logits |
+| `logits_b` | `[B, n_slots, T, vocab_b]` | control token logits |
+| `pointer_logits` | `[B, T, 1]` | advance/hold logit |
+| `progress_delta` | `[B, T, 1]` | phoneme 内進行度 (sigmoid, 0-1) |
+| `adv_logits` | varies or `None` | adversarial logits from VoiceStateEncoder |
+| `hidden_states` | `[B, T, d_model]` | transformer hidden states |
+| `advance_logit` | `[B, T, 1]` | advance/hold の raw logit (pointer_logits と同義、明示的命名) |
+| `boundary_confidence` | `[B, T, 1]` | phoneme 境界の信頼度スコア |
+| `next_pointer_state` | `PointerState` | 更新後の pointer state |

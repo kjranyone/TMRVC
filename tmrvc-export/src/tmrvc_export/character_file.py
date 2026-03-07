@@ -1,6 +1,6 @@
 """.tmrvc_character binary file format: create and load character profiles.
 
-Extends .tmrvc_speaker v2 with voice_source_preset, default_style, and character profile.
+Extends .tmrvc_speaker with voice_source_preset, default_style, and character profile.
 
 Binary layout (v1):
     Magic: 4 bytes "TMCH"

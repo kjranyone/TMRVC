@@ -1,4 +1,4 @@
-"""Script batch generation worker using UCLM v2."""
+"""Script batch generation worker using UCLM."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class ScriptWorker(BaseWorker):
-    """Background worker for batch TTS generation using UCLM v2.
+    """Background worker for batch TTS generation using UCLM.
 
     Config dict keys:
     - script_yaml: str

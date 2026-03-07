@@ -24,7 +24,7 @@ from tmrvc_core.dialogue_types import StyleParams
 
 
 class StyleEditorPage(QWidget):
-    """Editor for UCLM v2 8-dimensional physical style presets."""
+    """Editor for UCLM 8-dimensional physical style presets."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

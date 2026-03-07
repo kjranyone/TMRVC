@@ -1,21 +1,46 @@
+from __future__ import annotations
+
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import numpy as np
 import json
 
+# Valid tts_mode values
+_VALID_TTS_MODES = {"auto", "pointer", "legacy_duration"}
+
 
 class DisentangledUCLMDataset(Dataset):
-    """Dataset for Disentangled UCLM multi-task training (TTS & VC)."""
+    """Dataset for Disentangled UCLM multi-task training (TTS & VC).
+
+    Args:
+        cache_dir: Root directory of the feature cache.
+        max_frames: Maximum number of frames per utterance (for batching).
+        include_datasets: Optional whitelist of dataset names to include.
+        tts_mode: Controls how text supervision artifacts are loaded.
+            - ``"auto"`` (default): load whatever is available (phoneme_ids
+              and/or durations).  This preserves the original v2 behaviour.
+            - ``"pointer"``: load ``phoneme_ids.npy`` but never require or
+              load ``durations.npy``.  This is the recommended mode for
+              UCLM v3 pointer-based text progression.
+            - ``"legacy_duration"``: require *both* ``phoneme_ids.npy`` **and**
+              ``durations.npy`` for a sample to have text supervision.
+    """
 
     def __init__(
         self,
         cache_dir: str | Path,
         max_frames: int = 400,
         include_datasets: list[str] | None = None,
+        tts_mode: str = "auto",
     ):
+        if tts_mode not in _VALID_TTS_MODES:
+            raise ValueError(
+                f"Invalid tts_mode={tts_mode!r}. Must be one of {sorted(_VALID_TTS_MODES)}."
+            )
         self.cache_dir = Path(cache_dir)
         self.max_frames = max_frames
+        self.tts_mode = tts_mode
         self.include_datasets = (
             set(include_datasets) if include_datasets is not None else None
         )
@@ -85,6 +110,129 @@ class DisentangledUCLMDataset(Dataset):
     def __len__(self) -> int:
         return len(self.utterances)
 
+    def supervision_report(self) -> dict:
+        """Return per-dataset supervision statistics.
+
+        Returns a dict with:
+            - ``total``: total number of utterances
+            - ``with_text``: utterances where ``phoneme_ids.npy`` exists
+            - ``with_legacy_duration``: utterances where both
+              ``phoneme_ids.npy`` and ``durations.npy`` exist
+            - ``no_text``: utterances with no text supervision at all
+            - ``unknown_phone_ratio``: ratio of UNK tokens in phoneme_ids
+            - ``tts_mode``: the active tts_mode setting
+        """
+        from tmrvc_data.g2p import UNK_ID
+
+        total = len(self.utterances)
+        with_text = 0
+        with_legacy_duration = 0
+        total_phones = 0
+        unk_phones = 0
+
+        for utt in self.utterances:
+            utt_dir = utt["path"]
+            has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
+            has_durations = (utt_dir / "durations.npy").exists()
+            if has_phonemes:
+                with_text += 1
+                if has_durations:
+                    with_legacy_duration += 1
+                try:
+                    pids = np.load(utt_dir / "phoneme_ids.npy")
+                    total_phones += len(pids)
+                    unk_phones += int((pids == UNK_ID).sum())
+                except Exception:
+                    pass
+
+        unk_ratio = unk_phones / max(total_phones, 1)
+
+        report = {
+            "total": total,
+            "with_text": with_text,
+            "with_legacy_duration": with_legacy_duration,
+            "no_text": total - with_text,
+            "unknown_phone_ratio": round(unk_ratio, 6),
+            "tts_mode": self.tts_mode,
+        }
+        report["canonical_text_unit_coverage"] = report["with_text"] / max(report["total"], 1)
+        return report
+
+    def expressive_readiness_report(self) -> dict:
+        """Return expressive-data readiness statistics.
+
+        Checks for optional expressive supervision files per utterance:
+            - ``dialogue_context.npy`` — scene/dialogue embedding
+            - ``acting_intent.npy`` — utterance-level acting intent
+            - ``prosody_targets.npy`` — local prosody targets
+            - ``style_embedding.npy`` — extracted style embedding
+            - ``pause_events.json`` — pause/breath/event pseudo labels
+
+        Returns a dict with counts and a readiness summary.
+        """
+        total = len(self.utterances)
+        counts: dict[str, int] = {
+            "dialogue_context": 0,
+            "acting_intent": 0,
+            "prosody_targets": 0,
+            "style_embedding": 0,
+            "pause_events": 0,
+        }
+        multi_take_texts: dict[str, int] = {}
+
+        for utt in self.utterances:
+            utt_dir = utt["path"]
+            for key in counts:
+                ext = ".json" if key == "pause_events" else ".npy"
+                if (utt_dir / f"{key}{ext}").exists():
+                    counts[key] += 1
+            text = utt["meta"].get("text", "")
+            if text:
+                multi_take_texts[text] = multi_take_texts.get(text, 0) + 1
+
+        multi_take_count = sum(1 for c in multi_take_texts.values() if c > 1)
+
+        return {
+            "total": total,
+            **{f"with_{k}": v for k, v in counts.items()},
+            "multi_take_texts": multi_take_count,
+            "multi_take_total_utterances": sum(c for c in multi_take_texts.values() if c > 1),
+        }
+
+    def phone_inventory_report(self) -> dict:
+        """Report phone inventory statistics across the dataset.
+
+        Returns dict with:
+            active_phone_inventory: set of phone IDs actually used
+            alias_hit_ratio: fraction resolved by alias rules (placeholder)
+            direct_hit_ratio: fraction already in canonical inventory
+            unk_ratio: fraction of UNK tokens
+            total_phones: total phone count
+        """
+        from tmrvc_data.g2p import UNK_ID
+
+        active_phones: set[int] = set()
+        total_phones = 0
+        unk_count = 0
+
+        for utt in self.utterances:
+            phoneme_path = Path(utt["path"]) / "phoneme_ids.npy"
+            if phoneme_path.exists():
+                ids = np.load(phoneme_path)
+                active_phones.update(ids.tolist())
+                total_phones += len(ids)
+                unk_count += int((ids == UNK_ID).sum())
+
+        return {
+            "active_phone_inventory": sorted(active_phones),
+            "active_phone_count": len(active_phones),
+            "total_phones": total_phones,
+            "unk_count": unk_count,
+            "unk_ratio": unk_count / max(total_phones, 1),
+            "direct_hit_ratio": (total_phones - unk_count) / max(total_phones, 1),
+            "alias_hit_ratio": 0.0,  # placeholder until alias pipeline is wired
+        }
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         utt = self.utterances[idx]
         utt_dir = utt["path"]
@@ -124,12 +272,44 @@ class DisentangledUCLMDataset(Dataset):
             if f0_condition.shape[0] > target_a.shape[1]:
                 f0_condition = f0_condition[:target_a.shape[1], :]
 
+        # Load optional expressive data fields
+        dialogue_context = None
+        acting_intent = None
+        prosody_targets = None
+        if (utt_dir / "dialogue_context.npy").exists():
+            dialogue_context = torch.from_numpy(
+                np.load(utt_dir / "dialogue_context.npy")
+            ).float()
+        if (utt_dir / "acting_intent.npy").exists():
+            acting_intent = torch.from_numpy(
+                np.load(utt_dir / "acting_intent.npy")
+            ).float()
+        if (utt_dir / "prosody_targets.npy").exists():
+            pt = np.load(utt_dir / "prosody_targets.npy")
+            if T > self.max_frames and pt.shape[0] > self.max_frames:
+                pt = pt[start : start + self.max_frames, :]
+            prosody_targets = torch.from_numpy(pt).float()
+
         phoneme_ids = None
         durations = None
-        if (utt_dir / "phoneme_ids.npy").exists():
-            phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
-            if (utt_dir / "durations.npy").exists():
+        has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
+        has_durations = (utt_dir / "durations.npy").exists()
+
+        if self.tts_mode == "pointer":
+            # v3 pointer mode: load phoneme_ids only, never load durations
+            if has_phonemes:
+                phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
+        elif self.tts_mode == "legacy_duration":
+            # v2 legacy mode: require both phoneme_ids and durations
+            if has_phonemes and has_durations:
+                phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
                 durations = torch.from_numpy(np.load(utt_dir / "durations.npy")).long()
+        else:
+            # auto mode: load whatever is available (original behaviour)
+            if has_phonemes:
+                phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
+                if has_durations:
+                    durations = torch.from_numpy(np.load(utt_dir / "durations.npy")).long()
 
         phoneme_lens = None
         if phoneme_ids is not None:
@@ -153,4 +333,7 @@ class DisentangledUCLMDataset(Dataset):
             "f0_condition": f0_condition,
             "language_id": torch.tensor(meta.get("language_id", 0)).long(),
             "text": meta.get("text", ""),
+            "dialogue_context": dialogue_context,
+            "acting_intent": acting_intent,
+            "prosody_targets": prosody_targets,
         }

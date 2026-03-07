@@ -1,4 +1,4 @@
-"""Universal TMRVC UCLM v2 Constants.
+"""Universal TMRVC UCLM Constants.
 
 This module re-exports constants from _generated_constants.py (auto-generated from YAML).
 

@@ -1,284 +1,274 @@
-# TMRVC ONNX Model I/O Contract (UCLM Token Spec v2)
+# TMRVC ONNX Model I/O Contract
 
-Kojiro Tanaka — ONNX contract
-Created: 2026-02-16 (Asia/Tokyo)
-Updated: 2026-03-01 — UCLM dual-stream (`A_t` / `B_t`) 契約に更新
+この文書は、`tmrvc-export`、`tmrvc-serve`、`tmrvc-engine-rs` が共有する現行 ONNX 契約を定義する。前提は `UCLM v3 mainline` であり、TTS は `pointer-based causal progression`、VC は `causal semantic conditioning` を使う。
 
-> **Purpose:** Python (`tmrvc-export`) と Rust (`tmrvc-engine-rs`) 間のインターフェース仕様。
-> Disentangled UCLM (SOTAアーキテクチャ) で使用する ONNX モデル I/O、状態テンソル、パリティ基準を定義する。
+## 1. 共有不変条件
 
----
+- sample rate: `24,000 Hz`
+- frame step: `240 samples` (`10 ms`)
+- acoustic stream `A_t`: `8` codebooks, each `0..1023`
+- control stream `B_t`: `4` slots on the same frame clock
+- inference core is causal
+- runtime state is explicit and pre-allocated
 
-## 1. Shared Constants
+数値定数の単一正本は `configs/constants.yaml` とする。
 
-### 1.1 Source of Truth: `configs/constants.yaml`
+## 2. モデル集合
 
-```yaml
-# Audio
-sample_rate: 24000
-frame_size: 240              # 10ms
-frame_rate: 100
-
-# Acoustic stream (A_t)
-n_codebooks: 8
-rvq_vocab_size: 1024         # valid IDs: 0..1023
-codebook_dim: 128
-latent_dim: 512
-
-# Control stream (B_t)
-control_slots: 4             # [op, type, dur, int]
-control_vocab_size: 64
-
-# Conditions
-d_speaker: 192
-d_voice_state_explicit: 8
-d_voice_state_ssl: 128
-
-# UCLM core
-d_model: 512
-n_layers: 12
-n_heads: 8
-context_frames: 200          # 2.0 sec at 10ms/frame
-```
-
-### 1.2 Runtime Invariants
-
-- `A_t` は各 codebook ごとに `0..1023` のみを使用
-- `B_t` は `[op, type, dur, int]` の 4 スロットを常に維持
-- `frame_size=240` (10ms @24kHz) を推論の最小単位とする
-- 生成時は rolling context (`A_{t-k:t-1}`, `B_{t-k:t-1}`) を常時参照
-- `delta_voice_state = voice_state_t - voice_state_{t-1}` を UCLM 条件に含める
-
----
-
-## 2. ONNX Model Set
-
-### 2.1 Model List
-
-| Model | File | Inputs | Outputs | Execution |
-|---|---|---|---|---|
-| **codec_encoder** | `codec_encoder.onnx` | `audio_frame`, `state_in` | `acoustic_tokens`, `state_out` | per-frame (10ms) |
-| **vc_encoder** | `vc_encoder.onnx` | `source_A_t` | `vq_content_features` | VC時のみ |
-| **voice_state_enc**| `voice_state_enc.onnx`| `explicit_state`, `ssl_state`, `delta_state` | `state_cond` | per-frame (10ms) |
-| **uclm_core** | `uclm_core.onnx` | `content_features`, `b_ctx`, `spk_embed`, `state_cond`, `cfg_scale`, `kv_cache_in` | `logits_a`, `logits_b`, `kv_cache_out` | per-frame (10ms) |
-| **codec_decoder** | `codec_decoder.onnx` | `acoustic_tokens`, `control_tokens`, `voice_state`, `event_trace_in`, `state_in` | `audio_frame`, `event_trace_out`, `state_out` | per-frame (10ms) |
-| **speaker_encoder** | `speaker_encoder.onnx` | `mel_ref` | `spk_embed` | offline |
-
----
-
-## 3. Per-Model I/O Contract
-
-### 3.1 `codec_encoder.onnx`
-
-Causal codec encoder + RVQ quantizer.
-
-**Inputs**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `audio_frame` | `[1, 1, 240]` | `float32` | 10ms frame @24kHz |
-| `state_in` | `[1, ENC_STATE_DIM, ENC_STATE_FRAMES]` | `float32` | encoder causal state |
-
-**Outputs**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `acoustic_tokens` | `[1, 8]` | `int64` | `A_t` (8 codebooks, each `0..1023`) |
-| `state_out` | `[1, ENC_STATE_DIM, ENC_STATE_FRAMES]` | `float32` | updated state |
-
----
-
-### 3.2 `vc_encoder.onnx` (VC Mode Only)
-
-Information Bottleneck (VQ) to remove speaker/style information from source tokens.
-
-**Inputs**
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `source_A_t` | `[1, 8, L]` | `int64` | source acoustic tokens |
-
-**Outputs**
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `vq_content_features` | `[1, d_model, L]` | `float32` | pure content representation |
-
----
-
-### 3.3 `voice_state_enc.onnx`
-
-Combines 8-dim explicit parameters, WavLM SSL features, and delta state into a single condition vector.
-
-**Inputs**
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `explicit_state` | `[1, 8]` | `float32` | heuristic parameters (breathiness, etc.) |
-| `ssl_state` | `[1, 128]` | `float32` | latent style space from WavLM |
-| `delta_state` | `[1, 8]` | `float32` | `voice_state_t - voice_state_{t-1}` for temporal dynamics |
-
-**Outputs**
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `state_cond` | `[1, d_model]` | `float32` | fused style condition |
-
----
-
-### 3.4 `uclm_core.onnx`
-
-Dual-stream token predictor for TTS/VC.
-
-**Inputs**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `content_features` | `[1, d_model, L]` | `float32` | VQ bottlenecked features (VC) or text features (TTS) |
-| `b_ctx` | `[1, 4, L]` | `int64` | control context (`B_{t-L:t-1}`) |
-| `spk_embed` | `[1, 192]` | `float32` | speaker embedding |
-| `state_cond` | `[1, d_model]` | `float32` | explicit + ssl state combined (from voice_state_enc) |
-| `cfg_scale` | `[1]` | `float32` | CFG amplification scale (e.g., 1.5) |
-| `kv_cache_in` | `[N_CACHE]` | `float32` | flattened KV cache |
-
-`L` is context frames (default 200 = 2 sec).
-
-**Outputs**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `logits_a` | `[1, 8, 1024]` | `float32` | next `A_t` distribution |
-| `logits_b` | `[1, 4, 64]` | `float32` | next `B_t` distribution |
-| `kv_cache_out` | `[N_CACHE]` | `float32` | updated KV cache |
-
-**Sampling contract (Rust side):**
-
-```rust
-// Acoustic stream: 8 independent categorical draws
-let next_a: [i64; 8] = sample_per_head(logits_a, temperature_a, top_k_a);
-
-// Control stream: 4 slots [op, type, dur, int]
-let next_b: [i64; 4] = sample_per_slot(logits_b, temperature_b, top_k_b);
-```
-
----
-
-### 3.5 `codec_decoder.onnx`
-
-RVQ dequantization + causal decoder with control conditioning.
-
-> **Note:** Current implementation uses simplified Linear projection instead of ConvTranspose1d backbone.
-> Parity verification is skipped for this model. Full parity will be verified with trained checkpoints.
-
-**Inputs**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `acoustic_tokens` | `[1, 8]` | `int64` | `A_t` |
-| `control_tokens` | `[1, 4]` | `int64` | `B_t = [op,type,dur,int]` |
-| `voice_state` | `[1, 8]` | `float32` | frame condition |
-| `event_trace_in` | `[1, D_EVENT_TRACE]` | `float32` | hysteresis trace for non-verbal tails |
-| `state_in` | `[1, DEC_STATE_DIM, DEC_STATE_FRAMES]` | `float32` | decoder causal state |
-
-**Outputs**
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `audio_frame` | `[1, 1, 240]` | `float32` | decoded 10ms audio |
-| `event_trace_out` | `[1, D_EVENT_TRACE]` | `float32` | updated event trace |
-| `state_out` | `[1, DEC_STATE_DIM, DEC_STATE_FRAMES]` | `float32` | updated decoder state |
-
----
-
-### 3.6 `speaker_encoder.onnx` (Offline)
-
-| Name | Shape | Type | Description |
-|---|---|---|---|
-| `mel_ref` | `[1, 80, T]` | `float32` | reference log-mel |
-| `spk_embed` | `[1, 192]` | `float32` | normalized speaker embedding |
-
----
-
-## 4. Streaming State Management
-
-### 4.1 Persistent State Components
-
-| State | Owner | Type |
+| Model | File | 役割 |
 |---|---|---|
-| `enc_state` | codec_encoder | conv causal state |
-| `kv_cache` | uclm_core | transformer KV cache |
-| `dec_state` | codec_decoder | conv causal state |
-| `event_trace` | codec_decoder | non-verbal hysteresis trace |
-| `ctx_A` | engine | circular buffer for `A_t` |
-| `ctx_B` | engine | circular buffer for `B_t` |
-| `prev_voice_state` | engine | delta computation |
+| `codec_encoder` | `codec_encoder.onnx` | waveform -> `A_t` |
+| `semantic_encoder` | `semantic_encoder.onnx` | VC 用 causal semantic features |
+| `voice_state_encoder` | `voice_state_encoder.onnx` | explicit / ssl / prosody 条件の融合 |
+| `uclm_core` | `uclm_core.onnx` | `A_t / B_t / pointer` 予測 |
+| `codec_decoder` | `codec_decoder.onnx` | `A_t / B_t` -> waveform |
+| `speaker_encoder` | `speaker_encoder.onnx` | reference audio -> speaker embedding |
 
-### 4.2 Per-Frame Runtime Sequence
+## 3. runtime state 契約
 
-1. `audio_frame(240)` -> `codec_encoder` -> `A_src_t`
-2. update `ctx_A/ctx_B`
-3. `vc_encoder(ctx_A)` -> `content_features`
-4. extract/get `explicit_state` and `ssl_state`
-5. `voice_state_enc(explicit_state, ssl_state)` -> `state_cond`
-6. `uclm_core(content_features, ctx_B, speaker, state_cond, cfg_scale, kv_cache)` -> `logits_a`, `logits_b`
-7. sample -> `A_t`, `B_t`
-8. `codec_decoder(A_t, B_t, voice_state_t, event_trace, dec_state)` -> `audio_out_t`
-7. swap ping-pong states
+### 3.1 Shared engine state
 
-All buffers must be pre-allocated (RT-safe: no malloc/free/mutex on audio thread).
+| State | Shape | 説明 |
+|---|---|---|
+| `kv_cache` | implementation-defined | UCLM attention cache |
+| `ctx_a` | `[1, 8, K]` | acoustic token context |
+| `ctx_b` | `[1, 4, K]` | control token context |
+| `decoder_state` | implementation-defined | codec decoder causal state |
+| `encoder_state` | implementation-defined | codec/semantic encoder causal state |
 
----
+### 3.2 Pointer state
 
-## 5. `.tmrvc_speaker` Contract (UCLM v2 related)
+| Field | Shape | 説明 |
+|---|---|---|
+| `text_index` | `[1] int64` | 現在参照中の text unit index |
+| `progress` | `[1] float32` | current unit 内の連続進行量 |
+| `finished` | `[1] bool/int64` | EOS 到達フラグ |
+
+TTS runtime は `target_length` の事前確定に依存せず、この pointer state を frame ごとに更新する。
+
+## 4. モデル別 I/O
+
+### 4.1 `codec_encoder.onnx`
+
+Inputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `audio_frame` | `[1, 1, 240]` | `float32` |
+| `state_in` | implementation-defined | `float32` |
+
+Outputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `acoustic_tokens` | `[1, 8]` | `int64` |
+| `state_out` | implementation-defined | `float32` |
+
+### 4.2 `semantic_encoder.onnx`
+
+VC のみで使う。
+
+Inputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `source_a_ctx` | `[1, 8, K]` | `int64` |
+| `state_in` | implementation-defined | `float32` |
+
+Outputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `semantic_features` | `[1, K, d_model]` | `float32` |
+| `state_out` | implementation-defined | `float32` |
+
+### 4.3 `voice_state_encoder.onnx`
+
+Inputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `explicit_state` | `[1, 1, 8]` | `float32` |
+| `ssl_state` | `[1, 1, d_ssl]` | `float32` |
+| `prosody_latent` | `[1, 1, d_prosody]` | `float32` |
+| `delta_state` | `[1, 1, 8]` | `float32` |
+
+Outputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `state_cond` | `[1, 1, d_model]` | `float32` |
+
+### 4.4 `uclm_core.onnx`
+
+TTS / VC 共通コア。
+
+Inputs:
+
+| Name | Shape | Type | 説明 |
+|---|---|---|---|
+| `content_features` | `[1, K, d_model]` | `float32` | text-aligned features or semantic features |
+| `ctx_a` | `[1, 8, K]` | `int64` | acoustic history |
+| `ctx_b` | `[1, 4, K]` | `int64` | control history |
+| `speaker_embed` | `[1, d_speaker]` | `float32` | target speaker |
+| `state_cond` | `[1, 1, d_model]` | `float32` | fused state condition |
+| `pointer_state` | `[1, 3]` or structured equivalent | `float32/int64` | `text_index`, `progress`, `finished` |
+| `pace` | `[1]` | `float32` | pacing multiplier |
+| `hold_bias` | `[1]` | `float32` | bias toward hold |
+| `boundary_bias` | `[1]` | `float32` | bias toward boundary advance |
+| `cfg_scale` | `[1]` | `float32` | guidance scale |
+| `kv_cache_in` | implementation-defined | `float32` | transformer cache |
+
+Outputs:
+
+| Name | Shape | Type | 説明 |
+|---|---|---|---|
+| `logits_a` | `[1, 8, vocab_a]` | `float32` | next acoustic logits |
+| `logits_b` | `[1, 4, vocab_b]` | `float32` | next control logits |
+| `advance_logit` | `[1, 1]` | `float32` | advance vs hold |
+| `progress_delta` | `[1, 1]` | `float32` | pointer progress update |
+| `next_pointer_state` | structured equivalent | `float32/int64` | updated pointer state |
+| `kv_cache_out` | implementation-defined | `float32` | updated cache |
+
+### 4.5 `codec_decoder.onnx`
+
+Inputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `acoustic_tokens` | `[1, 8]` | `int64` |
+| `control_tokens` | `[1, 4]` | `int64` |
+| `voice_state` | `[1, 1, 8]` | `float32` |
+| `decoder_state_in` | implementation-defined | `float32` |
+
+Outputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `audio_frame` | `[1, 1, 240]` | `float32` |
+| `decoder_state_out` | implementation-defined | `float32` |
+
+### 4.6 `speaker_encoder.onnx`
+
+Inputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `mel_ref` | `[1, 80, T]` | `float32` |
+
+Outputs:
+
+| Name | Shape | Type |
+|---|---|---|
+| `speaker_embed` | `[1, d_speaker]` | `float32` |
+
+## 5. TTS runtime sequence
+
+1. text frontend が text units を生成する
+2. pointer state を初期化する
+3. `voice_state_encoder` で frame 条件を作る
+4. `uclm_core` で `A_t / B_t / advance_logit / progress_delta` を生成する
+5. engine が pointer state を更新する
+6. `codec_decoder` が 240 samples を復元する
+7. `finished` または EOS 条件で終了する
+
+## 6. VC runtime sequence
+
+1. `codec_encoder` が source frame を `A_t` に変換する
+2. `semantic_encoder` が causal semantic features を生成する
+3. `voice_state_encoder` が target style 条件を生成する
+4. `uclm_core` が target `A_t / B_t` を生成する
+5. `codec_decoder` が output frame を復元する
+
+## 7. `.tmrvc_speaker` 契約
 
 ```json
 {
   "version": 3,
-  "spk_embed": [192 floats],
-  "f0_mean": 220.0,
-  "reference_A_tokens": [[8 ints, ...], "optional"],
-  "reference_B_tokens": [[4 ints, ...], "optional"],
-  "voice_source_preset": [8 floats, "optional"],
-  "ssl_state": [128 floats, "optional - WavLM default SSL state"],
-  "metadata": {"created_at": "2026-03-01T00:00:00Z"}
+  "speaker_embed": [192 floats],
+  "ssl_state": [128 floats],
+  "voice_state_preset": [8 floats],
+  "metadata": {
+    "created_at": "2026-03-07T00:00:00Z",
+    "language": "ja"
+  }
 }
 ```
 
-- `reference_tokens` を使う場合は `A/B` 両ストリームで保存する
-- 旧 `reference_tokens[T,4]` は互換読み込みのみ (deprecated)
-- `ssl_state` は話者登録時に WavLM から抽出した 128 次元の潜在スタイル表現
-  - Rust 側では `ssl_state: Option<Vec<f32>>` として扱い、None の場合はゼロベクトルを使用
+話者ファイルは pointer state や duration 情報を持たない。
 
----
+### 7.1 `.tmrvc_speaker` v3 拡張
 
-## 6. Numerical Parity
+v3 では `prompt_kv_cache` を話者ファイルに含めることができる。事前に `encode_speaker_prompt` で生成した KV cache を永続化し、推論時のリファレンス再エンコードを省略する。
 
-| Tensor type | Metric | Threshold |
-|---|---|---|
-| Float outputs | L_inf | `< 1e-4` |
-| Float outputs | cosine similarity | `> 0.999` |
-| Int outputs | exact match | `100%` |
-
-Verification example:
-
-```bash
-uv run python -m tmrvc_export.verify_parity \
-  --codec-encoder models/fp32/codec_encoder.onnx \
-  --uclm-core models/fp32/uclm_core.onnx \
-  --codec-decoder models/fp32/codec_decoder.onnx
+```json
+{
+  "version": 3,
+  "speaker_embed": [192 floats],
+  "ssl_state": [128 floats],
+  "voice_state_preset": [8 floats],
+  "prompt_kv_cache": "base64-encoded tensor or external .bin reference",
+  "metadata": {
+    "created_at": "2026-03-07T00:00:00Z",
+    "language": "ja"
+  }
+}
 ```
 
----
+## 8. parity 基準
 
-## 7. Consistency Checklist
+| 項目 | 基準 |
+|---|---|
+| float tensor | `L_inf < 1e-4` |
+| token ids | exact match |
+| pointer state update | exact match or deterministic tolerance-defined match |
 
-- [x] `frame_size=240` (10ms) が Python/Rust/ONNX で一致
-- [x] `A_t`: `[1,8]` / id range `0..1023`
-- [x] `B_t`: `[1,4]` / vocab `64` (`[op,type,dur,int]`)
-- [x] `uclm_core` が `logits_a[1,8,1024]` と `logits_b[1,4,64]` を出力
-- [x] `delta_voice_state` が推論入力に含まれる (voice_state_enc に `delta_state` 入力として追加)
-- [x] `ssl_state` [128] が voice_state_enc で処理 (WavLM から抽出、.tmrvc_speaker に保存可能)
-- [x] `event_trace` が decoder の入出力で維持される
-- [x] rolling context (`ctx_A`, `ctx_B`) が 1-2秒保持される (CONTEXT_FRAMES=200)
-- [x] 全 state が pre-allocated で RT-safe
-- [x] `uclm_core` が CFG (Classifier-Free Guidance) 対応 (`cfg_scale` 入力追加)
-- [x] CFG 公式: `output = uncond + cfg_scale * (cond - uncond)` を常に両パス計算で実装
-- [x] KV Cache が `uclm_core` の入出力で維持される (`kv_cache_in` / `kv_cache_out`)
-- [x] 全6モデルの ONNX エクスポートが成功 (vc_encoder, voice_state_enc, uclm_core, codec_encoder, codec_decoder, speaker_encoder)
-- [x] パリティ検証 L_inf < 1e-4 (codec_decoder は簡易実装のため検証スキップ)
+## 9. 禁止事項
+
+- `MFA` 由来境界を ONNX runtime 必須入力にすること
+- duration 展開済み全文フレーム列を TTS runtime 契約に戻すこと
+- hidden mutable state を契約外で持つこと
+
+## 10. v3 ONNX 拡張
+
+### 10.1 `encode_speaker_prompt.onnx`
+
+Speaker Prompt Encoder を独立した ONNX グラフとしてエクスポートする。推論時にリファレンス音声から speaker embedding と prompt KV cache を生成する。
+
+Inputs:
+
+| Name | Shape | Type | 説明 |
+|---|---|---|---|
+| `prompt_codec_tokens` | `[1, T_prompt, n_codebooks]` | `int64` | リファレンス音声の codec tokens |
+| `speaker_embed` (optional) | `[1, d_speaker]` | `float32` | 外部 speaker embedding (融合用) |
+
+Outputs:
+
+| Name | Shape | Type | 説明 |
+|---|---|---|---|
+| `refined_speaker_embed` | `[1, d_model]` | `float32` | timbre bottleneck 経由の話者埋め込み |
+| `prompt_kv_cache` | `[1, n_layers, 2, n_heads, T_prompt, d_head]` | `float32` | 再利用可能な KV cache |
+
+### 10.2 `uclm_core.onnx` v3 追加入力
+
+既存の `uclm_core.onnx` に以下の入力が追加される。
+
+| Name | Shape | Type | 説明 |
+|---|---|---|---|
+| `prompt_kv_cache` | `[1, n_layers, 2, n_heads, T_prompt, d_head]` | `float32` | `encode_speaker_prompt` で生成した cached tensor。未使用時はゼロテンソル |
+| `cfg_scale` | `[1]` | `float32` | classifier-free guidance scale (既存定義の再掲、v3 で必須化) |
+| `voice_state` | `[1, 1, 8]` | `float32` | 明示的な voice state (従来の `state_cond` への融合ではなく、独立入力として扱う) |
+| `delta_voice_state` | `[1, 1, 8]` | `float32` | voice state の frame 間差分 (独立入力) |
+
+**`state_cond` との関係**: v3 では `voice_state` と `delta_voice_state` を独立入力として受け取る。`voice_state_encoder` による融合済み `state_cond` は引き続きサポートするが、v3 runtime では独立入力を優先する。これにより engine 側で voice state の直接制御が可能になる。
+
+### 10.3 Updated TTS Runtime Sequence (v3)
+
+1. text frontend が text units を生成する
+2. `encode_speaker_prompt` でリファレンス音声から `refined_speaker_embed` と `prompt_kv_cache` を生成する (初回のみ、以降はキャッシュを再利用)
+3. pointer state を初期化する
+4. `voice_state_encoder` で frame 条件を作る (または `voice_state` / `delta_voice_state` を直接渡す)
+5. `uclm_core` に `prompt_kv_cache` を含む全入力を渡し、`A_t / B_t / advance_logit / progress_delta` を生成する
+6. engine が pointer state を更新する
+7. `codec_decoder` が 240 samples を復元する
+8. `finished` または EOS 条件で終了する

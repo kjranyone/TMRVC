@@ -1,69 +1,51 @@
 # TMRVC Documentation
 
-Updated: 2026-03-01 (UCLM v2)
+Updated: 2026-03-07
 
-## プロジェクト概要
+このディレクトリは、`UCLM v3` mainline の設計と運用仕様をまとめた正本です。現行 docs の前提は次のとおりです。
 
-TMRVC は **Disentangled UCLM** を中核にした Voice Conversion / TTS 統合プロジェクト。
-SOTAレベルの官能的表現と完全な分離(Disentanglement)を達成します。
+- `MFA` は mainline の設計前提にしない
+- TTS は `internal alignment + causal pointer` を使う
+- `A_t / B_t` の dual-stream token contract は維持する
+- docs は completed `AS IS` を記述し、旧仕様の運用手順は主文書に残さない
 
-- 内部処理: 24kHz / 10ms フレーム
-- 生成表現: `A_t` (Acoustic RVQ, `[8]`) + `B_t` (Control tuple, `[4]`)
-- スタイル表現: explicit(8-dim) + ssl(WavLM 128-dim)
-- 推論: `codec_encoder -> (vc_encoder) -> voice_state_enc -> uclm_core -> codec_decoder`
-
----
-
-## 主要ドキュメント (まず読む)
+## まず読む
 
 | File | 役割 |
 |---|---|
-| `design/architecture.md` | 全体設計の入口 (Disentangled UCLM) |
-| `design/unified-codec-lm.md` | UCLM アーキテクチャ詳細 |
-| `design/emotion-aware-codec.md` | Token Spec v2 (`A_t/B_t`) の正本 |
-| `design/onnx-contract.md` | Python/Rust/ONNX の I/O 契約 |
-| `design/streaming-design.md` | 10ms ストリーミング / レイテンシ設計 |
-| `design/rust-engine-design.md` | Rust 推論エンジン設計 |
-| `design/uclm-implementation-roadmap.md` | 実装ロードマップ |
+| `design/architecture.md` | システム全体の設計入口 |
+| `design/unified-codec-lm.md` | UCLM コアのモデル仕様 |
+| `design/emotion-aware-codec.md` | codec / token contract |
+| `design/onnx-contract.md` | export / serve / rust 間の I/O 契約 |
+| `design/streaming-design.md` | 10 ms streaming runtime 設計 |
+| `design/dataset-preparation-flow.md` | dataset / cache の標準仕様 |
+| `training/README.md` | 学習文書の入口 |
 
----
+## 実装計画
 
-## 学習ドキュメント
+現行の実装分解は `plan/` が正本です。
+
+| File | 役割 |
+|---|---|
+| `../plan/README.md` | 全体計画と依存関係 |
+| `../plan/worker_01_architecture.md` | モデル設計 |
+| `../plan/worker_02_training.md` | 学習系 |
+| `../plan/worker_03_dataset_alignment.md` | dataset / text supervision |
+| `../plan/worker_04_serving.md` | serving / runtime |
+| `../plan/worker_05_devops_docs.md` | dev tooling / docs |
+| `../plan/worker_06_validation.md` | validation / acceptance |
+
+## 学習文書
 
 | File | 内容 |
 |---|---|
-| `training/README.md` | 学習パイプライン統合ガイド |
-| `training/uclm-training-plan.md` | UCLM 学習計画 (Phase 1-4) |
+| `training/README.md` | 学習資料の入口 |
+| `training/integrity-audit-2026-03-04.md` | 整合性監査 |
+| `training/integrity-remediation-2026-03-05.md` | 是正結果 |
 
----
+## 運用ルール
 
-## 参照資料 (Historical)
-
-`reference/` は研究メモ・旧設計の背景資料。
-実装契約としては使用せず、判断根拠の参照に限定する。
-
----
-
-## 実装モジュール対応
-
-| Module | 役割 |
-|---|---|
-| `tmrvc-core` | 共有定数・型 |
-| `tmrvc-data` | 前処理・キャッシュ生成 |
-| `tmrvc-train` | UCLM 学習 |
-| `tmrvc-export` | ONNX 出力/検証 |
-| `tmrvc-engine-rs` | RT 推論エンジン |
-| `tmrvc-rt` / `tmrvc-vst` | ユーザー向け実行系 |
-| `tmrvc-serve` | TTS サーバー |
-
----
-
-## docs 更新ルール
-
-1. Token 仕様変更時は以下を同時更新する:
-   - `design/emotion-aware-codec.md`
-   - `design/onnx-contract.md`
-   - `design/unified-codec-lm.md`
-   - `training/README.md`
-2. 旧仕様を残す場合は `Legacy Note` を明示する。
-3. 数値定数 (`frame_size`, vocab など) は `configs/constants.yaml` と一致させる。
+1. docs は mainline の completed state を記述する
+2. legacy 互換機能は必要最小限の注記に留める
+3. 数値定数は `configs/constants.yaml` を単一正本とする
+4. 実装計画は `plan/`、設計仕様は `docs/design/` に置く

@@ -1,4 +1,4 @@
-"""Text utilities for sentence segmentation and style inference (UCLM v2)."""
+"""Text utilities for sentence segmentation and style inference (UCLM)."""
 
 from __future__ import annotations
 

@@ -30,7 +30,7 @@ SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja", "en", "zh", "ko")
 
 @dataclass
 class StyleParams:
-    """Parsed style parameters for UCLM v2 VoiceState conditioning (8-dim).
+    """Parsed style parameters for UCLM VoiceState conditioning (8-dim).
 
     Dimensions:
     - 0: breathiness [0, 1]
@@ -56,7 +56,7 @@ class StyleParams:
     reasoning: str = ""
 
     def to_vector(self) -> list[float]:
-        """Convert to 8-dim UCLM v2 VoiceState vector."""
+        """Convert to 8-dim UCLM VoiceState vector."""
         vec = [0.0] * 8
 
         vec[0] = _clamp(self.breathiness, 0.0, 1.0)

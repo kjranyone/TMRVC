@@ -1,39 +1,43 @@
-# TMRVC — Unified Codec Language Model (UCLM) v2
+# TMRVC — Unified Codec Language Model (UCLM) v3
 
 ## Project Overview
 
-TMRVC は、Unified Codec Language Model (UCLM) v2 アーキテクチャを採用した、リアルタイム音声合成 (TTS) および音声変換 (VC) システムです。
+TMRVC は、Unified Codec Language Model (UCLM) v3 アーキテクチャを採用した、リアルタイム音声合成 (TTS) および音声変換 (VC) システムです。
 
-- **コア・アーキテクチャ**: UCLM v2 (Dual-Stream Token Spec)
+- **コア・アーキテクチャ**: UCLM v3 (Pointer-based Text Progression, MFA-Free)
 - **推論エンジン**: `UCLMEngine` (FastAPI / Rust Streaming)
-- **特徴**: 10ms 単位の極低遅延処理、8次元物理パラメータによる直接的な演技制御。
+- **特徴**: 10ms 単位の極低遅延処理、8次元物理パラメータによる直接的な演技制御。ポインタヘッドによる内部アライメントにより、外部の強制アライメント (MFA) が不要。
 
 ## Architecture
 
-UCLM v2 は、音声の「内容」「話者」「演技（Voice State）」を完全に分離し、統合されたトランスフォーマー・モデルで再構成します。
+UCLM v3 は、音声の「内容」「話者」「演技（Voice State）」を完全に分離し、統合されたトランスフォーマー・モデルで再構成します。v3 ではポインタベースのテキスト進行機構を導入し、外部アライメントツール (MFA) への依存を排除しました。モデル内部のポインタヘッド (`forward_tts_pointer`) がテキストトークン列上の読み上げ位置を自律的に追跡・進行させます。
 
 ### 推論コンポーネント (ONNX)
-- `uclm`: トークン予測のメインコア。
+- `uclm`: トークン予測のメインコア。ポインタヘッドによる内部アライメントを含む。
 - `codec`: 音声のエンコード/デコードを行う。
 - `speaker_encoder`: 数秒の音声から話者埋め込みを抽出。
+
+### ポインタヘッド (v3 新機能)
+- `forward_tts_pointer`: テキストトークン列上の現在位置をフレームごとに予測・進行させるポインタ機構。
+- MFA などの外部強制アライメントを不要とし、エンドツーエンドの学習・推論を実現。
 
 ## Monorepo Structure
 
 ```
 TMRVC/
-├── configs/              # constants.yaml (UCLM v2 Spec)
+├── configs/              # constants.yaml (UCLM v3 Spec)
 ├── docs/design/          # 正本設計資料
 ├── tmrvc-core/           # 共有定数・型定義
 ├── tmrvc-data/           # データセット準備・前処理
-├── tmrvc-train/          # UCLM v2 モデル定義・学習
+├── tmrvc-train/          # UCLM v3 モデル定義・学習 (pointer mode)
 ├── tmrvc-export/         # ONNX エクスポート・量子化
 ├── tmrvc-serve/          # 統合推論サーバー (UCLMEngine)
-├── tmrvc-gui/            # 開発・デモ用 GUI (UCLM v2 対応済)
+├── tmrvc-gui/            # 開発・デモ用 GUI (UCLM v3 対応済)
 ├── tmrvc-engine-rs/      # Rust 推論コア
 └── tmrvc-vst/            # VST3 プラグイン
 ```
 
-## Key Constants (UCLM v2)
+## Key Constants (UCLM v3)
 
 `configs/constants.yaml` に定義される主要定数:
 
@@ -48,7 +52,7 @@ TMRVC/
 | Command | Description |
 |---------|-------------|
 | `tmrvc-preprocess` | 学習データのトークナイズ・特徴量抽出 |
-| `tmrvc-train-uclm` | UCLM v2 モデルのマルチタスク学習 |
+| `tmrvc-train-uclm` | UCLM v3 モデルの学習 (pointer mode, MFA-free) |
 | `tmrvc-train-codec` | Emotion-Aware Codec の学習 |
 | `tmrvc-serve` | 統合推論サーバーの起動 |
 | `tmrvc-export` | UCLM/Codec の ONNX エクスポート |
@@ -93,7 +97,7 @@ tail -f logs/preprocess_worker_*.log
 
 ## Critical Constraints
 
-1. **Dual-Stream Token Sync**: Acoustic (`A_t`) と Control (`B_t`) は常に同期して予測されなければならない。
+1. **Pointer-based Text Progression**: ポインタヘッド (`forward_tts_pointer`) がテキスト位置を自律追跡し、内部アライメントを実現する。外部 MFA への依存は排除済み。
 2. **10ms Causal Core**: 未来の情報を参照する非因果的（Non-causal）な処理は一切禁止。
 3. **Physical-First Control**: 演技制御は 8次元の物理パラメータ（息漏れ等）を優先し、抽象的なラベルに頼らない。
 4. **Scientific Rigor & Zero Compromise**: 論文実装という観点から、緻密さと数学的整合性を最優先する。場当たり的なコード置換、テンソル形状の不一致を誤魔化すための不自然なパディング、あるいは失敗したテストの放置は「悪（Evil）」と定義し、厳禁とする。すべての変更は全スタック層（Core, Train, Serve, GUI, Export）において論理的に整合し、常に厳格な数学的パリティテストによって実証されなければならない。
@@ -119,7 +123,7 @@ tail -f logs/preprocess_worker_*.log
   - `tmrvc-core/_generated_constants.py`: Auto-generated (DO NOT EDIT)
   - `tmrvc-core/constants.py`: Re-exports + minimal compat aliases
   - `tmrvc-engine-rs/constants.rs`: Auto-generated
-- **Verification**: Python ↔ Rust constant values match exactly
+- **Verification**: Python <-> Rust constant values match exactly
 
 ### Issue E: Single Source of Truth for f0_mean (FIXED)
 - **Problem**: f0_mean stored in both binary section and metadata JSON

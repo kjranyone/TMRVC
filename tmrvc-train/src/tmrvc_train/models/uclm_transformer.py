@@ -150,11 +150,11 @@ class CodecTransformer(nn.Module):
         # Flatten KV cache if output requested as tensor
         if kv_caches is not None and isinstance(kv_caches, torch.Tensor):
             out_kv = torch.cat([torch.cat([k.reshape(B, -1), v.reshape(B, -1)], dim=1) for k, v in new_kv_list], dim=1)
-            return logits_a, logits_b, out_kv
+            return logits_a, logits_b, out_kv, x
             
-        return logits_a, logits_b, new_kv_list
+        return logits_a, logits_b, new_kv_list, x
 
     def forward_no_cache(self, content_features, b_ctx, state_cond, speaker_embed, cfg_scale=1.0):
         """Non-streaming forward for training. b_ctx must be shifted B_{t-1}."""
-        la, lb, _ = self.forward(content_features, b_ctx, speaker_embed, state_cond, cfg_scale)
-        return la, lb
+        la, lb, _, x = self.forward(content_features, b_ctx, speaker_embed, state_cond, cfg_scale)
+        return la, lb, x

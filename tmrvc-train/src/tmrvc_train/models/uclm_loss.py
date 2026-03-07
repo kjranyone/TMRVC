@@ -1,8 +1,207 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .duration_predictor import duration_loss
+
+def pointer_advance_loss(
+    pointer_logits: torch.Tensor,
+    advance_targets: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Binary cross-entropy loss for pointer advance decisions.
+
+    Args:
+        pointer_logits: [B, T, 1] raw logits for advance probability.
+        advance_targets: [B, T] binary targets (1 = advance, 0 = hold).
+        mask: [B, T] padding mask (True = ignore).
+    """
+    logits = pointer_logits.squeeze(-1)  # [B, T]
+    if mask is not None:
+        valid = ~mask
+        logits = logits[valid]
+        targets = advance_targets[valid].float()
+    else:
+        logits = logits.reshape(-1)
+        targets = advance_targets.reshape(-1).float()
+    if logits.numel() == 0:
+        return torch.tensor(0.0, device=pointer_logits.device)
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+def progress_regression_loss(
+    progress_delta: torch.Tensor,
+    progress_targets: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE loss for progress within current phoneme.
+
+    Args:
+        progress_delta: [B, T, 1] predicted progress (0-1).
+        progress_targets: [B, T] target progress values (0-1).
+        mask: [B, T] padding mask (True = ignore).
+    """
+    pred = progress_delta.squeeze(-1)  # [B, T]
+    if mask is not None:
+        valid = ~mask
+        pred = pred[valid]
+        targets = progress_targets[valid]
+    else:
+        pred = pred.reshape(-1)
+        targets = progress_targets.reshape(-1)
+    if pred.numel() == 0:
+        return torch.tensor(0.0, device=progress_delta.device)
+    return F.mse_loss(pred, targets)
+
+
+def context_diversity_loss(
+    hidden_states: torch.Tensor,
+    context_groups: torch.Tensor | None = None,
+    margin: float = 0.1,
+) -> torch.Tensor:
+    """Anti-collapse regularizer: same text under different context should not
+    produce identical hidden representations.
+
+    When ``context_groups`` is provided (integer group IDs per sample), pairs
+    within the same text group but different context are pushed apart by at
+    least ``margin`` in cosine distance.
+
+    Args:
+        hidden_states: [B, T, D] transformer hidden states.
+        context_groups: [B] integer group ids (samples sharing same text get
+            the same id).  If None, returns 0.
+        margin: minimum cosine distance between different-context pairs.
+
+    Returns:
+        Scalar loss (0 if no valid pairs exist).
+    """
+    if context_groups is None:
+        return torch.tensor(0.0, device=hidden_states.device)
+
+    # Pool over time -> [B, D]
+    pooled = hidden_states.mean(dim=1)
+    pooled = F.normalize(pooled, dim=-1)
+
+    B = pooled.shape[0]
+    loss = torch.tensor(0.0, device=pooled.device)
+    n_pairs = 0
+
+    for i in range(B):
+        for j in range(i + 1, B):
+            if context_groups[i] == context_groups[j]:
+                cos_sim = (pooled[i] * pooled[j]).sum()
+                # Push cosine similarity below (1 - margin)
+                pair_loss = F.relu(cos_sim - (1.0 - margin))
+                loss = loss + pair_loss
+                n_pairs += 1
+
+    if n_pairs > 0:
+        loss = loss / n_pairs
+    return loss
+
+
+def context_separation_score(
+    hidden_states: torch.Tensor,
+    context_groups: torch.Tensor,
+) -> float:
+    """Compute mean pairwise distance between same-text different-context pairs.
+
+    Higher = more diverse deliveries for same text under different context.
+    """
+    pooled = F.normalize(hidden_states.mean(dim=1), dim=-1)
+    B = pooled.shape[0]
+    dists = []
+    for i in range(B):
+        for j in range(i + 1, B):
+            if context_groups[i] == context_groups[j]:
+                cos_sim = (pooled[i] * pooled[j]).sum().item()
+                dists.append(1.0 - cos_sim)
+    return float(np.mean(dists)) if dists else 0.0
+
+
+def prosody_collapse_score(
+    hidden_states: torch.Tensor,
+    context_groups: torch.Tensor,
+) -> float:
+    """Ratio of between-context variance to total variance on same-text samples.
+
+    Higher = less collapse (good). Lower = more collapse (bad).
+    """
+    pooled = hidden_states.mean(dim=1)  # [B, D]
+    total_var = pooled.var(dim=0).mean().item()
+    if total_var < 1e-8:
+        return 0.0
+
+    unique_groups = context_groups.unique()
+    between_var = 0.0
+    n_groups = 0
+    group_means = []
+    for g in unique_groups:
+        mask = context_groups == g
+        if mask.sum() < 2:
+            continue
+        group_means.append(pooled[mask].mean(dim=0))
+        n_groups += 1
+
+    if n_groups < 2:
+        return 0.0
+
+    group_means_t = torch.stack(group_means)
+    between_var = group_means_t.var(dim=0).mean().item()
+    return between_var / (total_var + 1e-8)
+
+
+def control_response_score(
+    output_durations: list[float],
+    control_values: list[float],
+) -> float:
+    """Monotonic correlation between control sweep and output metric.
+
+    Returns Spearman-like rank correlation (1.0 = perfect monotonic, 0.0 = none).
+    """
+    if len(output_durations) < 2:
+        return 0.0
+    n = len(output_durations)
+    # Simple rank correlation
+    ranks_out = sorted(range(n), key=lambda i: output_durations[i])
+    ranks_ctrl = sorted(range(n), key=lambda i: control_values[i])
+    d_sq = sum((ranks_out[i] - ranks_ctrl[i]) ** 2 for i in range(n))
+    return 1.0 - (6.0 * d_sq) / (n * (n * n - 1))
+
+
+def alignment_loss_placeholder(
+    phoneme_features: torch.Tensor,
+    frame_features: torch.Tensor,
+    alignment_type: str = "none",
+) -> torch.Tensor:
+    """Placeholder for future MAS/CTC alignment loss."""
+    if alignment_type == "none":
+        return torch.tensor(0.0, device=phoneme_features.device)
+    raise NotImplementedError(f"Alignment loss type '{alignment_type}' not yet implemented.")
+
+
+def voice_state_supervision_loss(
+    predicted_state: torch.Tensor,
+    target_state: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE loss for voice state prediction (explicit or delta).
+
+    Args:
+        predicted_state: [B, T, D] predicted voice state.
+        target_state: [B, T, D] target voice state.
+        mask: [B, T] padding mask (True = ignore).
+    """
+    if mask is not None:
+        valid = ~mask
+        pred = predicted_state[valid]
+        tgt = target_state[valid]
+    else:
+        pred = predicted_state.reshape(-1, predicted_state.shape[-1])
+        tgt = target_state.reshape(-1, target_state.shape[-1])
+    if pred.numel() == 0:
+        return torch.tensor(0.0, device=predicted_state.device)
+    return F.mse_loss(pred, tgt)
 
 
 def uclm_loss(
@@ -11,35 +210,28 @@ def uclm_loss(
     target_a: torch.Tensor,
     target_b: torch.Tensor,
     vq_loss: torch.Tensor | None = None,
-    log_durations: torch.Tensor | None = None,
-    dur_target: torch.Tensor | None = None,
-    phoneme_mask: torch.Tensor | None = None,
     adv_logits: torch.Tensor | None = None,
     speaker_labels: torch.Tensor | None = None,
+    pointer_logits: torch.Tensor | None = None,
+    advance_targets: torch.Tensor | None = None,
+    progress_delta: torch.Tensor | None = None,
+    progress_targets: torch.Tensor | None = None,
+    frame_mask: torch.Tensor | None = None,
+    hidden_states: torch.Tensor | None = None,
+    context_groups: torch.Tensor | None = None,
     lambda_vq: float = 1.0,
-    lambda_dur: float = 0.1,
     lambda_adv: float = 0.1,
+    lambda_pointer: float = 0.5,
+    lambda_progress: float = 0.2,
+    lambda_diversity: float = 0.05,
+    lambda_voice_state: float = 0.0,
+    lambda_delta_voice_state: float = 0.0,
+    voice_state_pred: torch.Tensor | None = None,
+    voice_state_target: torch.Tensor | None = None,
+    delta_voice_state_pred: torch.Tensor | None = None,
+    delta_voice_state_target: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute the multi-task loss for Disentangled UCLM.
-
-    Args:
-        logits_a: [B, 8, T, 1024] Acoustic stream predictions
-        logits_b: [B, 4, T, 64] Control stream predictions
-        target_a: [B, 8, T] Ground truth acoustic tokens
-        target_b: [B, 4, T] Ground truth control tokens
-        vq_loss: Information bottleneck loss from VC Encoder (if in VC mode)
-        log_durations: [B, L] Predicted log-durations (TTS mode)
-        dur_target: [B, L] Ground truth durations (TTS mode)
-        phoneme_mask: [B, L] Mask for padded phonemes
-        adv_logits: [B, T, num_speakers] Adversarial logits from VoiceStateEncoder
-        speaker_labels: [B] Ground truth speaker labels
-        lambda_vq: Weight for VQ loss
-        lambda_dur: Weight for duration loss
-        lambda_adv: Weight for adversarial loss
-
-    Returns:
-        Dict with total loss and individual components
-    """
+    """Compute the multi-task loss for Disentangled UCLM (v3)."""
     B, n_cb, T, vocab_a = logits_a.shape
     _, n_slots, _, vocab_b = logits_b.shape
 
@@ -76,14 +268,7 @@ def uclm_loss(
         total_loss = total_loss + lambda_vq * vq_loss
         components["loss_vq"] = vq_loss
 
-    if log_durations is not None and dur_target is not None:
-        loss_dur = duration_loss(log_durations, dur_target, phoneme_mask)
-        total_loss = total_loss + lambda_dur * loss_dur
-        components["loss_dur"] = loss_dur
-
     if adv_logits is not None and speaker_labels is not None:
-        # Cross-entropy for adversarial training
-        # speaker_labels is [B], expand to [B, T]
         B_adv, T_adv, n_spk = adv_logits.shape
         labels_expanded = speaker_labels.unsqueeze(1).expand(B_adv, T_adv)
         loss_adv = F.cross_entropy(
@@ -91,6 +276,34 @@ def uclm_loss(
         )
         total_loss = total_loss + lambda_adv * loss_adv
         components["loss_adv"] = loss_adv
+
+    # v3 pointer losses
+    if pointer_logits is not None and advance_targets is not None:
+        loss_ptr = pointer_advance_loss(pointer_logits, advance_targets, frame_mask)
+        total_loss = total_loss + lambda_pointer * loss_ptr
+        components["loss_pointer"] = loss_ptr
+
+    if progress_delta is not None and progress_targets is not None:
+        loss_prog = progress_regression_loss(progress_delta, progress_targets, frame_mask)
+        total_loss = total_loss + lambda_progress * loss_prog
+        components["loss_progress"] = loss_prog
+
+    # Anti-collapse diversity regularizer
+    if hidden_states is not None and context_groups is not None:
+        loss_div = context_diversity_loss(hidden_states, context_groups)
+        total_loss = total_loss + lambda_diversity * loss_div
+        components["loss_diversity"] = loss_div
+
+    # Voice state supervision losses
+    if lambda_voice_state > 0 and voice_state_pred is not None and voice_state_target is not None:
+        loss_vs = voice_state_supervision_loss(voice_state_pred, voice_state_target, frame_mask)
+        total_loss = total_loss + lambda_voice_state * loss_vs
+        components["loss_voice_state"] = loss_vs
+
+    if lambda_delta_voice_state > 0 and delta_voice_state_pred is not None and delta_voice_state_target is not None:
+        loss_dvs = voice_state_supervision_loss(delta_voice_state_pred, delta_voice_state_target, frame_mask)
+        total_loss = total_loss + lambda_delta_voice_state * loss_dvs
+        components["loss_delta_voice_state"] = loss_dvs
 
     components["loss"] = total_loss
     return components

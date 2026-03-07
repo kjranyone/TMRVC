@@ -15,13 +15,13 @@ dependencies = [
     "torchaudio>=2.0",
     "hdbscan>=0.8.38",
     "scikit-learn>=1.4",
-]
-
-[project.optional-dependencies]
-tts = [
     "pyopenjtalk>=0.3",
     "phonemizer>=3.2",
 ]
+
+[project.optional-dependencies]
+# Kept for backward compatibility (already included in mandatory dependencies).
+tts = []
 asr = [
     "faster-whisper>=1.0",
 ]
@@ -31,6 +31,7 @@ tmrvc-preprocess = "tmrvc_data.cli.preprocess:main"
 tmrvc-extract-features = "tmrvc_data.cli.extract_features:main"
 tmrvc-verify-cache = "tmrvc_data.cli.verify_cache:main"
 tmrvc-prepare-uclm = "tmrvc_data.cli.prepare_uclm:main"
+tmrvc-curate = "tmrvc_data.cli.curate:main"
 
 [build-system]
 requires = ["hatchling"]

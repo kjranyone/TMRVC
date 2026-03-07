@@ -1,6 +1,6 @@
-"""UCLM v2 Codec wrapper for token extraction and decoding.
+"""UCLM Codec wrapper for token extraction and decoding.
 
-Uses the custom EmotionAwareCodec architecture (Token Spec v2) with 10ms hop.
+Uses the custom EmotionAwareCodec architecture (Token Spec) with 10ms hop.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class UCLMCodecWrapper(nn.Module):
-    """Wrapper for TMRVC UCLM v2 EmotionAwareCodec.
+    """Wrapper for TMRVC UCLM EmotionAwareCodec.
 
     Provides token extraction (A_t, B_t) and decoding at 24kHz, 100fps (10ms/frame).
     """

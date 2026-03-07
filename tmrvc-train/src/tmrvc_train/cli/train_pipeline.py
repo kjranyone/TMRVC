@@ -142,7 +142,7 @@ def _find_datasets_missing_raw(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tmrvc-train-pipeline",
-        description="Reproducible UCLM v2 training pipeline (preprocess + train)",
+        description="Reproducible UCLM v3 training pipeline (preprocess + train)",
     )
 
     parser.add_argument(
@@ -193,15 +193,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override UCLM training device (e.g., cuda, cpu)",
     )
     parser.add_argument(
+        "--require-tts-supervision",
+        action="store_true",
+        help="Fail training if cache has no TTS text supervision (phoneme_ids).",
+    )
+    parser.add_argument(
         "--skip-preprocess",
         action="store_true",
         help="Skip preprocessing (use existing cache)",
+    )
+    parser.add_argument(
+        "--preprocess-only",
+        action="store_true",
+        help="Run preprocessing only and skip UCLM training.",
+    )
+    parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help="Run only UCLM training using existing cache (implies --skip-preprocess).",
     )
     parser.add_argument(
         "--cache-dir",
         type=Path,
         default=None,
         help="Cache directory to reuse (required for deterministic skip-preprocess resumes)",
+    )
+    parser.add_argument(
+        "--tts-mode",
+        choices=["legacy_duration", "pointer"],
+        default="pointer",
+        help="TTS training mode: 'pointer' (v3, MFA-free, default) or 'legacy_duration' (v2).",
     )
     parser.add_argument(
         "--experiment-name",
@@ -226,6 +247,19 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.preprocess_only and args.train_only:
+        logger.error("--preprocess-only and --train-only cannot be used together.")
+        import sys
+
+        sys.exit(1)
+    if args.train_only:
+        args.skip_preprocess = True
+    if args.preprocess_only and args.skip_preprocess:
+        logger.error("--preprocess-only cannot be used with --skip-preprocess.")
+        import sys
+
+        sys.exit(1)
 
     datasets_yaml = Path("configs/datasets.yaml")
     registry: dict = {}
@@ -272,6 +306,9 @@ def main(argv: list[str] | None = None) -> None:
 
     config.setdefault("language", "ja")
     config.setdefault("train_steps", 100000)
+    if args.require_tts_supervision:
+        config["train_require_tts_supervision"] = True
+    config["tts_mode"] = args.tts_mode
 
     try:
         dataset_plans = _build_dataset_plans(
@@ -367,7 +404,7 @@ def main(argv: list[str] | None = None) -> None:
             workers=args.workers,
             seed=args.seed,
             skip_preprocess=args.skip_preprocess,
-            run_training=True,
+            run_training=not args.preprocess_only,
             train_datasets=[plan.name],
         )
         success = pipeline.run()
@@ -390,7 +427,7 @@ def main(argv: list[str] | None = None) -> None:
                     success = False
                     break
 
-        if success:
+        if success and not args.preprocess_only:
             # Train once on the selected dataset union.
             training_config = dict(config)
             if args.train_batch_size is not None:

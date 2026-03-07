@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Prepare TMRVC UCLM v2 dataset from raw audio files.
+"""Prepare TMRVC UCLM dataset from raw audio files.
 
-Comprehensive UCLM v2 Extraction Pipeline:
+Comprehensive UCLM Extraction Pipeline:
 1. Scan & Filter
 2. Normalize (24kHz LUFS)
 3. Extract Dual-Stream Tokens (A_t, B_t)
@@ -56,7 +56,7 @@ class UtteranceMeta:
 LANGUAGE_IDS = {"ja": 0, "en": 1, "zh": 2, "ko": 3}
 
 def run_pipeline(config: PipelineConfig) -> int:
-    logger.info("Starting UCLM v2 Dataset Preparation Pipeline")
+    logger.info("Starting UCLM Dataset Preparation Pipeline")
     
     # Load Models
     logger.info("Loading UCLM extraction models...")
@@ -173,7 +173,7 @@ def run_pipeline(config: PipelineConfig) -> int:
     return 0
 
 def main():
-    parser = argparse.ArgumentParser(description="UCLM v2 Data Prep")
+    parser = argparse.ArgumentParser(description="UCLM Data Prep")
     parser.add_argument("--input", "-i", type=Path, required=True)
     parser.add_argument("--output", "-o", type=Path, default=Path("data/cache"))
     parser.add_argument("--name", "-n", required=True)

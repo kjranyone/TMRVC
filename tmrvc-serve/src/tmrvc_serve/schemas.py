@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -52,6 +52,19 @@ class TTSRequest(BaseModel):
     )
     situation: str | None = Field(None, description="Scene/situation description.")
     speed: float = Field(1.0, ge=0.5, le=2.0)
+    pace: float = Field(1.0, ge=0.5, le=3.0, description="Speech pace multiplier (v3 pointer mode).")
+    hold_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward holding current phoneme (v3 pointer mode).")
+    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward phoneme boundaries (v3 pointer mode).")
+    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0, description="Interruption/urgency pressure (v3 acting).")
+    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0, description="Tendency to insert breathing pauses (v3 acting).")
+    dialogue_context: Optional[list[float]] = Field(None, description="Scene/dialogue embedding vector.")
+    acting_intent: Optional[list[float]] = Field(None, description="Utterance-level acting intent vector.")
+    reference_audio_base64: Optional[str] = Field(None, description="Base64-encoded reference audio for few-shot speaker adaptation (3-10 seconds).")
+    reference_text: Optional[str] = Field(None, description="Optional transcript of the reference audio.")
+    explicit_voice_state: Optional[list[float]] = Field(None, description="Explicit 8-D voice state vector.", min_length=8, max_length=8)
+    delta_voice_state: Optional[list[float]] = Field(None, description="Delta voice state vector.", min_length=8, max_length=8)
+    speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
+    cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
 
 
 class TTSResponse(BaseModel):
@@ -106,6 +119,19 @@ class TTSStreamRequest(BaseModel):
     )
     situation: str | None = Field(None, description="Scene/situation description.")
     speed: float = Field(1.0, ge=0.5, le=2.0)
+    pace: float = Field(1.0, ge=0.5, le=3.0, description="Speech pace multiplier (v3 pointer mode).")
+    hold_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward holding current phoneme (v3 pointer mode).")
+    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward phoneme boundaries (v3 pointer mode).")
+    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0, description="Interruption/urgency pressure (v3 acting).")
+    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0, description="Tendency to insert breathing pauses (v3 acting).")
+    dialogue_context: Optional[list[float]] = Field(None, description="Scene/dialogue embedding vector.")
+    acting_intent: Optional[list[float]] = Field(None, description="Utterance-level acting intent vector.")
+    reference_audio_base64: Optional[str] = Field(None, description="Base64-encoded reference audio for few-shot speaker adaptation (3-10 seconds).")
+    reference_text: Optional[str] = Field(None, description="Optional transcript of the reference audio.")
+    explicit_voice_state: Optional[list[float]] = Field(None, description="Explicit 8-D voice state vector.", min_length=8, max_length=8)
+    delta_voice_state: Optional[list[float]] = Field(None, description="Delta voice state vector.", min_length=8, max_length=8)
+    speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
+    cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
     chunk_duration_ms: int = Field(100, ge=20, le=500)
 
 

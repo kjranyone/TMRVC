@@ -1,6 +1,6 @@
 //! ONNX Runtime session bundle for Disentangled UCLM pipeline.
 //!
-//! Token Spec v2 models:
+//! ONNX models:
 //! - codec_encoder.onnx — audio → acoustic tokens A_t
 //! - vc_encoder.onnx — source A_t → VQ content features
 //! - voice_state_enc.onnx — explicit + SSL → state_cond

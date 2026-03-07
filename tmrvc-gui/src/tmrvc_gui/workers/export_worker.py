@@ -1,4 +1,4 @@
-"""ONNX export and quantization worker for TMRVC UCLM v2.
+"""ONNX export and quantization worker for TMRVC UCLM.
 
 Converts UCLM and Codec checkpoints to ONNX for the unified engine.
 """
@@ -15,7 +15,7 @@ from .base_worker import BaseWorker
 
 logger = logging.getLogger(__name__)
 
-# UCLM v2 Unified ONNX components
+# UCLM Unified ONNX components
 MODEL_NAMES: list[str] = [
     "uclm",
     "codec",
@@ -57,7 +57,7 @@ def _load_model_from_path(
 
 
 class ExportWorker(BaseWorker):
-    """Background worker for ONNX export and quantization (UCLM v2)."""
+    """Background worker for ONNX export and quantization (UCLM)."""
 
     def __init__(
         self,
@@ -94,7 +94,7 @@ class ExportWorker(BaseWorker):
 
                 self.log_message.emit(f"Loading and exporting {model_name}...")
                 
-                # In UCLM v2, each component might be in its own file or shared
+                # In UCLM, each component might be in its own file or shared
                 # For simplicity, we assume the provided path contains the target model
                 pytorch_model = _load_model_from_path(model_name, self.checkpoint_path)
                 

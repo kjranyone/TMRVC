@@ -1,4 +1,4 @@
-"""Reproducible training pipeline for UCLM v2."""
+"""Reproducible training pipeline for UCLM v3."""
 
 from __future__ import annotations
 
@@ -346,6 +346,26 @@ class TrainingPipeline:
             train_args.extend(
                 ["--sampling-strategy", str(self.config["train_sampling_strategy"])]
             )
+        if bool(self.config.get("train_require_tts_supervision", False)):
+            train_args.append("--require-tts-supervision")
+        tts_mode = self.config.get("tts_mode", "pointer")
+        if tts_mode in ("pointer", "legacy_duration"):
+            train_args.extend(["--tts-mode", tts_mode])
+        if "pointer_loss_weight" in self.config:
+            train_args.extend(["--pointer-loss-weight", str(self.config["pointer_loss_weight"])])
+        if "progress_loss_weight" in self.config:
+            train_args.extend(["--progress-loss-weight", str(self.config["progress_loss_weight"])])
+        alignment_loss_type = self.config.get("alignment_loss_type", "none")
+        if alignment_loss_type in ("none", "mas", "ctc"):
+            train_args.extend(["--alignment-loss-type", alignment_loss_type])
+        if "pointer_target_source" in self.config:
+            train_args.extend(["--pointer-target-source", str(self.config["pointer_target_source"])])
+        if "legacy_duration_loss_weight" in self.config:
+            train_args.extend(["--legacy-duration-loss-weight", str(self.config["legacy_duration_loss_weight"])])
+        if "voice_state_loss_weight" in self.config:
+            train_args.extend(["--voice-state-loss-weight", str(self.config["voice_state_loss_weight"])])
+        if "delta_voice_state_loss_weight" in self.config:
+            train_args.extend(["--delta-voice-state-loss-weight", str(self.config["delta_voice_state_loss_weight"])])
 
         try:
             train_uclm_main(train_args)
@@ -368,6 +388,9 @@ class TrainingPipeline:
         token_samples = int(self.config.get("quality_gate_token_samples", 64))
         rvq_vocab_size = int(self.config.get("rvq_vocab_size", 1024))
         control_vocab_size = int(self.config.get("control_vocab_size", 64))
+        allow_waveform_tail_remainder = bool(
+            self.config.get("quality_gate_allow_waveform_tail_remainder", True)
+        )
 
         required = (
             "meta.json",
@@ -401,6 +424,7 @@ class TrainingPipeline:
 
             token_errors = 0
             waveform_length_errors = 0
+            waveform_tail_remainders = 0
             waveform_checked = 0
             if valid_dirs and token_samples > 0:
                 sample_count = min(token_samples, len(valid_dirs))
@@ -446,9 +470,30 @@ class TrainingPipeline:
                     waveform = np.load(waveform_path, mmap_mode="r")
                     actual_samples = int(waveform.shape[-1])
                     if actual_samples != expected_samples:
-                        waveform_length_errors += 1
+                        diff = abs(actual_samples - expected_samples)
+                        floor_frames = actual_samples // int(HOP_LENGTH)
+                        ceil_frames = (actual_samples + int(HOP_LENGTH) - 1) // int(HOP_LENGTH)
+                        if (
+                            allow_waveform_tail_remainder
+                            and diff < int(HOP_LENGTH)
+                            and n_frames in {floor_frames, ceil_frames}
+                        ):
+                            waveform_tail_remainders += 1
+                        else:
+                            waveform_length_errors += 1
                 except Exception:
                     waveform_length_errors += 1
+
+            # Text supervision coverage (v3)
+            text_supervised = 0
+            legacy_duration_supervised = 0
+            for utt_dir in valid_dirs:
+                has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
+                has_durations = (utt_dir / "durations.npy").exists()
+                if has_phonemes:
+                    text_supervised += 1
+                if has_phonemes and has_durations:
+                    legacy_duration_supervised += 1
 
             dataset_report = {
                 "total_entries": total,
@@ -459,7 +504,12 @@ class TrainingPipeline:
                 "token_errors": token_errors,
                 "token_samples": min(token_samples, len(valid_dirs)),
                 "waveform_checked": waveform_checked,
+                "waveform_tail_remainders": waveform_tail_remainders,
                 "waveform_length_errors": waveform_length_errors,
+                "text_supervised": text_supervised,
+                "legacy_duration_supervised": legacy_duration_supervised,
+                "pointer_target_coverage": text_supervised,
+                "canonical_text_unit_coverage": text_supervised / max(len(valid_dirs), 1),
             }
             report["datasets"][dataset] = dataset_report
 
@@ -495,6 +545,14 @@ class TrainingPipeline:
                     dataset_report["token_samples"],
                 )
                 ok = False
+            if waveform_tail_remainders > 0:
+                logger.warning(
+                    "Quality gate warning [%s]: waveform_tail_remainders=%d (checked=%d, hop=%d)",
+                    dataset,
+                    waveform_tail_remainders,
+                    waveform_checked,
+                    HOP_LENGTH,
+                )
             if waveform_length_errors > 0:
                 logger.error(
                     "Quality gate failed [%s]: waveform_length_errors=%d (checked=%d, expected=n_frames*%d)",
