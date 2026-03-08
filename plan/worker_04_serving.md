@@ -68,6 +68,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - **Persist or retrieve these prompt features via the canonical `SpeakerProfile` contract managed in `models/characters/` (Casting Gallery).**
    - cache these prompt features across conversational turns for the same speaker to avoid redundant extraction.
 8. Define text-side cache contract:
+   - text frontend outputs (`phoneme_ids` and `text_suprasegmentals` when supported) are computed once per request or once per turn boundary
    - text encoder outputs are computed once per request or once per turn boundary
    - cross-attention keys/values for active text/context window are cached and reused across 10 ms steps
    - pointer advancement updates window indices or masks, not full encoded text recomputation
@@ -81,7 +82,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - explicit skip-protection when advance confidence is weak or inconsistent
    - explicit force-advance side-effect policy:
      - how `progress_value` is reset or clipped
-     - how `acoustic_history` remains continuity-safe to avoid glitches (must include **Acoustic Hidden State Smoothing** or cross-fade logic to ensure glitch-free/click-free audio during forced skips)
+     - how `acoustic_history` remains continuity-safe without hidden-state smoothing, cache rewriting, or decoder cross-fade heuristics outside the shared serializable contract
      - how forced-advance is surfaced in telemetry and parity tests
    - explicit numeric advance-decision rule:
      - thresholding method for `advance_logit` / `advance_prob`
@@ -122,12 +123,33 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - when `reference_audio` is encoded
    - how **`speaker_profile_id`** loads the precomputed embedding and prompt tokens from the Casting Gallery
    - how `speaker_embed` or prompt cache is reused across turns
+   - freeze `max_prompt_seconds_active`, `max_prompt_frames`, `max_prompt_kv_tokens`, and `max_prompt_cache_bytes` as runtime-enforced limits owned by `configs/constants.yaml`
+   - if enrollment evidence exceeds runtime limits, apply a deterministic prompt-selection/compression rule and record it in `SpeakerProfile`
    - how prompt encoding latency is measured separately from steady-state generation latency
    - how runtime logs enough metadata to reproduce external-baseline comparisons
    - how conflicts between `speaker_embed` and `prompt_codec_tokens` are resolved at runtime
    - how much authority prompt texture has relative to speaker-identity anchoring
+   - how Rust/VST degrade deterministically to reduced prompt summary or `speaker_embed`-only mode when the prompt budget would break real-time guarantees
+14.1 Freeze runtime-budget constants in `configs/constants.yaml`:
+   - `max_text_units_active`
+   - `max_dialogue_context_units`
+   - `max_prompt_seconds_active`
+   - `max_prompt_frames`
+   - `max_prompt_kv_tokens`
+   - `max_prompt_cache_bytes`
+   - `max_acoustic_history_frames`
+   - `max_cross_attn_kv_bytes`
+   - `streaming_latency_budget_ms`
+   - `streaming_hardware_class_primary`
+   - these constants are part of the public runtime contract and must not be re-declared independently in Python, Rust, ONNX, or VST
 15. Define CFG runtime behavior:
-   - guidance blends logits: `guided_logits = uncond_logits + cfg_scale * (cond_logits - uncond_logits)`
+   - guidance must be defined for all conditioned outputs used by the runtime:
+     - `guided_logits_a`
+     - `guided_logits_b`
+     - `guided_advance_logit`
+     - `guided_progress_delta`
+     - `guided_boundary_confidence` when enabled
+   - the canonical formula is `guided_x = uncond_x + cfg_scale * (cond_x - uncond_x)` followed by documented post-guidance clamps where required for numeric stability
    - unconditional pass is produced by zeroing out or dropping exactly the Worker 01 mask set:
      - `explicit_voice_state`
      - `delta_voice_state`
@@ -139,15 +161,18 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - `local_prosody_latent`
    - unconditional pass may reuse the same KV cache structure but with zeroed conditioning; it must not require a separate model instance
    - safe `cfg_scale` bounds: clamp to `[1.0, 3.0]` by default to avoid pointer instability; values above 3.0 require explicit opt-in
-   - low-latency runtime modes:
+   - v3.0 required modes:
      - `off`
      - `full` two-pass CFG
+   - post-v3.0 optimization modes:
      - `lazy` CFG refresh every N frames with bounded drift policy
-     - optional `distilled` one-pass CFG-compatible path
+     - `distilled` one-pass CFG-compatible path
    - define when VST / real-time engine must clamp or disable expensive CFG modes
    - real-time priority policy:
-     - Rust engine / VST default to `off`, `lazy`, or `distilled`
+     - Rust engine / VST default to `off` in v3.0 mainline
+     - `lazy` or `distilled` may become the default only after they ship and pass the full-mode validation gates
      - `full` two-pass CFG is non-default in hard real-time paths and must justify itself against the 10 ms budget
+   - the pointer update rule must consume `guided_advance_logit` / `guided_progress_delta` in `full` mode; using guided acoustic logits with unguided pointer outputs is forbidden unless explicitly labeled an ablation
 16. Define cache synchronization behavior:
    - sliding-window text attention policy or deterministic cache re-indexing
    - explicit invalidation rules when the pointer crosses a window boundary
@@ -159,7 +184,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - fallback path: always maintain the codec-native decoder as a guaranteed-available fast path
    - quality measurement: Worker 06 must include waveform artifact rate (clicks, buzzing, metallic artifacts) in the TTS quality gate
    - **v3.1 acoustic refinement runtime preparation:**
-     - define the runtime integration point for a future research-track refinement module that takes coarse AR codec tokens and produces refined full-RVQ tokens
+     - define the runtime integration point for the v3.1 acoustic refinement module that takes coarse AR codec tokens and produces refined full-RVQ tokens
      - the codec-native decoder remains as fallback when refinement is disabled or latency-constrained
 18. Define multilingual / code-switch runtime policy:
    - utterance-level vs token-level language conditioning inputs
@@ -169,6 +194,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - forced-advance after excessive stall
    - low-`boundary_confidence` fallback behavior
    - observability hooks so stalls/skips are visible in telemetry rather than silent
+   - force-advance may update only serialized pointer fields and documented bias terms; runtime-only hidden-state smoothing, transformer-cache rewriting, or decoder cross-fade heuristics are forbidden in the mainline contract
 20. Define UI event-stream contract:
    - SSE event types at minimum:
      - `job_progress`
@@ -187,7 +213,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - event stream must be resumable using `Last-Event-ID` or equivalent cursor
 21. Define API idempotency and conflict behavior for UI-originated writes:
    - upload/register/run/export/create-session actions accept `idempotency_key`
-   - review/edit/policy actions accept `object_version`
+   - review/edit/policy actions accept canonical `metadata_version`
    - conflict responses must be typed, not plain text:
      - `stale_version`
      - `locked_by_other`
@@ -225,6 +251,7 @@ The engine must be able to do:
 - keep text-side encoded context and attention cache stable across frame steps without O(N) recomputation
 - preserve the same state transition semantics in Python serve, Rust runtime, ONNX export, and VST parameter mapping
 - expose the active few-shot speaker-conditioning source (**`speaker_profile_id`** or on-the-fly reference) for debugging
+- expose the active prompt-budget mode and any prompt downselection/compression policy for debugging
 - expose active guidance scale and cache policy for debugging
 - expose active CFG runtime mode (`off | full | lazy | distilled`) and refresh interval for debugging
 - expose stall / skip fallback counters and the active pointer-fallback reason
@@ -243,11 +270,15 @@ The engine must be able to do:
 - do not let runtime invent pointer-state semantics that differ from Worker 01 state-transition definitions
 - do not let Python, Rust, ONNX, and VST drift into separate runtime contracts
 - do not expose `cfg_scale` without defining unconditional-pass semantics and safety limits
+- do not leave the 10 ms causal claim as a prose promise without frozen runtime-budget constants
+- do not claim real-time few-shot support if prompt conditioning requires automatic degradation on the primary hardware class
+- do not claim real-time CFG support if the required CFG mode misses the frozen streaming budget
 - do not let unconditional CFG retain prompt or prosody conditioning through an undocumented side path
 - do not expose lazy or distilled CFG modes without numerical and perceptual validation against the full mode
 - do not make `full` two-pass CFG the default in Rust/VST unless latency proof exists on the target budget
 - do not leave waveform quality to an unspecified decoder fallback
 - do not let silent stall-recovery or skip-recovery heuristics diverge across runtimes
+- do not preserve real-time latency by performing undocumented hidden-state surgery during force-advance
 
 
 ## Handoff Contract
@@ -257,7 +288,7 @@ The engine must be able to do:
 - Python serve, Rust runtime, ONNX export, and VST are all wired to the same control/state contract
 - worker 05 can wire `dev.py` serve defaults to the new mode
 - SSE event-stream implementation (task 20) is owned by worker 04 as part of `tmrvc-serve` routes; worker 12 is the consumer, not the implementer
-- idempotency and conflict handling (task 21) are enforced in `tmrvc-serve` middleware; worker 12 sends `idempotency_key` and `object_version` but does not implement the check
+- idempotency and conflict handling (task 21) are enforced in `tmrvc-serve` middleware; worker 12 sends `idempotency_key` and canonical `metadata_version` but does not implement the check
 
 
 ## Required Tests
@@ -280,7 +311,7 @@ The engine must be able to do:
 - route/engine test that force-advance does not violate serialized state invariants
 - Python vs Rust parity test for advance-threshold and near-threshold decisions
 - route/engine test for low-`boundary_confidence` fallback behavior
-- route conflict test for stale object-version submissions
+- route conflict test for stale `metadata_version` submissions
 - idempotency-key test for retried UI write requests
 - Python vs Rust pointer-state parity smoke test
 - PyTorch vs ONNX runtime-contract parity test for pointer / `voice_state` fields

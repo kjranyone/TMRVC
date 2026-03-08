@@ -28,37 +28,58 @@ This directory is intended for parallel execution by multiple workers. Each work
 - all authoritative multi-user human workflows must go through one typed backend API boundary; filesystem-direct UI access is dev-only and is not the mainline contract
 - frame-indexed artifacts must use the same audio stepping contract as `tmrvc-core`: `sample_rate=24000`, `hop_length=240`, and `T = ceil(num_samples / hop_length)` with exact parity to validated frame-alignment tests
 
+## Architectural Reset Policy
 
-## Release Tiers
+UCLM v3 is not an incremental refinement of v2.
+It is a clean architectural reset motivated by the conclusion that v2 is architecturally incomplete for the project's target claims.
 
-To prevent concept drift and scope collapse, this plan is split into two tiers.
+Implications:
 
-### Tier 1: v3 Mainline Release-Critical
+- v2 is retained only for compatibility, ablation, and historical comparison.
+- v2 design constraints must not limit v3 interface, runtime, or training decisions.
+- any reuse of v2 code is an implementation convenience only and does not imply contract inheritance.
+- sign-off for v3 depends on v3 meeting its own proof obligations, not on relative improvement over v2.
 
-These items define whether `UCLM v3` exists as a coherent product direction.
+
+## Release Scope
+
+The scope is split into `v3.0 required mainline` and `post-v3.0 optimization tracks`. This prevents future quality/performance upgrades from being confused with the proof obligations of the initial MFA-free pointer release.
+
+## SOTA Claim Policy
+
+TMRVC may claim SOTA or state-of-the-art competitiveness only under the following conditions:
+
+- the primary external baseline is frozen before large-scale Stage B training begins
+- the baseline artifact, tokenizer, prompt rule, reference lengths, inference settings, language set, and hardware class are fixed and versioned
+- evaluation is run on the same frozen protocol for TMRVC and the baseline
+- no release report may replace a failed direct comparison with internal-only comparisons against v2
+
+If TMRVC fails to match or exceed the pinned primary baseline on any metric declared as a primary claim axis, the corresponding claim is blocked.
+Acceptable fallback is to narrow the claim explicitly.
+Unacceptable fallback is to keep the broad claim and explain the deficit away as a trade-off after the fact.
+
+### v3.0 Required Mainline
 
 - causal pointer-driven TTS without MFA
 - shared pointer / cache / `voice_state` / `speaker_profile` schema in `tmrvc-core`
 - first-class 8-D physical control with trainable targets, masks, provenance, and validation
-- bounded dialogue-context path
-- few-shot speaker adaptation from a short reference clip under a reproducible contract
+- bounded dialogue-context path with runtime budgets frozen in `configs/constants.yaml`
+- canonical suprasegmental text-feature contract for accent / tone / phrase-boundary cues in languages that require it
+- few-shot speaker adaptation from a short reference clip under a reproducible and budget-bounded contract
 - deterministic bootstrap-alignment artifact contract for transitional supervision
 - one authoritative WebUI/backend API surface for ingest, curation, generation, export, and evaluation
 - parity and latency validation across Python / Rust / ONNX / VST
+- modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) as mainline; rollback is allowed only if the alternative wins the frozen parity/latency/quality gates
+- flow-matching prosody predictor
+- CFG mainline modes: `off` and `full`
+- direct evaluation against at least one fixed, version-pinned public external baseline
+- no SOTA-quality claim unless the pinned baseline comparison passes on the declared claim axes
 
-### Tier 2: Research Extensions
+### Post-v3.0 Optimization Tracks
 
-These items are important, but they must not silently redefine or block Tier 1 sign-off.
-
-- backbone modernization such as `RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`
-- flow-matching prosody predictor variants beyond the minimum stable mainline path
-- CFG acceleration modes such as `lazy` and `distilled`
-- alternative vocoders / acoustic refinement stages
-- advanced quantization strategies beyond the proven deployment baseline
-
-Rule:
-
-- Tier 2 features may land only if they preserve Tier 1 contracts, pass the same parity gates, and retain a rollback path without invalidating the mainline pointer architecture
+- CFG acceleration modes `lazy` and `distilled`
+- alternative vocoders / acoustic refinement stages (`v3.1` upgrade path)
+- advanced quantization strategies
 
 
 ## SOTA Landscape Awareness (2025-2026)
@@ -99,7 +120,7 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - shared runtime and tensor contracts live in `tmrvc-core`
 - dataset and cache contracts live in `tmrvc-data`
 - `tmrvc-gui` is a Gradio-only WebUI; PySide6/Qt has been fully deprecated and removed. The Gradio control plane is the sole HITL surface for multi-user audit, blind evaluation, role separation, and all operational workflows
-- `plan/arxiv_survey_2026_03.md` records the dated research survey used to justify Tier 1 vs Tier 2 boundaries; workers should update it when a new paper materially changes a design choice
+- `plan/arxiv_survey_2026_03.md` records the dated research survey used to inform architecture decisions; workers should update it when a new paper materially changes a design choice
 
 
 ## Target End State
@@ -124,6 +145,7 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - pointer and attention caches are updated with an explicit sliding-window / re-indexing policy
 - runtime can express turn-taking tempo, hesitation, overlap pressure, and phrase-final release
 - **runtime can consume short reference-speaker evidence for few-shot speaker adaptation via prompt-cache**
+- runtime enforces explicit prompt-conditioning budgets (`max_prompt_seconds_active`, `max_prompt_frames`, `max_prompt_cache_bytes`) so few-shot conditioning cannot silently break the 10 ms causal budget
 - waveform decoding quality is treated as a first-class bottleneck, with an explicit vocoder / codec-decoder quality plan
 - **v3.1 upgrade path: 2-stage acoustic refinement (flow matching / DiT) is the planned quality ceiling lift**
 - multilingual and code-switching inference is supported under a documented language-conditioning contract
@@ -177,6 +199,7 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - worker 01 defines new interfaces
 - worker 03 defines dataset/input contract
 - worker 04 aligns Python/Rust/export runtime state expectations
+- worker 06 freezes the primary external baseline registry entry, evaluation protocol version, and hardware class before large-scale Stage B training
 - worker 07 defines curation manifest and stage contracts
 - worker 08 defines provider contracts
 - worker 12 drafts only the minimum admin/eval UI contract; it must not freeze unsupported inputs

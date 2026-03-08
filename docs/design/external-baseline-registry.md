@@ -7,6 +7,11 @@ Do not use phrases like "or newer successor" in release reports.
 If the baseline changes, add a new entry and bump the evaluation protocol
 version.
 
+## Freeze Policy
+
+The active `primary` baseline entry must be fully specified before any large-scale Stage B training or any public quality claim.
+A placeholder entry is permitted only during pre-freeze drafting and must block release-signoff and SOTA-language usage.
+
 ---
 
 ## Entry Template
