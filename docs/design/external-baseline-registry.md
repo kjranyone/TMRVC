@@ -28,7 +28,7 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `inference_settings` | Temperature, top-k, cfg, decoding mode, etc. |
 | `hardware_class` | Frozen hardware class used for runtime and latency claims |
 | `task_scope` | Which public claim axes this baseline blocks or informs |
-| `evaluation_set_version` | Frozen prompt-set identifier |
+| `evaluation_set_version` | Frozen prompt-set identifier defined in `docs/design/evaluation-set-spec.md` |
 | `source_refs` | Official source URLs used to justify the entry |
 | `date_frozen` | Date the baseline entry was frozen |
 | `notes` | Any caveats needed for reproducibility |

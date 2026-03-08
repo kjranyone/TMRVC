@@ -6,6 +6,7 @@ It must remain consistent with:
 - `plan/worker_06_validation.md`
 - `docs/design/acceptance-thresholds.md`
 - `docs/design/external-baseline-registry.md`
+- `docs/design/evaluation-set-spec.md`
 
 ---
 
@@ -16,6 +17,17 @@ It must remain consistent with:
 - separate exploratory runs from release-sign-off runs
 - report both automatic metrics and human evaluation
 - report failure counters such as `forced_advance_count` and `skip_protection_count`
+
+### 1.1 Active Frozen Evaluation Set
+
+The active release-signoff set is:
+
+- `evaluation_set_version = tmrvc_eval_public_v1_2026_03_08`
+
+Its exact contents, subset counts, language scope, few-shot prompt construction,
+and human-rating assignment rules are frozen in
+`docs/design/evaluation-set-spec.md`.
+No release-signoff run may cite the set version without using that frozen spec.
 
 ---
 
@@ -137,6 +149,7 @@ The following must be frozen:
 - prompt trimming rules
 - inference parameters
 - evaluation prompt set version
+- hardware class
 
 ### 6.2 Dimensions
 
