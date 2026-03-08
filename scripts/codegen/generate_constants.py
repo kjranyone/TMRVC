@@ -91,6 +91,20 @@ _RUNTIME_KEYS = {
     # F0 Conditioning
     "d_f0",
     "f0_smoothing_frames",
+    # Suprasegmental text features (v3)
+    "d_suprasegmental",
+    # Prompt budget limits (v3)
+    "max_prompt_seconds_active",
+    "max_prompt_frames",
+    "max_prompt_kv_tokens",
+    "max_prompt_cache_bytes",
+    # Runtime budget limits (v3)
+    "max_text_units_active",
+    "max_dialogue_context_units",
+    "max_acoustic_history_frames",
+    "max_cross_attn_kv_bytes",
+    "streaming_latency_budget_ms",
+    "streaming_hardware_class_primary",
 }
 
 # Rust name overrides (YAML key → Rust const name) for backward compat.
@@ -144,6 +158,8 @@ def _cpp_type(v: object) -> str:
         return "int"
     if isinstance(v, float):
         return "float"
+    if isinstance(v, str):
+        return "const char*"
     return "auto"
 
 
@@ -152,6 +168,8 @@ def _cpp_value(v: object) -> str:
         return "true" if v else "false"
     if isinstance(v, float):
         return f"{v}f"
+    if isinstance(v, str):
+        return f'"{v}"'
     if isinstance(v, list):
         inner = ", ".join(_cpp_value(x) for x in v)
         return f"{{{inner}}}"
@@ -198,6 +216,8 @@ def _rust_type(v: object) -> str:
         return "f32"
     if isinstance(v, int):
         return "usize"
+    if isinstance(v, str):
+        return "&str"
     return "usize"
 
 
@@ -206,6 +226,8 @@ def _rust_value(v: object) -> str:
         return "true" if v else "false"
     if isinstance(v, float):
         return repr(v)
+    if isinstance(v, str):
+        return f'"{v}"'
     if isinstance(v, list):
         inner = ", ".join(_rust_value(x) for x in v)
         return f"[{inner}]"
@@ -301,6 +323,23 @@ def generate_rust(cfg: dict) -> str:
             "d_f0",
             "f0_smoothing_frames",
         ],
+        "suprasegmental": [
+            "d_suprasegmental",
+        ],
+        "prompt_budget": [
+            "max_prompt_seconds_active",
+            "max_prompt_frames",
+            "max_prompt_kv_tokens",
+            "max_prompt_cache_bytes",
+        ],
+        "runtime_budget": [
+            "max_text_units_active",
+            "max_dialogue_context_units",
+            "max_acoustic_history_frames",
+            "max_cross_attn_kv_bytes",
+            "streaming_latency_budget_ms",
+            "streaming_hardware_class_primary",
+        ],
     }
 
     section_headers = {
@@ -313,6 +352,9 @@ def generate_rust(cfg: dict) -> str:
         "tts": "\n// --- TTS extension ---",
         "uclm": "\n// --- UCLM (Unified Codec Language Model) ---",
         "f0": "\n// --- F0 Conditioning ---",
+        "suprasegmental": "\n// --- Suprasegmental text features (v3) ---",
+        "prompt_budget": "\n// --- Prompt budget limits (v3) ---",
+        "runtime_budget": "\n// --- Runtime budget limits (v3) ---",
     }
 
     # Remove the initial audio header since we add it per section
