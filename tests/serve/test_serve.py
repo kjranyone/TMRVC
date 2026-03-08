@@ -80,7 +80,7 @@ class TestUCLMEngineLogic:
         class _MockUCLMCoreModel:
             text_encoder = _MockTextEncoder()
 
-            def forward_streaming(self, content_features, b_ctx, speaker_embed, state_cond, cfg_scale=1.0, kv_caches=None, dialogue_context=None, acting_intent=None, prosody_latent=None):
+            def forward_streaming(self, content_features, a_ctx, b_ctx, speaker_embed, state_cond, cfg_scale=1.0, kv_caches=None, dialogue_context=None, acting_intent=None, prosody_latent=None):
                 B = content_features.shape[0]
                 return {
                     "logits_a": torch.zeros(B, 8, 1, 1024),
@@ -88,7 +88,6 @@ class TestUCLMEngineLogic:
                     "kv_cache_out": kv_caches,
                     "hidden_states": torch.zeros(B, 1, 512),
                 }
-
             _call_count = 0
 
             def pointer_head(self, hidden_states):
@@ -99,7 +98,8 @@ class TestUCLMEngineLogic:
                 if self._call_count > 3:
                     adv_logit = torch.tensor([[[10.0]]])  # high prob -> advance
                     progress = torch.tensor([[[1.0]]])
-                return adv_logit, progress
+                boundary_conf = torch.tensor([[[0.8]]])
+                return adv_logit, progress, boundary_conf
 
         class _MockCodecDec(torch.nn.Module):
             def forward(self, a_t, b_t, v_state, states):

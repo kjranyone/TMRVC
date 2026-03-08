@@ -70,9 +70,12 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
     g2p_result = text_to_phonemes(spoken_text, language=character.language)
     phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
 
-    # 4. Load speaker embedding
+    # 4. Load speaker embedding or profile
     spk_embed = _load_speaker_embed(character)
     spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
+
+    # Future: _load_speaker_profile logic to fetch prompt_codec_tokens
+    speaker_profile = None
 
     # 5. Convert optional embedding lists to tensors
     dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0) if req.dialogue_context is not None else None
@@ -85,6 +88,7 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
     # 6. Unified Synthesis (UCLM)
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
+        speaker_profile=speaker_profile,
         speaker_embed=spk_t,
         style=style,
         language_id=g2p_result.language_id,
@@ -190,8 +194,12 @@ async def stream_tts_sse(req: TTSStreamRequest) -> StreamingResponse:
     g2p_result = text_to_phonemes(spoken_text, language=character.language)
     phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
 
+    # 4. Load speaker embedding or profile
     spk_embed = _load_speaker_embed(character)
     spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
+
+    # Future: _load_speaker_profile logic to fetch prompt_codec_tokens
+    speaker_profile = None
 
     dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0) if req.dialogue_context is not None else None
     act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0) if req.acting_intent is not None else None
@@ -199,6 +207,7 @@ async def stream_tts_sse(req: TTSStreamRequest) -> StreamingResponse:
     # --- Batch synthesis (will be replaced by causal streaming) ---
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
+        speaker_profile=speaker_profile,
         speaker_embed=spk_t,
         style=style,
         language_id=g2p_result.language_id,

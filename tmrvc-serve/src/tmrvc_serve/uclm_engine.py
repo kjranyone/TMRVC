@@ -14,11 +14,11 @@ import torch.nn.functional as F
 
 from tmrvc_core.constants import SAMPLE_RATE
 from tmrvc_core.dialogue_types import StyleParams
+from tmrvc_core.types import PointerState, SpeakerProfile
 from tmrvc_train.models import (
     DisentangledUCLM,
     EmotionAwareDecoder,
     EmotionAwareEncoder,
-    PointerState,
 )
 
 logger = logging.getLogger(__name__)
@@ -259,8 +259,9 @@ class UCLMEngine:
     def tts(
         self,
         phonemes: torch.Tensor,
-        speaker_embed: torch.Tensor,
-        style: StyleParams,
+        speaker_profile: Optional[SpeakerProfile] = None,
+        speaker_embed: Optional[torch.Tensor] = None,
+        style: StyleParams | None = None,
         cfg_scale: float = 1.5,
         temperature: float = 0.8,
         language_id: int = 0,
@@ -286,7 +287,8 @@ class UCLMEngine:
 
         Args:
             phonemes: [1, L] phoneme token ids.
-            speaker_embed: [1, d_speaker] speaker embedding.
+            speaker_profile: optional :class:`SpeakerProfile` (provides both timbre and prompt tokens).
+            speaker_embed: optional [1, d_speaker] direct speaker embedding fallback.
             style: StyleParams for voice state conditioning.
             cfg_scale: classifier-free guidance scale.
             temperature: sampling temperature.
@@ -316,10 +318,26 @@ class UCLMEngine:
         self._require_loaded()
         t0 = time.perf_counter()
 
+        style = style or StyleParams.neutral()
         v_state = torch.tensor(style.to_vector(), device=self.device).float().view(1, 1, -1)
         num_phonemes = phonemes.shape[1]
         phoneme_ids = phonemes.to(self.device)
-        speaker_embed = speaker_embed.to(self.device)
+        
+        prompt_kv_cache = None
+        if speaker_profile is not None:
+            speaker_embed = speaker_profile.speaker_embed.to(self.device).unsqueeze(0)
+            if speaker_profile.prompt_codec_tokens is not None:
+                # Precompute prompt KV cache using the encoder
+                # Note: Assuming encode_speaker_prompt or a helper can recreate the cache from tokens
+                # For now, we'll just encode the prompt codec tokens directly if model supports it
+                pass # TODO: implement prompt_kv_cache restoration from prompt_codec_tokens
+        elif speaker_embed is not None:
+            speaker_embed = speaker_embed.to(self.device)
+            if speaker_embed.dim() == 1:
+                speaker_embed = speaker_embed.unsqueeze(0)
+        else:
+            raise ValueError("Either speaker_profile or speaker_embed must be provided")
+
         lang_id = torch.tensor([language_id], device=self.device).expand(1, num_phonemes)
 
         ptr = PointerInferenceState(total_phonemes=num_phonemes, max_frames_per_unit=max_frames_per_unit)
@@ -337,6 +355,7 @@ class UCLMEngine:
         _act_int = acting_intent.to(self.device) if acting_intent is not None else None
 
         a_tokens, b_tokens = [], []
+        ctx_a = torch.zeros(1, 8, 1, dtype=torch.long, device=self.device)
 
         for t in range(max_frames):
             if ptr.finished:
@@ -347,6 +366,7 @@ class UCLMEngine:
 
             out = self.uclm_core_model.forward_streaming(
                 content_features=content_features,
+                a_ctx=ctx_a,
                 b_ctx=ctx_b,
                 speaker_embed=speaker_embed,
                 state_cond=v_state,
@@ -359,7 +379,7 @@ class UCLMEngine:
             logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
             hidden_states = out["hidden_states"]
             
-            p_adv_logit, p_delta = self.uclm_core_model.pointer_head(hidden_states)
+            p_adv_logit, p_delta, _p_bc = self.uclm_core_model.pointer_head(hidden_states)
             # Combine all pacing controls:
             # - hold_bias: negative = hold longer, positive = advance sooner
             # - boundary_bias: positive = encourage boundary transitions
@@ -383,6 +403,7 @@ class UCLMEngine:
                 
             a_tokens.append(at.unsqueeze(-1))
             b_tokens.append(bt.unsqueeze(-1))
+            ctx_a = at.unsqueeze(-1)
             ctx_b = bt.unsqueeze(-1)
 
             # --- Pointer state-transition with failure handling ---
