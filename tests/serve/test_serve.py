@@ -45,7 +45,7 @@ class TestUCLMEngineLogic:
         def mock_enc(audio, states): return torch.zeros(1, 8, 1), None, states
         def mock_vc(tokens): return torch.zeros(1, 512, 1), None
         def mock_vstate(v, s): return (torch.zeros(1, 1, 512),)
-        def mock_uclm(c, b, s, st, cfg, kv): return torch.zeros(1, 8, 1, 1024), torch.zeros(1, 4, 1, 64), kv, torch.zeros(1, 1, 512)
+        def mock_uclm(c, ctx_a, ctx_b, spk, st, cfg, kv, f0_condition=None, **kwargs): return torch.zeros(1, 8, 1, 1024), torch.zeros(1, 4, 1, 64), kv, torch.zeros(1, 1, 512)
         def mock_dec(a, b, v, s): return torch.zeros(1, 1, 240), s
 
         engine.codec_enc.forward = mock_enc
@@ -73,15 +73,16 @@ class TestUCLMEngineLogic:
         engine = UCLMEngine(device="cpu")
 
         class _MockTextEncoder(torch.nn.Module):
-            def forward(self, phoneme_ids, lang_ids, phoneme_lens):
+            def forward(self, phoneme_ids, lang_ids, phoneme_lens, text_suprasegmentals=None):
                 B, L = phoneme_ids.shape
                 return torch.randn(B, 512, L)  # [B, d_model, L]
 
         class _MockUCLMCoreModel:
             text_encoder = _MockTextEncoder()
 
-            def forward_streaming(self, content_features, a_ctx, b_ctx, speaker_embed, state_cond, cfg_scale=1.0, kv_caches=None, dialogue_context=None, acting_intent=None, prosody_latent=None):
-                B = content_features.shape[0]
+            def forward_streaming(self, queries=None, memory=None, a_ctx=None, b_ctx=None, speaker_embed=None, state_cond=None, cfg_scale=1.0, kv_caches=None, dialogue_context=None, acting_intent=None, prosody_latent=None, prompt_summary_tokens=None, content_features=None):
+                q = queries if queries is not None else content_features
+                B = q.shape[0]
                 return {
                     "logits_a": torch.zeros(B, 8, 1, 1024),
                     "logits_b": torch.zeros(B, 4, 1, 64),

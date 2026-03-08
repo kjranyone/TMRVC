@@ -38,31 +38,11 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 
 ## Active Entries
 
-### `primary_qwen3_tts_12hz_1p7b_base_hf_fd4b254`
+### `primary_fun_cosyvoice3_0p5b_2512_hf_29e01c4`
 
 | Field | Value |
 |------|-------|
-| `baseline_id` | `primary_qwen3_tts_12hz_1p7b_base_hf_fd4b254` |
-| `model_name` | `Qwen3-TTS-12Hz-1.7B-Base` |
-| `artifact_id` | `hf:Qwen/Qwen3-TTS-12Hz-1.7B-Base@fd4b254` |
-| `tokenizer_version` | `hf:Qwen/Qwen3-TTS-Tokenizer-12Hz@7dd38ad` |
-| `language_set` | `Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian` |
-| `prompt_rule` | `Voice-clone mode only. Reference audio is trimmed to a voiced 3 s / 5 s / 10 s span with matched verbatim reference transcript. Reusable prompt path uses create_voice_clone_prompt. Pass explicit target language for the main evaluation set; allow language=auto only for subsets explicitly marked auto-language stress.` |
-| `reference_lengths_sec` | `3, 5, 10` |
-| `inference_settings` | `Use the official qwen-tts package in voice-clone mode; dtype=torch.float16; attn_implementation=sdpa; max_new_tokens=2048; all other sampling parameters from the checkpoint generate_config.json; no manual prompt embellishment or hidden decoding retuning.` |
-| `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
-| `task_scope` | `Primary blocker for broad public quality claims: few-shot speaker similarity, intelligibility, overall naturalness, multilingual zero-shot quality, and streaming-capable public-baseline comparison.` |
-| `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
-| `evaluation_protocol_version` | `v1_2026_03_08` |
-| `source_refs` | `https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/main ; https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz/tree/main ; https://github.com/QwenLM/Qwen3-TTS` |
-| `date_frozen` | `2026-03-08` |
-| `notes` | `Chosen as primary because it is an official open-weight baseline with streaming support, 3-second voice cloning, 10-language coverage, and explicit evaluation settings published by the model authors. Portuguese is in this model's language_set but excluded from sign-off because it is not in the secondary baseline intersection.` |
-
-### `secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4`
-
-| Field | Value |
-|------|-------|
-| `baseline_id` | `secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4` |
+| `baseline_id` | `primary_fun_cosyvoice3_0p5b_2512_hf_29e01c4` |
 | `model_name` | `Fun-CosyVoice3-0.5B-2512` |
 | `artifact_id` | `hf:FunAudioLLM/Fun-CosyVoice3-0.5B-2512@29e01c4` |
 | `tokenizer_version` | `bundled CosyVoice3 tokenizer in artifact @29e01c4; text normalization path = default WeText; optional ttsfrd disabled for sign-off reproducibility` |
@@ -71,12 +51,32 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `reference_lengths_sec` | `3, 5, 10` |
 | `inference_settings` | `Use the official CosyVoice3 inference_zero_shot path; stream=False for offline quality comparison and stream=True only in the streaming-latency suite; default released checkpoint config; no undocumented RAS/decoder overrides; no ttsfrd dependency in the sign-off path.` |
 | `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
-| `task_scope` | `Secondary blocker for streaming-first and multilingual zero-shot comparison. Used to stress-test whether TMRVC's causal path remains competitive against a public streaming-native baseline.` |
+| `task_scope` | `Primary blocker for broad public quality claims because its 0.5B scale is closer to TMRVC's target regime while still covering streaming, multilingual zero-shot quality, few-shot speaker similarity, intelligibility, and overall naturalness.` |
 | `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
 | `evaluation_protocol_version` | `v1_2026_03_08` |
 | `source_refs` | `https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/tree/main ; https://github.com/FunAudioLLM/CosyVoice ; https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/example.py` |
 | `date_frozen` | `2026-03-08` |
-| `notes` | `Chosen as secondary because it is an official open-weight streaming-native baseline with published multilingual and zero-shot claims, direct Hugging Face artifact availability, and an explicit repo example for CosyVoice3 zero-shot prompting.` |
+| `notes` | `Chosen as primary because it is an official open-weight streaming-native baseline with published multilingual and zero-shot claims, direct Hugging Face artifact availability, and model scale closer to TMRVC's planned regime.` |
+
+### `secondary_qwen3_tts_12hz_1p7b_base_hf_fd4b254`
+
+| Field | Value |
+|------|-------|
+| `baseline_id` | `secondary_qwen3_tts_12hz_1p7b_base_hf_fd4b254` |
+| `model_name` | `Qwen3-TTS-12Hz-1.7B-Base` |
+| `artifact_id` | `hf:Qwen/Qwen3-TTS-12Hz-1.7B-Base@fd4b254` |
+| `tokenizer_version` | `hf:Qwen/Qwen3-TTS-Tokenizer-12Hz@7dd38ad` |
+| `language_set` | `Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian` |
+| `prompt_rule` | `Voice-clone mode only. Reference audio is trimmed to a voiced 3 s / 5 s / 10 s span with matched verbatim reference transcript. Reusable prompt path uses create_voice_clone_prompt. Pass explicit target language for the main evaluation set; allow language=auto only for subsets explicitly marked auto-language stress.` |
+| `reference_lengths_sec` | `3, 5, 10` |
+| `inference_settings` | `Use the official qwen-tts package in voice-clone mode; dtype=torch.float16; attn_implementation=sdpa; max_new_tokens=2048; all other sampling parameters from the checkpoint generate_config.json; no manual prompt embellishment or hidden decoding retuning.` |
+| `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
+| `task_scope` | `Secondary ceiling baseline for broad multilingual quality, few-shot speaker similarity, overall naturalness, and high-capacity public-baseline comparison. Deficits on scale-sensitive axes require narrowed claims rather than silent failure relabeling.` |
+| `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
+| `evaluation_protocol_version` | `v1_2026_03_08` |
+| `source_refs` | `https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/main ; https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz/tree/main ; https://github.com/QwenLM/Qwen3-TTS` |
+| `date_frozen` | `2026-03-08` |
+| `notes` | `Chosen as secondary ceiling baseline because it is an official open-weight model with strong multilingual and short-reference voice-cloning claims, but its 1.7B scale is materially larger than TMRVC's target regime.` |
 
 ---
 

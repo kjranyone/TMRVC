@@ -70,22 +70,42 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
     g2p_result = text_to_phonemes(spoken_text, language=character.language)
     phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
 
-    # 4. Load speaker embedding or profile
-    spk_embed = _load_speaker_embed(character)
-    spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
-
-    # Future: _load_speaker_profile logic to fetch prompt_codec_tokens
+    # 4. Load speaker embedding or profile (Worker 04)
     speaker_profile = None
+    if req.speaker_profile_id:
+        # Load from Casting Gallery (Worker 12 requirement)
+        speaker_profile = engine.load_speaker_profile(req.speaker_profile_id)
+        if speaker_profile is None:
+            raise HTTPException(status_code=404, detail=f"Speaker profile '{req.speaker_profile_id}' not found.")
+        spk_t = speaker_profile.speaker_embed.unsqueeze(0).to(engine.device)
+    else:
+        spk_embed = _load_speaker_embed(character)
+        spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0).to(engine.device)
 
-    # 5. Convert optional embedding lists to tensors
-    dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0) if req.dialogue_context is not None else None
-    act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0) if req.acting_intent is not None else None
+    # 5. Handle on-the-fly few-shot adaptation
+    if req.reference_audio_base64:
+        ref_audio_bytes = base64.b64decode(req.reference_audio_base64)
+        # Convert to tensor and encode (Worker 01/04)
+        # For simplicity in this route, we assume engine has a helper for this
+        if req.wait_for_prompt:
+            logger.info("Encoding on-the-fly reference audio...")
+            ref_profile = engine.encode_on_the_fly_reference(
+                ref_audio_bytes, text=req.reference_text
+            )
+            speaker_profile = ref_profile
+            spk_t = ref_profile.speaker_embed.unsqueeze(0).to(engine.device)
+        else:
+            # Plan: return 202 Accepted or error if not ready, but here we enforce wait
+            pass
 
-    # Few-shot speaker adaptation: reference audio encoding
-    # (Placeholder: actual codec encoding from raw audio will be added when the
-    # full Speaker Prompt Encoder pipeline is integrated)
+    # 6. Convert optional embedding lists to tensors
+    dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.dialogue_context is not None else None
+    act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.acting_intent is not None else None
+    
+    explicit_vs = torch.tensor(req.explicit_voice_state, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.explicit_voice_state is not None else None
+    delta_vs = torch.tensor(req.delta_voice_state, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.delta_voice_state is not None else None
 
-    # 6. Unified Synthesis (UCLM)
+    # 7. Unified Synthesis (UCLM v3)
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
         speaker_profile=speaker_profile,
@@ -99,6 +119,10 @@ async def generate_tts(req: TTSRequest) -> TTSResponse:
         breath_tendency=req.breath_tendency,
         dialogue_context=dlg_ctx,
         acting_intent=act_int,
+        explicit_voice_state=explicit_vs,
+        delta_voice_state=delta_vs,
+        cfg_scale=req.cfg_scale,
+        cfg_mode=req.cfg_mode,
     )
     
     audio = audio_t.cpu().numpy()

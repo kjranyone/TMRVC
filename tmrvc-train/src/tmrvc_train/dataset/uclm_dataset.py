@@ -26,6 +26,8 @@ class DisentangledUCLMDataset(Dataset):
               UCLM v3 pointer-based text progression.
             - ``"legacy_duration"``: require *both* ``phoneme_ids.npy`` **and**
               ``durations.npy`` for a sample to have text supervision.
+        min_quality_score: Minimum quality_score to include (0.0 = no filter).
+        provenance_filter: If set, only include utterances with this provenance_class.
     """
 
     def __init__(
@@ -34,6 +36,8 @@ class DisentangledUCLMDataset(Dataset):
         max_frames: int = 400,
         include_datasets: list[str] | None = None,
         tts_mode: str = "auto",
+        min_quality_score: float = 0.0,
+        provenance_filter: str | None = None,
     ):
         if tts_mode not in _VALID_TTS_MODES:
             raise ValueError(
@@ -42,6 +46,8 @@ class DisentangledUCLMDataset(Dataset):
         self.cache_dir = Path(cache_dir)
         self.max_frames = max_frames
         self.tts_mode = tts_mode
+        self.min_quality_score = min_quality_score
+        self.provenance_filter = provenance_filter
         self.include_datasets = (
             set(include_datasets) if include_datasets is not None else None
         )
@@ -77,8 +83,19 @@ class DisentangledUCLMDataset(Dataset):
                     "ssl_state.npy",
                     "spk_embed.npy",
                 ]
+                # durations.npy is NOT in the required list --
+                # v3 pointer mode does not use external duration labels.
 
                 if all((utt_dir / req).exists() for req in required_files):
+                    # Quality filtering (Worker 03 contract)
+                    if self.min_quality_score > 0.0:
+                        qs = meta.get("quality_score", 1.0)
+                        if qs < self.min_quality_score:
+                            continue
+                    if self.provenance_filter is not None:
+                        if meta.get("provenance_class", "") != self.provenance_filter:
+                            continue
+
                     spk_id = meta.get("speaker_id") or utt_dir.parent.name
                     self.utterances.append(
                         {
@@ -111,26 +128,39 @@ class DisentangledUCLMDataset(Dataset):
     def supervision_report(self) -> dict:
         """Return per-dataset supervision statistics.
 
-        Returns a dict with coverage and UNK ratio.
+        Returns a dict with coverage and UNK ratio.  Distinguishes:
+        - text_supervision_coverage (has text in meta)
+        - canonical_text_unit_coverage (has phoneme_ids.npy)
+        - legacy_duration_coverage (has durations.npy)
         """
         from tmrvc_data.g2p import UNK_ID, PHONE2ID
 
         total = len(self.utterances)
         with_text = 0
+        with_canonical_text_units = 0
         with_legacy_duration = 0
+        with_voice_state = 0
+        with_suprasegmentals = 0
+        with_prompt_eligible = 0
         total_phones = 0
         unk_phones = 0
-        
+
         # JA Accent tracking
         accents = [PHONE2ID.get(a) for a in ["^", "=", "_"] if a in PHONE2ID]
         accent_count = 0
 
         for utt in self.utterances:
             utt_dir = utt["path"]
+            meta = utt.get("meta", {})
             has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
             has_durations = (utt_dir / "durations.npy").exists()
-            if has_phonemes:
+            has_vs_targets = (utt_dir / "voice_state_targets.npy").exists()
+            has_supra = (utt_dir / "text_suprasegmentals.npy").exists()
+
+            if meta.get("text"):
                 with_text += 1
+            if has_phonemes:
+                with_canonical_text_units += 1
                 if has_durations:
                     with_legacy_duration += 1
                 try:
@@ -141,13 +171,23 @@ class DisentangledUCLMDataset(Dataset):
                         accent_count += sum(1 for p in pids if p in accents)
                 except Exception:
                     pass
+            if has_vs_targets:
+                with_voice_state += 1
+            if has_supra:
+                with_suprasegmentals += 1
+            if "prompt_eligible" in meta:
+                with_prompt_eligible += 1
 
         return {
             "total": total,
             "text_supervision_coverage": with_text / max(total, 1),
+            "canonical_text_unit_coverage": with_canonical_text_units / max(total, 1),
             "legacy_duration_coverage": with_legacy_duration / max(total, 1),
             "unknown_phone_ratio": round(unk_phones / max(total_phones, 1), 6),
             "pitch_accent_coverage": round(accent_count / max(total_phones, 1), 6),
+            "voice_state_supervision_coverage": with_voice_state / max(total, 1),
+            "suprasegmental_coverage": with_suprasegmentals / max(total, 1),
+            "prompt_pairing_coverage": with_prompt_eligible / max(total, 1),
             "tts_mode": self.tts_mode,
         }
 
@@ -155,7 +195,7 @@ class DisentangledUCLMDataset(Dataset):
         """Return expressive-data readiness statistics."""
         total = len(self.utterances)
         fields = [
-            "dialogue_context", "acting_intent", "prosody_targets", 
+            "dialogue_context", "acting_intent", "prosody_targets",
             "style_embedding", "pause_events"
         ]
         counts = {f: 0 for f in fields}
@@ -236,6 +276,7 @@ class DisentangledUCLMDataset(Dataset):
         has_durations = (utt_dir / "durations.npy").exists()
 
         if self.tts_mode == "pointer":
+            # v3 pointer mode: never require durations
             if has_phonemes:
                 phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
         elif self.tts_mode == "legacy_duration":
@@ -251,6 +292,37 @@ class DisentangledUCLMDataset(Dataset):
         phoneme_lens = None
         if phoneme_ids is not None:
             phoneme_lens = torch.tensor(len(phoneme_ids)).long()
+
+        # Suprasegmentals (Worker 03 contract)
+        text_suprasegmentals = None
+        if (utt_dir / "text_suprasegmentals.npy").exists():
+            text_suprasegmentals = torch.from_numpy(np.load(utt_dir / "text_suprasegmentals.npy")).float()
+
+        # Voice state supervision (Worker 03 contract)
+        voice_state_targets = None
+        voice_state_observed_mask = None
+        voice_state_confidence = None
+        if (utt_dir / "voice_state_targets.npy").exists():
+            voice_state_targets = torch.from_numpy(np.load(utt_dir / "voice_state_targets.npy")).float()
+            if (utt_dir / "voice_state_observed_mask.npy").exists():
+                voice_state_observed_mask = torch.from_numpy(np.load(utt_dir / "voice_state_observed_mask.npy")).bool()
+            if (utt_dir / "voice_state_confidence.npy").exists():
+                voice_state_confidence = torch.from_numpy(np.load(utt_dir / "voice_state_confidence.npy")).float()
+
+        # Bootstrap alignment (Worker 03 contract)
+        bootstrap_alignment = None
+        if (utt_dir / "bootstrap_alignment.json").exists():
+            try:
+                with open(utt_dir / "bootstrap_alignment.json", encoding="utf-8") as f:
+                    bs_data = json.load(f)
+                if "phoneme_indices" in bs_data:
+                    bootstrap_alignment = {
+                        "phoneme_indices": torch.tensor(bs_data["phoneme_indices"], dtype=torch.long),
+                        "frame_count": bs_data.get("frame_count", 0),
+                        "phoneme_count": bs_data.get("phoneme_count", 0),
+                    }
+            except Exception:
+                pass
 
         spk_str = utt.get("speaker_id") or meta.get("speaker_id") or utt_dir.parent.name
         spk_int = self.speaker_to_id.get(spk_str, 0)
@@ -272,4 +344,17 @@ class DisentangledUCLMDataset(Dataset):
             "dialogue_context": dialogue_context,
             "acting_intent": acting_intent,
             "prosody_targets": prosody_targets,
+            "text_suprasegmentals": text_suprasegmentals,
+            "voice_state_targets": voice_state_targets,
+            "voice_state_observed_mask": voice_state_observed_mask,
+            "voice_state_confidence": voice_state_confidence,
+            "bootstrap_alignment": bootstrap_alignment,
+            # Curation fields (Worker 03)
+            "curation_record_id": meta.get("curation_record_id"),
+            "promotion_bucket": meta.get("promotion_bucket"),
+            "curation_pass": meta.get("curation_pass"),
+            "quality_score": meta.get("quality_score"),
+            # Few-shot prompt fields (Worker 03)
+            "prompt_eligible": meta.get("prompt_eligible"),
+            "prompt_pair_id": meta.get("prompt_pair_id"),
         }

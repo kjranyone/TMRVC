@@ -53,9 +53,16 @@ For reproducible held-out tests.
 - conversation metadata
 - source legality
 - quality score
+- `score_components`
 - provider provenance
+- provider decision provenance:
+  - `provider_id`
+  - `provider_revision`
+  - `calibration_version`
+  - optional `fallback_class`
 - promotion bucket
 - `voice_state` supervision status
+- few-shot prompt eligibility metadata
 
 Optional:
 
@@ -78,23 +85,24 @@ Optional:
    - `prev_record_id`
    - `next_record_id`
    - `context_window_ids`
-5. Add `dev.py` operations:
-   - run curation
-   - resume curation
-   - export promoted subset
-   - show curation summary
+5. Request `dev.py` entrypoints from Worker 05:
+   - Worker 05 owns `dev.py` implementation; Worker 10 defines the required export-side commands and their arguments
+   - required commands: run curation, resume curation, export promoted subset, show curation summary
+   - these commands must call through the authoritative backend API defined by Worker 04 / Worker 07
 6. Add WebUI-facing export actions:
    - materialize promoted subset
    - package holdout evaluation bundle
    - download or register exported artifacts for downstream training/eval
    - return structured payloads with artifact ids, download urls, and provenance summary
 7. Define how later training quality gates read curation provenance and legality.
+   - export must preserve the exact provider/calibration fields used by Worker 09 promotion policy so release bundles remain reproducible
 8. Export dialogue context in a model-agnostic way:
    - raw context text, turn graph, and canonical text units are the default export
    - optional derived context embeddings may be materialized only as checkpoint-hashed caches and must be invalidatable
 9. Export ASR-derived alignment for bootstrap:
    - preserve token-level or word-level timestamps from Stage 4/5 for provenance
-   - export `bootstrap_alignment.json` already projected onto canonical `phoneme_ids` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance, utilizing **Acoustic-Aware Heuristics** for precise boundary estimation.
+   - export `bootstrap_alignment.json` already projected onto canonical `phoneme_ids` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance.
+   - include `projection_algorithm_id`, `projection_algorithm_version`, and a parameter/config fingerprint so the projection is replayable.
    - ensure these labels are available to Worker 02 as a supervised `pointer_target_source`
    - freeze frame convention:
      - `sample_rate = 24000`
@@ -108,7 +116,17 @@ Optional:
    - `voice_state_confidence.npy`
    - `voice_state_meta.json`
    - preserve estimator identity, calibration version, and target-source provenance
-11. Define artifact package contract:
+11. Export canonical few-shot prompt metadata:
+   - promptable records must carry:
+     - `speaker_id`
+     - `prompt_candidate_record_ids`
+     - `prompt_policy_version`
+     - `prompt_duration_sec` summary
+     - `prompt_language`
+     - `speaker_purity_estimate`
+     - leakage-policy flags
+   - holdout bundles must freeze the exact prompt-target pairings used in evaluation so external-baseline comparisons are reproducible
+12. Define artifact package contract:
    - every exported package must include:
      - `artifact_id`
      - `artifact_type`
@@ -122,20 +140,23 @@ Optional:
      - cache-ready training bundle
      - holdout evaluation bundle
      - pinned workshop take bundle
-12. Define artifact lifecycle and cleanup policy:
+13. Define artifact lifecycle and cleanup policy:
    - `ephemeral`
    - `durable`
    - `release_candidate`
    - who may delete each class
    - whether download URLs are time-limited
-13. Define export failure / retry semantics:
+14. Define export failure / retry semantics:
    - partial package cleanup rules
    - idempotent retry behavior keyed by manifest snapshot and export intent
    - WebUI-visible failure payload with actionable remediation
-14. Define browser-safe artifact handoff:
+15. Define browser-safe artifact handoff:
    - download for human operators
    - server-side registration for training/eval jobs
    - checksum display and verification status in WebUI
+16. Post-v3.0 only: user voice adaptor export
+   - if adaptor/LoRA export remains in scope, move it behind the post-v3.0 Training Cockpit / production-export workstream
+   - do not let adaptor-merging or ONNX baking block the mainline curated-data export contract
 
 ## Guardrails
 
@@ -146,6 +167,7 @@ Optional:
 - do not make model-dependent context embeddings the canonical export contract
 - do not export bootstrap alignment that still requires downstream phoneme projection guesswork
 - do not export `voice_state` supervision without masks and provenance
+- do not export provider-driven scores or decisions without the pinned provider/calibration provenance that produced them
 - do not make shell access a prerequisite for exporting, packaging, or downloading curated outputs
 - do not produce opaque artifact directories that the WebUI cannot describe or audit
 
@@ -154,3 +176,10 @@ Optional:
 - training workers can ingest curated subsets cleanly
 - validation workers can trace evaluation failures back to curation history
 - worker 12 can present export/download state without inventing artifact metadata
+
+## Required Tests
+
+- export preserves bootstrap-alignment projection provenance fields
+- export preserves few-shot prompt eligibility metadata
+- holdout bundle freezes prompt-target pairings reproducibly
+- export fails closed when projection provenance is missing

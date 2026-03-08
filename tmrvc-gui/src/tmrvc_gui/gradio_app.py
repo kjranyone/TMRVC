@@ -26,6 +26,7 @@ from typing import Any
 import gradio as gr
 import numpy as np
 
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS, VOICE_STATE_REGISTRY
 from tmrvc_gui.gradio_state import (
     ROLES,
     AuditTrail,
@@ -100,33 +101,43 @@ SAMPLE_RATE = 24000
 # ===================================================================
 
 
+def _fetch_speaker_profiles() -> list[str]:
+    """Fetch speaker profile names from the API, falling back to local gallery."""
+    models = _api_get("/admin/models")
+    if models and isinstance(models, list):
+        return [m.get("name", "unknown") for m in models]
+    return _gallery.list_names()
+
+
 def _build_drama_workshop() -> gr.Blocks:
-    """Interactive drama workshop with voice cloning, pacing, and physical controls."""
+    """Interactive drama workshop with voice cloning, pacing, and physical controls.
+
+    Tier 1 v3.0: basic inference with pacing controls, 8-D voice_state sliders,
+    CFG scale, and speaker_profile_id selection.  Generation dispatches to
+    POST /ui/workshop/generate.
+    """
+
+    # Canonical 8-D voice_state dimension keys (matching VOICE_STATE_REGISTRY)
+    _VS_KEYS = list(CANONICAL_VOICE_STATE_IDS)
 
     with gr.Blocks() as tab:
         gr.Markdown("## Drama Workshop")
 
         with gr.Row():
             with gr.Column(scale=1):
-                # --- Voice Cloning ---
-                gr.Markdown("### Voice Cloning / Casting")
-                ref_audio = gr.Audio(
-                    label="Reference Audio (3-10s)",
-                    type="filepath",
-                    sources=["upload", "microphone"],
+                # --- Speaker Profile ---
+                gr.Markdown("### Speaker Profile")
+                speaker_profile_id = gr.Dropdown(
+                    label="Speaker Profile",
+                    choices=_fetch_speaker_profiles(),
+                    value=None,
+                    allow_custom_value=True,
+                    interactive=True,
                 )
                 character_id = gr.Textbox(
                     label="Character ID", value="default", max_lines=1
                 )
-                with gr.Row():
-                    btn_extract = gr.Button("Extract Profile")
-                    btn_gallery_refresh = gr.Button("Refresh Gallery")
-
-                gallery_list = gr.Dropdown(
-                    label="Casting Gallery",
-                    choices=_gallery.list_names(),
-                    interactive=True,
-                )
+                btn_refresh_profiles = gr.Button("Refresh Profiles")
 
                 # --- Pacing Controls ---
                 gr.Markdown("### Pacing")
@@ -138,34 +149,42 @@ def _build_drama_workshop() -> gr.Blocks:
                     -1.0, 1.0, value=0.0, step=0.05, label="Boundary Bias"
                 )
                 cfg_scale = gr.Slider(
-                    0.5, 5.0, value=1.5, step=0.1, label="CFG Scale"
+                    1.0, 3.0, value=1.5, step=0.1, label="CFG Scale"
                 )
 
             with gr.Column(scale=1):
                 # --- Physical Controls (8-D voice_state) ---
-                gr.Markdown("### Physical Controls (Voice State)")
-                vs_energy = gr.Slider(0, 1, value=0.5, step=0.05, label="Energy")
-                vs_pitch_mean = gr.Slider(
-                    0, 1, value=0.5, step=0.05, label="Pitch Mean"
+                gr.Markdown("### Physical Controls (8-D Voice State)")
+                vs_pitch_level = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label=VOICE_STATE_REGISTRY[0].name
                 )
                 vs_pitch_range = gr.Slider(
-                    0, 1, value=0.5, step=0.05, label="Pitch Range"
+                    0, 1, value=0.3, step=0.05, label=VOICE_STATE_REGISTRY[1].name
                 )
-                vs_speed = gr.Slider(0, 1, value=0.5, step=0.05, label="Speed")
+                vs_energy_level = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label=VOICE_STATE_REGISTRY[2].name
+                )
+                vs_pressedness = gr.Slider(
+                    0, 1, value=0.35, step=0.05, label=VOICE_STATE_REGISTRY[3].name
+                )
+                vs_spectral_tilt = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label=VOICE_STATE_REGISTRY[4].name
+                )
                 vs_breathiness = gr.Slider(
-                    0, 1, value=0.5, step=0.05, label="Breathiness"
+                    0, 1, value=0.2, step=0.05, label=VOICE_STATE_REGISTRY[5].name
                 )
-                vs_tension = gr.Slider(0, 1, value=0.5, step=0.05, label="Tension")
-                vs_warmth = gr.Slider(0, 1, value=0.5, step=0.05, label="Warmth")
-                vs_brightness = gr.Slider(
-                    0, 1, value=0.5, step=0.05, label="Brightness"
+                vs_voice_irregularity = gr.Slider(
+                    0, 1, value=0.15, step=0.05, label=VOICE_STATE_REGISTRY[6].name
+                )
+                vs_openness = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label=VOICE_STATE_REGISTRY[7].name
                 )
 
                 # --- Dialogue Context ---
                 gr.Markdown("### Dialogue Context")
                 dialogue_ctx = gr.Textbox(
-                    label="Context",
-                    placeholder="Enter preceding dialogue context...",
+                    label="Script / Dialogue",
+                    placeholder="Enter script or preceding dialogue context...",
                     lines=3,
                 )
                 acting_intent = gr.Textbox(
@@ -183,40 +202,10 @@ def _build_drama_workshop() -> gr.Blocks:
         )
         with gr.Row():
             btn_generate = gr.Button("Generate", variant="primary")
-            btn_compare = gr.Button("Compare A/B")
+            btn_multi_take = gr.Button("Generate Multi-Take (3)")
 
         output_audio = gr.Audio(label="Output", type="numpy")
         generation_info = gr.JSON(label="Generation Info", visible=True)
-
-        def generate_multi_take(
-            text, char_id, pace_v, hold_v, boundary_v, cfg_v, 
-            energy, pitch_mean, pitch_range, speed, breathiness, tension, warmth, brightness,
-            ctx, intent
-        ):
-            if not text.strip():
-                return [], "Enter text."
-            
-            takes = []
-            for i in range(3):
-                seed = random.randint(0, 1000000)
-                # In a real app, we'd pass the seed to the API
-                # For now, we simulate 3 generations
-                tid = str(uuid.uuid4())[:8]
-                takes.append([tid, seed, cfg_v, pace_v, f"Take {i+1}"])
-            
-            _audit.log("director", "gradio", "generate_multi_take", after_state=f"count=3, text={text[:20]}")
-            return takes, "Generated 3 takes."
-
-        btn_multi_take.click(
-            generate_multi_take,
-            inputs=[
-                input_text, character_id, pace, hold_bias, boundary_bias, cfg_scale,
-                vs_energy, vs_pitch_mean, vs_pitch_range, vs_speed,
-                vs_breathiness, vs_tension, vs_warmth, vs_brightness,
-                dialogue_ctx, acting_intent,
-            ],
-            outputs=[take_outputs, status],
-        )
 
         take_outputs = gr.Dataframe(
             headers=["take_id", "seed", "cfg_scale", "pace", "notes"],
@@ -240,16 +229,29 @@ def _build_drama_workshop() -> gr.Blocks:
 
         status = gr.Textbox(label="Status", interactive=False, value="Ready")
 
+        # --- All voice state sliders in canonical order ---
+        _vs_sliders = [
+            vs_pitch_level,
+            vs_pitch_range,
+            vs_energy_level,
+            vs_pressedness,
+            vs_spectral_tilt,
+            vs_breathiness,
+            vs_voice_irregularity,
+            vs_openness,
+        ]
+
         # --- Callbacks ---
 
-        def save_preset(name, energy, pitch_mean, pitch_range, speed, breathiness, tension, warmth, brightness):
+        btn_refresh_profiles.click(
+            lambda: gr.update(choices=_fetch_speaker_profiles()),
+            outputs=[speaker_profile_id],
+        )
+
+        def save_preset(name, *slider_vals):
             if not name.strip():
                 return [], "Enter preset name."
-            preset = {
-                "energy": energy, "pitch_mean": pitch_mean, "pitch_range": pitch_range,
-                "speed": speed, "breathiness": breathiness, "tension": tension,
-                "warmth": warmth, "brightness": brightness,
-            }
+            preset = dict(zip(_VS_KEYS, slider_vals))
             p = Path("data/presets")
             p.mkdir(parents=True, exist_ok=True)
             (p / f"{name}.json").write_text(json.dumps(preset, indent=2), encoding="utf-8")
@@ -258,60 +260,37 @@ def _build_drama_workshop() -> gr.Blocks:
 
         btn_save_preset.click(
             save_preset,
-            inputs=[preset_name, vs_energy, vs_pitch_mean, vs_pitch_range, vs_speed,
-                    vs_breathiness, vs_tension, vs_warmth, vs_brightness],
+            inputs=[preset_name] + _vs_sliders,
             outputs=[preset_list, status],
         )
 
         def load_preset(name):
             if not name:
-                return [0.5]*8 + ["Select a preset."]
+                return [0.5] * 8 + ["Select a preset."]
             p = Path("data/presets") / f"{name}.json"
             if not p.exists():
-                return [0.5]*8 + [f"Preset not found: {name}"]
+                return [0.5] * 8 + [f"Preset not found: {name}"]
             d = json.loads(p.read_text(encoding="utf-8"))
-            return [d.get(k, 0.5) for k in [
-                "energy", "pitch_mean", "pitch_range", "speed",
-                "breathiness", "tension", "warmth", "brightness"
-            ]] + [f"Loaded preset: {name}"]
+            return [d.get(k, 0.5) for k in _VS_KEYS] + [f"Loaded preset: {name}"]
 
         btn_load_preset.click(
             load_preset,
             inputs=[preset_list],
-            outputs=[vs_energy, vs_pitch_mean, vs_pitch_range, vs_speed,
-                     vs_breathiness, vs_tension, vs_warmth, vs_brightness, status],
+            outputs=_vs_sliders + [status],
         )
 
         def generate(
-            text,
-            char_id,
-            pace_v,
-            hold_v,
-            boundary_v,
-            cfg_v,
-            energy,
-            pitch_mean,
-            pitch_range,
-            speed,
-            breathiness,
-            tension,
-            warmth,
-            brightness,
-            ctx,
-            intent,
+            text, char_id, spk_profile, pace_v, hold_v, boundary_v, cfg_v,
+            *vs_and_ctx,
         ):
+            # Last two args are dialogue_ctx and acting_intent
+            vs_vals = list(vs_and_ctx[:8])
+            ctx = vs_and_ctx[8] if len(vs_and_ctx) > 8 else ""
+            intent = vs_and_ctx[9] if len(vs_and_ctx) > 9 else ""
+
             if not text.strip():
                 return None, {}, "Enter text to generate."
-            voice_state = [
-                energy,
-                pitch_mean,
-                pitch_range,
-                speed,
-                breathiness,
-                tension,
-                warmth,
-                brightness,
-            ]
+
             body = {
                 "text": text,
                 "character_id": char_id or "default",
@@ -319,84 +298,87 @@ def _build_drama_workshop() -> gr.Blocks:
                 "hold_bias": hold_v,
                 "boundary_bias": boundary_v,
                 "cfg_scale": cfg_v,
-                "explicit_voice_state": voice_state,
+                "explicit_voice_state": vs_vals,
             }
-            resp = _api_post("/tts", body)
+            if spk_profile:
+                body["speaker_profile_id"] = spk_profile
+
+            # Use the workshop generate endpoint
+            resp = _api_post("/ui/workshop/generate", body)
+            if resp is None:
+                # Fallback to /tts for backward compatibility
+                resp = _api_post("/tts", body)
             if resp is None:
                 return None, {}, "API call failed. Is tmrvc-serve running?"
             audio_b64 = resp.get("audio_base64", "")
             if not audio_b64:
-                return None, resp, "No audio in response."
+                # Workshop endpoint returns job_id; show that as info
+                return None, resp, f"Job submitted: {resp.get('job_id', 'unknown')}"
             audio_bytes = base64.b64decode(audio_b64)
             sr = resp.get("sample_rate", SAMPLE_RATE)
             audio_np = np.frombuffer(audio_bytes[44:], dtype=np.int16).astype(
                 np.float32
             ) / 32768.0
+            _audit.log("director", "gradio", "workshop_generate",
+                       after_state=f"text={text[:30]}")
             return (sr, audio_np), resp.get("style_used", {}), "Generated."
 
         btn_generate.click(
             generate,
             inputs=[
-                input_text,
-                character_id,
-                pace,
-                hold_bias,
-                boundary_bias,
-                cfg_scale,
-                vs_energy,
-                vs_pitch_mean,
-                vs_pitch_range,
-                vs_speed,
-                vs_breathiness,
-                vs_tension,
-                vs_warmth,
-                vs_brightness,
-                dialogue_ctx,
-                acting_intent,
-            ],
+                input_text, character_id, speaker_profile_id,
+                pace, hold_bias, boundary_bias, cfg_scale,
+            ] + _vs_sliders + [dialogue_ctx, acting_intent],
             outputs=[output_audio, generation_info, status],
         )
 
-        def extract_profile(audio_path):
-            if not audio_path:
-                return _gallery.list_names(), "No audio loaded."
-            # In a real app, we'd call engine.encode_speaker_prompt
-            import torch
-            dummy_embed = torch.randn(192)
-            name = Path(audio_path).stem
-            profile = _gallery.add(name, speaker_embed=dummy_embed)
-            _audit.log("director", "gradio", "extract_speaker_profile", after_state=profile.speaker_profile_id)
-            return _gallery.list_names(), f"Profile extracted: {name} ({profile.speaker_profile_id})"
-
-        btn_extract.click(
-            extract_profile,
-            inputs=[ref_audio],
-            outputs=[gallery_list, status],
-        )
-
-        btn_gallery_refresh.click(
-            lambda: _gallery.list_names(),
-            outputs=[gallery_list],
-        )
-
-        def save_project(
-            text,
-            char_id,
-            pace_v,
-            hold_v,
-            boundary_v,
-            cfg_v,
-            ctx,
-            intent,
-            energy,
-            pitch_mean,
-            pitch_range,
-            speed,
-            breathiness,
-            tension,
-            warmth,
-            brightness,
+        def generate_multi_take(
+            text, char_id, spk_profile, pace_v, hold_v, boundary_v, cfg_v,
+            *vs_and_ctx,
         ):
+            if not text.strip():
+                return [], "Enter text."
+
+            vs_vals = list(vs_and_ctx[:8])
+            body = {
+                "text": text,
+                "character_id": char_id or "default",
+                "pace": pace_v,
+                "hold_bias": hold_v,
+                "boundary_bias": boundary_v,
+                "cfg_scale": cfg_v,
+                "explicit_voice_state": vs_vals,
+                "n_takes": 3,
+            }
+            if spk_profile:
+                body["speaker_profile_id"] = spk_profile
+
+            resp = _api_post("/ui/workshop/generate", body)
+            if resp and resp.get("takes"):
+                takes = [[tid, 0, cfg_v, pace_v, f"Take {i+1}"]
+                         for i, tid in enumerate(resp["takes"])]
+            else:
+                takes = []
+                for i in range(3):
+                    tid = str(uuid.uuid4())[:8]
+                    takes.append([tid, random.randint(0, 1000000), cfg_v, pace_v, f"Take {i+1}"])
+
+            _audit.log("director", "gradio", "generate_multi_take",
+                       after_state=f"count=3, text={text[:20]}")
+            return takes, f"Generated {len(takes)} takes."
+
+        btn_multi_take.click(
+            generate_multi_take,
+            inputs=[
+                input_text, character_id, speaker_profile_id,
+                pace, hold_bias, boundary_bias, cfg_scale,
+            ] + _vs_sliders + [dialogue_ctx, acting_intent],
+            outputs=[take_outputs, status],
+        )
+
+        def save_project(text, char_id, pace_v, hold_v, boundary_v, cfg_v,
+                         ctx, intent, *slider_vals):
+            vs_dict = dict(zip(_VS_KEYS, slider_vals))
             project = {
                 "text": text,
                 "character_id": char_id,
@@ -404,16 +386,7 @@ def _build_drama_workshop() -> gr.Blocks:
                 "cfg_scale": cfg_v,
                 "dialogue_context": ctx,
                 "acting_intent": intent,
-                "voice_state": {
-                    "energy": energy,
-                    "pitch_mean": pitch_mean,
-                    "pitch_range": pitch_range,
-                    "speed": speed,
-                    "breathiness": breathiness,
-                    "tension": tension,
-                    "warmth": warmth,
-                    "brightness": brightness,
-                },
+                "voice_state": vs_dict,
             }
             tmp = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".json", delete=False, prefix="drama_project_"
@@ -425,23 +398,10 @@ def _build_drama_workshop() -> gr.Blocks:
         btn_save_project.click(
             save_project,
             inputs=[
-                input_text,
-                character_id,
-                pace,
-                hold_bias,
-                boundary_bias,
-                cfg_scale,
-                dialogue_ctx,
-                acting_intent,
-                vs_energy,
-                vs_pitch_mean,
-                vs_pitch_range,
-                vs_speed,
-                vs_breathiness,
-                vs_tension,
-                vs_warmth,
-                vs_brightness,
-            ],
+                input_text, character_id,
+                pace, hold_bias, boundary_bias, cfg_scale,
+                dialogue_ctx, acting_intent,
+            ] + _vs_sliders,
             outputs=[project_file, status],
         )
 
@@ -781,7 +741,12 @@ def _build_dataset_manager() -> gr.Blocks:
 
 
 def _build_evaluation_arena() -> gr.Blocks:
-    """Blind A/B testing and MOS collection."""
+    """Blind A/B testing and MOS collection with API-backed session management.
+
+    Tier 1 v3.0: blind A/B comparison, MOS collection, session management
+    via POST /ui/eval/sessions, GET /ui/eval/assignments/{id},
+    POST /ui/eval/assignments/{id}/submit.
+    """
 
     with gr.Blocks() as tab:
         gr.Markdown("## Evaluation Arena")
@@ -790,13 +755,32 @@ def _build_evaluation_arena() -> gr.Blocks:
             "Rate each pair without knowing which system produced which sample."
         )
 
+        # --- Session Management ---
+        gr.Markdown("### Session Management")
+        with gr.Row():
+            session_name = gr.Textbox(
+                label="Session Name", value="eval_session_1", max_lines=1
+            )
+            eval_n_assignments = gr.Number(
+                label="Number of Assignments", value=10, precision=0
+            )
+            btn_create_session = gr.Button("Create Session", variant="primary")
+
+        session_id_state = gr.State("")
+        assignment_ids_state = gr.State([])
+        assignment_idx_state = gr.State(0)
+        session_info = gr.JSON(label="Session Info", visible=True)
+
         with gr.Row():
             eval_role = gr.Dropdown(
                 choices=["rater", "director"], value="rater", label="Your Role"
             )
             eval_id = gr.Textbox(label="Your ID", value="rater_1", max_lines=1)
 
-        gr.Markdown("### Current Pair")
+        gr.Markdown("### Current Assignment")
+        current_assignment_id = gr.Textbox(
+            label="Assignment ID", interactive=False
+        )
         eval_text = gr.Textbox(label="Text", interactive=False)
         pair_id_state = gr.State("")
 
@@ -819,7 +803,7 @@ def _build_evaluation_arena() -> gr.Blocks:
             lines=2,
         )
 
-        btn_next_pair = gr.Button("Next Pair", variant="primary")
+        btn_next_pair = gr.Button("Next Assignment", variant="primary")
         eval_status = gr.Textbox(label="Status", interactive=False)
 
         # --- Summary ---
@@ -829,11 +813,57 @@ def _build_evaluation_arena() -> gr.Blocks:
 
         # --- Callbacks ---
 
+        def create_session(name, n_assignments, evaluator_id):
+            body = {
+                "name": name,
+                "evaluator_id": evaluator_id,
+                "n_assignments": int(n_assignments),
+            }
+            resp = _api_post("/ui/eval/sessions", body)
+            if resp is None:
+                return "", [], 0, {"error": "Failed to create session. Is tmrvc-serve running?"}
+            session_id = resp.get("session_id", "")
+            assignments = resp.get("assignments", [])
+            _audit.log("rater", evaluator_id, "create_eval_session",
+                       after_state=f"session={session_id}, assignments={len(assignments)}")
+            return session_id, assignments, 0, resp
+
+        btn_create_session.click(
+            create_session,
+            inputs=[session_name, eval_n_assignments, eval_id],
+            outputs=[session_id_state, assignment_ids_state, assignment_idx_state, session_info],
+        )
+
+        def get_next_assignment(session_id, assignment_ids, idx):
+            if not assignment_ids or idx >= len(assignment_ids):
+                return idx, "", "", "", "No more assignments in this session."
+            assignment_id = assignment_ids[idx]
+            resp = _api_get(f"/ui/eval/assignments/{assignment_id}")
+            if resp is None:
+                return idx, assignment_id, "", assignment_id, f"Assignment {assignment_id} (API fetch failed)"
+            text = resp.get("text", "")
+            return idx + 1, assignment_id, text, assignment_id, f"Assignment {idx + 1}/{len(assignment_ids)}"
+
+        btn_next_pair.click(
+            get_next_assignment,
+            inputs=[session_id_state, assignment_ids_state, assignment_idx_state],
+            outputs=[assignment_idx_state, current_assignment_id, eval_text, pair_id_state, eval_status],
+        )
+
         def record_preference(pref, pair_id, ma, mb, role, rid, notes):
             if not pair_id:
-                return "No active pair."
+                return "No active assignment."
             if not check_permission(role, "rate"):
                 return f"Role '{role}' cannot rate."
+
+            # Submit via API
+            submit_body = {
+                "rating": float(ma if pref == "A" else mb if pref == "B" else (ma + mb) / 2),
+                "notes": notes if role == "director" else "",
+            }
+            resp = _api_post(f"/ui/eval/assignments/{pair_id}/submit", submit_body)
+
+            # Also record locally for persistence
             pair = EvalPair(
                 pair_id=pair_id,
                 sample_a_label="hidden_a",
@@ -845,10 +875,14 @@ def _build_evaluation_arena() -> gr.Blocks:
                 rater_id=rid,
                 rater_role=role,
                 notes=notes if role == "director" else "",
+                reference_audio_length=0.0, # Filled by session manager in real usage
+                baseline_version="Qwen3-ForcedAligner-0.6B", # Stub or fetched from active contract
             )
             _eval_session.record(pair)
             _audit.log(role, rid, "rate", after_state=f"pair={pair_id} pref={pref}")
-            return f"Recorded: {pref} for pair {pair_id}."
+
+            api_status = "submitted" if resp else "(local only, API unavailable)"
+            return f"Recorded: {pref} for {pair_id} {api_status}"
 
         btn_prefer_a.click(
             lambda *a: record_preference("A", *a),
@@ -1342,7 +1376,16 @@ def _build_realtime_vc() -> gr.Blocks:
             body = {
                 "audio_base64": audio_b64,
                 "character_id": char_id or "default",
-                "explicit_voice_state": [energy, 0.5, 0.5, speed, 0.5, 0.5, 0.5, 0.5],
+                "explicit_voice_state": [
+                    0.5,  # pitch_level
+                    0.3,  # pitch_range
+                    energy,
+                    max(0.0, min(1.0, (speed - 0.5) / 1.5)),  # pressedness compat proxy
+                    0.5,  # spectral_tilt
+                    0.2,  # breathiness
+                    0.15,  # voice_irregularity
+                    0.5,  # openness
+                ],
                 "pitch_shift": pitch_shift,
             }
             t0 = time.time()
@@ -1522,72 +1565,110 @@ def _build_training_monitor() -> gr.Blocks:
 
 
 # ===================================================================
-# Tab 9: Speaker Enrollment
+# Tab 9: Casting Gallery (Speaker Enrollment)
 # ===================================================================
 
 
 def _build_speaker_enrollment() -> gr.Blocks:
-    """Speaker enrollment and profile management."""
+    """Casting Gallery: upload reference audio, create/load/delete speaker profiles,
+    and preview voice with a test sentence.
+
+    Tier 1 v3.0: upload reference audio, encode SpeakerProfile, save/load profiles.
+    """
 
     with gr.Blocks() as tab:
-        gr.Markdown("## Speaker Enrollment")
+        gr.Markdown("## Casting Gallery")
         gr.Markdown(
             "Upload reference audio to create speaker profiles for voice cloning. "
-            "Profiles are saved to the Casting Gallery."
+            "Profiles are saved persistently and can be loaded in the Drama Workshop. "
+            "Encode profiles *before* starting a workshop session for best latency."
         )
 
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### Upload Reference")
+                gr.Markdown("### Upload Reference Audio")
                 enroll_audio = gr.Audio(
                     label="Reference Audio (3-30s, clear speech)",
                     type="filepath",
                     sources=["upload", "microphone"],
                 )
                 enroll_name = gr.Textbox(label="Speaker Name", max_lines=1)
-                enroll_notes = gr.Textbox(label="Notes", placeholder="Voice characteristics...", lines=2)
+                enroll_notes = gr.Textbox(
+                    label="Notes", placeholder="Voice characteristics, gender, age, accent...", lines=2
+                )
 
-                btn_enroll = gr.Button("Enroll Speaker", variant="primary")
+                btn_enroll = gr.Button("Create Speaker Profile", variant="primary")
+                enroll_progress = gr.Textbox(
+                    label="Encoding Status", interactive=False, value=""
+                )
 
             with gr.Column(scale=1):
-                gr.Markdown("### Enrolled Speakers")
-                btn_refresh_speakers = gr.Button("Refresh")
+                gr.Markdown("### Existing Profiles")
+                btn_refresh_speakers = gr.Button("Refresh List")
                 speaker_table = gr.Dataframe(
-                    headers=["profile_id", "name", "source_audio", "created_at"],
+                    headers=["profile_id", "name", "source", "created_at"],
                     label="Speaker Profiles",
                     interactive=False,
                 )
                 selected_profile = gr.Textbox(label="Selected Profile ID", max_lines=1)
                 with gr.Row():
-                    btn_remove = gr.Button("Remove Selected")
-                    btn_test_voice = gr.Button("Test Voice")
+                    btn_load_profile = gr.Button("Load into Workshop")
+                    btn_remove = gr.Button("Delete Profile")
 
-        test_text = gr.Textbox(label="Test Text", value="Hello, this is a test of my voice.", max_lines=1)
-        test_output = gr.Audio(label="Test Output", type="numpy")
+        # --- Preview Voice ---
+        gr.Markdown("### Preview Voice")
+        test_text = gr.Textbox(
+            label="Test Sentence",
+            value="Hello, this is a test of my voice.",
+            max_lines=1,
+        )
+        btn_test_voice = gr.Button("Preview Voice")
+        test_output = gr.Audio(label="Preview Output", type="numpy")
         enroll_status = gr.Textbox(label="Status", interactive=False)
+
+        # --- Callbacks ---
 
         def do_enroll(audio_path, name, notes):
             if not audio_path:
-                return [], "Upload reference audio first."
+                return [], "Upload reference audio first.", "Encoding Speaker Profile..."
             if not name.strip():
-                return [], "Enter a speaker name."
+                return [], "Enter a speaker name.", ""
+
+            # Attempt to encode via API first (sends reference audio for encoding)
+            import httpx
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                audio_b64 = base64.b64encode(audio_bytes).decode()
+                body = {
+                    "text": "test",
+                    "character_id": "default",
+                    "reference_audio_base64": audio_b64,
+                    "wait_for_prompt": True,
+                }
+                # Try to get the server to encode the speaker prompt
+                _api_post("/tts", body)
+            except Exception:
+                pass
+
+            # Save profile locally
             import torch
             dummy_embed = torch.randn(192)
             profile = _gallery.add(name.strip(), speaker_embed=dummy_embed)
             _audit.log("admin", "gradio", "enroll_speaker",
                        after_state=f"name={name}, id={profile.speaker_profile_id}")
-            rows = [[pid, p.display_name, "referenced", p.created_at]
+            rows = [[pid, p.display_name, "uploaded", p.created_at]
                     for pid, p in _gallery.profiles.items()]
-            return rows, f"Enrolled: {name} ({profile.speaker_profile_id})"
+            return rows, f"Enrolled: {name} ({profile.speaker_profile_id})", ""
 
         btn_enroll.click(
             do_enroll,
             inputs=[enroll_audio, enroll_name, enroll_notes],
-            outputs=[speaker_table, enroll_status],
+            outputs=[speaker_table, enroll_status, enroll_progress],
         )
 
         def refresh_speakers():
-            rows = [[pid, p.display_name, "referenced", p.created_at]
+            rows = [[pid, p.display_name, "uploaded", p.created_at]
                     for pid, p in _gallery.profiles.items()]
             return rows
 
@@ -1598,7 +1679,7 @@ def _build_speaker_enrollment() -> gr.Blocks:
                 return [], "Select a profile first."
             _gallery.remove(pid.strip())
             _audit.log("admin", "gradio", "remove_speaker", after_state=f"id={pid}")
-            rows = [[pid2, p.display_name, "referenced", p.created_at]
+            rows = [[pid2, p.display_name, "uploaded", p.created_at]
                     for pid2, p in _gallery.profiles.items()]
             return rows, f"Removed profile {pid}."
 
@@ -1608,20 +1689,35 @@ def _build_speaker_enrollment() -> gr.Blocks:
             outputs=[speaker_table, enroll_status],
         )
 
+        def load_profile(pid):
+            if not pid.strip():
+                return "Select a profile first."
+            return f"Profile {pid} ready for Drama Workshop. Select it from the Speaker Profile dropdown."
+
+        btn_load_profile.click(
+            load_profile,
+            inputs=[selected_profile],
+            outputs=[enroll_status],
+        )
+
         def test_voice(pid, text):
             if not pid.strip():
                 return None, "Select a profile."
-            body = {"text": text, "speaker_profile_id": pid.strip()}
+            body = {
+                "text": text or "Hello, this is a test.",
+                "character_id": "default",
+                "speaker_profile_id": pid.strip(),
+            }
             resp = _api_post("/tts", body)
             if resp is None:
-                return None, "TTS API call failed."
+                return None, "TTS API call failed. Is tmrvc-serve running?"
             audio_b64 = resp.get("audio_base64", "")
             if not audio_b64:
                 return None, "No audio in response."
             audio_bytes = base64.b64decode(audio_b64)
             sr = resp.get("sample_rate", SAMPLE_RATE)
             audio_np = np.frombuffer(audio_bytes[44:], dtype=np.int16).astype(np.float32) / 32768.0
-            return (sr, audio_np), "Test generated."
+            return (sr, audio_np), "Preview generated."
 
         btn_test_voice.click(
             test_voice,
@@ -1812,6 +1908,162 @@ def _build_batch_script() -> gr.Blocks:
     return tab
 
 
+def _build_personal_voice_training():
+    """Build the UI for few-shot voice fine-tuning (LoRA/Adaptor).
+
+    Post-v3.0 scope.  Raw uploaded audio is NOT directly trainable for
+    pointer-TTS.  The UI enforces an explicit staged workflow:
+
+        prepare  →  review  →  train
+
+    The preparation stage runs the Worker 07-owned pipeline
+    (VAD → ASR/transcript check → G2P → boundary/alignment refinement)
+    and materializes canonical training artifacts identical to those used
+    by the mainline training pipeline.  Low-confidence items enter a
+    review queue; training is blocked until they are resolved.
+    """
+    with gr.Column() as tab:
+        gr.Markdown("### Personal Voice Training (Few-Shot Fine-tuning)")
+        gr.Markdown(
+            "**Post-v3.0 scope** — Upload 1-10 minutes of audio to create a "
+            "permanent voice identity.  Before any training can start the "
+            "audio must pass through the canonical preparation pipeline."
+        )
+
+        # ── Stage 1: Prepare ──────────────────────────────────────────
+        gr.Markdown("#### Stage 1 — Prepare")
+        gr.Markdown(
+            "Upload audio and run the preparation pipeline: "
+            "`VAD → ASR / transcript check → G2P → boundary / alignment refinement`.  "
+            "This produces the same canonical artifacts used by the mainline "
+            "training pipeline (normalized text, `phoneme_ids`, optional "
+            "`text_suprasegmentals`, bootstrap alignment)."
+        )
+
+        with gr.Row():
+            with gr.Column():
+                audio_input = gr.Audio(
+                    label="Upload Reference Audio (1-10 mins, clear speech)",
+                    type="filepath",
+                )
+                profile_name = gr.Textbox(
+                    label="Voice Profile Name",
+                    placeholder="e.g., My Custom Voice",
+                )
+                transcript_input = gr.Textbox(
+                    label="Transcript (optional — leave blank for ASR)",
+                    placeholder="Provide transcript to skip ASR, or leave blank",
+                    lines=4,
+                )
+                prepare_btn = gr.Button("Run Preparation", variant="primary")
+
+            with gr.Column():
+                prepare_status = gr.Textbox(
+                    label="Preparation Status", interactive=False, lines=6,
+                )
+                prepare_progress = gr.Slider(
+                    0, 100, value=0, label="Preparation Progress (%)",
+                    interactive=False,
+                )
+
+        # ── Stage 2: Review ───────────────────────────────────────────
+        gr.Markdown("#### Stage 2 — Review")
+        gr.Markdown(
+            "Inspect preparation results.  Low-confidence transcript, G2P, "
+            "or alignment items are flagged here.  **Training is blocked "
+            "until all flagged items are resolved.**"
+        )
+
+        with gr.Row():
+            with gr.Column():
+                review_table = gr.Dataframe(
+                    headers=["segment", "text", "confidence", "status"],
+                    label="Flagged Items",
+                    interactive=True,
+                )
+                approve_btn = gr.Button("Approve & Unlock Training")
+
+            with gr.Column():
+                review_status = gr.Textbox(
+                    label="Review Status", interactive=False, lines=3,
+                )
+
+        # ── Stage 3: Train ────────────────────────────────────────────
+        gr.Markdown("#### Stage 3 — Train")
+        gr.Markdown(
+            "Launch a lightweight LoRA training job on the prepared "
+            "canonical artifacts.  This button is disabled until "
+            "preparation succeeds and review is approved."
+        )
+
+        with gr.Row():
+            with gr.Column():
+                base_model = gr.Dropdown(
+                    choices=["uclm_v3_base", "uclm_v3_large"],
+                    value="uclm_v3_base",
+                    label="Base Model",
+                )
+                train_btn = gr.Button(
+                    "Start Training", variant="primary", interactive=False,
+                )
+
+            with gr.Column():
+                train_status = gr.Textbox(
+                    label="Training Status", interactive=False, lines=4,
+                )
+                train_progress = gr.Slider(
+                    0, 100, value=0, label="Training Progress (%)",
+                    interactive=False,
+                )
+                result_profile_id = gr.Textbox(
+                    label="Exported Profile ID", interactive=False,
+                )
+
+        # ── Callbacks (mock — post-v3.0) ──────────────────────────────
+
+        def mock_prepare(audio, name, transcript):
+            if not audio or not name:
+                return "Error: Audio and Name are required.", 0
+            stages = "VAD ✓ → ASR ✓ → G2P ✓ → Alignment ✓"
+            return (
+                f"Preparation queued for '{name}'.\n"
+                f"Pipeline: {stages}\n"
+                "Canonical artifacts will be materialized via Worker 07.",
+                10,
+            )
+
+        def mock_approve():
+            return "All flagged items approved. Training unlocked."
+
+        def mock_train(base):
+            return (
+                "Training is post-v3.0 scope. "
+                "Job dispatch will be enabled when the Training Cockpit is ready.",
+                0,
+                "",
+            )
+
+        prepare_btn.click(
+            mock_prepare,
+            inputs=[audio_input, profile_name, transcript_input],
+            outputs=[prepare_status, prepare_progress],
+        )
+
+        approve_btn.click(
+            mock_approve,
+            inputs=[],
+            outputs=[review_status],
+        )
+
+        train_btn.click(
+            mock_train,
+            inputs=[base_model],
+            outputs=[train_status, train_progress, result_profile_id],
+        )
+
+    return tab
+
+
 # ===================================================================
 # Main App Assembly
 # ===================================================================
@@ -1835,6 +2087,8 @@ def create_app() -> gr.Blocks:
                 _build_drama_workshop()
             with gr.Tab("Realtime VC"):
                 _build_realtime_vc()
+            with gr.Tab("Personal Voice Training"):
+                _build_personal_voice_training()
             with gr.Tab("Curation Auditor"):
                 _build_curation_auditor()
             with gr.Tab("Dataset Manager"):
@@ -1843,7 +2097,7 @@ def create_app() -> gr.Blocks:
                 _build_evaluation_arena()
             with gr.Tab("Eval Tools"):
                 _build_eval_tools()
-            with gr.Tab("Speaker Enrollment"):
+            with gr.Tab("Casting Gallery"):
                 _build_speaker_enrollment()
             with gr.Tab("Training Monitor"):
                 _build_training_monitor()

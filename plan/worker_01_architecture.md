@@ -10,6 +10,7 @@ Define the new v3 model contract so every other worker can build against stable 
 - `tmrvc-train/src/tmrvc_train/models/uclm_model.py`
 - `tmrvc-train/src/tmrvc_train/models/uclm_transformer.py` (Modernized)
 - `tmrvc-train/src/tmrvc_train/models/text_encoder.py`
+- `tmrvc-train/src/tmrvc_train/models/reference_encoder.py` (New — prosody target extraction)
 - `tmrvc-train/src/tmrvc_train/models/__init__.py`
 - `tmrvc-core/src/tmrvc_core/types.py`
 - `tmrvc-core/src/tmrvc_core/dialogue_types.py`
@@ -33,8 +34,9 @@ Define the new v3 model contract so every other worker can build against stable 
 - define whether VC consumes, bypasses, or emulates pointer state
 - freeze the canonical unconditional-conditioning contract used by CFG
 - define trainable 8-D `voice_state` target, mask, confidence, and provenance interfaces at the model boundary
-- adopt modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) as mainline
-- adopt flow-matching prosody predictor as the mainline prosody path
+- define the differentiable teacher-forced surrogate used to train the pointer without changing the hard runtime contract
+- keep backbone modernization (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) behind the README-defined `quality amplifier` gate rather than making pointer-core proof depend on it
+- keep flow-matching prosody as the preferred expressive path, but not a blocker for the initial pointer-core proof
 - define the single source of truth for serializable pointer / `voice_state` / cache-state schemas in `tmrvc-core`
 
 
@@ -44,6 +46,9 @@ Define the new v3 model contract so every other worker can build against stable 
 
 Worker 01 must freeze the canonical serializable state schema in one place.
 
+- **SpeakerProfile (Voice Identity Management):** The `SpeakerProfile` schema in `tmrvc-core` is the single source of truth for a voice in v3.0. The mainline contract is prompt-based only:
+  1. **Prompt-based (Zero-Shot / Few-Shot In-Context):** Reference audio tokens, optional prompt cache, and global speaker embeddings.
+- **Post-v3.0 extension boundary:** Weight-space adaptation (LoRA/adaptor deltas, merged fine-tuned checkpoints, per-actor ONNX variants) is not part of the v3.0 `SpeakerProfile` schema. If introduced later, it must ship as a separate artifact-management contract and must not change the prompt-based v3.0 serialization fields.
 - `tmrvc-core` owns:
   - pointer-state field names and types
   - `voice_state` / `delta_state` external contract
@@ -56,10 +61,10 @@ Worker 01 must freeze the canonical serializable state schema in one place.
 
 ### Modern Transformer Backbone
 
-The UCLM v3 core adopts the following SOTA LLM practices as the mainline backbone. These are required for v3 release and must pass parity and latency gates.
+The items in this section are the preferred `v3.0 quality amplifier` backbone, not the minimum pointer-core proof. Worker 01 must preserve a fallback path so Worker 06 can determine whether a failure came from the pointer architecture or from the modernization choice.
 
 - **Positional Embedding:** **RoPE (Rotary Positional Embeddings)** for better extrapolation to long dialogues.
-- **Attention Mechanism:** **GQA (Grouped Query Attention)** to reduce KV-cache memory footprint by 4x-8x during 10ms-step serving.
+- **Attention Mechanism:** **GQA (Grouped Query Attention)** to reduce KV-cache memory footprint. The KV head count is frozen as `n_kv_heads` in `configs/constants.yaml` (initial value: 2, yielding 4x reduction with `uclm_n_heads=8`). Changing `n_kv_heads` requires updating all runtime parity tests.
 - **Activation Function:** **SwiGLU** for better representational capacity.
 - **Normalization:** **RMSNorm** with pre-norm configuration for training stability.
 - **Training Acceleration:** Native **Flash Attention 2** support.
@@ -79,7 +84,14 @@ The UCLM v3 core adopts the following SOTA LLM practices as the mainline backbon
     - tonal languages: lexical tone id or equivalent normalized tone feature
 - canonical shape:
   - `phoneme_ids`: `[B, L]`
-  - `text_suprasegmentals`: `[B, L, d_supra]`
+  - `text_suprasegmentals`: `[B, L, d_supra]` (where `d_supra = d_suprasegmental` from `configs/constants.yaml`)
+- frozen initial `d_supra` value: `4`
+  - dim 0: `accent_upstep` — binary (0/1), accent rise marker (Japanese); 0 for languages without lexical accent
+  - dim 1: `accent_downstep` — binary (0/1), accent fall marker (Japanese); 0 for languages without lexical accent
+  - dim 2: `phrase_break` — binary (0/1), phrase-boundary marker; applicable to all languages
+  - dim 3: `lexical_tone_id` — normalized tone index (0.0–1.0); 0.0 for non-tonal languages, language-specific mapping for tonal languages (e.g., Mandarin 4-tone + neutral mapped to 0.2/0.4/0.6/0.8/0.0)
+  - languages that do not use a given dimension must set it to 0 (not omit it)
+  - future dimensions may be appended; existing dimensions must not be renumbered
 - implementation rule:
   - `phoneme_ids` remain the canonical text-unit ids
   - `text_suprasegmentals` are companion features, not a replacement vocabulary
@@ -88,13 +100,15 @@ The UCLM v3 core adopts the following SOTA LLM practices as the mainline backbon
 RoPE integration must be specified together with pointer execution:
 
 - freeze how decoder-side attention interprets stalled or advanced pointer positions against RoPE-encoded text memory
+- **Prevention of attention collapse during stalls:** To avoid the model misinterpreting prolonged pointer holds as repetitive text, the implementation must decouple "temporal steps" from "text progression" in the positional encoding.
+  - **Preferred Strategy:** Use **Relative Position Accumulation** or **Progress-aware RoPE (PM-RoPE)** where the positional index for text units remains stable during stalls, while a separate temporal offset tracks the frame count within that unit.
 - define whether cross-attention uses:
   - pointer-relative positional bias, or
   - an equivalent pointer-conditioned masking / biasing scheme
 - define how repeated stall frames avoid drifting the effective text-position semantics
 - define how skip-protection and force-advance update the effective relative-position reference so cached text memory remains coherent
 
-Progress-aware positional structure is a valid research direction for this section. Worker 01 may evaluate a progress-aware RoPE-style scheme if it simplifies the pointer loop, but it must be treated as a research-track alternative until it proves parity with the explicit pointer contract.
+Progress-aware positional structure is a valid research direction for this section. Worker 01 may evaluate a progress-aware RoPE-style scheme only as an ablation against the frozen explicit pointer-head contract. It must not delay or redefine the mainline pointer schema consumed by Workers 02/04/06.
 
 ### Pointer State
 
@@ -124,6 +138,28 @@ Worker 01 must also freeze the invariants:
   - thresholding / comparison method for `advance_logit` or `advance_prob`
   - tie-break behavior at equality or near-equality
   - parity-safe handling of denormals / rounding across Python and Rust
+
+### Differentiable Pointer Training Contract
+
+The runtime pointer is discrete and serializable. Training may not hand-wave this by relying on an undefined hidden alignment path.
+
+- hard runtime/exported state remains:
+  - `text_index`
+  - `progress_value`
+  - `advance_logit` / `advance_prob`
+  - optional `boundary_confidence`
+  - optional `stall_frames`
+- teacher-forced `latent_only` training must use a differentiable local surrogate over at most two text units: the current unit `i_t` and the next unit `i_t + 1`
+- canonical teacher-forced text-conditioning rule:
+  - compute `advance_prob_t = sigmoid(advance_logit_t)`
+  - build the conditioning vector as an expected local mixture of text memory at `i_t` and `i_t + 1`
+  - no hidden argmax, offline duration expansion, or full-sequence resampling is allowed in the mainline `latent_only` recipe
+- canonical update rule split:
+  - training: differentiable local expected update, optionally followed by straight-through hardening during the scheduled transition window
+  - runtime/export: hard thresholded discrete advance using the same pointer-head outputs and the same frozen numeric rule
+- supervised pointer losses, when present, must attach to the same `advance_logit` / `progress_delta` outputs used by the `latent_only` path; a separate training-only pointer head is forbidden
+- any training-only surrogate state (for example a 2-way local pointer mass) is internal-only and must not replace the exported discrete pointer contract
+- Worker 02 must define the annealing and hardening schedule against this exact contract rather than inventing a second pointer semantics
 
 ### Pointer Outputs
 
@@ -222,6 +258,48 @@ Canonical supervised artifact contract:
 
 Worker 01 must document how missing or low-confidence dimensions are masked in loss computation rather than silently treated as zeros.
 
+Before any downstream worker may bind controls, losses, or export fields to `voice_state`, Worker 01 must freeze the canonical dimension registry itself, not only the tensor rank.
+
+Required per-dimension registry fields:
+
+- **Extractability constraint:** Before fixing a dimension, Worker 01 must confirm that a stable OSS estimator exists (e.g., Pitch, Energy, CPP/H1-H2, HNR). Abstract dimensions (e.g., "Tension", "Husky") must NOT be included in the canonical 8-D state unless a reliable continuous-value extractor is identified.
+- stable dimension id
+- short public name
+- physical interpretation
+- unit or normalized scale
+- valid numeric range
+- directionality semantics
+  - what positive deltas mean
+  - what negative deltas mean
+- neutral / default value
+- whether the dimension is frame-local, slowly varying, or both
+- expected primary observable proxies for validation
+- estimator-to-dimension mapping contract used by pseudo-label providers
+
+This registry must be owned in `tmrvc-core` and referenced by docs, training, serving, export, VST automation, and Gradio. Reusing index `k` with different semantics across workers is forbidden.
+
+**Frozen initial 8-D `voice_state` dimension registry:**
+
+| idx | id | public name | physical interpretation | unit (normalized) | range | positive delta means | negative delta means | neutral | temporal | primary OSS estimator |
+|-----|-----|-------------|----------------------|-------------------|-------|---------------------|---------------------|---------|----------|-----------------------|
+| 0 | `pitch_level` | Pitch Level | fundamental frequency (F0) | log-Hz, min-max normalized | [0.0, 1.0] | higher pitch | lower pitch | 0.5 | frame-local | FCPE / CREPE / parselmouth |
+| 1 | `pitch_range` | Pitch Range | F0 standard deviation over local window | normalized std | [0.0, 1.0] | more melodic variation | flatter intonation | 0.3 | slowly varying | derived from F0 trajectory (window = 0.5s) |
+| 2 | `energy_level` | Energy Level | RMS amplitude | dB, min-max normalized | [0.0, 1.0] | louder | quieter | 0.5 | frame-local | librosa / torchaudio RMS |
+| 3 | `pressedness` | Pressedness | phonation compression / glottal adduction proxy | normalized CPP + inverse H1-H2 composite | [0.0, 1.0] | firmer / more pressed closure | looser / more relaxed closure | 0.35 | slowly varying | parselmouth CPP + H1-H2 |
+| 4 | `spectral_tilt` | Spectral Tilt | spectral brightness (slope of log-spectrum) | normalized slope | [0.0, 1.0] | brighter / tenser | darker / softer | 0.5 | frame-local | linear regression on log-magnitude spectrum |
+| 5 | `breathiness` | Breathiness | inverse harmonics-to-noise ratio | normalized 1/HNR | [0.0, 1.0] | more breathy | more clear/pressed | 0.2 | frame-local | parselmouth HNR (inverted and normalized) |
+| 6 | `voice_irregularity` | Voice Irregularity | jitter + shimmer composite | normalized composite | [0.0, 1.0] | more irregular / tense | more regular / smooth | 0.15 | frame-local | parselmouth jitter (local) + shimmer (local) |
+| 7 | `openness` | Openness | vocal-tract opening proxy | normalized F1 / vowel-openness proxy | [0.0, 1.0] | more open / wider articulation | more closed / muffled articulation | 0.5 | slowly varying | formant tracker / vowel-region F1 proxy |
+
+Registry rules:
+- all dimensions are normalized to [0.0, 1.0] so they can share a single UI slider range and loss scale
+- pseudo-label providers (Worker 08) must map their raw estimator outputs to these normalized ranges using the calibration contract
+- dimensions where the estimator is unavailable or unreliable for a given sample must be marked as unobserved in `voice_state_observed_mask`, not set to the neutral value
+- future dimension additions are append-only (idx >= 8) and require a registry version bump in `configs/constants.yaml`
+- timing authority is explicitly outside the canonical `voice_state` registry:
+  - `pace`, `hold_bias`, and `boundary_bias` are the runtime-authoritative timing controls
+  - `voice_state` may correlate with timing indirectly, but must not become a second primary timing-control path
+
 ### Dialogue Context
 
 `dialogue_context` in v3 mainline is text-side context, not raw waveform.
@@ -274,12 +352,11 @@ Canonical export policy:
 `acoustic_history` is mandatory for causal autoregressive TTS decoding.
 
 - purpose: provide past emitted acoustic/control-token context for next-step prediction
-- representation:
-  - either raw past codec/control token ids before embedding, or
-  - already embedded autoregressive history accepted by the decoder wrapper
-- minimum conceptual shape:
-  - token ids: `[B, T_hist, n_codebooks]` for acoustic tokens plus control history
-  - embedded history: `[B, T_hist, d_model]`
+- **frozen canonical representation: raw token ids before embedding**
+  - canonical shape: `[B, T_hist, n_codebooks + n_slots]` (acoustic tokens from Stream A plus control tokens from Stream B)
+  - rationale: token ids are serializable across Python / Rust / ONNX / VST without depending on a specific embedding checkpoint; the model's own embedding layer converts them to `[B, T_hist, d_model]` internally
+  - the embedded form `[B, T_hist, d_model]` is an internal intermediate, not the public API-boundary contract
+  - Worker 04 runtime caches may store embedded KV projections for efficiency, but the authoritative state-transition contract operates on token ids
 
 Training and runtime must use the same conceptual state machine:
 
@@ -325,7 +402,7 @@ Interaction rules:
 
 - purpose: local delivery shape within the current utterance
 - shape:
-  - utterance-global form: `[B, d_prosody]` (canonical for initial v3)
+  - utterance-global form: `[B, d_prosody]` (canonical for initial v3; `d_prosody` is frozen in `configs/constants.yaml`)
   - time-local planning form: `[B, T_plan, d_prosody]` (future extension)
 
 **Frozen initial v3 policy: utterance-global `[B, d_prosody]`.**
@@ -334,6 +411,10 @@ The `ProsodyPredictor` outputs `[B, d_prosody]`. When injecting into frame featu
 
 **Time-local prosody upgrade schedule:**
 Utterance-global prosody is insufficient for fine-grained drama-grade acting (mid-sentence emotion shifts, selective emphasis, trailing-off). Recent surveyed work supports token-level or segment-level prosody granularity. The upgrade to time-local `[B, T_plan, d_prosody]` must be evaluated at Stage B completion and scheduled for Stage C if drama acting quality gates are not met with the utterance-global form.
+- **Latency constraint mitigation:** To maintain the 10 ms causal streaming budget, time-local prosody must NOT be predicted frame-by-frame. It must be generated in a single batched pass over the text-window *before* audio decoding starts, cached, and then referenced causally by the 10 ms pointer loop.
+- **Pointer-synchronous addressing requirement:** Any cached time-local prosody plan must be anchored to canonical text units / pointer position, not to absolute elapsed frame index. Real-time controls such as `pace`, `hold_bias`, and `boundary_bias` are allowed to stretch or compress wall-clock realization, but they must not detach a prosodic event from its intended phoneme/span.
+- **Runtime consumption rule:** If the future `[B, T_plan, d_prosody]` path is activated, the runtime must address it by current `text_index` plus optional within-unit `progress_value` interpolation. Holding longer on one unit prolongs that unit's prosody region; early advance moves the active region forward with the pointer.
+- **Forbidden design:** Precomputing an absolute-time prosody schedule and replaying it regardless of pointer drift is forbidden, because it would conflict with causal pacing control and produce positionally broken prosody.
 
 **Prosody Predictor Requirement:**
 The architecture must define a stable prosody-prediction interface and satisfy it with a flow-matching predictor.
@@ -351,16 +432,63 @@ Required implementation:
 
 - **Why Flow-matching?** It provides a deterministic mapping with high-diversity potential, superior to simple VAEs and more efficient than Diffusion for 1-step inference.
 - Training mode:
-  - Latent is extracted from the target waveform (e.g., via a Reference Encoder) and used as a target for Flow-matching training.
+  - Latent is extracted from the target waveform via the `ReferenceEncoder` and used as a target for Flow-matching training.
 - Inference mode:
   - Predictor generates the latent in a single ODE-step (or N-step for higher quality).
   - Optional: Manual override or sampling for diversity.
+
+### Reference Encoder (Training-Time Prosody Target Extraction)
+
+The `ReferenceEncoder` is a training-time utility module that extracts the ground-truth `local_prosody_latent` from target audio. It is not used at inference time (the `ProsodyPredictor` replaces it).
+
+- **Architecture:** Lightweight convolutional or transformer encoder over mel-spectrogram or codec features of the target utterance, projecting to `[B, d_prosody]`.
+- **Training:** The `ReferenceEncoder` is trained jointly with the main model. Its output serves as:
+  1. The direct conditioning input for the decoder during teacher-forced training (so the decoder learns to use prosody latents).
+  2. The regression target for the flow-matching `ProsodyPredictor` loss.
+- **Frozen contract:**
+  - output shape: `[B, d_prosody]` (must match `ProsodyPredictor` output shape exactly)
+  - the `ReferenceEncoder` must NOT have access to `speaker_embed` or `prompt_codec_tokens` to prevent timbre information from leaking into the prosody latent
+  - if information leakage is detected (prosody latent predicts speaker identity above chance), an information bottleneck (e.g., VQ or capacity-limited linear projection) must be added
+- **Ownership:** Worker 01 defines the interface and architecture. Worker 02 integrates it into the training loop. Worker 06 validates that the extracted latent is prosody-informative but speaker-agnostic.
+- **Primary file:** `tmrvc-train/src/tmrvc_train/models/reference_encoder.py`
+
+### Speaker Module Architecture (Speaker Encoder + SpeakerPromptEncoder + Prompt Resampler)
+
+The speaker conditioning path comprises three distinct modules with clear responsibilities:
+
+1. **Speaker Encoder** (`SpeakerEncoder`)
+   - **Purpose:** Extract a global, utterance-level timbre embedding from reference audio.
+   - **Input:** Raw audio waveform or pre-extracted features from a 3–10s reference clip.
+   - **Output:** `speaker_embed` — shape `[B, d_speaker]`.
+   - **Architecture:** Pre-trained speaker verification backbone (WavLM / Wespeaker / ECAPA-TDNN), optionally with a trainable projection head.
+   - **Role at inference:** Always available. Serves as the primary timbre anchor and as the `speaker_embed`-only fallback when prompt cache budget is exceeded.
+
+2. **SpeakerPromptEncoder** (`SpeakerPromptEncoder`)
+   - **Purpose:** Encode the reference audio's codec tokens into a dense prompt representation that captures fine-grained timbre detail beyond what `speaker_embed` alone provides.
+   - **Input:** `prompt_codec_tokens` — shape `[B, T_prompt, n_codebooks]`.
+   - **Output:** `prompt_features` — shape `[B, T_prompt, d_model]` (before resampling).
+   - **Architecture:** Lightweight 2-layer transformer encoder. Explicitly excluded from the RoPE/GQA/SwiGLU modernization requirement.
+   - **Disentanglement bottleneck:** An Information Bottleneck or VQ layer must be applied to the output, restricting information flow to low-frequency timbre components and preventing prosody leakage.
+
+3. **Prompt Resampler** (`PromptResampler`)
+   - **Purpose:** Compress the variable-length `prompt_features` into a fixed-size summary to maintain the 10ms causal budget.
+   - **Input:** `prompt_features` from `SpeakerPromptEncoder` — shape `[B, T_prompt, d_model]`.
+   - **Output:** `prompt_kv_cache` — shape `[B, N_summary, d_model]` where `N_summary = 32` (frozen initial value; recorded in `configs/constants.yaml` as `n_prompt_summary_tokens`).
+   - **Architecture:** Q-Former or Perceiver Resampler with learned query tokens.
+
+**Inference-time combination rule:**
+- `speaker_embed` is always injected as a global conditioning bias (added to or concatenated with frame features).
+- `prompt_kv_cache` is prepended to the transformer's key/value sequences for cross-attention enrichment.
+- When both are available, both are used. `speaker_embed` provides a stable global timbre anchor; `prompt_kv_cache` provides fine-grained texture detail.
+- When only `speaker_embed` is available (prompt budget exceeded, Rust/VST fallback), the model operates in `speaker_embed`-only mode with documented quality degradation.
+- Conflicts are resolved by design: `speaker_embed` and `prompt_kv_cache` are complementary (global + local timbre), not competing.
 
 ### Speaker Prompting and Timbre-Prosody Disentanglement (Zero-Shot / Few-Shot)
 
 To support SOTA zero-shot/few-shot voice cloning while maintaining drama-grade acting, the architecture must abandon static speaker IDs in favor of an **In-Context Prompting** paradigm, combined with explicit disentanglement.
 
 - **Acoustic & Text Prompting:** The model must accept `prompt_codec_tokens` (and optionally `prompt_text_tokens`) representing a 3-10 second reference audio clip. This serves as the in-context acoustic conditioning for the Codec LM.
+- **Prompt Resampler (Computation Bottleneck):** To maintain the 10ms causal budget on CPU/ONNX, the model MUST NOT attend directly to the full sequence of prompt tokens (e.g., 1000 frames for 10s). Instead, the architecture must include a **Prompt Resampler** (e.g., Q-Former or Perceiver Resampler) to condense the 3-10s prompt into a fixed, small number of summary tokens (e.g., 32 or 64 tokens) before injection into the main transformer.
 - **Speaker Encoder (Global Timbre):** A dedicated `Speaker Encoder` (e.g., integrating pre-trained WavLM/Wespeaker or a custom neural feature extractor) to extract a highly robust continuous `speaker_embed` from the prompt audio.
 - **Disentanglement Constraint:** The model must explicitly disentangle *Timbre* from *Prosody*. When cloning a voice from a neutral read speech prompt, the model must borrow only the timbre from the `speaker_embed` and `prompt_codec_tokens`, while allowing the `dialogue_context` and the `Prosody Predictor` to override the acting/prosody.
 - **Disentanglement Bottleneck:** To enforce this separation, the `Speaker Prompt Encoder` must incorporate an Information Bottleneck or Vector Quantization (VQ) layer, ensuring that attention mechanisms are restricted to low-frequency timbre components and cannot silently copy the prompt's prosody.
@@ -422,6 +550,7 @@ The dominant SOTA pattern (CosyVoice 3, MiniMax-Speech, DiSTAR, Qwen3-TTS) uses 
   - the 10 ms causal AR core remains unchanged; refinement operates on buffered blocks
 - ownership: Worker 01 defines the interface contract between AR core and refinement module. Worker 04 defines the runtime integration. Worker 06 validates quality uplift.
 - trigger: if v3 initial quality gates (Worker 06 § External Baseline Parity) show a quality gap attributable to fine-grained acoustic detail, the v3.1 path is activated.
+  - operational definition of "attributable to fine-grained acoustic detail": the gap is considered acoustic-detail-attributable when (a) token-level pointer alignment and prosody metrics are within acceptable range, AND (b) waveform artifact rate or spectral detail metrics (e.g., high-frequency energy, formant clarity) are measurably worse than the baseline, OR (c) ablating the vocoder/codec-decoder with a higher-fidelity alternative closes a significant portion of the MOS gap. Worker 06 must freeze this diagnostic protocol before Stage B.
 
 Worker 01 must ensure that the initial v3 flattened codec output can serve as input to a future refinement module without architectural rework.
 
@@ -466,6 +595,8 @@ Worker 01 must ensure that the initial v3 flattened codec output can serve as in
    - baseline v3 policy:
      - TTS uses pointer as the primary progression mechanism
      - VC does not require pointer for frame-synchronous conversion
+   - Zero-Shot Few-Shot constraint for VC:
+     - Applying few-shot `SpeakerPromptEncoder` features directly to VC is excluded from the initial v3.0 required scope. VC remains focused on converting against a fixed model/speaker space initially to reduce complexity, while TTS carries the zero-shot proof obligations.
    - optional future path:
      - expressive VC may consume a pacing-control analogue or pointer-conditioned semantic plan
    - explicit non-goal for initial v3:
@@ -481,8 +612,8 @@ Worker 01 must ensure that the initial v3 flattened codec output can serve as in
    - training/model API accepts raw state inputs (`explicit_voice_state`, `delta_voice_state`, optional `ssl_voice_state`)
    - export/runtime wrappers may consume or emit fused `state_cond`, but only if the mapping to raw state inputs is documented and tested
 18. Define RoPE / pointer interaction rules for cross-attention and cached text memory.
-    - evaluate VoiceStar PM-RoPE (arXiv:2505.19462) as a candidate or comparison point
-    - document whether PM-RoPE can replace or simplify the explicit pointer head
+    - evaluate VoiceStar PM-RoPE (arXiv:2505.19462) only as a post-freeze comparison point
+    - do not allow PM-RoPE evaluation to replace, postpone, or weaken the explicit pointer-head mainline contract in v3.0
 19. Freeze the unconditional-conditioning mask schema shared by CFG training and inference.
     - freeze the guided pointer-output formulas and post-guidance clamps used by `full` CFG mode
 20. Freeze the `SpeakerProfile` serialization contract in `tmrvc-core/src/tmrvc_core/types.py` and ownership fields used by Worker 04 and Worker 12. The canonical field list (prompt evidence, speaker embedding metadata, ownership, reproducibility) must be frozen here and referenced by `docs/design/speaker-profile-spec.md`.
@@ -491,6 +622,16 @@ Worker 01 must ensure that the initial v3 flattened codec output can serve as in
 22. Evaluate time-local prosody as a Stage C upgrade only if Worker 06 quality gates show the utterance-global latent is insufficient.
 23. Define the v3.1 acoustic refinement interface contract so future modules can attach without breaking mainline contracts.
 24. Document codec-level disentanglement as a future investigation path rather than an initial v3 requirement.
+25. Define the `ReferenceEncoder` module:
+    - architecture (convolutional or lightweight transformer over mel/codec features)
+    - output shape `[B, d_prosody]` matching the `ProsodyPredictor` target
+    - information isolation: no access to speaker identity inputs
+    - leakage detection test: prosody latent must not predict speaker identity above chance
+26. Define the `SpeakerEncoder` / `SpeakerPromptEncoder` / `PromptResampler` module boundary:
+    - `SpeakerEncoder` outputs `speaker_embed` `[B, d_speaker]`
+    - `SpeakerPromptEncoder` outputs `prompt_features` `[B, T_prompt, d_model]` with disentanglement bottleneck
+    - `PromptResampler` compresses to `prompt_kv_cache` `[B, N_summary, d_model]` with `N_summary` frozen in `configs/constants.yaml`
+    - document the inference-time combination rule and `speaker_embed`-only fallback behavior
 
 
 ## Proposed API Shape
@@ -584,6 +725,8 @@ Before handing off:
 - `docs/design/onnx-contract.md` and `docs/design/rust-engine-design.md` reflect the same contract
 - `tmrvc-core` exposes the shared serializable schema used by all runtimes
 - `uclm_model.py` has stable function names and includes the Prosody Predictor interface
+- `reference_encoder.py` implements `ReferenceEncoder` with verified speaker-agnosticism and `[B, d_prosody]` output shape
+- Speaker modules (`SpeakerEncoder`, `SpeakerPromptEncoder`, `PromptResampler`) have stable interfaces; `PromptResampler` output shape is `[B, 32, d_model]`
 - `tmrvc-core` exposes `SpeakerProfile`, pointer state, and `voice_state` supervision schema without runtime-specific reinterpretation
 - output dict keys are fixed
 - worker 02 and worker 04 can code against the interfaces without guessing
@@ -603,3 +746,8 @@ Before handing off:
 - force-advance state-transition test covering `progress_value` reset and `acoustic_history` continuity semantics
 - codec-hierarchy schedule contract test for the chosen `n_codebooks` policy
 - shape/mask/confidence test for `voice_state_targets`
+- `ReferenceEncoder` output shape test (`[B, d_prosody]` matches `ProsodyPredictor` target)
+- `ReferenceEncoder` speaker-agnosticism test (prosody latent does not predict speaker identity above chance)
+- `SpeakerEncoder` → `SpeakerPromptEncoder` → `PromptResampler` pipeline shape test
+- `PromptResampler` output shape test (`[B, N_summary, d_model]` with frozen `N_summary`)
+- `speaker_embed`-only fallback mode smoke test (model produces valid output without `prompt_kv_cache`)

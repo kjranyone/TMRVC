@@ -6,12 +6,47 @@ from .models import (
     PromotionBucket,
     Provenance,
     LegalityStatus,
+    StageResult,
+    VALID_TRANSITIONS,
+)
+from .errors import (
+    CurationError,
+    StaleVersionError,
+    InvalidTransitionError,
+    StageExecutionError,
 )
 from .orchestrator import CurationOrchestrator
 from .scoring import QualityScoringEngine, ScoringConfig, BucketThresholds
-from .export import CurationExporter, ExportConfig
-from .validation import CurationValidator, ValidationConfig
+from .export import (
+    CurationExporter,
+    ExportConfig,
+    ArtifactPackage,
+    VOICE_STATE_DIM_NAMES,
+    VOICE_STATE_NDIM,
+    RETENTION_EPHEMERAL,
+    RETENTION_DURABLE,
+    RETENTION_RELEASE_CANDIDATE,
+    ARTIFACT_TYPE_TRAINING_BUNDLE,
+    ARTIFACT_TYPE_HOLDOUT_BUNDLE,
+    ARTIFACT_TYPE_WORKSHOP_BUNDLE,
+)
+from .validation import (
+    CurationValidator,
+    ValidationConfig,
+    ComprehensiveValidator,
+    DownstreamComparison,
+    HumanWorkflowValidator,
+    ProviderAcceptanceThresholds,
+    ProviderRecalibrator,
+    QualityMetrics,
+    SampleAuditor,
+    SplitIntegrityValidator,
+    StageBenchmark,
+    VoiceStateValidator,
+)
 from .providers import BaseProvider, ProviderRegistry, create_default_registry
+from .service import CurationDataService
+from .stage_framework import CurationStage, StageRegistry, STAGE_NAMES
 
 __all__ = [
     "CurationRecord",
@@ -19,15 +54,44 @@ __all__ = [
     "PromotionBucket",
     "Provenance",
     "LegalityStatus",
+    "StageResult",
+    "VALID_TRANSITIONS",
+    "CurationError",
+    "StaleVersionError",
+    "InvalidTransitionError",
+    "StageExecutionError",
     "CurationOrchestrator",
     "QualityScoringEngine",
     "ScoringConfig",
     "BucketThresholds",
     "CurationExporter",
     "ExportConfig",
+    "ArtifactPackage",
+    "VOICE_STATE_DIM_NAMES",
+    "VOICE_STATE_NDIM",
+    "RETENTION_EPHEMERAL",
+    "RETENTION_DURABLE",
+    "RETENTION_RELEASE_CANDIDATE",
+    "ARTIFACT_TYPE_TRAINING_BUNDLE",
+    "ARTIFACT_TYPE_HOLDOUT_BUNDLE",
+    "ARTIFACT_TYPE_WORKSHOP_BUNDLE",
     "CurationValidator",
     "ValidationConfig",
+    "ComprehensiveValidator",
+    "DownstreamComparison",
+    "HumanWorkflowValidator",
+    "ProviderAcceptanceThresholds",
+    "ProviderRecalibrator",
+    "QualityMetrics",
+    "SampleAuditor",
+    "SplitIntegrityValidator",
+    "StageBenchmark",
+    "VoiceStateValidator",
     "BaseProvider",
     "ProviderRegistry",
     "create_default_registry",
+    "CurationDataService",
+    "CurationStage",
+    "StageRegistry",
+    "STAGE_NAMES",
 ]

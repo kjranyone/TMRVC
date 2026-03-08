@@ -101,9 +101,11 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - preserve normalized text alongside canonical phoneme ids
    - allow byte-level or grapheme-level fallback artifacts when G2P confidence is too low
    - mark fallback mode explicitly in metadata so training/validation can stratify on it
-15. Define canonical bootstrap-alignment projection artifacts:
+15. Define canonical bootstrap-alignment projection artifacts (Default transitional artifact for Stage 2; not a permanent mainline dependency):
    - preserve raw ASR token/word timestamps for provenance
-   - deterministically project those timestamps onto canonical `phoneme_ids`
+   - deterministically project those timestamps onto canonical `phoneme_ids` where possible, or allow use of robust pre-trained aligners (e.g., Wav2Vec2) if they avoid MFA's heavy dependency footprint.
+   - the projection algorithm must be frozen as one deterministic, versioned recipe rather than an implementation-defined heuristic
+   - the recipe must specify feature extraction, parameter defaults, tie-break rules, low-confidence behavior, and exact fallback behavior when acoustic cues are unusable
    - export `bootstrap_alignment.json` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance
    - fail validation if projection skips, reorders, or ambiguously duplicates canonical text units
 16. Define canonical `voice_state` supervision artifacts:
@@ -118,6 +120,18 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
      - calibration version
      - provenance
      - whether labels are direct, pseudo-labeled, or absent
+17. Define canonical few-shot prompt-pairing artifacts:
+   - each record must either expose deterministic prompt eligibility metadata or explicit ineligibility
+   - minimum required metadata:
+     - canonical `speaker_id` or speaker-cluster id
+     - `prompt_candidate_record_ids`
+     - `prompt_language`
+     - `prompt_duration_sec`
+     - `speaker_purity_estimate`
+     - `prompt_target_overlap_forbidden`
+     - same-file / same-conversation policy flag
+     - `prompt_selection_policy_version`
+   - training and evaluation must be able to choose prompt clips without hidden trainer-only heuristics
 
 
 ## Important Design Decision
@@ -163,6 +177,12 @@ Implementation rules:
 - if future phones must be added, add them append-only and never renumber existing ids
 - keep `phoneme_vocab_size` capacity management separate from the active canonical symbol count
 - treat the active symbol inventory defined in `tmrvc_data.g2p` as the source of truth for actual ids; overprovisioned embedding capacity is not a reason to redefine ids
+
+Capacity expansion trigger:
+
+- `configs/constants.yaml` defines `phoneme_vocab_size` with a minimum headroom of 20 symbols above the active canonical symbol count
+- if `active_phone_inventory` count exceeds `(phoneme_vocab_size - 20)`, Worker 03 must file a capacity-expansion request before new languages or annotation backends are added
+- capacity expansion is append-only and requires checkpoint migration documentation
 
 Non-goal for initial v3:
 
@@ -222,6 +242,10 @@ Worker 03 must define a safety path for multilingual and code-switch instability
 - fallback path when G2P is weak or ambiguous:
   - normalized text + explicit fallback marker
   - optional byte/grapheme-level side input artifact for later-stage experiments
+  - runtime policy must be explicit and shared across Python/Rust:
+    - for the initial v3 mainline TTS contract, if canonical `phoneme_ids` cannot be produced with sufficient confidence, the request/record is downgraded or rejected rather than silently synthesized into a divergent runtime-only text representation
+    - any accepted fallback mode must carry an explicit `fallback_mode` tag that survives dataset export, training, serving, and validation
+    - Rust/VST must follow the same canonical accept/reject/downgrade rule as Python serve; a Rust-only text frontend contract is forbidden
 - forbidden behavior:
   - silently emitting large `UNK` spans without preserving enough text to recover later
 
@@ -238,7 +262,15 @@ Bootstrap alignment is transitional supervision, not a hidden replacement for th
   - ASR token/word timestamps retained for provenance
 - required derived artifact:
   - `bootstrap_alignment.json` already indexed in canonical phoneme space
-  - projection must use **Acoustic-Aware Phoneme Boundary Heuristics** (e.g., energy flux or spectral changes) rather than naive uniform time-splitting, to provide sharper initial targets for pointer learning.
+  - projection must use one frozen deterministic algorithm version rather than vague "acoustic-aware heuristics"
+  - the algorithm spec must include:
+    - algorithm id
+    - parameter set and defaults
+    - feature extraction recipe
+    - tie-break rules
+    - behavior on low-confidence spans
+    - fallback rule when acoustic cues are unusable
+  - any change to these items requires a version bump in exported provenance
   - frame convention is frozen:
     - `sample_rate = 24000`
     - `hop_length = 240`
@@ -252,6 +284,25 @@ Bootstrap alignment is transitional supervision, not a hidden replacement for th
   - Worker 02 consumes it and may densify it to frame-level loss targets
 - forbidden behavior:
   - handing Worker 02 raw ASR timestamps and leaving phoneme projection implicit
+  - exporting labels produced by an implementation-defined heuristic with no algorithm/version identity
+
+## Few-Shot Prompt Eligibility Policy
+
+Worker 03 must define a canonical dataset-level contract for promptable speaker evidence.
+
+- each train/eval record must either:
+  - declare one or more valid prompt candidates, or
+  - declare explicit absence / ineligibility
+- the canonical policy must freeze:
+  - whether prompt and target may come from the same source file
+  - whether prompt and target may come from the same conversation window
+  - minimum and maximum prompt duration
+  - minimum speaker-purity threshold
+  - cross-lingual prompt eligibility tagging
+  - deterministic ordering / sampling key so repeated runs can reproduce prompt choice
+- forbidden behavior:
+  - ad hoc "pick another clip from the same speaker" logic living only in the trainer
+  - evaluation-time prompt sampling that can accidentally choose the target segment or a leakage-equivalent near-duplicate
 
 
 ## Alias Mapping Specification
@@ -314,6 +365,8 @@ Minimum report fields:
 - `same_text_multi_context_coverage`
 - `code_switch_coverage`
 - `cross_lingual_prompt_coverage`
+ - `prompt_pairing_coverage`
+ - `prompt_leakage_risk_count`
 - `g2p_fallback_coverage`
 - `voice_state_supervision_coverage`
 - `voice_state_observed_ratio`
@@ -335,6 +388,10 @@ Interpretation requirements:
   - fraction of records with valid token-span or segment-level language annotations
 - `cross_lingual_prompt_coverage`
   - fraction of speakers or records usable for prompt-language != target-language evaluation
+- `prompt_pairing_coverage`
+  - fraction of records with at least one valid prompt candidate under the frozen few-shot policy
+- `prompt_leakage_risk_count`
+  - count of records whose only available prompt candidates violate same-target or leakage guardrails
 - `g2p_fallback_coverage`
   - fraction of records that required normalized-text or byte/grapheme fallback because canonical G2P was too weak
 
@@ -392,4 +449,6 @@ Fail / warn policy:
 - bootstrap-alignment projection determinism test
 - bootstrap-alignment frame-convention parity test against `tmrvc-core`
 - `voice_state` artifact shape/reporting test
+- few-shot prompt-eligibility policy determinism test
+- few-shot prompt leakage-guard test
 - canonical context-graph fields present even when no derived context cache is exported

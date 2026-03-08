@@ -58,6 +58,8 @@
 - transcript / speaker / language correction
 - promote / reject / review action
 - export trigger
+- post-v3.0 personal-voice training を残す場合は、raw audio upload をそのまま学習に流さず、`VAD -> ASR/transcript check -> G2P -> boundary/alignment refinement` の lightweight preparation job を明示的に踏ませる
+- low-confidence transcript/G2P/alignment 項目は review queue に出し、未解決のまま fine-tune を開始させない
 
 表示:
 
@@ -181,3 +183,12 @@ UI は完全な HITL (Human-in-the-Loop) ループをカバーする。
 
 - ワークショップ状態 (スライダー位置、コンテキスト、アクター、比較履歴) の保存・読み込みが可能
 - セッション間で作業状態を維持する
+
+## 11. Personal Voice Training Boundary
+
+post-v3.0 に Personal Voice Training を導入する場合でも、UI は "upload wav -> LoRA train" の単純化された幻想を見せてはならない。
+
+- training job の前に canonical trainable artifacts を生成する preparation stage が必須
+- preparation stage は Worker 07-owned curation/orchestration path を通す
+- transcript/G2P/bootstrap preparation に失敗したデータは block か visible downgrade にする
+- raw uploaded audio を直接 trainer に渡す GUI-only shortcut は非準拠

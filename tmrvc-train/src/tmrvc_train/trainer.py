@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +8,14 @@ from tqdm import tqdm
 from typing import Optional
 
 from .models import DisentangledUCLM
-from .models.uclm_loss import uclm_loss, monotonic_alignment_search, voice_state_supervision_loss
+from .models.uclm_loss import (
+    uclm_loss,
+    monotonic_alignment_search,
+    voice_state_supervision_loss,
+    pointer_advance_loss,
+    progress_regression_loss,
+    boundary_confidence_loss,
+)
 from .models.reference_encoder import ReferenceEncoderFromWaveform
 
 
@@ -85,6 +93,11 @@ class UCLMTrainer:
         - Duration prediction loss (TTS legacy mode)
         - Pointer-based TTS training (v3 pointer mode)
         - Monotonic Alignment Search (MAS) for pointer targets
+        - 3-stage training curriculum (Base, Align, Drama)
+        - Flow-matching prosody loss
+        - Voice state supervision with masks and confidence
+        - Anti-collapse diagnostics (pointer stall rate, advance entropy, voice_state variance)
+        - Boundary confidence loss
     """
     def __init__(
         self,
@@ -95,21 +108,27 @@ class UCLMTrainer:
         tts_mode: str = "pointer",
         pointer_loss_weight: float = 0.5,
         progress_loss_weight: float = 0.2,
+        boundary_confidence_loss_weight: float = 0.1,
         alignment_loss_type: str = "none",
         pointer_target_source: str = "heuristic_bootstrap",
+        pointer_supervision_mode: str = "latent_only",
         legacy_duration_loss_weight: float = 0.0,
         bootstrap_alignment_required: bool = False,
         voice_state_loss_weight: float = 0.0,
         delta_voice_state_loss_weight: float = 0.0,
         conditioning_dropout_prob: float = 0.15,
+        prosody_loss_weight: float = 1.0,
         curriculum: CurriculumScheduler | None = None,
         prompt_sampling_prob: float = 0.0,
         pointer_aux_alignment_warmup_steps: int = 2000,
         pointer_aux_alignment_anneal_steps: int = 5000,
+        pointer_hardening_start_step: int = 10000,
+        pointer_hardening_ramp_steps: int = 5000,
         cfg_distillation_weight: float = 0.0,
         cfg_distillation_scale_range: tuple[float, float] = (1.0, 3.0),
         cfg_distillation_temperature: float = 2.0,
         reference_encoder: ReferenceEncoderFromWaveform | None = None,
+        training_stage: str = "base",
     ):
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -124,20 +143,26 @@ class UCLMTrainer:
         self.tts_mode = tts_mode
         self.pointer_loss_weight = pointer_loss_weight
         self.progress_loss_weight = progress_loss_weight
+        self.boundary_confidence_loss_weight = boundary_confidence_loss_weight
         self.alignment_loss_type = alignment_loss_type
         self.pointer_target_source = pointer_target_source
+        self.pointer_supervision_mode = pointer_supervision_mode
         self.legacy_duration_loss_weight = legacy_duration_loss_weight
         self.bootstrap_alignment_required = bootstrap_alignment_required
         self.voice_state_loss_weight = voice_state_loss_weight
         self.delta_voice_state_loss_weight = delta_voice_state_loss_weight
         self.conditioning_dropout_prob = conditioning_dropout_prob
+        self.prosody_loss_weight = prosody_loss_weight
         self.curriculum = curriculum
         self.prompt_sampling_prob = prompt_sampling_prob
         self.pointer_aux_alignment_warmup_steps = pointer_aux_alignment_warmup_steps
         self.pointer_aux_alignment_anneal_steps = pointer_aux_alignment_anneal_steps
+        self.pointer_hardening_start_step = pointer_hardening_start_step
+        self.pointer_hardening_ramp_steps = pointer_hardening_ramp_steps
         self.cfg_distillation_weight = cfg_distillation_weight
         self.cfg_distillation_scale_range = cfg_distillation_scale_range
         self.cfg_distillation_temperature = cfg_distillation_temperature
+        self.training_stage = training_stage
         self._global_step = 0
         self._validate_config()
 
@@ -158,6 +183,53 @@ class UCLMTrainer:
             raise ValueError(
                 f"alignment_loss_type must be one of {valid_alignment_types}, got {self.alignment_loss_type!r}"
             )
+
+        valid_supervision_modes = {"latent_only", "supervised"}
+        if self.pointer_supervision_mode not in valid_supervision_modes:
+            raise ValueError(
+                f"pointer_supervision_mode must be one of {valid_supervision_modes}, "
+                f"got {self.pointer_supervision_mode!r}"
+            )
+
+        # Supervised pointer mode requires a valid target source
+        if (
+            self.pointer_supervision_mode == "supervised"
+            and self.pointer_target_source == "none"
+        ):
+            raise ValueError(
+                "pointer_supervision_mode='supervised' requires a valid pointer_target_source "
+                "(not 'none'). Use 'latent_only' for alignment-free training."
+            )
+
+    def _get_annealing_phase(self, step: int) -> str:
+        """Determine the pointer annealing phase for the given step.
+
+        Returns one of: 'hard_bootstrap', 'soft_transition', 'latent_only'.
+        """
+        warmup = self.pointer_aux_alignment_warmup_steps
+        anneal = self.pointer_aux_alignment_anneal_steps
+        if step < warmup:
+            return "hard_bootstrap"
+        elif step < warmup + anneal:
+            return "soft_transition"
+        else:
+            return "latent_only"
+
+    def _get_bootstrap_mix_ratio(self, step: int) -> float:
+        """Compute the mix ratio for bootstrap vs model predictions.
+
+        Returns 1.0 during hard bootstrap, linearly anneals to 0.0 during
+        soft transition, and 0.0 during latent-only phase.
+        """
+        warmup = self.pointer_aux_alignment_warmup_steps
+        anneal = self.pointer_aux_alignment_anneal_steps
+        if step < warmup:
+            return 1.0
+        elif step < warmup + anneal:
+            progress = (step - warmup) / max(anneal, 1)
+            return 1.0 - progress
+        else:
+            return 0.0
 
     def _generate_pointer_targets(
         self, durations: torch.Tensor, target_length: int
@@ -180,13 +252,13 @@ class UCLMTrainer:
         for b in range(B):
             curr_durations = durations[b]
             cum_dur = torch.cumsum(curr_durations, dim=0).long()
-            
+
             # Boundary indices (where phoneme changes)
             boundaries = cum_dur - 1
             # Filter valid boundaries within target_length
             valid_boundaries = boundaries[boundaries < target_length]
             advance_targets[b, valid_boundaries] = 1.0
-            
+
             # Calculate progress within each phoneme
             start_idx = 0
             for i, dur in enumerate(curr_durations):
@@ -203,7 +275,7 @@ class UCLMTrainer:
                 start_idx = end_idx
                 if start_idx >= target_length:
                     break
-                    
+
         return advance_targets, progress_targets
 
     def _generate_pointer_targets_from_path(
@@ -212,20 +284,90 @@ class UCLMTrainer:
         """Convert MAS binary path [B, L, T] into pointer targets."""
         B, L, T = path.shape
         device = path.device
-        
+
         # durations: [B, L]
         durations = path.sum(dim=2)
         return self._generate_pointer_targets(durations, T)
+
+    def _generate_boundary_targets_from_advance(
+        self, advance_targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Generate boundary confidence targets from advance targets.
+
+        Boundary confidence should be high near phoneme boundaries.
+        Uses a simple Gaussian-smoothed version of advance targets.
+        """
+        # advance_targets: [B, T], binary
+        # Return same shape with values near 1.0 at boundaries, decaying away
+        B, T = advance_targets.shape
+        boundary_targets = advance_targets.clone()
+        # Smooth with a small window to create soft boundary targets
+        if T > 3:
+            kernel = torch.tensor([0.25, 0.5, 1.0, 0.5, 0.25], device=advance_targets.device)
+            kernel = kernel / kernel.sum()
+            padded = F.pad(advance_targets.unsqueeze(1), (2, 2), mode="replicate")
+            smoothed = F.conv1d(padded, kernel.view(1, 1, -1)).squeeze(1)
+            boundary_targets = smoothed.clamp(0.0, 1.0)
+        return boundary_targets
+
+    def _compute_pointer_diagnostics(
+        self, advance_logit: torch.Tensor, progress_delta: torch.Tensor
+    ) -> dict:
+        """Compute anti-collapse diagnostics for pointer behavior.
+
+        Returns:
+            pointer_stall_rate: fraction of frames where pointer doesn't advance
+            advance_entropy: Shannon entropy of advance decisions (higher = more diverse)
+            progress_variance: variance of progress predictions across frames
+        """
+        diagnostics = {}
+        with torch.no_grad():
+            # Pointer stall rate: fraction of frames with advance prob < 0.5
+            advance_prob = torch.sigmoid(advance_logit.squeeze(-1))  # [B, T]
+            advances = (advance_prob > 0.5).float()
+            stall_rate = 1.0 - advances.mean().item()
+            diagnostics["pointer_stall_rate"] = stall_rate
+
+            # Advance entropy: -p*log(p) - (1-p)*log(1-p) averaged across all frames
+            p = advance_prob.clamp(1e-7, 1.0 - 1e-7)
+            entropy = -(p * p.log() + (1 - p) * (1 - p).log())
+            diagnostics["advance_entropy"] = entropy.mean().item()
+
+            # Progress variance across frames
+            prog = progress_delta.squeeze(-1)  # [B, T]
+            diagnostics["progress_variance"] = prog.var().item()
+
+        return diagnostics
+
+    def _compute_voice_state_diagnostics(
+        self, hidden_states: torch.Tensor
+    ) -> dict:
+        """Compute voice_state variance across utterances for anti-collapse monitoring."""
+        diagnostics = {}
+        with torch.no_grad():
+            # Use first 8 dims as voice state proxy
+            vs_proxy = hidden_states[:, :, :8]  # [B, T, 8]
+            # Per-utterance mean
+            vs_means = vs_proxy.mean(dim=1)  # [B, 8]
+            # Variance across utterances
+            if vs_means.shape[0] > 1:
+                diagnostics["voice_state_between_utt_variance"] = vs_means.var(dim=0).mean().item()
+            else:
+                diagnostics["voice_state_between_utt_variance"] = 0.0
+        return diagnostics
 
     def train_step(self, batch: dict) -> dict:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
+        current_step = self._global_step
+        self._global_step += 1
+
         # Stage 3 anti-forgetting replay: override drama config with
         # Stage 1/2 stability settings when the scheduler says so.
         is_replay = (
             self.curriculum is not None
-            and self.curriculum.should_replay(self._global_step)
+            and self.curriculum.should_replay(current_step)
         )
 
         # Apply curriculum overrides for this step
@@ -237,24 +379,12 @@ class UCLMTrainer:
                 # Use Stage 2 config to maintain base quality
                 overrides = self.curriculum.get_config(self.curriculum.stage2_start)
             else:
-                overrides = self.curriculum.get_config(self._global_step)
+                overrides = self.curriculum.get_config(current_step)
             tts_prob = overrides.get("tts_prob", tts_prob)
             pointer_loss_weight = overrides.get("pointer_loss_weight", pointer_loss_weight)
             conditioning_dropout_prob = overrides.get(
                 "conditioning_dropout_prob", conditioning_dropout_prob
             )
-        
-        # Auxiliary alignment weight annealing
-        aux_alignment_weight = 0.0
-        if self.pointer_target_source == "mas":
-            if self._global_step < self.pointer_aux_alignment_warmup_steps:
-                aux_alignment_weight = 1.0
-            elif self._global_step < (self.pointer_aux_alignment_warmup_steps + self.pointer_aux_alignment_anneal_steps):
-                # Linear anneal to 0
-                elapsed = self._global_step - self.pointer_aux_alignment_warmup_steps
-                aux_alignment_weight = 1.0 - (elapsed / self.pointer_aux_alignment_anneal_steps)
-        
-        self._global_step += 1
 
         # Move common tensors to device
         target_a = batch["target_a"].to(self.device)
@@ -321,37 +451,327 @@ class UCLMTrainer:
                 adv_logits=out.get("adv_logits"),
                 speaker_labels=speaker_labels
             )
-
         else:
+            # TTS path
             phonemes = batch["phoneme_ids"].to(self.device)
             language_ids = batch["language_id"].to(self.device)
+            B = phonemes.shape[0]
             target_length = target_a.shape[-1]
-
-            dialogue_context = batch.get("dialogue_context")
-            if dialogue_context is not None:
-                dialogue_context = dialogue_context.to(self.device)
-            acting_intent = batch.get("acting_intent")
-            if acting_intent is not None:
-                acting_intent = acting_intent.to(self.device)
-            prosody_targets = batch.get("prosody_targets")
-            if prosody_targets is not None:
-                prosody_targets = prosody_targets.to(self.device)
-            elif self.reference_encoder is not None and batch.get("audio") is not None:
-                # On-the-fly prosody target extraction from ground-truth audio
-                with torch.no_grad():
-                    audio = batch["audio"].to(self.device)
-                    prosody_targets = self.reference_encoder(audio)
-            delta_voice_state = batch.get("delta_voice_state")
-            if delta_voice_state is not None:
-                delta_voice_state = delta_voice_state.to(self.device)
+            
+            # --- Replay Mix (Worker 02 Task 15) ---
+            if is_replay:
+                dialogue_context = None
+                acting_intent = None
+                prosody_targets = None
+                delta_voice_state = None
+            else:
+                dialogue_context = batch.get("dialogue_context")
+                if dialogue_context is not None:
+                    dialogue_context = dialogue_context.to(self.device)
+                acting_intent = batch.get("acting_intent")
+                if acting_intent is not None:
+                    acting_intent = acting_intent.to(self.device)
+                prosody_targets = batch.get("prosody_targets")
+                if prosody_targets is not None:
+                    prosody_targets = prosody_targets.to(self.device)
+                elif self.reference_encoder is not None and batch.get("audio") is not None:
+                    with torch.no_grad():
+                        audio = batch["audio"].to(self.device)
+                        prosody_targets = self.reference_encoder(audio)
+                delta_voice_state = batch.get("delta_voice_state")
+                if delta_voice_state is not None:
+                    delta_voice_state = delta_voice_state.to(self.device)
             text_suprasegmentals = batch.get("text_suprasegmentals")
             if text_suprasegmentals is not None:
                 text_suprasegmentals = text_suprasegmentals.to(self.device)
 
-            out = self.model.forward_tts_pointer(
-                phoneme_ids=phonemes,
+            if self.tts_mode == "pointer":
+                losses = self._tts_pointer_step(
+                    phonemes=phonemes,
+                    language_ids=language_ids,
+                    speaker_embed=speaker_embed,
+                    speaker_labels=speaker_labels,
+                    explicit_state=explicit_state,
+                    ssl_state=ssl_state,
+                    target_a=target_a,
+                    target_b=target_b,
+                    target_length=target_length,
+                    f0_condition=f0_condition,
+                    dialogue_context=dialogue_context,
+                    acting_intent=acting_intent,
+                    prosody_targets=prosody_targets,
+                    delta_voice_state=delta_voice_state,
+                    text_suprasegmentals=text_suprasegmentals,
+                    batch=batch,
+                    current_step=current_step,
+                    pointer_loss_weight=pointer_loss_weight,
+                )
+            else:
+                # Legacy duration-based TTS
+                losses = self._tts_legacy_step(
+                    phonemes=phonemes,
+                    language_ids=language_ids,
+                    speaker_embed=speaker_embed,
+                    speaker_labels=speaker_labels,
+                    explicit_state=explicit_state,
+                    ssl_state=ssl_state,
+                    target_a=target_a,
+                    target_b=target_b,
+                    target_length=target_length,
+                    f0_condition=f0_condition,
+                    dialogue_context=dialogue_context,
+                    acting_intent=acting_intent,
+                    prosody_targets=prosody_targets,
+                    delta_voice_state=delta_voice_state,
+                    text_suprasegmentals=text_suprasegmentals,
+                    batch=batch,
+                )
+
+        # Optimization
+        losses["loss"].backward()
+        self.optimizer.step()
+
+        res = {k: v.item() for k, v in losses.items() if isinstance(v, torch.Tensor)}
+        res["mode"] = 1 if mode == "tts" else 0
+        res["is_replay"] = 1 if is_replay else 0
+        return res
+
+    def _tts_pointer_step(
+        self,
+        phonemes: torch.Tensor,
+        language_ids: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        speaker_labels: torch.Tensor,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        target_a: torch.Tensor,
+        target_b: torch.Tensor,
+        target_length: int,
+        f0_condition: torch.Tensor | None,
+        dialogue_context: torch.Tensor | None,
+        acting_intent: torch.Tensor | None,
+        prosody_targets: torch.Tensor | None,
+        delta_voice_state: torch.Tensor | None,
+        text_suprasegmentals: torch.Tensor | None,
+        batch: dict,
+        current_step: int,
+        pointer_loss_weight: float,
+    ) -> dict:
+        """Pointer-mode TTS training step with full annealing schedule."""
+        B = phonemes.shape[0]
+        L = phonemes.shape[1]
+
+        # Determine annealing phase
+        annealing_phase = self._get_annealing_phase(current_step)
+        is_hard_bootstrap = (annealing_phase == "hard_bootstrap")
+
+        # Stage 2 Annealing: provide bootstrap alignment if in hard phase
+        bootstrap_data = None
+        if is_hard_bootstrap:
+            bootstrap_data = batch.get("bootstrap_alignment")
+            if bootstrap_data is None:
+                # Fallback to heuristic durations if curated bootstrap is missing
+                # but we are in the hard bootstrap phase.
+                indices = torch.arange(target_length, device=self.device).float() * L / target_length
+                bootstrap_data = {
+                    "phoneme_indices": indices.long().clamp(max=L - 1).unsqueeze(0).expand(B, -1)
+                }
+
+        out = self.model.forward_tts_pointer(
+            phoneme_ids=phonemes,
+            language_ids=language_ids,
+            pointer_state=None,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            target_length=target_length,
+            f0_condition=f0_condition,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_targets,
+            delta_voice_state=delta_voice_state,
+            bootstrap_alignment=bootstrap_data,
+            text_suprasegmentals=text_suprasegmentals,
+        )
+
+        # --- Alignment Target Generation (Stage 2 Annealing Logic) ---
+        warmup = self.pointer_aux_alignment_warmup_steps
+        anneal = self.pointer_aux_alignment_anneal_steps
+
+        if annealing_phase == "hard_bootstrap":
+            # Phase 1: Use Bootstrap Alignment as ground truth
+            if bootstrap_data is not None and "phoneme_indices" in bootstrap_data:
+                indices = bootstrap_data["phoneme_indices"]  # [B, T]
+                pseudo_durations = torch.zeros(B, L, device=self.device)
+                for b in range(B):
+                    counts = torch.bincount(indices[b].clamp(min=0), minlength=L)
+                    pseudo_durations[b] = counts[:L].float()
+                adv_targets, prog_targets = self._generate_pointer_targets(pseudo_durations, target_length)
+            else:
+                # Heuristic fallback
+                dummy_durations = torch.full((B, L), target_length / max(L, 1), device=self.device)
+                adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
+        elif annealing_phase == "soft_transition":
+            # Phase 2: Mix bootstrap with MAS-derived targets
+            mix_ratio = self._get_bootstrap_mix_ratio(current_step)
+
+            # MAS targets
+            with torch.no_grad():
+                phoneme_lens = (phonemes != 0).sum(dim=1)
+                x_text = self.model.text_encoder(
+                    phonemes, language_ids, phoneme_lens,
+                    text_suprasegmentals=text_suprasegmentals,
+                ).transpose(1, 2)
+                x_acoustic = out["hidden_states"]
+                dist = torch.cdist(x_text, x_acoustic)
+                log_probs = -0.5 * (dist ** 2)
+                path = monotonic_alignment_search(log_probs)
+                mas_adv, mas_prog = self._generate_pointer_targets_from_path(path)
+
+            if mix_ratio > 0 and bootstrap_data is not None and "phoneme_indices" in bootstrap_data:
+                indices = bootstrap_data["phoneme_indices"]
+                pseudo_durations = torch.zeros(B, L, device=self.device)
+                for b in range(B):
+                    counts = torch.bincount(indices[b].clamp(min=0), minlength=L)
+                    pseudo_durations[b] = counts[:L].float()
+                boot_adv, boot_prog = self._generate_pointer_targets(pseudo_durations, target_length)
+                # Blend
+                adv_targets = mix_ratio * boot_adv + (1 - mix_ratio) * mas_adv
+                prog_targets = mix_ratio * boot_prog + (1 - mix_ratio) * mas_prog
+            else:
+                adv_targets = mas_adv
+                prog_targets = mas_prog
+        else:
+            # Phase 3: Pure Latent-Only (MAS from internal attention)
+            with torch.no_grad():
+                phoneme_lens = (phonemes != 0).sum(dim=1)
+                x_text = self.model.text_encoder(
+                    phonemes, language_ids, phoneme_lens,
+                    text_suprasegmentals=text_suprasegmentals,
+                ).transpose(1, 2)
+                x_acoustic = out["hidden_states"]
+                dist = torch.cdist(x_text, x_acoustic)
+                log_probs = -0.5 * (dist ** 2)
+                path = monotonic_alignment_search(log_probs)
+                adv_targets, prog_targets = self._generate_pointer_targets_from_path(path)
+
+        # --- Final Target Selection and Position Index Derivation (Worker 01/02) ---
+        # Derived pos_indices [B, T] will tell RoPE where each frame is in text-space.
+        if annealing_phase == "hard_bootstrap":
+            if bootstrap_data is not None and "phoneme_indices" in bootstrap_data:
+                pos_indices = bootstrap_data["phoneme_indices"]
+            else:
+                indices = torch.arange(target_length, device=self.device).float() * L / max(target_length, 1)
+                pos_indices = indices.long().clamp(max=L - 1).unsqueeze(0).expand(B, -1)
+        else:
+            # For MAS-based phases, we derive pos_indices from the accumulated advance signals
+            # Note: mas_adv (or adv_targets) is [B, T] binary.
+            # We use cumsum to get monotonic indices.
+            pos_indices = torch.cumsum(adv_targets, dim=1).long().clamp(max=L - 1)
+
+        # Worker 01/02: Re-run forward with correct position_indices for RoPE
+        # This ensures the model learns alignment with explicit text-position awareness.
+        out = self.model.forward_tts_pointer(
+            phoneme_ids=phonemes,
+            language_ids=language_ids,
+            pointer_state=None,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            target_length=target_length,
+            f0_condition=f0_condition,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_targets,
+            delta_voice_state=delta_voice_state,
+            bootstrap_alignment=bootstrap_data,
+            text_suprasegmentals=text_suprasegmentals,
+        )
+
+        # Generate boundary confidence targets
+        boundary_targets = self._generate_boundary_targets_from_advance(adv_targets)
+
+        context_groups = batch.get("context_groups")
+        if context_groups is not None:
+            context_groups = context_groups.to(self.device)
+
+        # Voice state supervision (Worker 01/03 contract)
+        vs_targets = batch.get("voice_state_targets")
+        vs_observed_mask = batch.get("voice_state_observed_mask")
+        vs_confidence = batch.get("voice_state_confidence")
+        if vs_targets is not None:
+            vs_targets = vs_targets.to(self.device)
+            if vs_observed_mask is not None:
+                vs_observed_mask = vs_observed_mask.to(self.device)
+            else:
+                # Default to True if not provided
+                vs_observed_mask = torch.ones_like(vs_targets, dtype=torch.bool, device=self.device)
+                
+            if vs_confidence is not None:
+                vs_confidence = vs_confidence.to(self.device)
+                # Apply confidence floor (Worker 02 requirement)
+                floor_mask = vs_confidence >= self.voice_state_confidence_floor
+                # If confidence is [B, T, 1], broadcast to [B, T, D]
+                if floor_mask.shape[-1] == 1 and vs_observed_mask.shape[-1] > 1:
+                    floor_mask = floor_mask.expand_as(vs_observed_mask)
+                vs_observed_mask = vs_observed_mask & floor_mask
+
+        # Compute phoneme features for prosody loss (reuse text encoder)
+        phoneme_lens = (phonemes != 0).sum(dim=1)
+        phoneme_features = self.model.text_encoder(
+            phonemes, language_ids, phoneme_lens,
+            text_suprasegmentals=text_suprasegmentals,
+        ).transpose(1, 2)
+
+        losses = uclm_loss(
+            logits_a=out["logits_a"],
+            logits_b=out["logits_b"],
+            target_a=target_a,
+            target_b=target_b,
+            adv_logits=out.get("adv_logits"),
+            speaker_labels=speaker_labels,
+            pointer_logits=out.get("advance_logit"),
+            advance_targets=adv_targets,
+            progress_delta=out.get("progress_delta"),
+            progress_targets=prog_targets,
+            hidden_states=out.get("hidden_states"),
+            context_groups=context_groups,
+            lambda_pointer=pointer_loss_weight,
+            lambda_progress=self.progress_loss_weight,
+            # Flow-matching loss for ProsodyPredictor
+            prosody_predictor=self.model.prosody_predictor,
+            phoneme_features=phoneme_features,
+            target_prosody=prosody_targets,
+            prosody_dialogue_context=dialogue_context,
+            prosody_speaker_embed=speaker_embed,
+            lambda_prosody=self.prosody_loss_weight if prosody_targets is not None else 0.0,
+        )
+
+        # Boundary confidence loss
+        if (
+            self.boundary_confidence_loss_weight > 0
+            and out.get("boundary_confidence") is not None
+        ):
+            loss_boundary = boundary_confidence_loss(
+                out["boundary_confidence"], boundary_targets
+            )
+            losses["loss"] = losses["loss"] + self.boundary_confidence_loss_weight * loss_boundary
+            losses["loss_boundary_confidence"] = loss_boundary
+
+        # CFG distillation loss (Stage 3 only)
+        if (
+            self.cfg_distillation_weight > 0
+            and self.curriculum is not None
+            and self.curriculum.get_stage(current_step) >= 3
+        ):
+            self._apply_cfg_distillation(
+                losses=losses,
+                phonemes=phonemes,
                 language_ids=language_ids,
-                pointer_state=None,
                 speaker_embed=speaker_embed,
                 explicit_state=explicit_state,
                 ssl_state=ssl_state,
@@ -361,184 +781,276 @@ class UCLMTrainer:
                 f0_condition=f0_condition,
                 dialogue_context=dialogue_context,
                 acting_intent=acting_intent,
-                prosody_latent=prosody_targets,
+                prosody_targets=prosody_targets,
                 delta_voice_state=delta_voice_state,
                 text_suprasegmentals=text_suprasegmentals,
+                out=out,
             )
 
-            # Alignment Target Generation
-            if self.pointer_target_source == "mas":
-                # Compute log-likelihood for MAS
-                with torch.no_grad():
-                    phoneme_lens = (phonemes != 0).sum(dim=1)
-                    x_text = self.model.text_encoder(phonemes, language_ids, phoneme_lens, text_suprasegmentals=text_suprasegmentals).transpose(1, 2)
-                    x_acoustic = out["hidden_states"]
-                    dist = torch.cdist(x_text, x_acoustic)
-                    log_probs = -0.5 * (dist ** 2)
-                    path = monotonic_alignment_search(log_probs)
-                    adv_targets, prog_targets = self._generate_pointer_targets_from_path(path)
-            elif self.pointer_target_source == "ctc":
-                # CTC alignment placeholder — falls back to heuristic
-                L = phonemes.shape[1]
-                dummy_durations = torch.full((phonemes.shape[0], L), target_length // L, device=self.device)
-                adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
-            elif self.pointer_target_source == "legacy_duration" and has_durations:
-                durations = batch["durations"].to(self.device)
-                adv_targets, prog_targets = self._generate_pointer_targets(durations, target_length)
-            elif self.pointer_target_source == "heuristic_bootstrap":
-                # Uniform heuristic fallback
-                L = phonemes.shape[1]
-                dummy_durations = torch.full((phonemes.shape[0], L), target_length // L, device=self.device)
-                adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
-            else:
-                raise RuntimeError(f"Unknown pointer_target_source: {self.pointer_target_source}")
+        # Voice state supervision with observed_mask and confidence (Worker 02)
+        if (
+            self.voice_state_loss_weight > 0
+            and vs_targets is not None
+            and out.get("hidden_states") is not None
+        ):
+            # Use hidden_states[:, :, :8] as proxy for voice state prediction
+            # (real implementation uses a dedicated head)
+            vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :8]
+            loss_vs = voice_state_supervision_loss(
+                vs_pred,
+                vs_targets,
+                observed_mask=vs_observed_mask,
+                confidence=vs_confidence,
+            )
+            losses["loss"] = losses["loss"] + self.voice_state_loss_weight * loss_vs
+            losses["loss_voice_state"] = loss_vs
 
-            context_groups = batch.get("context_groups")
-            if context_groups is not None:
-                context_groups = context_groups.to(self.device)
+        # Anti-collapse diagnostics (logged but not added to loss)
+        if out.get("advance_logit") is not None:
+            pointer_diag = self._compute_pointer_diagnostics(
+                out["advance_logit"], out["progress_delta"]
+            )
+            for k, v in pointer_diag.items():
+                losses[k] = torch.tensor(v)
 
-            # Voice state supervision (Worker 01/03 contract)
-            vs_targets = batch.get("voice_state_targets")
-            vs_observed_mask = batch.get("voice_state_observed_mask")
-            vs_confidence = batch.get("voice_state_confidence")
-            if vs_targets is not None:
-                vs_targets = vs_targets.to(self.device)
-                if vs_observed_mask is not None:
-                    vs_observed_mask = vs_observed_mask.to(self.device)
-                if vs_confidence is not None:
-                    vs_confidence = vs_confidence.to(self.device)
+        if out.get("hidden_states") is not None:
+            vs_diag = self._compute_voice_state_diagnostics(out["hidden_states"])
+            for k, v in vs_diag.items():
+                losses[k] = torch.tensor(v)
 
-            losses = uclm_loss(
-                logits_a=out["logits_a"],
-                logits_b=out["logits_b"],
+        return losses
+
+    def _apply_cfg_distillation(
+        self,
+        losses: dict,
+        phonemes: torch.Tensor,
+        language_ids: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        target_a: torch.Tensor,
+        target_b: torch.Tensor,
+        target_length: int,
+        f0_condition: torch.Tensor | None,
+        dialogue_context: torch.Tensor | None,
+        acting_intent: torch.Tensor | None,
+        prosody_targets: torch.Tensor | None,
+        delta_voice_state: torch.Tensor | None,
+        text_suprasegmentals: torch.Tensor | None,
+        out: dict,
+    ) -> None:
+        """Stage 3 CFG Self-Distillation (Worker 02 Task 10).
+        
+        Supervise the conditional forward pass to match the guided (blended) target.
+        """
+        with torch.no_grad():
+            # 1. Unconditional Forward Pass (masking all conditions)
+            # Use DisentangledUCLM's mask helper to be contract-consistent
+            masked = DisentangledUCLM.apply_cfg_unconditional_mask(
+                explicit_state=explicit_state,
+                ssl_state=ssl_state,
+                speaker_embed=speaker_embed,
+                dialogue_context=dialogue_context,
+                acting_intent=acting_intent,
+                delta_voice_state=delta_voice_state,
+                prosody_latent=prosody_targets,
+            )
+            
+            uncond_out = self.model.forward_tts_pointer(
+                phoneme_ids=phonemes,
+                language_ids=language_ids,
+                pointer_state=None, # Teacher-forced
+                speaker_embed=masked["speaker_embed"],
+                explicit_state=masked["explicit_state"],
+                ssl_state=masked["ssl_state"],
                 target_a=target_a,
                 target_b=target_b,
-                adv_logits=out.get("adv_logits"),
-                speaker_labels=speaker_labels,
-                pointer_logits=out.get("advance_logit"),
-                advance_targets=adv_targets,
-                progress_delta=out.get("progress_delta"),
-                progress_targets=prog_targets,
-                hidden_states=out.get("hidden_states"),
-                context_groups=context_groups,
-                lambda_pointer=pointer_loss_weight,
-                lambda_progress=self.progress_loss_weight,
-                # Flow-matching loss for ProsodyPredictor
-                prosody_predictor=self.model.prosody_predictor,
-                phoneme_features=self.model.text_encoder(phonemes, language_ids, (phonemes != 0).sum(dim=1), text_suprasegmentals=text_suprasegmentals).transpose(1, 2),
-                target_prosody=prosody_targets,
-                prosody_dialogue_context=dialogue_context,
-                prosody_speaker_embed=speaker_embed,
-                lambda_prosody=1.0 if prosody_targets is not None else 0.0,
+                target_length=target_length,
+                f0_condition=f0_condition,
+                dialogue_context=masked["dialogue_context"],
+                acting_intent=masked["acting_intent"],
+                prosody_latent=masked["prosody_latent"],
+                delta_voice_state=masked["delta_voice_state"],
+                text_suprasegmentals=text_suprasegmentals,
             )
-
-            # CFG distillation loss (Stage 3 only)
-            if (
-                self.cfg_distillation_weight > 0
-                and self.curriculum is not None
-                and self.curriculum.get_stage(self._global_step) >= 3
-            ):
-                # Sample a random cfg_scale from the configured range
-                cfg_lo, cfg_hi = self.cfg_distillation_scale_range
-                sampled_cfg_scale = cfg_lo + random.random() * (cfg_hi - cfg_lo)
-
-                # Teacher: full two-pass guided logits (detached)
-                with torch.no_grad():
-                    # Conditional pass (already computed: out["logits_a"], out["logits_b"])
-                    cond_a = out["logits_a"]
-                    cond_b = out["logits_b"]
-
-                    # Unconditional pass
-                    masked_distill = DisentangledUCLM.apply_cfg_unconditional_mask(
-                        explicit_state=explicit_state,
-                        ssl_state=ssl_state,
-                        speaker_embed=speaker_embed,
-                        dialogue_context=dialogue_context,
-                        acting_intent=acting_intent,
-                        prosody_latent=prosody_targets,
-                        delta_voice_state=delta_voice_state,
-                    )
-                    out_uncond = self.model.forward_tts_pointer(
-                        phoneme_ids=phonemes,
-                        language_ids=language_ids,
-                        pointer_state=None,
-                        speaker_embed=masked_distill["speaker_embed"],
-                        explicit_state=masked_distill["explicit_state"],
-                        ssl_state=masked_distill["ssl_state"],
-                        target_a=target_a,
-                        target_b=target_b,
-                        target_length=target_length,
-                        f0_condition=f0_condition,
-                        dialogue_context=masked_distill["dialogue_context"],
-                        acting_intent=masked_distill["acting_intent"],
-                        prosody_latent=masked_distill["prosody_latent"],
-                        delta_voice_state=masked_distill["delta_voice_state"],
-                        text_suprasegmentals=text_suprasegmentals,
-                    )
-                    uncond_a = out_uncond["logits_a"]
-                    uncond_b = out_uncond["logits_b"]
-
-                    # Full CFG blend (teacher targets)
-                    teacher_a = uncond_a + sampled_cfg_scale * (cond_a - uncond_a)
-                    teacher_b = uncond_b + sampled_cfg_scale * (cond_b - uncond_b)
-
-                # Student: single-pass with cfg_scale as input (gradients flow)
-                student_out = self.model.forward_tts_distilled_cfg(
-                    phoneme_ids=phonemes,
-                    language_ids=language_ids,
-                    speaker_embed=speaker_embed,
-                    explicit_state=explicit_state,
-                    ssl_state=ssl_state,
-                    target_a=target_a,
-                    target_b=target_b,
-                    cfg_scale=sampled_cfg_scale,
-                    target_length=target_length,
-                    f0_condition=f0_condition,
-                    dialogue_context=dialogue_context,
-                    acting_intent=acting_intent,
-                    prosody_latent=prosody_targets,
-                    delta_voice_state=delta_voice_state,
-                    text_suprasegmentals=text_suprasegmentals,
-                )
-                student_a = student_out["logits_a"]
-                student_b = student_out["logits_b"]
-
-                loss_cfg_distill = DisentangledUCLM.cfg_distillation_loss(
-                    teacher_logits_a=teacher_a.detach(),
-                    teacher_logits_b=teacher_b.detach(),
-                    student_logits_a=student_a,
-                    student_logits_b=student_b,
-                    temperature=self.cfg_distillation_temperature,
-                )
-                losses["loss"] = losses["loss"] + self.cfg_distillation_weight * loss_cfg_distill
-                losses["loss_cfg_distillation"] = loss_cfg_distill
-
-            # Voice state supervision with observed_mask and confidence (Worker 02)
-            if (
-                self.voice_state_loss_weight > 0
-                and vs_targets is not None
-                and out.get("hidden_states") is not None
-            ):
-                # Use hidden_states[:, :, :8] as proxy for voice state prediction
-                # (real implementation uses a dedicated head)
-                vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :8]
-                loss_vs = voice_state_supervision_loss(
-                    vs_pred,
-                    vs_targets,
-                    observed_mask=vs_observed_mask,
-                    confidence=vs_confidence,
-                )
-                losses["loss"] = losses["loss"] + self.voice_state_loss_weight * loss_vs
-                losses["loss_voice_state"] = loss_vs
-
-        # Optimization
-        losses["loss"].backward()
-        self.optimizer.step()
+            
+            # 2. Compute Guided Target: uncond + cfg_scale * (cond - uncond)
+            # (Note: 'out' is the conditional pass already computed in the main loop)
+            cfg_scale = self.cfg_scale_default # Use default training scale
+            
+            target_logits_a = uncond_out["logits_a"] + cfg_scale * (out["logits_a"].detach() - uncond_out["logits_a"])
+            target_logits_b = uncond_out["logits_b"] + cfg_scale * (out["logits_b"].detach() - uncond_out["logits_b"])
+            
+        # 3. Distillation Loss (MSE)
+        # Supervise the conditional logits toward the guided targets
+        loss_distill_a = F.mse_loss(out["logits_a"], target_logits_a)
+        loss_distill_b = F.mse_loss(out["logits_b"], target_logits_b)
         
-        res = {k: v.item() for k, v in losses.items() if isinstance(v, torch.Tensor)}
-        res["mode"] = 1 if mode == "tts" else 0
-        res["is_replay"] = 1 if is_replay else 0
-        return res
+        loss_distill = loss_distill_a + loss_distill_b
+        losses["loss"] = losses["loss"] + self.cfg_distillation_weight * loss_distill
+        losses["loss_cfg_distill"] = loss_distill
+
+    def _tts_legacy_step(
+        self,
+        phonemes: torch.Tensor,
+        language_ids: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        speaker_labels: torch.Tensor,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        target_a: torch.Tensor,
+        target_b: torch.Tensor,
+        target_length: int,
+        f0_condition: torch.Tensor | None,
+        dialogue_context: torch.Tensor | None,
+        acting_intent: torch.Tensor | None,
+        prosody_targets: torch.Tensor | None,
+        delta_voice_state: torch.Tensor | None,
+        text_suprasegmentals: torch.Tensor | None,
+        batch: dict,
+    ) -> dict:
+        """Legacy duration-based TTS training step (v2 compatibility)."""
+        B = phonemes.shape[0]
+        L = phonemes.shape[1]
+
+        # Legacy mode uses forward_tts_pointer with no pointer state
+        # and relies on duration-based targets.
+        out = self.model.forward_tts_pointer(
+            phoneme_ids=phonemes,
+            language_ids=language_ids,
+            pointer_state=None,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            target_length=target_length,
+            f0_condition=f0_condition,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_targets,
+            delta_voice_state=delta_voice_state,
+            text_suprasegmentals=text_suprasegmentals,
+        )
+
+        has_durations = batch.get("durations") is not None
+        if has_durations:
+            durations = batch["durations"].to(self.device)
+            adv_targets, prog_targets = self._generate_pointer_targets(durations, target_length)
+        else:
+            dummy_durations = torch.full((B, L), target_length / L, device=self.device)
+            adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
+
+        losses = uclm_loss(
+            logits_a=out["logits_a"],
+            logits_b=out["logits_b"],
+            target_a=target_a,
+            target_b=target_b,
+            adv_logits=out.get("adv_logits"),
+            speaker_labels=speaker_labels,
+            pointer_logits=out.get("advance_logit"),
+            advance_targets=adv_targets,
+            progress_delta=out.get("progress_delta"),
+            progress_targets=prog_targets,
+            lambda_pointer=self.legacy_duration_loss_weight,
+            lambda_progress=self.legacy_duration_loss_weight * 0.4,
+        )
+
+        return losses
+
+    def _apply_cfg_distillation(
+        self,
+        losses: dict,
+        phonemes: torch.Tensor,
+        language_ids: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        target_a: torch.Tensor,
+        target_b: torch.Tensor,
+        target_length: int,
+        f0_condition: torch.Tensor | None,
+        dialogue_context: torch.Tensor | None,
+        acting_intent: torch.Tensor | None,
+        prosody_targets: torch.Tensor | None,
+        delta_voice_state: torch.Tensor | None,
+        text_suprasegmentals: torch.Tensor | None,
+        out: dict,
+    ) -> None:
+        """Apply CFG self-distillation loss (Stage 3 only)."""
+        # Sample a random cfg_scale from the configured range
+        cfg_lo, cfg_hi = self.cfg_distillation_scale_range
+        sampled_cfg_scale = cfg_lo + random.random() * (cfg_hi - cfg_lo)
+
+        # Teacher: full two-pass guided logits (detached)
+        with torch.no_grad():
+            # Conditional pass (already computed: out["logits_a"], out["logits_b"])
+            cond_a = out["logits_a"]
+            cond_b = out["logits_b"]
+
+            # Unconditional pass
+            masked_distill = DisentangledUCLM.apply_cfg_unconditional_mask(
+                explicit_state=explicit_state,
+                ssl_state=ssl_state,
+                speaker_embed=speaker_embed,
+                dialogue_context=dialogue_context,
+                acting_intent=acting_intent,
+                prosody_latent=prosody_targets,
+                delta_voice_state=delta_voice_state,
+            )
+            out_uncond = self.model.forward_tts_pointer(
+                phoneme_ids=phonemes,
+                language_ids=language_ids,
+                pointer_state=None,
+                speaker_embed=masked_distill["speaker_embed"],
+                explicit_state=masked_distill["explicit_state"],
+                ssl_state=masked_distill["ssl_state"],
+                target_a=target_a,
+                target_b=target_b,
+                target_length=target_length,
+                f0_condition=f0_condition,
+                dialogue_context=masked_distill["dialogue_context"],
+                acting_intent=masked_distill["acting_intent"],
+                prosody_latent=masked_distill["prosody_latent"],
+                delta_voice_state=masked_distill["delta_voice_state"],
+            )
+            uncond_a = out_uncond["logits_a"]
+            uncond_b = out_uncond["logits_b"]
+
+            # Full CFG blend (teacher targets)
+            teacher_a = uncond_a + sampled_cfg_scale * (cond_a - uncond_a)
+            teacher_b = uncond_b + sampled_cfg_scale * (cond_b - uncond_b)
+
+        # Student: single-pass with cfg_scale as input (gradients flow)
+        student_out = self.model.forward_tts_distilled_cfg(
+            phoneme_ids=phonemes,
+            language_ids=language_ids,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            cfg_scale=sampled_cfg_scale,
+            target_length=target_length,
+            f0_condition=f0_condition,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_targets,
+            delta_voice_state=delta_voice_state,
+            text_suprasegmentals=text_suprasegmentals,
+        )
+        student_a = student_out["logits_a"]
+        student_b = student_out["logits_b"]
+
+        loss_cfg_distill = DisentangledUCLM.cfg_distillation_loss(
+            teacher_logits_a=teacher_a.detach(),
+            teacher_logits_b=teacher_b.detach(),
+            student_logits_a=student_a,
+            student_logits_b=student_b,
+            temperature=self.cfg_distillation_temperature,
+        )
+        losses["loss"] = losses["loss"] + self.cfg_distillation_weight * loss_cfg_distill
+        losses["loss_cfg_distillation"] = loss_cfg_distill
 
     def train_epoch(self, dataloader: DataLoader):
         total_loss = 0

@@ -1,7 +1,8 @@
 """Provider abstraction layer for AI Curation System.
 
 Each curation stage (ASR, diarization, separation, etc.) can have multiple
-provider implementations. This module defines the base interface and registry.
+provider implementations. This module defines the base interface and registry,
+plus concrete provider adapters (Worker 08).
 """
 from __future__ import annotations
 
@@ -11,9 +12,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Type
 
-from .models import CurationRecord, Provenance
+from ..models import CurationRecord, Provenance
 
 logger = logging.getLogger(__name__)
+
+
+# =====================================================================
+# Core abstractions (originally providers.py)
+# =====================================================================
 
 
 class ProviderUnavailableError(Exception):
@@ -224,3 +230,50 @@ def create_default_registry() -> ProviderRegistry:
     registry.register(PyannoteDializer())
     registry.register(TranscriptRefiner())
     return registry
+
+
+# =====================================================================
+# Worker 08: Concrete provider adapters (deferred imports to avoid
+# circular dependencies -- import from submodules)
+# =====================================================================
+
+from .asr import Qwen3ASRProvider
+from .alignment import Qwen3AlignerProvider
+from .diarization import PyAnnoteDiarizationProvider
+from .voice_state import VoiceStateEstimator
+from .speaker_clustering import CrossFileSpeakerClustering
+from .registry import (
+    create_provider_registry,
+    MAINLINE_PROVIDERS,
+    ProviderSpec,
+)
+from .comparison import ProviderComparisonMetrics
+
+__all__ = [
+    # Core abstractions
+    "ProviderUnavailableError",
+    "ProviderOutput",
+    "BaseProvider",
+    "ASRProvider",
+    "DiarizationProvider",
+    "SeparationProvider",
+    "SpeakerClusteringProvider",
+    "EventExtractionProvider",
+    "TranscriptRefinementProvider",
+    "VoiceStateEstimationProvider",
+    "ProviderRegistry",
+    "FasterWhisperASR",
+    "PyannoteDializer",
+    "TranscriptRefiner",
+    "create_default_registry",
+    # Worker 08 providers
+    "Qwen3ASRProvider",
+    "Qwen3AlignerProvider",
+    "PyAnnoteDiarizationProvider",
+    "VoiceStateEstimator",
+    "CrossFileSpeakerClustering",
+    "create_provider_registry",
+    "MAINLINE_PROVIDERS",
+    "ProviderSpec",
+    "ProviderComparisonMetrics",
+]

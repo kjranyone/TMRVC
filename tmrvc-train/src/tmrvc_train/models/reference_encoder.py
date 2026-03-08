@@ -31,7 +31,7 @@ class ReferenceEncoder(nn.Module):
     def __init__(
         self,
         d_model: int = 512,
-        d_prosody: int = 64,
+        d_prosody: int = 128,
         n_mels: int = 80,
         n_cnn_layers: int = 6,
         cnn_channels: tuple[int, ...] = (32, 32, 64, 64, 128, 128),
@@ -147,7 +147,7 @@ class ReferenceEncoderFromWaveform(nn.Module):
     def __init__(
         self,
         d_model: int = 512,
-        d_prosody: int = 64,
+        d_prosody: int = 128,
         n_mels: int = 80,
         sample_rate: int = 24000,
         n_fft: int = 1024,

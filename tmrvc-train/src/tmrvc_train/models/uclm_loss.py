@@ -54,6 +54,41 @@ def progress_regression_loss(
     return F.mse_loss(pred, targets)
 
 
+def boundary_confidence_loss(
+    boundary_confidence: torch.Tensor,
+    boundary_targets: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """BCE loss for boundary confidence prediction.
+
+    Args:
+        boundary_confidence: [B, T, 1] predicted boundary confidence (after sigmoid).
+        boundary_targets: [B, T] target boundary values (0-1, soft targets allowed).
+        mask: [B, T] padding mask (True = ignore).
+    """
+    pred = boundary_confidence.squeeze(-1)  # [B, T]
+    if mask is not None:
+        valid = ~mask
+        pred = pred[valid]
+        targets = boundary_targets[valid].float()
+    else:
+        pred = pred.reshape(-1)
+        targets = boundary_targets.reshape(-1).float()
+    if pred.numel() == 0:
+        return torch.tensor(0.0, device=boundary_confidence.device)
+    # boundary_confidence is already after sigmoid, use BCE (not with_logits)
+    return F.binary_cross_entropy(pred.clamp(1e-7, 1.0 - 1e-7), targets)
+
+
+def pointer_progress_loss(
+    progress_delta: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE loss for pointer progress delta. Alias for progress_regression_loss."""
+    return progress_regression_loss(progress_delta, target, mask)
+
+
 def context_diversity_loss(
     hidden_states: torch.Tensor,
     context_groups: torch.Tensor | None = None,

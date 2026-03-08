@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ratio of dataset to process (0.0-1.0)",
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--export-golden-fixture", action="store_true", help="Export text frontend parity data for Rust (Worker 06).")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -154,9 +155,24 @@ def main(argv: list[str] | None = None) -> None:
             )
             text = "".join(seg.text for seg in segments).strip()
 
-            phoneme_ids, durations = None, None
-            # Note: TTS alignment (phonemes, durations) is deferred to a specialized
-            # MFA pipeline. This script focuses on UCLM acoustic/control feature extraction.
+            # Worker 03: Run G2P to get phoneme_ids and suprasegmentals (accents/tones)
+            from tmrvc_data.g2p import text_to_phonemes
+            g2p_res = text_to_phonemes(text, language=args.language)
+            phoneme_ids = g2p_res.phoneme_ids
+            text_suprasegmentals = g2p_res.text_suprasegmentals # [L, D]
+
+            # Worker 06: Export Golden Fixture for Python/Rust G2P parity
+            if args.export_golden_fixture:
+                fixture_path = args.cache_dir / "golden_fixtures" / f"{utt.utterance_id}_g2p.json"
+                fixture_path.parent.mkdir(parents=True, exist_ok=True)
+                import json
+                with open(fixture_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "text": text,
+                        "language": args.language,
+                        "phoneme_ids": phoneme_ids.tolist(),
+                        "text_suprasegmentals": text_suprasegmentals.tolist() if text_suprasegmentals is not None else None,
+                    }, f, ensure_ascii=False, indent=2)
 
             spk_embed = spk_encoder.extract(waveform_t.squeeze(1))
 
@@ -222,6 +238,7 @@ def main(argv: list[str] | None = None) -> None:
                 spk_embed=spk_embed.detach().cpu().squeeze(0),
                 phoneme_ids=phoneme_ids.detach() if phoneme_ids is not None else None,
                 durations=durations.detach() if durations is not None else None,
+                text_suprasegmentals=text_suprasegmentals.detach() if text_suprasegmentals is not None else None,
                 text=text,
                 utterance_id=utt.utterance_id,
                 speaker_id=utt.speaker_id,

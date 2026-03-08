@@ -43,7 +43,13 @@ Implications:
 
 ## Release Scope
 
-The scope is split into `v3.0 required mainline` and `post-v3.0 optimization tracks`. This prevents future quality/performance upgrades from being confused with the proof obligations of the initial MFA-free pointer release.
+The scope is split into three layers:
+
+- `v3.0 core proof obligations`
+- `v3.0 quality amplifiers`
+- `post-v3.0 optimization tracks`
+
+This prevents future quality/performance upgrades from being confused with the proof obligations of the initial MFA-free pointer release.
 
 ## SOTA Claim Policy
 
@@ -58,22 +64,54 @@ If TMRVC fails to match or exceed the pinned primary baseline on any metric decl
 Acceptable fallback is to narrow the claim explicitly.
 Unacceptable fallback is to keep the broad claim and explain the deficit away as a trade-off after the fact.
 
-### v3.0 Required Mainline
+### Codec Model Ownership
+
+The v3 plan assumes a stable RVQ codec model (`n_codebooks=8`, 24 kHz, `hop_length=240`). Codec model selection, version pinning, and any retraining are owned by Worker 01 (artifact identity) and Worker 06 (quality validation). The codec artifact and its decoder must be frozen before Stage B large-scale training begins. Codec-level factorization or replacement is a v3.1/v4 investigation path (see Worker 01 § Acoustic Refinement Roadmap), not an initial v3 requirement.
+
+### v3.0 Core Proof Obligations
 
 - causal pointer-driven TTS without MFA
+- differentiable teacher-forced pointer-training surrogate explicitly mapped to the hard runtime pointer state-transition contract
 - shared pointer / cache / `voice_state` / `speaker_profile` schema in `tmrvc-core`
 - first-class 8-D physical control with trainable targets, masks, provenance, and validation
 - bounded dialogue-context path with runtime budgets frozen in `configs/constants.yaml`
 - canonical suprasegmental text-feature contract for accent / tone / phrase-boundary cues in languages that require it
 - few-shot speaker adaptation from a short reference clip under a reproducible and budget-bounded contract
+- v3.0 `SpeakerProfile` is prompt-evidence based (`speaker_embed`, prompt tokens/cache) and must not require runtime weight mutation
 - deterministic bootstrap-alignment artifact contract for transitional supervision
 - one authoritative WebUI/backend API surface for ingest, curation, generation, export, and evaluation
-- parity and latency validation across Python / Rust / ONNX / VST
-- modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) as mainline; rollback is allowed only if the alternative wins the frozen parity/latency/quality gates
-- flow-matching prosody predictor
-- CFG mainline modes: `off` and `full`
+- parity and latency validation across Python / Rust / ONNX / VST for the shared pointer / `voice_state` / cache-state contract
 - direct evaluation against at least one fixed, version-pinned public external baseline
 - no SOTA-quality claim unless the pinned baseline comparison passes on the declared claim axes
+
+### v3.0 Quality Amplifiers
+
+- modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) as a candidate default; rollback is allowed if the frozen core-proof gates pass without it and the fallback wins the quality/latency tradeoff
+- flow-matching prosody predictor as the preferred expressive path, with a simpler fallback path retained until the pointer-core proof is independently closed
+- CFG mainline modes: `off` and `full`
+- richer WebUI ergonomics
+
+### v3.0 Proof Layering Policy
+
+To keep the initial MFA-free pointer release scientifically interpretable, the plan must distinguish:
+
+- `v3.0 core proof obligations`
+  - pointer-driven causal TTS
+  - shared serializable contracts in `tmrvc-core`
+  - frozen 8-D `voice_state` semantics
+  - frozen runtime budgets and parity gates
+  - deterministic bootstrap and few-shot evaluation contracts
+- `v3.0 quality amplifiers`
+  - backbone modernization
+  - flow-matching prosody
+  - `full` CFG
+  - richer WebUI ergonomics
+
+Rule:
+
+- a failed quality amplifier must not be allowed to obscure whether the pointer architecture itself passed or failed
+- every amplifier promoted into the shipping `v3.0` release must retain an ablation or rollback path so Worker 06 can isolate regressions cleanly
+- worker reports must separate `core-proof pass/fail` from `quality-amplifier pass/fail`
 
 ### Post-v3.0 Optimization Tracks
 
@@ -112,6 +150,8 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - **Target data scale (initial v3):** 10K-100K hours curated data. The curation system is designed to maximize quality at this scale rather than competing on raw volume.
 - **Scaling strategy:** Quality-first at modest scale, with architecture designed to scale up without redesign. The 2-stage refinement upgrade path (v3.1) is the primary quality lever before scaling data.
 - **Non-goal for initial v3:** Matching 1M+ hour training runs or 1B+ parameter models. Competitive quality is pursued through architectural efficiency (pointer alignment, disentanglement, CFG, flow-matching prosody) rather than scale alone.
+- **Scale gap risk:** Comparing a 300M single-stage AR model against a 1.7B 2-stage model (Qwen3-TTS) on zero-shot similarity or waveform quality is structurally disadvantaged. The frozen baseline assignment is: **CosyVoice 3 (0.5B) is the `primary` baseline** for fair scale-aligned evaluation; **Qwen3-TTS (1.7B) is the `secondary` ceiling baseline** for aspirational comparison. If TMRVC cannot match a baseline on a declared primary claim axis, the honest response is to narrow the claim rather than blame scale. Worker 06 must pre-register which axes are "scale-sensitive" (e.g., raw MOS on unseen languages, pure audio fidelity) versus "architecture-sensitive" (e.g., controllability, disentanglement, streaming latency) so that sign-off language is grounded in the actual gap, not post-hoc rationalization.
+- **Data augmentation policy:** Data augmentation (speed perturbation, noise injection, pitch shifting, SpecAugment, etc.) is not adopted as a default mainline training technique in initial v3. The curation system is the primary data-quality lever. If Worker 06 quality gates show that data diversity is a binding constraint at the target scale, augmentation strategies may be evaluated as a Stage C or post-v3.0 addition. Any adopted augmentation must be documented, switchable, and its effect on pointer-alignment stability must be validated before mainline adoption.
 
 
 ## Execution Reality
@@ -149,6 +189,9 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - waveform decoding quality is treated as a first-class bottleneck, with an explicit vocoder / codec-decoder quality plan
 - **v3.1 upgrade path: 2-stage acoustic refinement (flow matching / DiT) is the planned quality ceiling lift**
 - multilingual and code-switching inference is supported under a documented language-conditioning contract
+- v3.0 drama-grade claim is scoped per runtime class:
+  - Python serve may use `full` CFG and is the only path eligible for CFG-enhanced drama-grade acting claims in v3.0
+  - Rust / VST / strict real-time paths must preserve pointer/control parity and causal latency, but are not eligible for CFG-enhanced drama claims until `lazy` or `distilled` CFG are validated and promoted
 
 ### Tooling
 
@@ -199,7 +242,10 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - worker 01 defines new interfaces
 - worker 03 defines dataset/input contract
 - worker 04 aligns Python/Rust/export runtime state expectations
+- worker 01 freezes the canonical 8-D `voice_state` dimension registry before any downstream worker binds UI, losses, or export fields to dimension order
+- worker 04 freezes numeric runtime budgets in `configs/constants.yaml` before latency-sensitive implementation is considered stable
 - worker 06 freezes the primary external baseline registry entry, evaluation protocol version, and hardware class before large-scale Stage B training
+- worker 06 freezes the metric extractor/version choices used by acting and disentanglement metrics before large-scale Stage B training
 - worker 07 defines curation manifest and stage contracts
 - worker 08 defines provider contracts
 - worker 12 drafts only the minimum admin/eval UI contract; it must not freeze unsupported inputs
@@ -248,8 +294,10 @@ worker_01_architecture   worker_03_dataset_alignment
 worker_04_serving     |    |
         |    \        v    v
         |     +-> worker_02_training
-        |             |
-        |             v
+        |             |         |
+        |             |         | (training artifacts,
+        |             |         |  evaluation data)
+        |             v         v
         +-------> worker_12_gradio
         |         (WebUI Control Plane)
         |             ^
@@ -349,6 +397,7 @@ Use this section as the handoff gate. A worker should not start coding until its
 - may start immediately
 - must publish manifest, stage-state, split-state, and legality-state contracts before `worker_08`, `worker_09`, and `worker_10` freeze their outputs
 - must keep reruns/resume semantics deterministic
+- owns `docs/design/auth-spec.md` for optimistic locking, audit-trail, and concurrency-control contracts; Worker 04 implements the network-level auth/RBAC middleware in `tmrvc-serve`, and Worker 12 consumes both
 
 ### worker_08_curation_providers
 
@@ -400,6 +449,12 @@ Use this section as the handoff gate. A worker should not start coding until its
 - `docs/design/architecture.md`
 - `docs/design/unified-codec-lm.md`
 - `docs/design/external-baseline-registry.md`
+- `docs/design/auth-spec.md`
+- `docs/design/speaker-profile-spec.md`
+- `docs/design/curation-contract.md`
+- `docs/design/onnx-contract.md`
+- `docs/design/rust-engine-design.md`
+- `docs/design/gui-design.md`
 - `plan/arxiv_survey_2026_03.md`
 - shared pointer / `voice_state` / cache-state schema in `tmrvc-core`
 - shared `speaker_profile` and prompt-cache metadata schema in `tmrvc-core`

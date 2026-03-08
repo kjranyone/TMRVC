@@ -45,7 +45,7 @@ def test_tts_import_integrity(client, monkeypatch):
     """
     from tmrvc_serve.uclm_engine import UCLMEngine
     
-    def mock_tts(self, phonemes, speaker_profile=None, speaker_embed=None, style=None, cfg_scale=1.5, temperature=0.8, language_id=0, pace=1.0, hold_bias=0.0, boundary_bias=0.0, max_frames=1500, dialogue_context=None, acting_intent=None, phrase_pressure=0.0, breath_tendency=0.0):
+    def mock_tts(self, phonemes, speaker_profile=None, speaker_embed=None, style=None, cfg_scale=1.5, temperature=0.8, language_id=0, pace=1.0, hold_bias=0.0, boundary_bias=0.0, max_frames=1500, dialogue_context=None, acting_intent=None, phrase_pressure=0.0, breath_tendency=0.0, **kwargs):
         # Return a dummy 1-second audio tensor and dummy metrics
         return torch.zeros(24000), {"rtf": 0.1, "gen_time_ms": 100.0}
     

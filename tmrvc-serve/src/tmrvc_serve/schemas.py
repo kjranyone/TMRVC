@@ -6,9 +6,14 @@ import enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 
 StylePreset = Literal["default", "asmr_soft", "asmr_intimate"]
 CFGModeStr = Literal["off", "full", "lazy", "distilled"]
+VOICE_STATE_DESCRIPTION = (
+    "Canonical 8-D voice_state vector ordered as: "
+    + ", ".join(CANONICAL_VOICE_STATE_IDS)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -62,11 +67,14 @@ class TTSRequest(BaseModel):
     acting_intent: Optional[list[float]] = Field(None, description="Utterance-level acting intent vector.")
     reference_audio_base64: Optional[str] = Field(None, description="Base64-encoded reference audio for few-shot speaker adaptation (3-10 seconds).")
     reference_text: Optional[str] = Field(None, description="Optional transcript of the reference audio.")
-    explicit_voice_state: Optional[list[float]] = Field(None, description="Explicit 8-D voice state vector.", min_length=8, max_length=8)
-    delta_voice_state: Optional[list[float]] = Field(None, description="Delta voice state vector.", min_length=8, max_length=8)
+    explicit_voice_state: Optional[list[float]] = Field(None, description=VOICE_STATE_DESCRIPTION, min_length=8, max_length=8)
+    delta_voice_state: Optional[list[float]] = Field(None, description=f"Canonical 8-D voice_state delta ordered as: {', '.join(CANONICAL_VOICE_STATE_IDS)}", min_length=8, max_length=8)
     speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
+    wait_for_prompt: bool = Field(True, description="If True, wait for few-shot prompt encoding before starting synthesis (Worker 04).")
     cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
     cfg_mode: CFGModeStr = Field("full", description="CFG operating mode: off, full, lazy, or distilled.")
+    language_id: Optional[int] = Field(None, description="Language ID for multilingual support (0=ja, 1=en, 2=zh, 3=ko).")
+    dialogue_text: Optional[str] = Field(None, description="Optional scene/dialogue text for context conditioning.")
 
 
 class TTSResponse(BaseModel):
@@ -76,6 +84,81 @@ class TTSResponse(BaseModel):
     sample_rate: int = 24000
     duration_sec: float = 0.0
     style_used: dict = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# v3 TTS schemas with pointer telemetry
+# ---------------------------------------------------------------------------
+
+
+class PointerTelemetry(BaseModel):
+    """Pointer state telemetry from a TTS generation run."""
+
+    text_index: int = 0
+    progress: float = 0.0
+    total_phonemes: int = 0
+    frames_generated: int = 0
+    stall_frames: int = 0
+    max_frames_per_unit: int = 50
+    frames_on_current_unit: int = 0
+    skip_protection_threshold: float = 0.3
+    forced_advance_count: int = 0
+    skip_protection_count: int = 0
+    cfg_cache_age: int = 0
+
+
+class TTSResponseV3(BaseModel):
+    """Extended response for POST /tts with v3 pointer telemetry."""
+
+    audio_base64: str = Field(..., description="WAV audio encoded as base64.")
+    sample_rate: int = 24000
+    duration_sec: float = 0.0
+    style_used: dict = Field(default_factory=dict)
+    pointer_telemetry: Optional[PointerTelemetry] = None
+    rtf: float = 0.0
+    gen_time_ms: float = 0.0
+    prompt_encoding_time_ms: float = 0.0
+    cfg_mode: str = "off"
+    forced_advance_count: int = 0
+    skip_protection_count: int = 0
+
+
+class SpeakerProfileResponse(BaseModel):
+    """Response containing speaker profile information."""
+
+    speaker_profile_id: str
+    display_name: str = ""
+    language: str = "ja"
+    gender: str = "other"
+    has_prompt_tokens: bool = False
+    has_summary_tokens: bool = False
+    has_adaptor: bool = False
+    created_at: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class AdminHealthResponse(BaseModel):
+    """Detailed system health (used by admin routes)."""
+
+    status: str = "ok"
+    models_loaded: bool = False
+    device: str = "cpu"
+    cuda_available: bool = False
+    cuda_memory_allocated_mb: float = 0.0
+    cuda_memory_reserved_mb: float = 0.0
+    uptime_seconds: float = 0.0
+
+
+class AdminTelemetryResponse(BaseModel):
+    """Runtime telemetry snapshot."""
+
+    vram_allocated_mb: float = 0.0
+    vram_reserved_mb: float = 0.0
+    avg_tts_latency_ms: float = 0.0
+    avg_vc_latency_ms: float = 0.0
+    recent_rtf: float = 0.0
+    tts_mode: str = "pointer"
+    model_checkpoint: str = ""
 
 
 class CharacterInfo(BaseModel):
@@ -130,11 +213,14 @@ class TTSStreamRequest(BaseModel):
     acting_intent: Optional[list[float]] = Field(None, description="Utterance-level acting intent vector.")
     reference_audio_base64: Optional[str] = Field(None, description="Base64-encoded reference audio for few-shot speaker adaptation (3-10 seconds).")
     reference_text: Optional[str] = Field(None, description="Optional transcript of the reference audio.")
-    explicit_voice_state: Optional[list[float]] = Field(None, description="Explicit 8-D voice state vector.", min_length=8, max_length=8)
-    delta_voice_state: Optional[list[float]] = Field(None, description="Delta voice state vector.", min_length=8, max_length=8)
+    explicit_voice_state: Optional[list[float]] = Field(None, description=VOICE_STATE_DESCRIPTION, min_length=8, max_length=8)
+    delta_voice_state: Optional[list[float]] = Field(None, description=f"Canonical 8-D voice_state delta ordered as: {', '.join(CANONICAL_VOICE_STATE_IDS)}", min_length=8, max_length=8)
     speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
+    wait_for_prompt: bool = Field(True, description="If True, wait for few-shot prompt encoding before starting synthesis (Worker 04).")
     cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
     cfg_mode: CFGModeStr = Field("full", description="CFG operating mode: off, full, lazy, or distilled.")
+    language_id: Optional[int] = Field(None, description="Language ID for multilingual support (0=ja, 1=en, 2=zh, 3=ko).")
+    dialogue_text: Optional[str] = Field(None, description="Optional scene/dialogue text for context conditioning.")
     chunk_duration_ms: int = Field(100, ge=20, le=500)
 
 

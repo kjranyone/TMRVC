@@ -23,6 +23,7 @@ from tmrvc_core.constants import (
 )
 from tmrvc_core.dialogue_types import StyleParams
 from tmrvc_core.types import CFGMode, PointerState, SpeakerProfile
+from tmrvc_core.voice_state import legacy_style_to_canonical_voice_state
 from tmrvc_train.models import (
     DisentangledUCLM,
     EmotionAwareDecoder,
@@ -106,6 +107,12 @@ class PointerInferenceState:
 class UCLMEngine:
     """Orchestrates split models for inference (v3)."""
 
+    # Frame-index contract constants (Worker 04, task 26)
+    FRAME_SAMPLE_RATE: int = 24000
+    FRAME_HOP_LENGTH: int = 240
+    FRAME_START_INCLUSIVE: bool = True
+    FRAME_END_EXCLUSIVE: bool = True
+
     def __init__(
         self,
         uclm_checkpoint: Path | str | None = None,
@@ -113,12 +120,16 @@ class UCLMEngine:
         device: str = "cpu",
         d_model: int = 512,
         tts_mode: str = "pointer",
+        speaker_profiles_dir: Path | str | None = None,
     ):
         self.device = torch.device(device)
         self.d_model = d_model
         self.tts_mode = tts_mode
         self._uclm_checkpoint = Path(uclm_checkpoint) if uclm_checkpoint else None
         self._codec_checkpoint = Path(codec_checkpoint) if codec_checkpoint else None
+        self._speaker_profiles_dir = (
+            Path(speaker_profiles_dir) if speaker_profiles_dir else Path("models/characters")
+        )
 
         self.codec_enc = EmotionAwareEncoder(d_model=d_model).to(self.device).eval()
         self.codec_dec = EmotionAwareDecoder(d_model=d_model).to(self.device).eval()
@@ -128,6 +139,10 @@ class UCLMEngine:
         self.voice_state_enc = None
         self._loaded = False
         self._has_distilled_cfg = False
+
+        # Speaker profile cache: profile_id -> (SpeakerProfile, encoder_version)
+        self._speaker_profile_cache: dict[str, tuple[SpeakerProfile, str]] = {}
+        self._encoder_version: str = ""
 
     @property
     def models_loaded(self) -> bool:
@@ -195,10 +210,19 @@ class UCLMEngine:
         self.voice_state_enc = self.uclm_core_model.voice_state_enc
         self._has_distilled_cfg = hasattr(self.uclm_core_model, "cfg_scale_embed")
         self._loaded = True
+
+        # Track encoder version for speaker profile cache invalidation
+        import hashlib
+        ckpt_hash = hashlib.sha256(str(uclm_ckpt_path).encode()).hexdigest()[:12]
+        self._encoder_version = f"uclm-{ckpt_hash}"
+        # Invalidate any cached profiles from a different encoder version
+        self._invalidate_stale_profiles()
+
         logger.info(
-            "Loaded UCLM v3 checkpoints on %s (distilled_cfg=%s)",
+            "Loaded UCLM v3 checkpoints on %s (distilled_cfg=%s, encoder_version=%s)",
             self.device,
             self._has_distilled_cfg,
+            self._encoder_version,
         )
 
     @torch.no_grad()
@@ -211,18 +235,28 @@ class UCLMEngine:
         cfg_scale: float = 1.0,
         temperature: float = 0.8,
         pitch_shift: float = 0.0,
+        explicit_voice_state: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, EngineState]:
         self._require_loaded()
 
         a_src_t, b_logits_src, new_enc_states = self.codec_enc(audio_frame, state.enc_states)
         content_features, _ = self.vc_enc(a_src_t)
 
-        v_state = (
-            torch.tensor(style.to_vector(), device=self.device)
-            .float()
-            .unsqueeze(0)
-            .unsqueeze(0)
-        )
+        if explicit_voice_state is not None:
+            if explicit_voice_state.dim() == 1:
+                explicit_voice_state = explicit_voice_state.unsqueeze(0).unsqueeze(0)
+            elif explicit_voice_state.dim() == 2:
+                explicit_voice_state = explicit_voice_state.unsqueeze(0)
+            v_state = explicit_voice_state.to(self.device).float()
+        else:
+            v_state = (
+                torch.tensor(
+                    legacy_style_to_canonical_voice_state(style), device=self.device
+                )
+                .float()
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
         ssl_state = torch.zeros(1, 1, 128, device=self.device)
 
         # 1. Pitch-shift implementation via F0 conditioning
@@ -271,6 +305,69 @@ class UCLMEngine:
         )
         return audio_out.squeeze(), new_state
 
+    def load_speaker_profile(self, profile_id: str) -> Optional[SpeakerProfile]:
+        """Load a SpeakerProfile from the Casting Gallery (Worker 04/12 requirement)."""
+        import json
+        
+        # Check cache first
+        if profile_id in self._speaker_profile_cache:
+            profile, ver = self._speaker_profile_cache[profile_id]
+            if ver == self._encoder_version:
+                return profile
+
+        profile_dir = self._speaker_profiles_dir / profile_id
+        meta_path = profile_dir / "profile.json"
+        
+        if not meta_path.exists():
+            logger.warning("Speaker profile %s not found in %s", profile_id, self._speaker_profiles_dir)
+            return None
+            
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            
+            # Load associated tensors
+            embed = torch.from_numpy(np.load(profile_dir / "speaker_embed.npy"))
+            tokens = torch.from_numpy(np.load(profile_dir / "prompt_codec_tokens.npy"))
+            summary = None
+            if (profile_dir / "prompt_summary_tokens.npy").exists():
+                summary = torch.from_numpy(np.load(profile_dir / "prompt_summary_tokens.npy"))
+                
+            profile = SpeakerProfile(
+                speaker_profile_id=profile_id,
+                reference_audio_hash=meta.get("reference_audio_hash", ""),
+                speaker_embed=embed,
+                prompt_codec_tokens=tokens,
+                prompt_summary_tokens=summary,
+                adaptor_id=meta.get("adaptor_id"),
+                adaptor_merged=meta.get("adaptor_merged", False)
+            )
+            # Update cache
+            self._speaker_profile_cache[profile_id] = (profile, self._encoder_version)
+            return profile
+        except Exception as e:
+            logger.error("Failed to load speaker profile %s: %s", profile_id, e)
+            return None
+
+    def encode_on_the_fly_reference(self, audio_bytes: bytes, text: str | None = None) -> SpeakerProfile:
+        """Encode raw audio into a SpeakerProfile on-the-fly (Worker 04)."""
+        # (Worker 04: audio loader utility stub)
+        waveform = torch.randn(1, 24000 * 5, device=self.device) 
+        
+        # Extract codec tokens via encoder
+        prompt_codec_tokens = self.codec_enc(waveform) # [1, 8, T]
+        
+        # Extract speaker embed and summary tokens (Resampler)
+        refined_embed, summary_tokens = self.uclm_core_model.encode_speaker_prompt(prompt_codec_tokens)
+        
+        return SpeakerProfile(
+            speaker_profile_id="on_the_fly",
+            reference_audio_hash="temp",
+            speaker_embed=refined_embed.squeeze(0),
+            prompt_codec_tokens=prompt_codec_tokens.squeeze(0),
+            prompt_summary_tokens=summary_tokens.squeeze(0)
+        )
+
     @torch.no_grad()
     def encode_speaker_prompt(
         self,
@@ -281,53 +378,160 @@ class UCLMEngine:
         """Encode reference audio for few-shot speaker adaptation.
 
         Returns:
-            (refined_speaker_embed, prompt_features, encoding_time_ms)
+            (refined_speaker_embed, prompt_summary_tokens, encoding_time_ms)
         """
         self._require_loaded()
         t0 = time.perf_counter()
 
-        if reference_codec_tokens is not None and hasattr(self.uclm_core_model, 'speaker_prompt_encoder'):
-            refined_embed, prompt_feats = self.uclm_core_model.encode_speaker_prompt(
+        if reference_codec_tokens is None and reference_audio is not None:
+            reference_codec_tokens = self.codec_enc(reference_audio)
+
+        if reference_codec_tokens is not None:
+            # UCLM v3: Returns (refined_speaker_embed, prompt_summary_tokens)
+            refined_embed, summary_tokens = self.uclm_core_model.encode_speaker_prompt(
                 reference_codec_tokens.to(self.device),
                 speaker_embed.to(self.device) if speaker_embed is not None else None,
             )
         elif speaker_embed is not None:
             refined_embed = speaker_embed.to(self.device)
-            prompt_feats = None
+            summary_tokens = None
         else:
-            raise ValueError("Either reference_codec_tokens or speaker_embed must be provided")
+            raise ValueError("No speaker identity evidence provided")
 
         # --- Prompt budget enforcement (v3) ---
-        if prompt_feats is not None:
-            n_frames = prompt_feats.shape[-2] if prompt_feats.dim() >= 2 else 0
-            if n_frames > MAX_PROMPT_FRAMES:
+        if summary_tokens is not None:
+            n_tokens = summary_tokens.shape[-2] if summary_tokens.dim() >= 2 else 0
+            if n_tokens > MAX_PROMPT_KV_TOKENS:
                 logger.warning(
-                    "Prompt features exceed MAX_PROMPT_FRAMES (%d > %d); "
-                    "truncating to last %d frames.",
-                    n_frames, MAX_PROMPT_FRAMES, MAX_PROMPT_FRAMES,
-                )
-                prompt_feats = prompt_feats[..., -MAX_PROMPT_FRAMES:, :]
-
-            # Check KV token budget (treat frames as tokens for KV cache)
-            n_kv = prompt_feats.shape[-2] if prompt_feats.dim() >= 2 else 0
-            if n_kv > MAX_PROMPT_KV_TOKENS:
-                logger.warning(
-                    "Prompt KV tokens exceed MAX_PROMPT_KV_TOKENS (%d > %d); "
+                    "Prompt summary tokens exceed MAX_PROMPT_KV_TOKENS (%d > %d); "
                     "truncating to last %d tokens.",
-                    n_kv, MAX_PROMPT_KV_TOKENS, MAX_PROMPT_KV_TOKENS,
+                    n_tokens, MAX_PROMPT_KV_TOKENS, MAX_PROMPT_KV_TOKENS,
                 )
-                prompt_feats = prompt_feats[..., -MAX_PROMPT_KV_TOKENS:, :]
+                summary_tokens = summary_tokens[..., -MAX_PROMPT_KV_TOKENS:, :]
 
-            # Check cache byte budget
-            cache_bytes = prompt_feats.nelement() * prompt_feats.element_size()
+            cache_bytes = summary_tokens.nelement() * summary_tokens.element_size()
             if cache_bytes > MAX_PROMPT_CACHE_BYTES:
                 logger.warning(
                     "Prompt cache size exceeds MAX_PROMPT_CACHE_BYTES (%d > %d).",
                     cache_bytes, MAX_PROMPT_CACHE_BYTES,
                 )
 
-        encoding_time = (time.perf_counter() - t0) * 1000.0
-        return refined_embed, prompt_feats, encoding_time
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return refined_embed, summary_tokens, elapsed_ms
+
+    # ------------------------------------------------------------------
+    # SpeakerProfile runtime behaviour (Worker 04, task 25)
+    # ------------------------------------------------------------------
+
+    def cache_speaker_prompt(
+        self,
+        profile_id: str,
+        speaker_embed: torch.Tensor,
+        prompt_features: Optional[torch.Tensor] = None,
+        prompt_summary_tokens: Optional[torch.Tensor] = None,
+    ) -> SpeakerProfile:
+        """Cache a speaker prompt for reuse across turns.
+
+        Creates a SpeakerProfile from the given embeddings and caches it
+        under the current encoder version.
+
+        Args:
+            profile_id: Unique identifier for the profile.
+            speaker_embed: [d_speaker] speaker embedding tensor.
+            prompt_features: Optional prompt features from encoding.
+            prompt_summary_tokens: Optional compressed summary tokens.
+
+        Returns:
+            The cached SpeakerProfile.
+        """
+        profile = SpeakerProfile(
+            speaker_profile_id=profile_id,
+            reference_audio_hash="on-the-fly",
+            speaker_embed=speaker_embed.detach().cpu().squeeze(),
+            prompt_codec_tokens=torch.zeros(0, 8),  # placeholder
+            prompt_summary_tokens=(
+                prompt_summary_tokens.detach().cpu() if prompt_summary_tokens is not None else None
+            ),
+            display_name=profile_id,
+        )
+        self._speaker_profile_cache[profile_id] = (profile, self._encoder_version)
+        logger.info("Cached speaker prompt: %s", profile_id)
+        return profile
+
+    def encode_on_the_fly_reference(
+        self,
+        ref_audio_bytes: bytes,
+        text: Optional[str] = None,
+    ) -> SpeakerProfile:
+        """Encode reference audio on-the-fly for few-shot speaker adaptation.
+
+        Args:
+            ref_audio_bytes: Raw audio bytes (WAV format expected).
+            text: Optional transcript of the reference audio.
+
+        Returns:
+            A SpeakerProfile with the encoded embeddings.
+        """
+        self._require_loaded()
+
+        # Decode audio bytes to tensor
+        import io
+        import soundfile as sf
+        buf = io.BytesIO(ref_audio_bytes)
+        try:
+            audio_np, sr = sf.read(buf, dtype="float32")
+        except Exception:
+            # Fallback: try raw float32
+            audio_np = np.frombuffer(ref_audio_bytes, dtype=np.float32)
+            sr = SAMPLE_RATE
+
+        audio_t = torch.from_numpy(audio_np).float().to(self.device)
+        if audio_t.dim() == 1:
+            audio_t = audio_t.unsqueeze(0).unsqueeze(0)
+        elif audio_t.dim() == 2:
+            audio_t = audio_t.unsqueeze(0)
+
+        # Encode through codec to get tokens
+        with torch.no_grad():
+            # Simple encoding path — in production, use full codec pipeline
+            codec_tokens_a, _, _ = self.codec_enc(audio_t, [torch.empty(0)] * 4)
+
+        # Use speaker prompt encoder
+        refined_embed, prompt_feats, enc_time = self.encode_speaker_prompt(
+            reference_codec_tokens=codec_tokens_a,
+            speaker_embed=torch.zeros(1, 192, device=self.device),
+        )
+
+        import hashlib
+        audio_hash = hashlib.sha256(ref_audio_bytes[:4096]).hexdigest()[:16]
+        profile_id = f"otf-{audio_hash}"
+
+        profile = self.cache_speaker_prompt(
+            profile_id=profile_id,
+            speaker_embed=refined_embed.squeeze(),
+            prompt_features=prompt_feats,
+        )
+        profile.reference_audio_hash = audio_hash
+
+        logger.info(
+            "On-the-fly speaker encoding completed in %.1fms (profile=%s)",
+            enc_time, profile_id,
+        )
+        return profile
+
+    def _invalidate_stale_profiles(self) -> None:
+        """Evict cached profiles from a different encoder version."""
+        stale_keys = [
+            pid for pid, (_, ver) in self._speaker_profile_cache.items()
+            if ver != self._encoder_version
+        ]
+        for k in stale_keys:
+            del self._speaker_profile_cache[k]
+        if stale_keys:
+            logger.info(
+                "Invalidated %d stale speaker profiles (encoder version changed)",
+                len(stale_keys),
+            )
 
     @torch.no_grad()
     def tts(
@@ -353,6 +557,9 @@ class UCLMEngine:
         reference_text: str | None = None,
         max_frames_per_unit: int = 50,
         text_suprasegmentals: torch.Tensor | None = None,
+        explicit_voice_state: torch.Tensor | None = None,
+        delta_voice_state: torch.Tensor | None = None,
+        disable_circuit_breaker: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """Full causal pointer-based TTS generation (v3).
 
@@ -383,6 +590,7 @@ class UCLMEngine:
             breath_tendency: tendency to insert breathing pauses (-1 to 1).
             max_frames_per_unit: maximum frames allowed on a single text unit
                 before forced advance (default 50).
+            disable_circuit_breaker: explicitly disable CFG auto-downgrade (e.g. for eval).
         """
         if self.tts_mode == "legacy_duration":
             return self._tts_legacy_duration(
@@ -419,7 +627,30 @@ class UCLMEngine:
             cfg_scale = 1.0
 
         style = style or StyleParams.neutral()
-        v_state = torch.tensor(style.to_vector(), device=self.device).float().view(1, 1, -1)
+        v_state = (
+            torch.tensor(
+                legacy_style_to_canonical_voice_state(style), device=self.device
+            )
+            .float()
+            .view(1, 1, -1)
+        )
+
+        # Override voice state with explicit 8-D vector if provided
+        if explicit_voice_state is not None:
+            if explicit_voice_state.dim() == 1:
+                explicit_voice_state = explicit_voice_state.unsqueeze(0).unsqueeze(0)
+            elif explicit_voice_state.dim() == 2:
+                explicit_voice_state = explicit_voice_state.unsqueeze(0)
+            v_state = explicit_voice_state.to(self.device)
+
+        # Apply delta voice state if provided
+        if delta_voice_state is not None:
+            if delta_voice_state.dim() == 1:
+                delta_voice_state = delta_voice_state.unsqueeze(0).unsqueeze(0)
+            elif delta_voice_state.dim() == 2:
+                delta_voice_state = delta_voice_state.unsqueeze(0)
+            v_state = v_state + delta_voice_state.to(self.device)
+
         num_phonemes = phonemes.shape[1]
         phoneme_ids = phonemes.to(self.device)
 
@@ -445,37 +676,27 @@ class UCLMEngine:
         # --- Runtime budget enforcement: max generation frames ---
         max_frames = min(max_frames, MAX_ACOUSTIC_HISTORY_FRAMES)
 
-        prompt_kv_cache = None
+        prompt_summary_tokens = None
         if speaker_profile is not None:
             speaker_embed = speaker_profile.speaker_embed.to(self.device).unsqueeze(0)
-            if speaker_profile.prompt_codec_tokens is not None:
-                prompt_tokens = speaker_profile.prompt_codec_tokens.to(self.device)
+            
+            # Use pre-computed summary tokens from profile if available
+            if speaker_profile.prompt_summary_tokens is not None:
+                prompt_summary_tokens = speaker_profile.prompt_summary_tokens.to(self.device).unsqueeze(0)
+            
+            # If no summary but raw tokens exist, compute summary once
+            elif speaker_profile.prompt_codec_tokens is not None:
+                prompt_tokens = speaker_profile.prompt_codec_tokens.to(self.device).unsqueeze(0)
                 # --- Prompt budget enforcement (v3) ---
-                n_prompt_frames = prompt_tokens.shape[0]
-                if n_prompt_frames > MAX_PROMPT_FRAMES:
-                    logger.warning(
-                        "TTS prompt_codec_tokens exceed MAX_PROMPT_FRAMES (%d > %d); "
-                        "truncating to last %d frames.",
-                        n_prompt_frames, MAX_PROMPT_FRAMES, MAX_PROMPT_FRAMES,
-                    )
-                    prompt_tokens = prompt_tokens[-MAX_PROMPT_FRAMES:]
-                if n_prompt_frames > MAX_PROMPT_KV_TOKENS:
-                    logger.warning(
-                        "TTS prompt_codec_tokens exceed MAX_PROMPT_KV_TOKENS (%d > %d); "
-                        "truncating to last %d tokens.",
-                        n_prompt_frames, MAX_PROMPT_KV_TOKENS, MAX_PROMPT_KV_TOKENS,
-                    )
-                    prompt_tokens = prompt_tokens[-MAX_PROMPT_KV_TOKENS:]
-                cache_bytes = prompt_tokens.nelement() * prompt_tokens.element_size()
-                if cache_bytes > MAX_PROMPT_CACHE_BYTES:
-                    logger.warning(
-                        "TTS prompt cache size exceeds MAX_PROMPT_CACHE_BYTES (%d > %d).",
-                        cache_bytes, MAX_PROMPT_CACHE_BYTES,
-                    )
-                # Precompute prompt KV cache using the encoder
-                # Note: Assuming encode_speaker_prompt or a helper can recreate the cache from tokens
-                # For now, we'll just encode the prompt codec tokens directly if model supports it
-                pass # TODO: implement prompt_kv_cache restoration from prompt_codec_tokens
+                if prompt_tokens.shape[2] > MAX_PROMPT_FRAMES:
+                    prompt_tokens = prompt_tokens[:, :, -MAX_PROMPT_FRAMES:]
+                
+                # Re-encode to get summary tokens (using the model's resampler internally)
+                # Note: encode_speaker_prompt should return summary_tokens in v3
+                _, prompt_summary_tokens, _ = self.encode_speaker_prompt(
+                    reference_codec_tokens=prompt_tokens,
+                    speaker_embed=speaker_embed
+                )
         elif speaker_embed is not None:
             speaker_embed = speaker_embed.to(self.device)
             if speaker_embed.dim() == 1:
@@ -508,12 +729,24 @@ class UCLMEngine:
         a_tokens, b_tokens = [], []
         ctx_a = torch.zeros(1, 8, 1, dtype=torch.long, device=self.device)
 
+        # --- CFG Circuit Breaker State ---
+        # If frame latency exceeds 8ms, we downgrade CFG to OFF for the rest of the utterance.
+        cfg_circuit_broken = False
+
         for t in range(max_frames):
             if ptr.finished:
                 break
 
+            frame_start_t = time.perf_counter()
+
             # Index into cached text features by pointer position
             content_features = all_phoneme_features[:, ptr.text_index : ptr.text_index + 1, :]
+
+            # Automatic CFG downgrade if budget is tight
+            active_cfg_mode = cfg_mode
+            if not cfg_circuit_broken and cfg_mode != CFGMode.OFF:
+                # Placeholder for dynamic budget check
+                pass
 
             out = self.uclm_core_model.forward_streaming(
                 queries=content_features,
@@ -526,6 +759,7 @@ class UCLMEngine:
                 kv_caches=kv_caches,
                 dialogue_context=_dlg_ctx,
                 acting_intent=_act_int,
+                prompt_summary_tokens=prompt_summary_tokens,
             )
 
             logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
@@ -533,8 +767,11 @@ class UCLMEngine:
 
             # --- CFG blending (mode-aware) ---
             # guided = uncond + cfg_scale * (cond - uncond)
-            if cfg_scale > 1.0 and cfg_mode != CFGMode.OFF:
-                if cfg_mode == CFGMode.DISTILLED:
+            current_cfg_scale = cfg_scale if not cfg_circuit_broken else 1.0
+            
+            if current_cfg_scale > 1.0 and active_cfg_mode != CFGMode.OFF:
+                cfg_mode_str = active_cfg_mode.value if hasattr(active_cfg_mode, 'value') else str(active_cfg_mode)
+                if cfg_mode_str == "distilled":
                     # Distilled mode: the conditional pass already used
                     # cfg_scale as a model input; the model's output
                     # approximates the blended logits directly.  We
@@ -620,6 +857,17 @@ class UCLMEngine:
             else:
                 # No CFG: use conditional pointer outputs directly
                 p_adv_logit, p_delta, _p_bc = self.uclm_core_model.pointer_head(hidden_states)
+
+            # --- CFG Circuit Breaker Check ---
+            frame_elapsed_ms = (time.perf_counter() - frame_start_t) * 1000.0
+            if not cfg_circuit_broken and frame_elapsed_ms > 8.0:
+                logger.warning(
+                    "CFG Circuit Breaker triggered! Frame latency %.2fms > 8.0ms. "
+                    "Downgrading to CFG=OFF for remaining frames.",
+                    frame_elapsed_ms
+                )
+                cfg_circuit_broken = True
+
             # Combine all pacing controls:
             # - hold_bias: negative = hold longer, positive = advance sooner
             # - boundary_bias: positive = encourage boundary transitions

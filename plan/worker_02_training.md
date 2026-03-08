@@ -42,12 +42,24 @@ Worker 02 must implement and document the following curriculum:
 - **Goal:** Learn general acoustic/codec distributions and basic speaker/timbre consistency.
 - **Data:** Massive raw audio (curated but potentially low-supervision).
 - **Task:** Next-token prediction for codec tokens.
+- **Few-shot requirement:** Stage 1 must already learn prompt-conditioned timbre anchoring from prompt-target pairs of the same speaker so `SpeakerPromptEncoder` and `speaker_embed` are part of the base path rather than a Stage 3 add-on.
 - **Note:** VC path is primarily trained here.
+- **VC training contract:**
+  - VC reconstruction loss (source timbre → target timbre codec prediction) must be explicitly defined and independently switchable
+  - VC-specific conditioning (source semantic features, optional speaker embed) must remain compatible with the v2 VC path to prevent regression
+  - VC quality gates (speaker similarity, intelligibility) must be tracked per-stage so Stage 2/3 regressions are detectable
+  - if VC shares the codec LM backbone with TTS, the loss weighting and batch mixing ratio between VC and TTS samples must be documented
 
 ### Stage 2: Alignment & Pointer Training
 - **Goal:** Learn text-to-audio alignment and monotonic pointer progression.
 - **Data:** High-quality transcribed subsets (curated).
-- **Task:** Internal pointer learning with optional auxiliary monotonic regularization and optional bootstrap supervision.
+- **Task:** Internal pointer learning with optional auxiliary monotonic regularization and optional bootstrap supervision, while preserving prompt-conditioned timbre behavior on the TTS path.
+- **Training contract:** `latent_only` training must follow Worker 01's differentiable local-pointer surrogate. The model may use a soft expected mixture over only the current and next text unit during teacher forcing, but the exported/runtime pointer remains hard and discrete.
+- **Default transitional artifact requirement:** The default Stage 2 recipe assumes canonical `bootstrap_alignment` is available as a transitional artifact for cold-start protection. A fully bootstrap-free Stage 2 recipe may exist as a research or fallback recipe, but it is not the default worker handoff unless Worker 02 explicitly redefines the curriculum and Worker 06 signs off on convergence.
+- **Annealing Schedule (Cold-Start Protection):** To prevent pointer collapse during early training, the trainer MUST follow a strictly defined schedule:
+  1. **Hard Bootstrap Phase:** Force the pointer to use external `bootstrap_alignment` (from ASR) as the ground truth for the first N steps.
+  2. **Soft Transition Phase:** Mix `bootstrap_alignment` with the model's own `latent` predictions.
+  3. **Latent-Only Phase:** Remove external alignment and train through the frozen differentiable local-pointer contract rather than through hidden discrete argmax behavior.
 - **Note:** Duration-predictor logic is replaced by pointer-loss here.
 
 ### Stage 3: Dramatic & Dialogue Finetuning
@@ -56,6 +68,7 @@ Worker 02 must implement and document the following curriculum:
 - **Task:** Dialogue-conditioned TTS with Prosody Predictor and CFG training.
 - **Note:** **Classifier-Free Guidance (CFG)** training is introduced here by randomly dropping conditioning (10-20% dropout) to allow inference-time guidance scaling.
 - **Note:** Stage 3 must train the exact pointer-aware CFG contract used at inference, including `advance_logit` / `progress_delta` guidance behavior.
+- **Few-shot scope:** Stage 3 strengthens cross-context disentanglement and acting override, but must not be the first stage where prompt conditioning is learned.
 - **Quality gate at Stage B completion:** Evaluate whether utterance-global prosody `[B, d_prosody]` is sufficient for drama acting quality. If anti-collapse metrics (`context_separation_score`, `prosody_collapse_score`) indicate insufficient local variation, schedule time-local prosody `[B, T_plan, d_prosody]` upgrade for Stage C.
 
 
@@ -65,6 +78,7 @@ Worker 02 must implement and document the following curriculum:
    - `tts_mode: legacy_duration | pointer`
    - `alignment_loss_type: none | aux_mas | aux_ctc`
    - `pointer_supervision_mode: latent_only | supervised`
+   - `pointer_training_mode: local_expected | local_expected_st_hardening`
    - `pointer_target_source: none | heuristic_bootstrap | bootstrap_projection | legacy_duration`
      - `heuristic_bootstrap`: uniform phoneme distribution used as initial scaffolding (no external labels needed)
      - `bootstrap_projection`: ASR-derived timestamps projected onto canonical phoneme indices (requires curated alignment artifacts)
@@ -75,6 +89,8 @@ Worker 02 must implement and document the following curriculum:
    - `bootstrap_alignment_required: true | false`
    - `pointer_aux_alignment_warmup_steps`
    - `pointer_aux_alignment_anneal_steps`
+   - `pointer_hardening_start_step`
+   - `pointer_hardening_ramp_steps`
    - `stage3_replay_mix_ratio`
    - `stage3_dialogue_mix_ratio`
    - **`conditioning_dropout_prob`** (for CFG training)
@@ -83,7 +99,6 @@ Worker 02 must implement and document the following curriculum:
    - `voice_state_loss_weight`
    - `voice_state_confidence_floor`
    - `voice_state_teacher_mode: none | pseudo_labeled | direct_labeled | mixed`
-   - `suprasegmental_loss_weight`
    - `suprasegmental_required_languages`
 2. Refactor `trainer.py`:
    - separate VC step and TTS pointer step
@@ -135,6 +150,9 @@ Worker 02 must implement and document the following curriculum:
     - `off` and `full` are the v3.0 mainline requirements
     - `lazy` and `distilled` are post-v3.0 optimization tracks unless explicitly promoted into the release checklist
 11. **Implement Flow-matching Loss for the Prosody Predictor.**
+    - the ground-truth prosody target `[B, d_prosody]` is extracted by Worker 01's `ReferenceEncoder` from the target waveform during training
+    - the `ProsodyPredictor` is trained to predict this target from text tokens, dialogue context, and speaker embed via a flow-matching objective
+    - the `ReferenceEncoder` is trained jointly; Worker 02 must ensure gradients flow to it through the decoder's prosody-conditioning path
 12. Add expressive-training hooks:
     - dialogue-context conditioning batch fields
     - utterance-level style / acting labels when available
@@ -145,8 +163,11 @@ Worker 02 must implement and document the following curriculum:
 13. Add anti-collapse training losses or diagnostics:
     - same-text different-context separation metric
     - prosody variance floor or diversity regularizer
-14. **Add Zero-Shot/Few-Shot prompt training logic:**
+14. **Add Zero-Shot/Few-Shot prompt training logic across Stage 1-3:**
     - dynamic prompt sampling: pick a random 3-10s clip from the same speaker to serve as `prompt_codec_tokens` and `speaker_embed` target.
+    - Stage 1: train prompt-conditioned timbre anchoring and prompt-cache consumption.
+    - Stage 2: retain prompt-conditioned timbre anchoring while pointer alignment is learned.
+    - Stage 3: add cross-context / cross-emotion prompting so `dialogue_context` overrides prompt prosody.
     - information bottleneck or contrastive learning objectives to enforce timbre-prosody disentanglement (ensure the model doesn't just copy the reference prosody).
     - cross-emotion/cross-context prompting: train with a prompt from context A, while generating text from context B, to force the model to rely on `dialogue_context` for prosody and the prompt only for timbre.
 15. Add Stage 3 anti-forgetting sampling policy:
@@ -235,6 +256,24 @@ MAS-derived pointer targets are structurally a form of duration supervision. Whi
 
 Worker 02 must validate at least one of these paths before release sign-off.
 
+### Latent-Only Convergence Mechanism
+
+In `latent_only` mode (no external frame-level alignment labels), the pointer head learns to advance through the following implicit supervision signals:
+
+0. **Differentiable local-pointer surrogate:** The teacher-forced path must not use a hidden hard argmax. Instead, it uses Worker 01's local two-state pointer surrogate over the current and next text unit. This creates a defined gradient path from acoustic reconstruction into `advance_logit` / `progress_delta` without violating the hard runtime pointer contract.
+
+1. **Reconstruction gradient:** When the local pointer mixture references the wrong region, the conditioned acoustic prediction degrades. The gradient from the acoustic reconstruction loss (`logits_a`, `logits_b`) propagates backward through the local text-conditioning mixture and cross-attention path, creating an implicit alignment signal for `advance_logit` and `progress_delta`.
+
+2. **Monotonicity inductive bias:** The pointer is architecturally constrained to be monotonically non-decreasing with at most one text-unit advance per frame, and the differentiable surrogate is local to `{i_t, i_t+1}`. Combined with `progress_value` accumulation, the model only needs to learn *when* to advance, not arbitrary many-to-many text-audio alignment. This dramatically reduces the search space relative to unconstrained attention.
+
+3. **Cross-attention entropy regularizer (optional, lightweight):** An optional low-weight regularizer may encourage peaky (low-entropy) cross-attention distributions during the annealing window. Unlike full MAS or CTC, this does not produce frame-level alignment labels; it only biases the attention pattern toward monotonic sharpness. This is distinct from the auxiliary alignment modes (`aux_mas`, `aux_ctc`) and does not constitute an external aligner dependency.
+
+4. **Boundary confidence co-training:** The `boundary_confidence` head is trained jointly with acoustic prediction, creating an auxiliary signal that reinforces pointer advancement at natural phoneme/word boundaries detectable from the acoustic-text relationship.
+
+5. **Scheduled hardening:** Before release sign-off, Stage 2 must transition from fully soft expected updates toward straight-through or sampled hard pointer updates so teacher-forced training does not drift arbitrarily far from runtime semantics.
+
+**Convergence hypothesis:** The combination of the explicit differentiable local-pointer surrogate, acoustic reconstruction gradient through cross-attention, monotonic structural constraints, and scheduled hardening is expected to be sufficient for pointer convergence after auxiliary alignment is annealed to zero. This hypothesis must be validated empirically before release sign-off. If convergence fails, the annealing schedule must be extended or the progress-aware positional alternative must be evaluated.
+
 ### Suprasegmental Supervision Policy
 
 - `phoneme_ids` remain the canonical text-unit ids
@@ -282,7 +321,7 @@ Exact production formulas may evolve, but these names and intents must be fixed 
 - legacy duration mode still works for comparison
 - checkpoint saves all new pointer-head weights
 - **CFG training capability confirmed.**
-- **CFG fast-path contract (`full | lazy | distilled | off`) documented and aligned with Worker 04.**
+- **CFG v3.0 modes (`off`, `full`) trained and validated; post-v3.0 acceleration modes (`lazy`, `distilled`) deferred and documented as upgrade path, aligned with Worker 04.**
 - **Flow-matching prosody prediction trained.**
 - `voice_state` supervision path is documented and masked correctly when pseudo-label confidence is partial
 - at least one documented recipe trains pointer mode without requiring external aligners at release time

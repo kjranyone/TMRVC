@@ -373,14 +373,17 @@ class TestDialogueContextProjector:
 
 class TestEncodeSpkPrompt:
     def test_encode_speaker_prompt_smoke(self):
-        """encode_speaker_prompt should delegate to SpeakerPromptEncoder."""
+        """encode_speaker_prompt should return timbre and summary tokens."""
         B, T_prompt, n_codebooks = 2, 20, 8
         model = _make_model()
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
 
-        timbre, prompt_feats = model.encode_speaker_prompt(tokens)
+        timbre, summary_tokens = model.encode_speaker_prompt(tokens)
         assert timbre.shape == (B, _D_MODEL)
-        assert prompt_feats.shape == (B, T_prompt, _D_MODEL)
+        # encode_speaker_prompt runs PromptResampler, output is [B, n_summary, D]
+        assert summary_tokens.ndim == 3
+        assert summary_tokens.shape[0] == B
+        assert summary_tokens.shape[2] == _D_MODEL
 
     def test_encode_speaker_prompt_with_external_embed(self):
         B, T_prompt, n_codebooks = 1, 10, 4
@@ -637,6 +640,187 @@ class TestStepPointer:
         advanced = state.step_pointer(advance_prob=0.8, progress_delta=0.01)
         assert advanced is True
         assert state.stall_frames == 0
+
+
+# ---------------------------------------------------------------------------
+# PromptResampler tests (Worker 01 § Architecture)
+# ---------------------------------------------------------------------------
+
+
+class TestPromptResampler:
+    def test_resampler_compresses_to_n_summary(self):
+        """PromptResampler: [B, T, D] -> [B, 32, D]."""
+        from tmrvc_train.models.uclm_transformer import PromptResampler
+
+        B, T_prompt, D = 2, 100, _D_MODEL
+        resampler = PromptResampler(d_model=D, n_summary=32, n_heads=4)
+        x = torch.randn(B, T_prompt, D)
+        out = resampler(x)
+        assert out.shape == (B, 32, D)
+
+    def test_resampler_variable_length_input(self):
+        """PromptResampler should handle different T_prompt values."""
+        from tmrvc_train.models.uclm_transformer import PromptResampler
+
+        D = _D_MODEL
+        resampler = PromptResampler(d_model=D, n_summary=32, n_heads=4)
+
+        for T_prompt in [10, 50, 200]:
+            x = torch.randn(1, T_prompt, D)
+            out = resampler(x)
+            assert out.shape == (1, 32, D), f"Failed for T_prompt={T_prompt}"
+
+
+# ---------------------------------------------------------------------------
+# ReferenceEncoder output shape test (Worker 01 § Architecture)
+# ---------------------------------------------------------------------------
+
+
+class TestReferenceEncoderOutput:
+    def test_reference_encoder_output_shape(self):
+        """ReferenceEncoder should output [B, d_prosody] with d_prosody=128."""
+        from tmrvc_train.models.reference_encoder import ReferenceEncoder
+
+        B, n_mels, T_mel = 2, 80, 200
+        d_prosody = 128
+        enc = ReferenceEncoder(d_prosody=d_prosody, n_mels=n_mels)
+        mel = torch.randn(B, n_mels, T_mel)
+        out = enc(mel)
+        assert out.shape == (B, d_prosody), f"Expected [B, {d_prosody}], got {out.shape}"
+
+
+# ---------------------------------------------------------------------------
+# SpeakerPromptEncoder -> PromptResampler pipeline test
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerPromptEncoderResamplerPipeline:
+    def test_pipeline_output_shapes(self):
+        """SpeakerPromptEncoder -> PromptResampler should produce [B, 32, D]."""
+        from tmrvc_train.models.uclm_transformer import PromptResampler
+
+        B, T_prompt, n_codebooks = 2, 60, 8
+        enc = SpeakerPromptEncoder(d_model=_D_MODEL, d_speaker=_D_SPEAKER)
+        resampler = PromptResampler(d_model=_D_MODEL, n_summary=32, n_heads=4)
+
+        tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
+        timbre, prompt_feats = enc(tokens)
+
+        assert prompt_feats.shape == (B, T_prompt, _D_MODEL)
+
+        summary = resampler(prompt_feats)
+        assert summary.shape == (B, 32, _D_MODEL)
+
+    def test_encode_speaker_prompt_produces_summary(self):
+        """DisentangledUCLM.encode_speaker_prompt should produce summary tokens."""
+        B, T_prompt, n_codebooks = 2, 40, 8
+        model = _make_model()
+        tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
+
+        timbre, summary = model.encode_speaker_prompt(tokens)
+        # Summary should be [B, n_prompt_summary_tokens, d_model]
+        assert summary.ndim == 3
+        assert summary.shape[0] == B
+        assert summary.shape[2] == _D_MODEL
+
+
+# ---------------------------------------------------------------------------
+# ModernTransformerBlock tests (RoPE, GQA, SwiGLU)
+# ---------------------------------------------------------------------------
+
+
+class TestModernTransformerBlock:
+    def test_modern_block_forward_shape(self):
+        """ModernTransformerBlock output shape should match input."""
+        from tmrvc_train.models.uclm_transformer import ModernTransformerBlock
+
+        B, T, D = 2, 30, _D_MODEL
+        block = ModernTransformerBlock(
+            d_model=D, n_heads=4, d_ff=D * 4, n_kv_heads=2,
+        )
+        x = torch.randn(B, T, D)
+        memory = torch.randn(B, 20, D)
+
+        out, nk, nv = block(x, memory=memory)
+        assert out.shape == (B, T, D)
+
+    def test_modern_block_without_memory(self):
+        """ModernTransformerBlock should work without cross-attention memory."""
+        from tmrvc_train.models.uclm_transformer import ModernTransformerBlock
+
+        B, T, D = 2, 30, _D_MODEL
+        block = ModernTransformerBlock(
+            d_model=D, n_heads=4, d_ff=D * 4, n_kv_heads=2,
+        )
+        x = torch.randn(B, T, D)
+
+        out, nk, nv = block(x, memory=None)
+        assert out.shape == (B, T, D)
+
+    def test_modern_block_gqa_kv_heads(self):
+        """ModernTransformerBlock should use n_kv_heads=2 for GQA."""
+        from tmrvc_train.models.uclm_transformer import ModernTransformerBlock
+
+        block = ModernTransformerBlock(
+            d_model=_D_MODEL, n_heads=4, d_ff=_D_MODEL * 4, n_kv_heads=2,
+        )
+        assert block.attn.n_kv_heads == 2
+        assert block.attn.n_rep == 2  # 4 heads / 2 kv_heads = 2
+
+    def test_codec_transformer_use_modern_backbone(self):
+        """CodecTransformer with use_modern_backbone=True should use ModernTransformerBlock."""
+        from tmrvc_train.models.uclm_transformer import (
+            CodecTransformer,
+            ModernTransformerBlock,
+        )
+
+        ct = CodecTransformer(
+            d_model=_D_MODEL, n_heads=4, n_layers=2,
+            rvq_vocab_size=128, n_codebooks=8,
+            control_vocab_size=32, d_speaker=_D_SPEAKER,
+            use_modern_backbone=True,
+        )
+        assert isinstance(ct.layers[0], ModernTransformerBlock)
+
+
+# ---------------------------------------------------------------------------
+# d_prosody=128 default verification tests
+# ---------------------------------------------------------------------------
+
+
+class TestDProsodyDefaults:
+    def test_prosody_predictor_default_d_prosody_128(self):
+        """ProsodyPredictor default d_prosody should be 128 (matching constants.yaml)."""
+        pred = ProsodyPredictor(d_model=_D_MODEL)
+        assert pred.d_prosody == 128
+
+    def test_dialogue_context_projector_default_d_prosody_128(self):
+        """DialogueContextProjector default d_prosody should be 128."""
+        proj = DialogueContextProjector(d_model=_D_MODEL)
+        assert proj.prosody_proj.in_features == 128
+
+
+# ---------------------------------------------------------------------------
+# PointerState property aliases test
+# ---------------------------------------------------------------------------
+
+
+class TestPointerStateProperties:
+    def test_progress_value_alias(self):
+        """PointerState.progress_value should be an alias for progress."""
+        state = PointerState(
+            text_index=torch.tensor([3]),
+            progress=torch.tensor([0.42]),
+        )
+        assert torch.equal(state.progress_value, state.progress)
+
+    def test_progress_delta_alias(self):
+        """PointerState.progress_delta should return current progress as float."""
+        state = PointerState(
+            text_index=torch.tensor([0]),
+            progress=torch.tensor([0.75]),
+        )
+        assert abs(state.progress_delta - 0.75) < 1e-5
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ The system is only useful if it can say "use this", "re-run this", or "throw thi
 - bucket-specific numeric thresholds encoded in config
 - explicit human-override and approval policy
 - explicit policy for partial or missing `voice_state` supervision
+- explicit fallback policy for provider-unsupported languages and uncalibrated provider outputs
 
 ## Scoring Dimensions
 
@@ -98,10 +99,13 @@ Not all promoted data belong in the same training path.
 3. Define anti-contamination rules:
    - holdout must not leak into train
 4. Encode legality gates into promotion policy.
+   - provider-supported-language gate must be explicit
+   - if a required provider lacks declared support for the record language, the record must go to `review` or a non-mainline fallback bucket rather than inheriting the normal mainline threshold
 5. Define same-text clustering policy:
    - preserve same-text multi-context examples for expressive evaluation
 6. Define reporting:
    - score histogram
+   - `score_components` breakdown per bucket and per decision outcome
    - top rejection reasons
    - provider disagreement summary
 7. Define human approval policy:
@@ -113,6 +117,10 @@ Not all promoted data belong in the same training path.
    - which buckets require minimum `voice_state` coverage
    - when missing `voice_state` is acceptable with explicit absence metadata
    - when low-confidence `voice_state` forces `review` rather than `promote`
+9. Define calibration-aware threshold policy:
+   - every thresholded provider score must carry `provider_id` and `calibration_version`
+   - provider families may use different thresholds until Worker 11 proves cross-provider calibration parity
+   - uncalibrated provider outputs must not auto-promote into `tts_mainline`
 
 ## Guardrails
 
@@ -124,6 +132,8 @@ Not all promoted data belong in the same training path.
 - do not let workers invent bucket thresholds ad hoc
 - do not leave human override rules implicit if the UI exposes promotion controls
 - do not promote samples as physical-control-ready when `voice_state` coverage/confidence is unknown
+- do not silently treat unsupported-language provider outputs as if they passed the normal mainline policy
+- do not auto-promote from raw, uncalibrated provider confidence
 
 ## Handoff Contract
 

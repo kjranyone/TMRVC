@@ -26,6 +26,7 @@ These are mandatory.
 3. **High-fidelity Zero-Shot / Few-Shot speaker adaptation (in-context prompting)**
 4. Local prosody latent or equivalent phrase-planning channel
 5. Classifier-free guidance or an equally explicit sampling-control mechanism
+   - **Scope limitation (v3.0):** In v3.0, `full` two-pass CFG is available only in Python serve. Rust engine / VST default to CFG `off` due to the 10 ms real-time budget and ONNX/CPU deployment constraints. This means drama-grade CFG-enhanced acting is Python-serve-only in v3.0. Rust/VST must still preserve pointer/control semantics and causal latency, but they must not inherit the full drama-grade claim until `lazy` or `distilled` CFG modes are validated and promoted. `lazy` or `distilled` CFG modes are the planned path to extend CFG to Rust/VST (post-v3.0 optimization track). VST distribution requires ONNX, meaning heavy operations like CFG must be distilled into the weights or aggressively optimized. If CFG proves essential for drama quality and cannot be deferred, promotion of `lazy`/`distilled` into v3.0 scope must be evaluated at Stage B completion.
 6. Explicit waveform-decoder / vocoder quality plan
 7. Multilingual and code-switch conditioning contract if SOTA claims extend beyond monolingual read speech
 8. Runtime pacing controls:
@@ -41,6 +42,12 @@ Pointer alone is insufficient. A purely pointer-based model without context/pros
 Initial v3 uses utterance-global prosody `[B, d_prosody]`. This is sufficient for utterance-level style (e.g., "say this angrily") but insufficient for fine-grained dramatic delivery (mid-sentence emotion shifts, selective emphasis, trailing-off). SOTA systems (DiFlow-TTS, Flamed-TTS, Vevo) operate at token-level or segment-level granularity.
 
 If drama acting quality gates (§ 6.1 context-sensitivity score, § 6.2 same-line different-context appropriateness) are not met with the utterance-global form at Stage B completion, the upgrade to time-local `[B, T_plan, d_prosody]` must be scheduled for Stage C. This is not optional if the drama-grade claim is to be maintained.
+
+If this time-local path is activated, it must be pointer-synchronous rather than absolute-time-synchronous:
+
+- cached local prosody must attach to canonical text units / pointer neighborhoods
+- runtime pacing controls (`pace`, `hold_bias`, `boundary_bias`) may stretch wall-clock realization, but they must not shift a planned accent/emphasis event onto the wrong text unit
+- a fixed pre-timed schedule such as "boost pitch at 500 ms" is non-compliant unless it is deterministically derived from and re-indexed by pointer position
 
 ### Waveform quality escalation policy
 
@@ -107,6 +114,7 @@ If source separation is used, its primary purpose is annotation uplift. It must 
 4. The engine must not depend on pre-expanded duration plans
 5. Cache synchronization under moving pointers must be explicitly testable
 6. Waveform-decoder quality must be measurable, not assumed from token quality
+7. if time-local prosody planning is enabled in any release track, the runtime must prove that prosody application follows pointer progression rather than raw elapsed frame count
 
 ## 6. Proof obligations
 
@@ -151,6 +159,11 @@ At minimum:
 ## 7. Acceptance bar
 
 TMRVC may claim drama-grade conversational TTS only if all of the following hold:
+
+Runtime scope for the initial v3.0 claim:
+
+- in v3.0, this drama-grade claim applies only to the validated Python serve path using the frozen serving/evaluation protocol
+- Rust / VST / strict ONNX real-time paths in v3.0 may claim pointer/control parity and causal latency, but they must not inherit the full drama-grade acting claim until a validated fast-CFG path is promoted
 
 1. mainline v3 train/serve path works without MFA artifacts
 2. held-out dialogue evaluation shows context-sensitive phrasing changes

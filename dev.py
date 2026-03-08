@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""TMRVC Development Menu (UCLM v3)."""
+"""TMRVC Development Menu (UCLM v3).
+
+v3 (pointer-based causal) is the mainline.  v2 (MFA/duration) paths are
+retained for ablation and comparison but are marked [v2-legacy].
+"""
 
 from __future__ import annotations
 
@@ -18,10 +22,53 @@ import yaml
 CONFIGS_DIR = Path("configs")
 DATASETS_YAML = CONFIGS_DIR / "datasets.yaml"
 CHARACTERS_JSON = CONFIGS_DIR / "characters.json"
+TRAIN_UCLM_YAML = CONFIGS_DIR / "train_uclm.yaml.example"
 EXPERIMENTS_DIR = Path("experiments")
 CHECKPOINTS_DIR = Path("checkpoints")
 MODELS_DIR = Path("models")
 CHARACTERS_DIR = MODELS_DIR / "characters"
+
+# ---------------------------------------------------------------------------
+# v3-required training config fields.  validate_v3_config() checks these.
+# ---------------------------------------------------------------------------
+V3_REQUIRED_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "tts_mode": str,
+    "pointer_loss_weight": (int, float),
+    "progress_loss_weight": (int, float),
+    "voice_state_loss_weight": (int, float),
+}
+
+V3_OPTIONAL_DEFAULTS: dict[str, object] = {
+    "pointer_mode": True,
+    "cfg_enabled": True,
+    "cfg_drop_rate": 0.1,
+    "voice_state_supervision": True,
+    "prosody_flow_matching": True,
+    "training_stage": "base",
+    "bootstrap_alignment_path": None,
+    "few_shot_prompt_training": True,
+    "replay_mix_ratio": 0.1,
+}
+
+
+def validate_v3_config(cfg: dict) -> list[str]:
+    """Return a list of validation errors for v3 training config.
+
+    An empty list means the config is valid for v3.
+    """
+    errors: list[str] = []
+    for key, expected_type in V3_REQUIRED_FIELDS.items():
+        if key not in cfg:
+            errors.append(f"missing required v3 field: {key}")
+        elif not isinstance(cfg[key], expected_type):
+            errors.append(
+                f"{key}: expected {expected_type}, got {type(cfg[key])}"
+            )
+    if cfg.get("tts_mode") not in ("pointer", "legacy_duration"):
+        errors.append(
+            f"tts_mode must be 'pointer' or 'legacy_duration', got {cfg.get('tts_mode')!r}"
+        )
+    return errors
 
 
 def clear_screen() -> None:
@@ -32,11 +79,13 @@ def print_menu() -> None:
     clear_screen()
     print("=== TMRVC Development Menu (UCLM v3) ===")
     print()
-    print("--- 学習 (Training) ---")
+    print("--- v3 学習 (Training — pointer mainline) ---")
     print("1) フル学習 (前処理 + 学習) [v3 pointer]")
     print("2) 既存キャッシュで学習のみ [v3 pointer]")
     print("8) Codec学習 (最新cacheから)")
-    print("12) v2 legacy MFA学習 (前処理 + 学習) [legacy_duration]")
+    print()
+    print("--- [v2-legacy] 学習 (MFA / duration — 比較用) ---")
+    print("12) [v2-legacy] MFA学習 (前処理 + 学習)")
     print()
     print("--- 運用・管理 (Ops & Management) ---")
     print("7) 学習成果物を確定 (latest更新 + 整合性スモーク)")
@@ -51,10 +100,11 @@ def print_menu() -> None:
     print()
     print("--- AI キュレーション (Curation) ---")
     print("13) キュレーション: 音声ファイル取込 (ingest)")
-    print("14) キュレーション: スコアリング & 昇格判定")
-    print("15) キュレーション: エクスポート (promoted → cache)")
-    print("16) キュレーション: 検証レポート")
-    print("17) キュレーション: サマリー表示")
+    print("14) キュレーション: スコアリング & 昇格判定 (run)")
+    print("15) キュレーション: 中断再開 (resume)")
+    print("16) キュレーション: エクスポート (promoted → cache)")
+    print("17) キュレーション: 検証レポート")
+    print("18) キュレーション: サマリー表示 (status)")
     print()
     print("--- メンテナンス (Maintenance) ---")
     print("10) システム整合性チェック (テスト & 静的解析)")
@@ -66,16 +116,41 @@ def print_menu() -> None:
 def print_dependency_map() -> None:
     print("\n=== コマンド依存関係マップ (UCLM v3) ===")
     print()
-    print("1) フル学習")
+    print("--- v3 mainline (pointer) ---")
+    print()
+    print("1) フル学習 [v3 pointer]")
     print("  依存: 4 (enabled dataset 必須)")
     print("  出力: experiments/*/cache, uclm_final.pt")
     print("  備考: MFA不要。ポインタベースのポータブルな学習フロー。")
     print()
-    print("2) 既存キャッシュで学習")
+    print("2) 既存キャッシュで学習 [v3 pointer]")
     print("  依存: 既存 cache + enabled dataset")
     print("  出力: uclm_final.pt")
     print()
-    print("推奨フロー: 6 -> 4 -> 1 -> 8 -> 7 -> 11")
+    print("推奨フロー (v3): 6 -> 4 -> 13 -> 14 -> 16 -> 1 -> 8 -> 7 -> 11")
+    print("  (設定 -> データ追加 -> ingest -> curation -> export -> 学習 -> codec -> 確定 -> serve)")
+    print()
+    print("--- キュレーション (Curation) ---")
+    print()
+    print("13) ingest: 音声取込")
+    print("  依存: 音声ディレクトリ")
+    print("  出力: data/curation/")
+    print()
+    print("14) run: スコアリング & 昇格判定")
+    print("  依存: 13")
+    print("  出力: data/curation/ (scored)")
+    print()
+    print("15) resume: 中断再開")
+    print("  依存: 14 (中断されたセッション)")
+    print()
+    print("16) export: promoted → cache")
+    print("  依存: 14")
+    print("  出力: data/curated_export/")
+    print()
+    print("18) status: サマリー表示")
+    print("  依存: 13+")
+    print()
+    print("--- 共通 ---")
     print()
     print("6) 設定初期化")
     print("  依存: なし")
@@ -95,6 +170,12 @@ def print_dependency_map() -> None:
     print()
     print("11) 推論サーバー起動")
     print("  依存: uclm_latest.pt (+ codec_latest.pt 推奨)")
+    print()
+    print("--- [v2-legacy] (比較・アブレーション用) ---")
+    print()
+    print("12) [v2-legacy] MFA学習")
+    print("  依存: MFA環境 + enabled dataset")
+    print("  備考: v3 mainline はポインタモード。MFA は比較実験用に残存。")
 
 
 def cmd_run_serve() -> None:
@@ -401,6 +482,7 @@ def _promote_uclm_checkpoint(ckpt: Path) -> Path:
 
 
 def get_mfa_command() -> list[str]:
+    # [v2-legacy] This path is retained for ablation. v3 mainline uses pointer mode.
     """Get MFA command from environment or default."""
     env_cmd = os.environ.get("MFA_COMMAND")
     if env_cmd:
@@ -409,6 +491,7 @@ def get_mfa_command() -> list[str]:
 
 
 def normalize_mfa_model_name(name: str) -> str:
+    # [v2-legacy] This path is retained for ablation. v3 mainline uses pointer mode.
     """Normalize MFA model name to include _mfa suffix."""
     _ALIASES = {"english", "japanese", "mandarin", "korean"}
     if name in _ALIASES:
@@ -417,6 +500,7 @@ def normalize_mfa_model_name(name: str) -> str:
 
 
 def _extract_env_name_from_run_command(cmd: list[str]) -> str | None:
+    # [v2-legacy] This path is retained for ablation. v3 mainline uses pointer mode.
     """Extract conda/micromamba environment name from run command."""
     for i, arg in enumerate(cmd):
         if arg in ("-n", "--name") and i + 1 < len(cmd):
@@ -424,7 +508,7 @@ def _extract_env_name_from_run_command(cmd: list[str]) -> str | None:
     return None
 
 
-def _suggest_mfa_install_cmd(
+def _suggest_mfa_install_cmd(  # [v2-legacy]
     mfa_cmd: list[str],
     packages: list[str],
     python_pin: str | None = None,
@@ -444,6 +528,7 @@ def _suggest_mfa_install_cmd(
 
 
 def _check_mfa_japanese_runtime(mfa_cmd: list[str]) -> tuple[bool, str, list[str]]:
+    # [v2-legacy] This path is retained for ablation. v3 mainline uses pointer mode.
     """Check if MFA Japanese runtime dependencies are available.
 
     Returns (ok, python_version, missing_packages).
@@ -470,7 +555,7 @@ def _check_mfa_japanese_runtime(mfa_cmd: list[str]) -> tuple[bool, str, list[str
         return False, "", []
 
 
-def _build_mfa_corpus_from_cache_dataset(
+def _build_mfa_corpus_from_cache_dataset(  # [v2-legacy]
     cache_dir: Path, dataset: str, corpus_dir: Path, language: str
 ) -> tuple[int, int, int]:
     """Build MFA corpus from cache dataset. Returns (total, skipped, written)."""
@@ -486,7 +571,7 @@ def _build_mfa_corpus_from_cache_dataset(
     return total, skipped, written
 
 
-def cmd_prepare_tts_alignment_from_latest_cache(
+def cmd_prepare_tts_alignment_from_latest_cache(  # [v2-legacy]
     cache_dir: Path | None = None,
     enabled_cfg: dict | None = None,
     textgrid_overrides: dict | None = None,
@@ -517,7 +602,7 @@ def cmd_prepare_tts_alignment_from_latest_cache(
     return True
 
 
-def cmd_mfa_align_and_inject_from_cache(
+def cmd_mfa_align_and_inject_from_cache(  # [v2-legacy]
     cache_dir: Path | None = None,
     enabled_cfg: dict | None = None,
 ) -> bool:
@@ -633,11 +718,12 @@ def _find_codec_checkpoint() -> Path | None:
 
 
 def cmd_full_training_legacy() -> None:
+    # [v2-legacy] This path is retained for ablation. v3 mainline uses pointer mode.
     enabled = get_enabled_datasets()
     if not enabled: return
     device = select_device()
     workers = select_workers(device)
-    print(f"\n=== v2 legacy MFA学習 開始 ===")
+    print(f"\n=== [v2-legacy] MFA学習 開始 ===")
     cmd = ["uv", "run", "tmrvc-train-pipeline", "--output-dir", "experiments", "--workers", str(workers), "--train-device", device, "--tts-mode", "legacy_duration"]
     if run_checked(cmd):
         if input_default("Codec学習も実行しますか? (y/n)", "y").lower() == "y":
@@ -694,42 +780,110 @@ def cmd_init_configs() -> None:
 
 def cmd_curate_ingest() -> None:
     input_dir = input_default("取込対象ディレクトリ")
-    output_dir = input_default("キュレーション出力先", "data/curation")
     ext = input_default("拡張子", ".wav")
-    run_checked(["uv", "run", "tmrvc-curate", "--output-dir", output_dir, "ingest", "--input-dir", input_dir, "--extension", ext])
+    print("\nAPI経由でキュレーション取込を開始します...")
+    payload = {"input_dir": input_dir, "extension": ext}
+    if _api_post("/ui/curation/jobs/ingest", payload):
+        print("ジョブを受け付けました。")
+    input("\nEnterで戻る...")
 
 
-def cmd_curate_score() -> None:
-    output_dir = input_default("キュレーションディレクトリ", "data/curation")
-    run_checked(["uv", "run", "tmrvc-curate", "--output-dir", output_dir, "score"])
+def cmd_curate_run() -> None:
+    """Run curation scoring and promotion (calls backend API)."""
+    print("\nAPI経由でスコアリングを開始します...")
+    if _api_post("/ui/curation/jobs/run", {}):
+        print("ジョブを受け付けました。")
+    input("\nEnterで戻る...")
+
+
+def cmd_curate_resume() -> None:
+    """Resume an interrupted curation session (calls backend API)."""
+    print("\nAPI経由でレジュームを開始します...")
+    if _api_post("/ui/curation/jobs/resume", {}):
+        print("ジョブを受け付けました。")
+    input("\nEnterで戻る...")
 
 
 def cmd_curate_export() -> None:
-    output_dir = input_default("キュレーションディレクトリ", "data/curation")
+    """Export promoted subset to training cache (calls backend API)."""
     export_dir = input_default("エクスポート先", "data/curated_export")
-    run_checked(["uv", "run", "tmrvc-curate", "--output-dir", output_dir, "export", "--export-dir", export_dir])
+    print(f"\nAPI経由で '{export_dir}' へのエクスポートを開始します...")
+    if _api_post("/ui/curation/jobs/export", {"export_dir": export_dir}):
+        print("エクスポートジョブを開始しました。")
+    input("\nEnterで戻る...")
 
 
 def cmd_curate_validate() -> None:
-    output_dir = input_default("キュレーションディレクトリ", "data/curation")
-    run_checked(["uv", "run", "tmrvc-curate", "--output-dir", output_dir, "validate"])
+    """Run validation report on curated data."""
+    print("\nAPI経由で検証レポート生成を開始します...")
+    if _api_post("/ui/curation/jobs/validate", {}):
+        print("ジョブを受け付けました。")
+    input("\nEnterで戻る...")
 
 
-def cmd_curate_summary() -> None:
-    output_dir = input_default("キュレーションディレクトリ", "data/curation")
-    run_checked(["uv", "run", "tmrvc-curate", "--output-dir", output_dir, "summary"])
+def cmd_curate_status() -> None:
+    """Show curation summary / status (calls backend API)."""
+    import requests
+    try:
+        resp = requests.get("http://localhost:8000/ui/curation/summary", timeout=5)
+        if resp.status_code == 200:
+            print("\n=== キュレーションサマリー ===")
+            print(json.dumps(resp.json(), indent=2))
+        else:
+            print(f"API Error: {resp.status_code}")
+    except Exception as e:
+        print(f"Connection failed: {e}")
+    input("\nEnterで戻る...")
+
+
+def _api_post(path: str, data: dict) -> bool:
+    """Helper to call tmrvc-serve API."""
+    import requests
+    try:
+        url = f"http://localhost:8000{path}"
+        resp = requests.post(url, json=data, timeout=10)
+        if resp.status_code < 300:
+            return True
+        print(f"API Error: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print(f"Connection failed: {e}")
+    return False
 
 
 def main() -> None:
     while True:
         print_menu()
-        choice = input("選択 [1-17, h=ヘルプ, q=終了]: ").strip()
+        choice = input("選択 [1-18, h=ヘルプ, q=終了]: ").strip()
         if choice == "q": break
         if choice == "h":
             print_dependency_map()
             input("\nEnterで続行...")
             continue
-        handlers = {"1": cmd_full_training, "2": cmd_skip_preprocess, "3": cmd_list_datasets, "4": cmd_add_dataset, "5": cmd_cluster_speakers, "6": cmd_init_configs, "7": cmd_finalize_training_outputs, "8": cmd_train_codec_from_latest_cache, "9": cmd_manage_characters, "10": cmd_system_check, "11": cmd_run_serve, "12": cmd_full_training_legacy, "13": cmd_curate_ingest, "14": cmd_curate_score, "15": cmd_curate_export, "16": cmd_curate_validate, "17": cmd_curate_summary}
+        handlers = {
+            # v3 mainline training
+            "1": cmd_full_training,
+            "2": cmd_skip_preprocess,
+            # data prep
+            "3": cmd_list_datasets,
+            "4": cmd_add_dataset,
+            "5": cmd_cluster_speakers,
+            "6": cmd_init_configs,
+            # ops
+            "7": cmd_finalize_training_outputs,
+            "8": cmd_train_codec_from_latest_cache,
+            "9": cmd_manage_characters,
+            "10": cmd_system_check,
+            "11": cmd_run_serve,
+            # [v2-legacy]
+            "12": cmd_full_training_legacy,
+            # curation: ingest / run / resume / export / validate / status
+            "13": cmd_curate_ingest,
+            "14": cmd_curate_run,
+            "15": cmd_curate_resume,
+            "16": cmd_curate_export,
+            "17": cmd_curate_validate,
+            "18": cmd_curate_status,
+        }
         if choice in handlers: handlers[choice]()
         else: input(f"無効な選択: {choice}. Enterで続行...")
 

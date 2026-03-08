@@ -25,12 +25,15 @@ P(A_t, B_t, G_t | C_t, S, V_t, H_t)
 ### 2.1 TTS 条件
 
 - normalized text
-- text units (`phoneme_ids` または grapheme ids)
+- canonical text units (`phoneme_ids`)
+- optional `text_suprasegmentals`
 - pointer state
   - `text_index`
   - `progress_value`
   - optional `boundary_confidence`
   - optional `stall_frames`
+
+mainline の TTS contract は canonical `phoneme_ids` ベースである。grapheme / byte fallback は downgrade された補助経路としてのみ許可し、Python/Rust で異なる text contract を作ってはならない。
 
 ### 2.2 VC 条件
 
@@ -49,6 +52,8 @@ P(A_t, B_t, G_t | C_t, S, V_t, H_t)
 - `prompt_codec_tokens` or `prompt_kv_cache`
 - `dialogue_context`
 - external controls: `pace`, `hold_bias`, `boundary_bias`
+
+`pace`, `hold_bias`, `boundary_bias` は runtime の primary timing-control path である。`voice_state` は timing と相関しうるが、同等の timing authority を持ってはならない。
 
 ## 3. 出力
 
@@ -82,6 +87,8 @@ for each 10 ms step:
 
 この設計により、文脈に応じた間、食い気味、溜め、語尾処理を online に変化させられる。
 
+teacher-forced `latent_only` training では、runtime の離散 pointer をそのまま微分可能には扱えないため、current/next text unit 上の局所 differentiable surrogate を使う。これは training-only の近似であり、export/runtime の hard pointer contract を置き換えない。
+
 ## 5. 学習
 
 ### 5.1 共通損失
@@ -98,6 +105,8 @@ for each 10 ms step:
 
 `durations.npy` を中心教師にしない。legacy ablation でだけ duration loss を残してよい。
 
+default の Stage 2 curriculum では canonical `bootstrap_alignment.json` を transitional artifact として使ってよいが、release sign-off では恒久依存にしてはならない。
+
 ### 5.3 VC 損失
 
 - token reconstruction
@@ -110,7 +119,7 @@ for each 10 ms step:
 TTS サンプルで必要なのは:
 
 - text
-- text units
+- canonical text units
 - audio-side frame artifacts
 - optional `voice_state` supervision artifacts
 - optional `bootstrap_alignment.json`
@@ -139,19 +148,28 @@ legacy は mainline 仕様に干渉してはならない。
 
 ## 7.3 Release-Critical Contract
 
-mainline 正本として固定するもの:
+`v3.0 core proof obligations` として固定するもの:
 
 - pointer-based causal progression
+- differentiable teacher-forced pointer-training surrogate explicitly mapped to the hard runtime state transition
 - `advance_logit` を主キーとする pointer 出力
 - `voice_state_targets` / mask / confidence / provenance
 - `SpeakerProfile` による few-shot prompt contract
+- v3.0 `SpeakerProfile` は prompt evidence only であり、request-time weight mutation を含まない
 - `sample_rate = 24000`, `hop_length = 240`, `T = ceil(num_samples / 240)` の frame 規約
 
-v3 リリースに含まれるが、段階的に統合するもの:
+`v3.0 quality amplifiers`:
 
-- modern transformer backbone（RoPE, GQA, SwiGLU, RMSNorm, FlashAttention2）— 実装済み
-- CFG 全モード（off, full, lazy, distilled）
+- modern transformer backbone（RoPE, GQA, SwiGLU, RMSNorm, FlashAttention2）
+- flow-matching prosody predictor
+- CFG `off` / `full`
+
+`post-v3.0 optimization tracks`:
+
+- CFG `lazy` / `distilled`
 - second-stage acoustic refinement（v3.1 upgrade path）
+
+runtime claim は経路別に分離する。v3.0 で CFG-enhanced drama claim を許可するのは Python serve path のみであり、Rust/VST は shared pointer/control contract と causal latency を主張対象とする。
 
 ## v3 Pointer Contract
 
@@ -199,6 +217,8 @@ def forward_tts_pointer(
 - `acting_intent` (`[B, D_act]`): `acting_proj` で同様に `[B, 1, d_model]` にブロードキャスト加算。
 - `local_prosody_latent` (`[B, T, D_pro]`): `prosody_proj` で `[B, T, d_model]` に射影して加算。T が content features と異なる場合は `F.interpolate(mode="nearest")` でリサイズ。
 
+time-local prosody planning を将来有効化する場合、`T` は absolute wall-clock frame index ではなく pointer-synchronous planning index として解釈する。つまり active prosody region は elapsed frame count だけで決めず、current `text_index` と optional `progress_value` に従って選択する。`pace` / `hold_bias` / `boundary_bias` による runtime の伸縮で prosody event が別 phoneme にずれる設計は非準拠とする。
+
 入力が `None` の場合は寄与ゼロ (加算をスキップ)。
 
 ### PointerHead
@@ -209,9 +229,20 @@ def forward_tts_pointer(
 - **`progress_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1) -> Sigmoid` — 現在 phoneme 内の進行度を `[0, 1]` で出力。
 - optional `boundary_proj`: 境界信頼度を出力。
 
+### Differentiable Pointer Training Contract
+
+training path では以下を固定する:
+
+- local differentiable surrogate は `{i_t, i_t+1}` の 2-unit neighborhood のみを扱う
+- `advance_prob_t = sigmoid(advance_logit_t)` により current/next text memory の expected mixture を構成する
+- hidden argmax, full-sequence duration expansion, training-only 別 pointer head は禁止
+- 学習後半では scheduled hardening により runtime の hard pointer semantics に寄せる
+
 ## Few-Shot Speaker Adaptation Contract
 
 本セクションは v3 の few-shot voice cloning に関する契約を定義する。
+
+v3.0 mainline の few-shot contract は prompt-based only である。`SpeakerProfile` は `speaker_embed`, prompt token/cache, fingerprint, provenance を保持するが、LoRA/adaptor delta や model hot-swap 情報は保持しない。
 
 ### `encode_speaker_prompt()` API
 
@@ -230,6 +261,8 @@ def encode_speaker_prompt(
 ### prompt_kv_cache Reuse
 
 `prompt_kv_cache` は会話ターンをまたいで再利用できる。同一話者による連続発話では、リファレンス音声の再エンコードを省略し、キャッシュされた KV を `forward_tts_pointer()` に直接渡す。これにより multi-turn 対話の推論コストを大幅に削減する。cache の有効性は `SpeakerProfile` の encoder/tokenizer fingerprint に従って判定する。
+
+実行時 budget を超える prompt は deterministic に圧縮または reject されなければならず、benchmark/sign-off 実行では silent degradation を許可しない。
 
 ### Timbre-Prosody Disentanglement
 
@@ -304,3 +337,5 @@ unconditional pass では以下を drop / zero する:
 - causal `acoustic_history`
 
 この契約は training, PyTorch inference, ONNX, Rust で一致しなければならない。
+
+benchmark / claim-valid run では CFG mode は固定され、budget 超過時に `full -> lazy/off` へ自動 downgrade してはならない。超過時は run を fail/invalid とする。

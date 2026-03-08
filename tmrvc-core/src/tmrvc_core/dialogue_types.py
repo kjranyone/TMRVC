@@ -1,7 +1,9 @@
 """Dialogue and character types for context-aware TTS.
 
-Used by the ContextStylePredictor (Phase 4) and VTuber integration (Phase 5)
-to represent characters, conversation history, and style parameters.
+`StyleParams` in this module is a legacy convenience layer used by existing
+heuristics, script parsing, and context predictors. It is not the canonical
+v3 `voice_state` registry; the canonical 8-D physical contract lives in
+`tmrvc_core.voice_state`.
 """
 
 from __future__ import annotations
@@ -30,17 +32,11 @@ SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja", "en", "zh", "ko")
 
 @dataclass
 class StyleParams:
-    """Parsed style parameters for UCLM VoiceState conditioning (8-dim).
+    """Legacy convenience style parameters for compatibility paths.
 
-    Dimensions:
-    - 0: breathiness [0, 1]
-    - 1: tension [0, 1]
-    - 2: arousal [0, 1]
-    - 3: valence [-1, 1]
-    - 4: roughness [0, 1]
-    - 5: voicing [0, 1]
-    - 6: energy [0, 1]
-    - 7: speech_rate [0.5, 2.0]
+    `to_vector()` returns the legacy 8-D style vector used by older style
+    predictors and script tooling. It should not be treated as the canonical
+    v3 physical `voice_state` registry for sign-off purposes.
     """
 
     emotion: str = "neutral"
@@ -56,7 +52,7 @@ class StyleParams:
     reasoning: str = ""
 
     def to_vector(self) -> list[float]:
-        """Convert to 8-dim UCLM VoiceState vector."""
+        """Convert to the legacy 8-dim style vector."""
         vec = [0.0] * 8
 
         vec[0] = _clamp(self.breathiness, 0.0, 1.0)
@@ -89,7 +85,7 @@ class StyleParams:
 
     @classmethod
     def neutral(cls) -> StyleParams:
-        """Return default neutral style."""
+        """Return default neutral style for compatibility paths."""
         return cls()
 
 

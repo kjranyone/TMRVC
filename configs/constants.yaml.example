@@ -28,6 +28,12 @@ dec_state_dim: 256
 dec_state_frames: 32
 d_event_trace: 64
 uclm_vq_bins: 128
+# Active canonical symbol count is managed by tmrvc_data.g2p PHONE2ID.
+# This capacity value must always exceed the active count by at least 20
+# symbols to allow append-only multilingual expansion without retraining
+# embeddings. If active_phone_inventory count exceeds
+# (phoneme_vocab_size - 20), Worker 03 must file a capacity-expansion
+# request before new languages are added.
 phoneme_vocab_size: 200
 n_languages: 4
 lora_rank: 4
@@ -40,13 +46,32 @@ uclm_dropout: 0.1
 uclm_max_seq_len: 2048
 uclm_context_frames: 200
 uclm_block_size: 4
-max_lookahead_hops: 6
+# v2 legacy VC only; v3 mainline VC must not consume this constant.
+max_lookahead_hops_v2_legacy: 6
 hq_threshold_q: 0.3
 f0_smoothing_frames: 5
 d_style: 128
+d_prosody: 128
+n_kv_heads: 2
 d_text_encoder: 256
 n_text_encoder_layers: 6
 n_text_encoder_heads: 4
 text_encoder_ff_dim: 1024
 n_voice_source_params: 8
 n_acoustic_params: 32
+d_suprasegmental: 4
+cfg_scale_default: 1.5
+cfg_scale_max: 3.0
+n_prompt_summary_tokens: 32
+max_prompt_seconds_active: 10.0
+max_prompt_frames: 1000
+max_prompt_kv_tokens: 512
+max_prompt_cache_bytes: 52428800
+max_frames_per_unit: 50
+skip_protection_threshold: 0.3
+max_text_units_active: 512
+max_dialogue_context_units: 1024
+max_acoustic_history_frames: 2000
+max_cross_attn_kv_bytes: 104857600
+streaming_latency_budget_ms: 10.0
+streaming_hardware_class_primary: "single_nvidia_rtx_2080ti_22gb_cuda12_sdpa"

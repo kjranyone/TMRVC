@@ -1,14 +1,14 @@
 """Voice State Estimator for frame-level acoustic parameter extraction.
 
-Voice state parameters control acoustic properties of speech generation:
+Canonical UCLM v3 voice_state dimensions:
+- pitch_level: Fundamental frequency (F0) level
+- pitch_range: Local melodic variation / F0 spread
+- energy_level: Overall loudness
+- pressedness: Phonation compression proxy
+- spectral_tilt: Spectral slope / brightness
 - breathiness: Aspiration noise level
-- tension: Vocal fold tension
-- arousal: Emotional activation
-- valence: Positive/negative emotion
-- roughness: Voice quality (creaky/harsh)
-- voicing: Voiced vs unvoiced continuum
-- energy: Overall loudness
-- rate: Speaking rate
+- voice_irregularity: Jitter + shimmer style perturbation proxy
+- openness: Vocal-tract openness proxy
 
 Usage:
     from tmrvc_data.voice_state import VoiceStateEstimator
@@ -21,26 +21,26 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 
 logger = logging.getLogger(__name__)
 
 # Voice state dimensions
 VOICE_STATE_DIM = 8
 
-# Parameter indices
-IDX_BREATHINESS = 0
-IDX_TENSION = 1
-IDX_AROUSAL = 2
-IDX_VALENCE = 3
-IDX_ROUGHNESS = 4
-IDX_VOICING = 5
-IDX_ENERGY = 6
-IDX_RATE = 7
+# Parameter indices (canonical 8-D physical registry)
+IDX_PITCH_LEVEL = 0
+IDX_PITCH_RANGE = 1
+IDX_ENERGY_LEVEL = 2
+IDX_PRESSEDNESS = 3
+IDX_SPECTRAL_TILT = 4
+IDX_BREATHINESS = 5
+IDX_VOICE_IRREGULARITY = 6
+IDX_OPENNESS = 7
 
 
 @dataclass
@@ -51,11 +51,11 @@ class VoiceStateConfig:
     breathiness_threshold_low: float = 0.3
     breathiness_threshold_high: float = 0.7
 
-    # Tension estimation
+    # Pitch-level normalization
     tension_f0_base: float = 150.0  # Hz, reference F0
     tension_f0_range: float = 200.0  # Hz, range for normalization
 
-    # Roughness estimation
+    # Voice-irregularity estimation
     roughness_jitter_threshold: float = 0.02
 
     # Energy normalization
@@ -94,17 +94,10 @@ class VoiceStateEstimator(nn.Module):
             nn.Sigmoid(),
         )
 
-        self.roughness_net = nn.Sequential(
+        self.voice_irregularity_net = nn.Sequential(
             nn.Conv1d(1, 32, 5, padding=2),
             nn.ReLU(),
             nn.Conv1d(32, 1, 1),
-            nn.Sigmoid(),
-        )
-
-        self.arousal_net = nn.Sequential(
-            nn.Linear(n_mels + 1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
             nn.Sigmoid(),
         )
 
@@ -136,33 +129,31 @@ class VoiceStateEstimator(nn.Module):
         f0 = f0.to(self.device)
         self.to(self.device)
 
-        # 1. Energy from mel (mean across frequency)
-        energy = self._estimate_energy(mel)  # [B, T]
-
-        # 2. Voicing from F0
-        voicing = self._estimate_voicing(f0)  # [B, T]
-
-        # 3. Breathiness from spectral tilt
+        # Canonical physical factors
+        pitch_level = self._estimate_pitch_level(f0)  # [B, T]
+        pitch_range = self._estimate_pitch_range(f0)  # [B, T]
+        energy_level = self._estimate_energy(mel)  # [B, T]
+        spectral_tilt = self._estimate_spectral_tilt(mel)  # [B, T]
         breathiness = self._estimate_breathiness(mel)  # [B, T]
+        voice_irregularity = self._estimate_voice_irregularity(f0)  # [B, T]
+        openness = self._estimate_openness(mel)  # [B, T]
 
-        # 4. Tension from F0 level
-        tension = self._estimate_tension(f0)  # [B, T]
+        # Pressedness is a coarse proxy built from source intensity and inverse breathiness.
+        pressedness = self._estimate_pressedness(
+            pitch_level, energy_level, spectral_tilt, breathiness
+        )
 
-        # 5. Roughness from F0 perturbations
-        roughness = self._estimate_roughness(f0)  # [B, T]
-
-        # 6. Arousal from energy + F0 dynamics
-        arousal = self._estimate_arousal(mel, f0)  # [B, T]
-
-        # 7. Valence (default neutral, can be overridden by external emotion)
-        valence = torch.zeros(B, T, device=mel.device)  # [B, T]
-
-        # 8. Speaking rate (default 1.0, should be estimated from duration)
-        rate = torch.ones(B, T, device=mel.device)  # [B, T]
-
-        # Stack all parameters
         voice_state = torch.stack(
-            [breathiness, tension, arousal, valence, roughness, voicing, energy, rate],
+            [
+                pitch_level,
+                pitch_range,
+                energy_level,
+                pressedness,
+                spectral_tilt,
+                breathiness,
+                voice_irregularity,
+                openness,
+            ],
             dim=-1,
         )  # [B, T, 8]
 
@@ -183,10 +174,26 @@ class VoiceStateEstimator(nn.Module):
 
         return torch.clamp(normalized, 0.0, 1.0)
 
-    def _estimate_voicing(self, f0: torch.Tensor) -> torch.Tensor:
-        """Estimate voicing from F0."""
-        # F0 > 50 Hz indicates voiced
-        return (f0.squeeze(1) > 50).float()  # [B, T]
+    def _estimate_pitch_level(self, f0: torch.Tensor) -> torch.Tensor:
+        """Estimate normalised F0 level."""
+        f0_flat = f0.squeeze(1)
+        voiced = f0_flat > 50.0
+        log_f0 = torch.zeros_like(f0_flat)
+        log_f0[voiced] = torch.log2(torch.clamp(f0_flat[voiced], min=50.0) / 50.0)
+        return torch.clamp(log_f0 / 4.0, 0.0, 1.0)
+
+    def _estimate_pitch_range(self, f0: torch.Tensor) -> torch.Tensor:
+        """Estimate local melodic variation from short-term F0 dynamics."""
+        f0_flat = f0.squeeze(1)
+        voiced = f0_flat > 50.0
+        f0_safe = torch.where(voiced, f0_flat, torch.zeros_like(f0_flat))
+        mean = self._smooth(f0_safe, kernel_size=9)
+        sq_mean = self._smooth(f0_safe * f0_safe, kernel_size=9)
+        variance = torch.clamp(sq_mean - mean * mean, min=0.0)
+        std = torch.sqrt(variance)
+        norm = std / (mean + 1e-6)
+        norm = torch.where(voiced, norm, torch.zeros_like(norm))
+        return torch.clamp(norm / 0.35, 0.0, 1.0)
 
     def _estimate_breathiness(self, mel: torch.Tensor) -> torch.Tensor:
         """Estimate breathiness from spectral features."""
@@ -208,21 +215,16 @@ class VoiceStateEstimator(nn.Module):
 
         return breathiness
 
-    def _estimate_tension(self, f0: torch.Tensor) -> torch.Tensor:
-        """Estimate vocal fold tension from F0 level."""
-        f0_flat = f0.squeeze(1)  # [B, T]
+    def _estimate_spectral_tilt(self, mel: torch.Tensor) -> torch.Tensor:
+        """Estimate spectral tilt from low/high band energy balance."""
+        n_mels = mel.shape[1]
+        low_band = mel[:, : max(1, n_mels // 3), :].mean(dim=1)
+        high_band = mel[:, max(1, 2 * n_mels // 3) :, :].mean(dim=1)
+        ratio = high_band / (low_band + 1e-8)
+        return torch.clamp(ratio / 2.0, 0.0, 1.0)
 
-        # Normalize F0 to [0, 1] based on reference range
-        tension = (f0_flat - self.config.tension_f0_base) / self.config.tension_f0_range
-        tension = torch.clamp(tension, 0.0, 1.0)
-
-        # Smooth over time
-        tension = self._smooth(tension, kernel_size=5)
-
-        return tension
-
-    def _estimate_roughness(self, f0: torch.Tensor) -> torch.Tensor:
-        """Estimate roughness from F0 perturbations (jitter)."""
+    def _estimate_voice_irregularity(self, f0: torch.Tensor) -> torch.Tensor:
+        """Estimate voice irregularity from F0 perturbations (jitter proxy)."""
         f0_flat = f0.squeeze(1)  # [B, T]
 
         # Compute local F0 variation (jitter)
@@ -233,29 +235,35 @@ class VoiceStateEstimator(nn.Module):
         jitter = f0_diff.abs() / (f0_flat + 1e-8)
 
         # Use learned network
-        roughness = self.roughness_net(jitter.unsqueeze(1)).squeeze(1)  # [B, T]
+        irregularity = self.voice_irregularity_net(jitter.unsqueeze(1)).squeeze(1)  # [B, T]
 
-        return roughness
+        return irregularity
 
-    def _estimate_arousal(
+    def _estimate_pressedness(
         self,
-        mel: torch.Tensor,
-        f0: torch.Tensor,
+        pitch_level: torch.Tensor,
+        energy_level: torch.Tensor,
+        spectral_tilt: torch.Tensor,
+        breathiness: torch.Tensor,
     ) -> torch.Tensor:
-        """Estimate emotional arousal from energy and F0 dynamics."""
-        B, _, T = mel.shape
+        """Estimate pressedness from source intensity and inverse breathiness."""
+        pressedness = (
+            0.35 * pitch_level
+            + 0.30 * energy_level
+            + 0.20 * spectral_tilt
+            + 0.15 * (1.0 - breathiness)
+        )
+        return torch.clamp(pressedness, 0.0, 1.0)
 
-        # Combine mel and f0 features
-        mel_mean = mel.mean(dim=1, keepdim=True).transpose(1, 2)  # [B, T, 1]
-        f0_norm = (f0.transpose(1, 2) - 100) / 400  # Normalize F0
-        f0_norm = torch.clamp(f0_norm, 0, 1)
-
-        features = torch.cat([mel.transpose(1, 2), f0_norm], dim=-1)  # [B, T, n_mels+1]
-
-        # Use learned network
-        arousal = self.arousal_net(features).squeeze(-1)  # [B, T]
-
-        return arousal
+    def _estimate_openness(self, mel: torch.Tensor) -> torch.Tensor:
+        """Estimate articulation openness from lower-mid spectral emphasis."""
+        n_mels = mel.shape[1]
+        low_mid_start = max(0, n_mels // 6)
+        low_mid_end = max(low_mid_start + 1, n_mels // 2)
+        low_mid = mel[:, low_mid_start:low_mid_end, :].mean(dim=1)
+        full = mel.mean(dim=1)
+        openness = low_mid / (full + 1e-8)
+        return torch.clamp(openness / 1.5, 0.0, 1.0)
 
     def _smooth(self, x: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
         """Apply temporal smoothing."""
@@ -298,16 +306,7 @@ def voice_state_to_dict(voice_state: torch.Tensor) -> dict[str, torch.Tensor]:
     Returns:
         Dict with named parameters.
     """
-    names = [
-        "breathiness",
-        "tension",
-        "arousal",
-        "valence",
-        "roughness",
-        "voicing",
-        "energy",
-        "rate",
-    ]
+    names = list(CANONICAL_VOICE_STATE_IDS)
 
     return {name: voice_state[..., i] for i, name in enumerate(names)}
 

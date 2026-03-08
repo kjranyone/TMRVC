@@ -71,11 +71,11 @@ Reason:
 
 ### Diarization fallback
 
-- `pyannote.audio`
+- `pyannote/speaker-diarization-community-1`
 
 Reason:
 
-- strong OSS baseline for speaker diarization and overlap detection
+- strong OSS baseline for speaker diarization and overlap detection, with exclusive diarization support that simplifies ASR timestamp binding
 
 ### Separation / enhancement
 
@@ -99,6 +99,16 @@ Reason:
 Reason:
 
 - practical fallback when larger long-form stacks are unavailable
+
+### Mainline ASR / Alignment pair
+
+- `Qwen3-ASR-1.7B`
+- `Qwen3-ForcedAligner-0.6B`
+
+Reason:
+
+- one family for ASR and bootstrap alignment reduces timestamp-contract drift between transcript recovery and transitional pointer supervision
+- forced-aligner language support is narrower than ASR support, so unsupported languages must fall back explicitly rather than being force-fit into pseudo-truth labels
 
 ## Outputs
 

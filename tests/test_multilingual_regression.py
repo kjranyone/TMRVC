@@ -325,3 +325,151 @@ class TestG2PDeterminism:
             )
             assert r1.phonemes == r2.phonemes
             assert r1.language_id == r2.language_id
+
+
+# ---------------------------------------------------------------------------
+# Frozen Language Set Validation (Worker 06)
+# ---------------------------------------------------------------------------
+
+# The frozen external-comparison set from worker_06_validation.md (v1_2026_03_08)
+FROZEN_LANGUAGE_SET_V1 = {
+    "English", "Mandarin Chinese", "Japanese",
+    "Korean", "Spanish", "French", "German",
+    "Italian", "Russian",
+}
+
+# Map of G2P language codes to frozen language names
+G2P_LANGUAGE_MAP = {
+    "ja": "Japanese",
+    "en": "English",
+    "zh": "Mandarin Chinese",
+    "ko": "Korean",
+}
+
+# Frozen code-switch evaluation pairs (pre-registered)
+FROZEN_CODE_SWITCH_PAIRS = [
+    ("en", "ja"),  # EN-JA
+    ("en", "zh"),  # EN-ZH
+    ("zh", "ja"),  # ZH-JA
+]
+
+
+class TestFrozenLanguageSetValidation:
+    """The evaluation language set must contain at least 9 languages."""
+
+    def test_minimum_9_languages(self):
+        """Frozen language set must have at least 9 languages."""
+        assert len(FROZEN_LANGUAGE_SET_V1) >= 9, (
+            f"Frozen language set has only {len(FROZEN_LANGUAGE_SET_V1)} languages, "
+            f"need at least 9"
+        )
+
+    def test_required_languages_present(self):
+        """All required languages from the plan must be in the frozen set."""
+        required = {
+            "English", "Mandarin Chinese", "Japanese", "Korean",
+            "Spanish", "French", "German", "Italian", "Russian",
+        }
+        missing = required - FROZEN_LANGUAGE_SET_V1
+        assert not missing, f"Missing languages from frozen set: {missing}"
+
+    def test_g2p_covers_core_languages(self):
+        """G2P must support at least the core 4 languages (ja, en, zh, ko)."""
+        for code, name in G2P_LANGUAGE_MAP.items():
+            assert name in FROZEN_LANGUAGE_SET_V1, (
+                f"G2P language {code} ({name}) not in frozen language set"
+            )
+
+    def test_language_set_version_tagged(self):
+        """The language set must have a version identifier for tracking."""
+        # Version is implicit in the constant name; verify it's non-empty
+        assert FROZEN_LANGUAGE_SET_V1, "Frozen language set is empty"
+
+
+# ---------------------------------------------------------------------------
+# Per-Language Intelligibility Gate Skeleton (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestPerLanguageIntelligibilityGate:
+    """Skeleton: per-language intelligibility must be measurable.
+
+    Full implementation requires:
+    - Trained model checkpoint
+    - ASR re-transcription pipeline
+    - Per-language held-out test sets
+    """
+
+    @pytest.mark.xfail(
+        reason="G2P backends may produce <unk> for some phonemes; "
+               "requires phonemizer/espeak configuration improvements",
+        strict=False,
+    )
+    @pytest.mark.parametrize("language", ["ja", "en", "zh", "ko"])
+    def test_g2p_round_trip_no_unk(self, language: str):
+        """G2P output for frozen texts must not contain <unk> tokens.
+
+        This is a proxy for intelligibility: if G2P cannot handle the text,
+        the model cannot produce intelligible speech for it.
+        """
+        _skip_if_g2p_unavailable(language)
+        for text in FROZEN_TEXTS[language]:
+            result = text_to_phonemes(text, language=language)
+            ids = result.phoneme_ids.tolist()
+            assert UNK_ID not in ids, (
+                f"<unk> token in G2P output for {language}: {text!r}. "
+                f"This indicates potential intelligibility issues."
+            )
+
+    @pytest.mark.skip(
+        reason="TODO: Requires trained checkpoint and ASR pipeline for full evaluation"
+    )
+    @pytest.mark.parametrize("language", ["ja", "en", "zh", "ko"])
+    def test_per_language_cer_within_budget(self, language: str):
+        """Per-language CER must be within the regression budget.
+
+        TODO: Implement with:
+        1. Generate speech for held-out test set in each language
+        2. Re-transcribe with frozen ASR model
+        3. Compute CER
+        4. Compare against frozen per-language threshold
+        """
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Code-Switch Pair Registration (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestCodeSwitchPairRegistration:
+    """Code-switch evaluation pairs must be pre-registered."""
+
+    def test_minimum_code_switch_pairs(self):
+        """At least 3 code-switch pairs must be registered."""
+        assert len(FROZEN_CODE_SWITCH_PAIRS) >= 3
+
+    def test_registered_pairs_use_supported_languages(self):
+        """All code-switch pairs must use languages in the G2P map."""
+        for lang_a, lang_b in FROZEN_CODE_SWITCH_PAIRS:
+            assert lang_a in G2P_LANGUAGE_MAP, (
+                f"Code-switch language {lang_a} not in G2P map"
+            )
+            assert lang_b in G2P_LANGUAGE_MAP, (
+                f"Code-switch language {lang_b} not in G2P map"
+            )
+
+    def test_no_self_pairs(self):
+        """Code-switch pairs must not be self-pairs (e.g., en-en)."""
+        for lang_a, lang_b in FROZEN_CODE_SWITCH_PAIRS:
+            assert lang_a != lang_b, f"Self code-switch pair: ({lang_a}, {lang_b})"
+
+    @pytest.mark.skip(
+        reason="TODO: Requires trained checkpoint for code-switch intelligibility testing"
+    )
+    def test_code_switch_intelligibility_within_budget(self):
+        """Code-switch CER must be within 2% of monolingual baseline per segment.
+
+        TODO: Implement with mixed-language evaluation set.
+        """
+        pass

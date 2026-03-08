@@ -8,6 +8,8 @@ Endpoints:
 - GET  /characters     List available characters
 - POST /characters     Register a new character
 - GET  /health         Health check
+- /admin/*             System administration and telemetry
+- /ui/*                WebUI orchestration and event streams
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 
 from tmrvc_core.dialogue_types import CharacterProfile
 from tmrvc_serve.uclm_engine import UCLMEngine
+from tmrvc_data.curation.data_service import CurationDataService
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +31,21 @@ from tmrvc_serve.middleware import IdempotencyMiddleware
 app = FastAPI(
     title="TMRVC TTS/VC Server",
     description="Real-time Unified TTS/VC using UCLM v3 pointer-based architecture.",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # Idempotency middleware for UI-originated write endpoints (Worker 04, task 21)
 app.add_middleware(IdempotencyMiddleware, ttl=300, max_cache_size=4096)
 
 _engine: UCLMEngine | None = None
+_data_service: Optional[CurationDataService] = None
+_orchestrator = None
 _characters: dict[str, CharacterProfile] = {}
 _context_predictor = None
-_curation_orchestrator = None
 
 
 def _load_persisted_characters() -> None:
     global _characters
-    from pathlib import Path
     import json
     
     char_json = Path("configs/characters.json")
@@ -67,30 +70,6 @@ def _load_persisted_characters() -> None:
         logger.error("Failed to load characters from %s: %s", char_json, e)
 
 
-def _save_persisted_characters() -> None:
-    from pathlib import Path
-    import json
-    
-    char_json = Path("configs/characters.json")
-    char_json.parent.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        data = {}
-        for cid, p in _characters.items():
-            data[cid] = {
-                "name": p.name,
-                "speaker_file": str(p.speaker_file) if p.speaker_file else None,
-                "adaptation_level": "standard", # Default for now
-                "personality": p.personality,
-                "voice_description": p.voice_description,
-                "language": p.language
-            }
-        with open(char_json, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error("Failed to save characters to %s: %s", char_json, e)
-
-
 def get_engine() -> UCLMEngine:
     if _engine is None:
         raise HTTPException(status_code=503, detail="UCLM engine not initialized.")
@@ -102,19 +81,29 @@ def init_app(
     codec_checkpoint: str | Path | None = None,
     device: str = "cpu",
     api_key: str | None = None,
+    curation_db: str | Path | None = "data/curation/curation.db",
     curation_dir: str | Path | None = "data/curation",
 ) -> None:
-    global _engine, _context_predictor, _curation_orchestrator
+    global _engine, _context_predictor, _data_service, _orchestrator
 
-    # Load persisted characters from configs/characters.json
+    # 1. Initialize Curation Data Service (Worker 07 requirement)
+    if curation_db:
+        from tmrvc_data.curation.data_service import CurationDataService
+        _data_service = CurationDataService(curation_db)
+        
+        from tmrvc_data.curation.orchestrator import CurationOrchestrator
+        _orchestrator = CurationOrchestrator(curation_dir, data_service=_data_service)
+        
+        # Supply to ui router
+        import tmrvc_serve.routes.ui as ui_module
+        ui_module._data_service = _data_service
+        ui_module._orchestrator = _orchestrator
+        logger.info("Curation orchestrator & SQLite initialized at %s", curation_db)
+
+    # 2. Load persisted characters
     _load_persisted_characters()
 
-    # Initialize Curation Orchestrator
-    if curation_dir:
-        from tmrvc_data.curation.orchestrator import CurationOrchestrator
-        _curation_orchestrator = CurationOrchestrator(curation_dir)
-        logger.info("Curation orchestrator initialized at %s", curation_dir)
-
+    # 3. Initialize UCLM Engine
     if uclm_checkpoint and codec_checkpoint:
         try:
             _engine = UCLMEngine(
@@ -123,6 +112,9 @@ def init_app(
                 device=device,
             )
             _engine.load_models()
+            # Supply to admin router
+            import tmrvc_serve.routes.admin as admin_module
+            admin_module._engine = _engine
             logger.info("UCLM engine initialized on %s", device)
         except Exception as e:
             logger.error("Failed to initialize UCLM engine: %s", e)
@@ -158,11 +150,3 @@ app.include_router(vc_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(ui_router)
-
-
-# Helper for style prediction (async)
-async def predict_style_from_inputs(**kwargs):
-    from tmrvc_serve.style_resolver import _predict_style_from_inputs as _predict_style_impl
-    if "context_predictor" not in kwargs:
-        kwargs["context_predictor"] = _context_predictor
-    return await _predict_style_impl(**kwargs)

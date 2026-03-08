@@ -4,8 +4,23 @@ Loads pre-extracted features from cache:
 - codec_tokens: [n_codebooks, T] from EnCodec
 - voice_state: [T, 8] from VoiceStateEstimator
 - phoneme_ids: [L] from G2P (includes Pitch Accent for Japanese)
-- durations: [L] from MFA (optional in v3)
+- durations: [L] from MFA (optional in v3 -- never required for pointer mode)
 - spk_embed: [192] from SpeakerEncoder
+
+Worker 03 contract:
+- ``durations.npy`` is NEVER required in v3 pointer mode.
+- ``voice_state.npy`` is the core frame-level inference artifact.
+  ``voice_state_targets.npy``, ``voice_state_observed_mask.npy``, and
+  ``voice_state_confidence.npy`` are optional supervision artifacts.
+- ``text_suprasegmentals.npy`` is the canonical companion to ``phoneme_ids.npy``
+  for accent/tone/phrase-boundary cues.  Shape ``[L, 4]`` (d_suprasegmental=4).
+- ``bootstrap_alignment.json`` maps frames to phoneme indices using the
+  canonical frame convention (sample_rate=24000, hop_length=240).
+- meta.json may contain curation fields: ``curation_record_id``,
+  ``promotion_bucket``, ``curation_pass``, ``quality_score``.
+- meta.json may contain few-shot prompt fields: ``prompt_eligible``,
+  ``prompt_pair_id``.
+- Quality filtering via ``min_quality_score`` skips low-quality samples.
 """
 
 from __future__ import annotations
@@ -22,6 +37,28 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+# Canonical voice_state dimension names (Worker 03 contract).
+# Order matches the 8 columns of voice_state.npy / voice_state_targets.npy.
+VOICE_STATE_DIMS = (
+    "pitch_level",
+    "pitch_range",
+    "energy_level",
+    "speech_rate",
+    "spectral_tilt",
+    "breathiness",
+    "voice_irregularity",
+    "pause_tendency",
+)
+
+# Canonical text_suprasegmentals dimension names (Worker 03 contract).
+# Order matches the 4 columns of text_suprasegmentals.npy.
+SUPRASEGMENTAL_DIMS = (
+    "accent_upstep",
+    "accent_downstep",
+    "phrase_break",
+    "lexical_tone_id",
+)
+
 
 @dataclass
 class UCLMBatch:
@@ -30,7 +67,7 @@ class UCLMBatch:
     codec_tokens: torch.Tensor  # [B, n_codebooks, T]
     voice_state: torch.Tensor  # [B, T, d_voice_state]
     phoneme_ids: torch.Tensor  # [B, L]
-    durations: Optional[torch.Tensor]  # [B, L]
+    durations: Optional[torch.Tensor]  # [B, L] -- None in v3 pointer mode
     spk_embed: torch.Tensor  # [B, d_speaker]
     text: list[str]  # [B]
     utterance_ids: list[str]  # [B]
@@ -40,6 +77,8 @@ class UCLMBatch:
     dialogue_context: Optional[torch.Tensor] = None
     acting_intent: Optional[torch.Tensor] = None
     prosody_targets: Optional[torch.Tensor] = None
+    text_suprasegmentals: Optional[torch.Tensor] = None  # [B, L, 4]
+    bootstrap_alignment: Optional[dict] = None  # Contains 'phoneme_indices'
     # v3 voice state supervision (Worker 01/03)
     voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
     voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool
@@ -51,12 +90,17 @@ class UCLMDataset(Dataset):
 
     Expects cache directory structure:
         data/cache/{dataset}/train/{speaker}/{utterance}/
-        ├── codec_tokens.npy     # [n_codebooks, T]
-        ├── voice_state.npy      # [T, 8]
-        ├── phoneme_ids.npy      # [L]
-        ├── durations.npy        # [L] (optional)
-        ├── spk_embed.npy        # [192]
-        └── meta.json
+        +-- codec_tokens.npy     # [n_codebooks, T]
+        +-- voice_state.npy      # [T, 8]
+        +-- phoneme_ids.npy      # [L]
+        +-- durations.npy        # [L] (optional -- never required in v3)
+        +-- spk_embed.npy        # [192]
+        +-- text_suprasegmentals.npy  # [L, 4] (optional)
+        +-- voice_state_targets.npy   # [T, 8] (optional supervision)
+        +-- voice_state_observed_mask.npy  # [T, 8] bool (optional)
+        +-- voice_state_confidence.npy     # [T, 8] float32 (optional)
+        +-- bootstrap_alignment.json  # (optional)
+        +-- meta.json
 
     Args:
         cache_dir: Root cache directory.
@@ -66,7 +110,10 @@ class UCLMDataset(Dataset):
         include_datasets: If set, only include these datasets.
         exclude_speakers: Speaker IDs to exclude.
         tts_mode: "auto", "pointer", or "legacy_duration".
-        quality_score_threshold: Minimum quality_score to include (0.0 = no filter).
+            - "pointer": load phoneme_ids but NEVER require durations.npy.
+            - "legacy_duration": require BOTH phoneme_ids.npy AND durations.npy.
+            - "auto": load whatever is available (v2 compat).
+        min_quality_score: Minimum quality_score to include (0.0 = no filter).
         provenance_filter: If set, only include utterances with this provenance_class.
     """
 
@@ -79,8 +126,10 @@ class UCLMDataset(Dataset):
         include_datasets: list[str] | None = None,
         exclude_speakers: list[str] | None = None,
         tts_mode: str = "auto",
-        quality_score_threshold: float = 0.0,
+        min_quality_score: float = 0.0,
         provenance_filter: str | None = None,
+        # Legacy alias kept for backward compatibility
+        quality_score_threshold: float | None = None,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.datasets = datasets or []
@@ -89,16 +138,22 @@ class UCLMDataset(Dataset):
         self.include_datasets = include_datasets
         self.exclude_speakers = set(exclude_speakers or [])
         self.tts_mode = tts_mode
-        self.quality_score_threshold = quality_score_threshold
+        # Support both param names for backward compat
+        if quality_score_threshold is not None and min_quality_score == 0.0:
+            self.min_quality_score = quality_score_threshold
+        else:
+            self.min_quality_score = min_quality_score
         self.provenance_filter = provenance_filter
 
         self.utterances: list[dict[str, Any]] = []
         self._scan_utterances()
 
         logger.info(
-            "UCLMDataset: %d utterances from %d datasets",
+            "UCLMDataset: %d utterances from %d datasets (tts_mode=%s, min_quality_score=%.2f)",
             len(self.utterances),
             len(self.datasets) if self.datasets else 0,
+            self.tts_mode,
+            self.min_quality_score,
         )
 
     def _scan_utterances(self) -> None:
@@ -131,7 +186,9 @@ class UCLMDataset(Dataset):
                     if not utt_dir.is_dir():
                         continue
 
-                    # Check for required core files
+                    # Check for required core files.
+                    # durations.npy is NOT required -- v3 pointer mode
+                    # does not use external duration labels.
                     codec_path = utt_dir / "codec_tokens.npy"
                     voice_path = utt_dir / "voice_state.npy"
                     meta_path = utt_dir / "meta.json"
@@ -150,10 +207,10 @@ class UCLMDataset(Dataset):
                     if n_frames < self.min_frames:
                         continue
 
-                    # Quality filtering (Worker 03)
-                    if self.quality_score_threshold > 0.0:
+                    # Quality filtering (Worker 03 contract)
+                    if self.min_quality_score > 0.0:
                         qs = meta.get("quality_score", 1.0)
-                        if qs < self.quality_score_threshold:
+                        if qs < self.min_quality_score:
                             continue
                     if self.provenance_filter is not None:
                         if meta.get("provenance_class", "") != self.provenance_filter:
@@ -177,7 +234,12 @@ class UCLMDataset(Dataset):
     def supervision_report(self) -> dict:
         """Return dataset-level supervision statistics (Worker 03 requirement).
 
-        Returns a dict compatible with DatasetReport fields.
+        Returns a dict compatible with DatasetReport fields.  Distinguishes:
+        - text_supervision_coverage (has text in meta)
+        - canonical_text_unit_coverage (has phoneme_ids.npy)
+        - legacy_duration_coverage (has durations.npy)
+        - voice_state_supervision_coverage (has voice_state_targets.npy)
+        - prompt_pairing_coverage (has prompt_eligible in meta)
         """
         from tmrvc_data.g2p import UNK_ID, PHONE2ID, ID2PHONE
 
@@ -187,6 +249,10 @@ class UCLMDataset(Dataset):
         with_legacy_duration = 0
         with_voice_state = 0
         with_dialogue_context = 0
+        with_suprasegmentals = 0
+        with_bootstrap_alignment = 0
+        with_prompt_eligible = 0
+        with_curation_record = 0
         total_phones = 0
         unk_phones = 0
         active_ids: set[int] = set()
@@ -201,10 +267,13 @@ class UCLMDataset(Dataset):
 
         for utt in self.utterances:
             utt_path = utt["path"]
+            meta = utt.get("meta", {})
             has_phonemes = (utt_path / "phoneme_ids.npy").exists()
             has_durations = (utt_path / "durations.npy").exists()
             has_vs_targets = (utt_path / "voice_state_targets.npy").exists()
             has_dialogue = (utt_path / "dialogue_context.npy").exists()
+            has_supra = (utt_path / "text_suprasegmentals.npy").exists()
+            has_bootstrap = (utt_path / "bootstrap_alignment.json").exists()
 
             if utt.get("text"):
                 with_text += 1
@@ -222,6 +291,10 @@ class UCLMDataset(Dataset):
                     pass
             if has_durations:
                 with_legacy_duration += 1
+            if has_supra:
+                with_suprasegmentals += 1
+            if has_bootstrap:
+                with_bootstrap_alignment += 1
             if has_vs_targets:
                 with_voice_state += 1
                 try:
@@ -239,6 +312,12 @@ class UCLMDataset(Dataset):
             if has_dialogue:
                 with_dialogue_context += 1
 
+            # Few-shot prompt and curation fields
+            if "prompt_eligible" in meta:
+                with_prompt_eligible += 1
+            if "curation_record_id" in meta:
+                with_curation_record += 1
+
         active_phone_inventory = sorted(
             ID2PHONE.get(i, f"id:{i}") for i in active_ids if i != UNK_ID
         )
@@ -254,6 +333,8 @@ class UCLMDataset(Dataset):
             "alias_hit_ratio": 0.0,  # Requires normalization pass to compute
             "active_phone_inventory": active_phone_inventory,
             "pitch_accent_coverage": accent_count / max(total_phones, 1),
+            "suprasegmental_coverage": with_suprasegmentals / max(total, 1),
+            "bootstrap_alignment_coverage": with_bootstrap_alignment / max(total, 1),
             "voice_state_supervision_coverage": with_voice_state / max(total, 1),
             "voice_state_observed_ratio": (
                 vs_observed_sum / vs_observed_count if vs_observed_count > 0 else 0.0
@@ -264,6 +345,8 @@ class UCLMDataset(Dataset):
             },
             "dialogue_context_coverage": with_dialogue_context / max(total, 1),
             "same_text_multi_context_coverage": multi_context_count / max(len(multi_take_texts), 1) if multi_take_texts else 0.0,
+            "prompt_pairing_coverage": with_prompt_eligible / max(total, 1),
+            "curation_record_coverage": with_curation_record / max(total, 1),
             "tts_mode": self.tts_mode,
         }
 
@@ -271,7 +354,7 @@ class UCLMDataset(Dataset):
         """Return expressive-data readiness statistics (Worker 03 requirement)."""
         total = len(self.utterances)
         fields = [
-            "dialogue_context", "acting_intent", "prosody_targets", 
+            "dialogue_context", "acting_intent", "prosody_targets",
             "style_embedding", "pause_events"
         ]
         counts = {f: 0 for f in fields}
@@ -299,6 +382,7 @@ class UCLMDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         utt = self.utterances[idx]
         utt_path = utt["path"]
+        meta = utt.get("meta", {})
 
         # Load codec tokens
         codec_tokens = np.load(utt_path / "codec_tokens.npy")
@@ -308,7 +392,7 @@ class UCLMDataset(Dataset):
         voice_state = np.load(utt_path / "voice_state.npy")
         voice_state = torch.from_numpy(voice_state).float()
 
-        # Load phoneme ids and durations
+        # Load phoneme ids and durations (Worker 03: durations never required in v3)
         phoneme_ids_path = utt_path / "phoneme_ids.npy"
         durations_path = utt_path / "durations.npy"
 
@@ -316,13 +400,15 @@ class UCLMDataset(Dataset):
         durations = None
 
         if self.tts_mode == "pointer":
+            # v3 pointer mode: load phoneme_ids, NEVER require durations
             if phoneme_ids_path.exists():
                 phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
         elif self.tts_mode == "legacy_duration":
+            # Legacy v2 mode: require BOTH phoneme_ids AND durations
             if phoneme_ids_path.exists() and durations_path.exists():
                 phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
                 durations = torch.from_numpy(np.load(durations_path)).long()
-        else: # auto
+        else:  # auto
             if phoneme_ids_path.exists():
                 phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
                 if durations_path.exists():
@@ -336,7 +422,7 @@ class UCLMDataset(Dataset):
         dialogue_context = None
         if (utt_path / "dialogue_context.npy").exists():
             dialogue_context = torch.from_numpy(np.load(utt_path / "dialogue_context.npy")).float()
-            
+
         acting_intent = None
         if (utt_path / "acting_intent.npy").exists():
             acting_intent = torch.from_numpy(np.load(utt_path / "acting_intent.npy")).float()
@@ -345,7 +431,7 @@ class UCLMDataset(Dataset):
         if (utt_path / "prosody_targets.npy").exists():
             prosody_targets = torch.from_numpy(np.load(utt_path / "prosody_targets.npy")).float()
 
-        # Voice state supervision artifacts (Worker 03)
+        # Voice state supervision artifacts (Worker 03 contract)
         voice_state_targets = None
         voice_state_observed_mask = None
         voice_state_confidence = None
@@ -358,6 +444,38 @@ class UCLMDataset(Dataset):
             vs_conf_path = utt_path / "voice_state_confidence.npy"
             if vs_conf_path.exists():
                 voice_state_confidence = torch.from_numpy(np.load(vs_conf_path)).float()
+
+        # Suprasegmentals (Worker 03 contract: [L, 4] aligned with phoneme_ids)
+        text_suprasegmentals = None
+        suprasegmentals_path = utt_path / "text_suprasegmentals.npy"
+        if suprasegmentals_path.exists():
+            text_suprasegmentals = torch.from_numpy(np.load(suprasegmentals_path)).float()
+
+        # Bootstrap Alignment (Worker 03 contract)
+        bootstrap_alignment = None
+        bootstrap_path = utt_path / "bootstrap_alignment.json"
+        if bootstrap_path.exists():
+            try:
+                with open(bootstrap_path, encoding="utf-8") as f:
+                    bs_data = json.load(f)
+                if "phoneme_indices" in bs_data:
+                    bootstrap_alignment = {
+                        "phoneme_indices": torch.tensor(bs_data["phoneme_indices"], dtype=torch.long),
+                        "frame_count": bs_data.get("frame_count", 0),
+                        "phoneme_count": bs_data.get("phoneme_count", 0),
+                    }
+            except Exception as e:
+                logger.warning("Failed to load bootstrap_alignment.json for %s: %s", utt["utterance_id"], e)
+
+        # Expose curation fields from meta (Worker 03 contract)
+        curation_record_id = meta.get("curation_record_id")
+        promotion_bucket = meta.get("promotion_bucket")
+        curation_pass = meta.get("curation_pass")
+        quality_score = meta.get("quality_score")
+
+        # Expose few-shot prompt fields from meta (Worker 03 contract)
+        prompt_eligible = meta.get("prompt_eligible")
+        prompt_pair_id = meta.get("prompt_pair_id")
 
         return {
             "codec_tokens": codec_tokens,
@@ -374,6 +492,16 @@ class UCLMDataset(Dataset):
             "voice_state_targets": voice_state_targets,
             "voice_state_observed_mask": voice_state_observed_mask,
             "voice_state_confidence": voice_state_confidence,
+            "text_suprasegmentals": text_suprasegmentals,
+            "bootstrap_alignment": bootstrap_alignment,
+            # Curation fields (Worker 03)
+            "curation_record_id": curation_record_id,
+            "promotion_bucket": promotion_bucket,
+            "curation_pass": curation_pass,
+            "quality_score": quality_score,
+            # Few-shot prompt fields (Worker 03)
+            "prompt_eligible": prompt_eligible,
+            "prompt_pair_id": prompt_pair_id,
         }
 
 
@@ -383,7 +511,7 @@ def collate_uclm_batch(
 ) -> UCLMBatch:
     """Collate a batch of UCLM samples."""
     max_codec_frames = max(sample["codec_tokens"].shape[1] for sample in batch)
-    
+
     # Filter out samples without phoneme_ids for max_phonemes calc
     samples_with_text = [s for s in batch if s["phoneme_ids"] is not None]
     max_phonemes = max(s["phoneme_ids"].shape[0] for s in samples_with_text) if samples_with_text else 1
@@ -400,21 +528,42 @@ def collate_uclm_batch(
     spk_embed = torch.zeros(B, d_speaker, dtype=torch.float)
     frame_lengths = torch.zeros(B, dtype=torch.long)
     phoneme_lengths = torch.zeros(B, dtype=torch.long)
-    
+
     dialogue_context = None
     if any(s["dialogue_context"] is not None for s in batch):
         d_ctx = next(s["dialogue_context"].shape[-1] for s in batch if s["dialogue_context"] is not None)
         dialogue_context = torch.zeros(B, d_ctx)
-        
+
     acting_intent = None
     if any(s["acting_intent"] is not None for s in batch):
         d_act = next(s["acting_intent"].shape[-1] for s in batch if s["acting_intent"] is not None)
         acting_intent = torch.zeros(B, d_act)
-        
+
     prosody_targets = None
     if any(s["prosody_targets"] is not None for s in batch):
         d_pro = next(s["prosody_targets"].shape[-1] for s in batch if s["prosody_targets"] is not None)
         prosody_targets = torch.zeros(B, max_codec_frames, d_pro)
+
+    # Suprasegmentals
+    text_suprasegmentals = None
+    if any(s.get("text_suprasegmentals") is not None for s in batch):
+        d_supra = next(s["text_suprasegmentals"].shape[-1] for s in batch if s.get("text_suprasegmentals") is not None)
+        text_suprasegmentals = torch.zeros(B, max_phonemes, d_supra)
+
+    # Bootstrap alignment
+    bootstrap_alignment = None
+    if any(s.get("bootstrap_alignment") is not None for s in batch):
+        bootstrap_alignment = {"phoneme_indices": torch.zeros(B, max_codec_frames, dtype=torch.long)}
+
+    # Voice state targets
+    voice_state_targets = None
+    voice_state_observed_mask = None
+    voice_state_confidence = None
+    if any(s.get("voice_state_targets") is not None for s in batch):
+        d_vs = next(s["voice_state_targets"].shape[-1] for s in batch if s.get("voice_state_targets") is not None)
+        voice_state_targets = torch.zeros(B, max_codec_frames, d_vs)
+        voice_state_observed_mask = torch.zeros(B, max_codec_frames, d_vs, dtype=torch.bool)
+        voice_state_confidence = torch.zeros(B, max_codec_frames, d_vs)
 
     text = []
     utterance_ids = []
@@ -439,10 +588,13 @@ def collate_uclm_batch(
             phoneme_lengths[i] = n_p
             if durations is not None and sample["durations"] is not None:
                 durations[i, :n_p] = sample["durations"]
+            if text_suprasegmentals is not None and sample.get("text_suprasegmentals") is not None:
+                ts = sample["text_suprasegmentals"]
+                text_suprasegmentals[i, :n_p, :] = ts[:n_p]
 
         spk_embed[i] = sample["spk_embed"]
         frame_lengths[i] = n_codec_frames
-        
+
         if dialogue_context is not None and sample["dialogue_context"] is not None:
             dialogue_context[i] = sample["dialogue_context"]
         if acting_intent is not None and sample["acting_intent"] is not None:
@@ -450,6 +602,21 @@ def collate_uclm_batch(
         if prosody_targets is not None and sample["prosody_targets"] is not None:
             pt = sample["prosody_targets"]
             prosody_targets[i, :min(pt.shape[0], max_codec_frames)] = pt[:max_codec_frames]
+
+        if bootstrap_alignment is not None and sample.get("bootstrap_alignment") is not None:
+            bs = sample["bootstrap_alignment"]["phoneme_indices"]
+            bootstrap_alignment["phoneme_indices"][i, :min(bs.shape[0], max_codec_frames)] = bs[:max_codec_frames]
+
+        if voice_state_targets is not None and sample.get("voice_state_targets") is not None:
+            vst = sample["voice_state_targets"]
+            vsm = sample["voice_state_observed_mask"]
+            vsc = sample["voice_state_confidence"]
+            limit = min(vst.shape[0], max_codec_frames)
+            voice_state_targets[i, :limit] = vst[:limit]
+            if vsm is not None:
+                voice_state_observed_mask[i, :limit] = vsm[:limit]
+            if vsc is not None:
+                voice_state_confidence[i, :limit] = vsc[:limit]
 
         text.append(sample["text"])
         utterance_ids.append(sample["utterance_id"])
@@ -467,4 +634,9 @@ def collate_uclm_batch(
         dialogue_context=dialogue_context,
         acting_intent=acting_intent,
         prosody_targets=prosody_targets,
+        text_suprasegmentals=text_suprasegmentals,
+        bootstrap_alignment=bootstrap_alignment,
+        voice_state_targets=voice_state_targets,
+        voice_state_observed_mask=voice_state_observed_mask,
+        voice_state_confidence=voice_state_confidence,
     )

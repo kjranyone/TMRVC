@@ -89,15 +89,66 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     offset: int = 0,
+    position_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply rotary embeddings to *x* ``[B, n_heads, T, head_dim]``.
 
-    *cos* / *sin* are ``[max_seq, head_dim]``; we slice ``[offset:offset+T]``.
+    If *position_indices* [B, T] is provided, it uses those as indices into
+    the RoPE table instead of a simple linear offset. This prevents attention
+    collapse during pointer stalls (Progress-aware RoPE).
     """
-    T = x.shape[2]
-    cos = cos[offset : offset + T].unsqueeze(0).unsqueeze(0)  # [1, 1, T, hd]
-    sin = sin[offset : offset + T].unsqueeze(0).unsqueeze(0)
-    return x * cos + _rotate_half(x) * sin
+    B, n_h, T, hd = x.shape
+    if position_indices is not None:
+        # Use provided indices [B, T] to slice RoPE table
+        # We need to expand cos/sin to [B, T, hd] using indices
+        # and then unsqueeze for head dimension alignment.
+        indices = position_indices.long()
+        cos_b = cos[indices].unsqueeze(1)  # [B, 1, T, hd]
+        sin_b = sin[indices].unsqueeze(1)  # [B, 1, T, hd]
+        return x * cos_b + _rotate_half(x) * sin_b
+    else:
+        # Legacy linear offset mode
+        cos = cos[offset : offset + T].unsqueeze(0).unsqueeze(0)  # [1, 1, T, hd]
+        sin = sin[offset : offset + T].unsqueeze(0).unsqueeze(0)
+        return x * cos + _rotate_half(x) * sin
+
+
+# ---------------------------------------------------------------------------
+# Prompt Resampler (condenses T_prompt into fixed N_summary tokens)
+# ---------------------------------------------------------------------------
+
+class PromptResampler(nn.Module):
+    """Condenses a variable-length prompt sequence into fixed summary tokens.
+
+    Uses a learned query-based attention (Perceiver style) to aggregate
+    information from the prompt tokens.
+    """
+
+    def __init__(self, d_model: int, n_summary: int = 32, n_heads: int = 8):
+        super().__init__()
+        self.n_summary = n_summary
+        self.d_model = d_model
+        # Learned summary queries
+        self.queries = nn.Parameter(torch.randn(n_summary, d_model) * 0.02)
+        self.attn = CrossAttention(d_model, n_heads)
+        self.norm = RMSNorm(d_model)
+        self.ff = SwiGLUFFN(d_model, d_model * 4)
+
+    def forward(self, prompt_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            prompt_tokens: [B, T_prompt, d_model]
+        Returns:
+            summary_tokens: [B, n_summary, d_model]
+        """
+        B = prompt_tokens.shape[0]
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)  # [B, n_summary, d_model]
+
+        # Attend to prompt tokens
+        h = self.attn(q, prompt_tokens)
+        h = self.norm(q + h)
+        h = h + self.ff(h)
+        return h
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +239,7 @@ class CausalGQAttention(nn.Module):
         x: torch.Tensor,
         k_cache: Optional[torch.Tensor] = None,
         v_cache: Optional[torch.Tensor] = None,
+        position_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, C = x.shape
 
@@ -199,8 +251,8 @@ class CausalGQAttention(nn.Module):
         rope_offset = k_cache.shape[2] if k_cache is not None else 0
         cos, sin = self.rope(rope_offset + T)
 
-        q = apply_rotary_emb(q, cos, sin, offset=rope_offset)
-        k = apply_rotary_emb(k, cos, sin, offset=rope_offset)
+        q = apply_rotary_emb(q, cos, sin, offset=rope_offset, position_indices=position_indices)
+        k = apply_rotary_emb(k, cos, sin, offset=rope_offset, position_indices=position_indices)
 
         # Concatenate KV cache
         if k_cache is not None:
@@ -326,8 +378,62 @@ class CrossAttention(nn.Module):
         return self.out_proj(out)
 
 
-# Backward-compatible alias
+# Backward-compatible aliases
 CausalSelfAttention = CausalGQAttention
+GQAAttention = CausalGQAttention
+
+
+# ---------------------------------------------------------------------------
+# Modern Transformer Block (pre-norm with RMSNorm + SwiGLU + GQA + RoPE)
+# ---------------------------------------------------------------------------
+
+class ModernTransformerBlock(nn.Module):
+    """Modern LLM-style transformer block using RMSNorm, RoPE, GQA, SwiGLU.
+
+    This is the recommended block for new training runs (use_modern_backbone=True).
+    Identical to TransformerBlock in interface, but uses named modern primitives
+    explicitly for clarity and auditability.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        dropout: float = 0.0,
+        n_kv_heads: Optional[int] = None,
+        max_seq_len: int = 4096,
+    ):
+        super().__init__()
+        # Pre-norm with RMSNorm (not LayerNorm)
+        self.norm1 = RMSNorm(d_model)
+        # GQA self-attention with RoPE (via CausalGQAttention)
+        self.attn = GQAAttention(
+            d_model, n_heads, n_kv_heads=n_kv_heads, dropout=dropout, max_seq_len=max_seq_len,
+        )
+        # Cross-attention layer
+        self.norm_cross = RMSNorm(d_model)
+        self.cross_attn = CrossAttention(
+            d_model, n_heads, n_kv_heads=n_kv_heads, dropout=dropout
+        )
+        # SwiGLU FFN (not standard GELU FFN)
+        self.norm2 = RMSNorm(d_model)
+        self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, memory=None, k_cache=None, v_cache=None):
+        # Self-attention with pre-norm
+        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache)
+        x = x + self.dropout(h)
+
+        # Cross-attention against phoneme memory
+        if memory is not None:
+            h_cross = self.cross_attn(self.norm_cross(x), memory)
+            x = x + self.dropout(h_cross)
+
+        # SwiGLU FFN with pre-norm
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x, nk, nv
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +463,9 @@ class TransformerBlock(nn.Module):
         self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, memory=None, k_cache=None, v_cache=None):
+    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None):
         # Self-attention
-        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache)
+        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices)
         x = x + self.dropout(h)
 
         # Cross-attention (against full phoneme sequence/memory)
@@ -388,6 +494,8 @@ class CodecTransformer(nn.Module):
         d_speaker=192,
         n_kv_heads=None,
         max_seq_len=4096,
+        n_prompt_summary_tokens=32,
+        use_modern_backbone: bool = False,
     ):
         super().__init__()
         self.d_model, self.n_layers = d_model, n_layers
@@ -395,9 +503,13 @@ class CodecTransformer(nn.Module):
         self.n_codebooks = n_codebooks
         self.n_kv_heads = n_kv_heads if n_kv_heads is not None else max(1, n_heads // 4)
         self.head_dim = d_model // n_heads
+        self.use_modern_backbone = use_modern_backbone
 
         self.speaker_proj = nn.Linear(d_speaker, d_model)
         self.f0_proj = nn.Linear(2, d_model)  # F0 fusion layer (UCLM v3)
+
+        # Prompt Resampler (condenses T_prompt into fixed N_summary tokens)
+        self.prompt_resampler = PromptResampler(d_model, n_summary=n_prompt_summary_tokens, n_heads=n_heads)
 
         # Acoustic context embeds (Stream A) - past A_{t-1}
         self.a_ctx_embeds = nn.ModuleList(
@@ -411,9 +523,11 @@ class CodecTransformer(nn.Module):
         )
         self.b_ctx_fusion = nn.Linear(d_model, d_model)
 
+        # Select block class based on use_modern_backbone flag
+        BlockClass = ModernTransformerBlock if use_modern_backbone else TransformerBlock
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(
+                BlockClass(
                     d_model,
                     n_heads,
                     d_model * 4,
@@ -439,14 +553,26 @@ class CodecTransformer(nn.Module):
         b_ctx,
         speaker_embed,
         state_cond,
+        prompt_tokens=None,  # [B, T_prompt, d_model] raw prompt
+        prompt_summary_tokens=None,  # [B, n_summary, d_model] pre-condensed
         cfg_scale=1.0,
         kv_caches=None,
         max_seq_len=200,
         f0_condition=None,
+        position_indices=None,
     ):
         # x starts as the queries (temporal frame base)
         x = queries
         B, T, _ = x.shape
+
+        # 1. Handle Prompt Conditioning (Few-shot)
+        # Use pre-condensed summary if available, otherwise run resampler
+        if prompt_summary_tokens is None and prompt_tokens is not None:
+            prompt_summary_tokens = self.prompt_resampler(prompt_tokens)
+
+        if prompt_summary_tokens is not None:
+            # Concatenate summary tokens to the phoneme memory for cross-attention
+            memory = torch.cat([prompt_summary_tokens, memory], dim=1)
 
         # Add F0 conditioning if provided
         if f0_condition is not None:
@@ -518,7 +644,13 @@ class CodecTransformer(nn.Module):
             k_in = kv_list[i][0] if kv_list else None
             v_in = kv_list[i][1] if kv_list else None
             # layer now takes 'memory' (full phonemes) for cross-attention
-            x, nk, nv = layer(x, memory=memory, k_cache=k_in, v_cache=v_in)
+            x, nk, nv = layer(
+                x, 
+                memory=memory, 
+                k_cache=k_in, 
+                v_cache=v_in,
+                position_indices=position_indices
+            )
 
             if nk.shape[2] > max_seq_len:
                 nk = nk[:, :, -max_seq_len:, :]
@@ -557,9 +689,15 @@ class CodecTransformer(nn.Module):
         speaker_embed,
         cfg_scale=1.0,
         f0_condition=None,
+        prompt_tokens=None,
+        prompt_summary_tokens=None,
     ):
         """Non-streaming forward for training. History must be shifted."""
         la, lb, _, x = self.forward(
-            queries, memory, a_ctx, b_ctx, speaker_embed, state_cond, cfg_scale, f0_condition=f0_condition
+            queries, memory, a_ctx, b_ctx, speaker_embed, state_cond,
+            prompt_tokens=prompt_tokens,
+            prompt_summary_tokens=prompt_summary_tokens,
+            cfg_scale=cfg_scale,
+            f0_condition=f0_condition,
         )
         return la, lb, x

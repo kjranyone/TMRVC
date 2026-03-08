@@ -117,7 +117,7 @@ class TestModelExpressiveInputs:
             target_length=T,
             dialogue_context=torch.randn(B, 256),
             acting_intent=torch.randn(B, 64),
-            prosody_latent=torch.randn(B, T, 64),
+            prosody_latent=torch.randn(B, T, 128),
         )
         assert out["logits_a"].shape[0] == B
 
@@ -281,7 +281,7 @@ def _build_basic_cache(
         if add_expressive:
             np.save(utt_dir / "dialogue_context.npy", np.random.randn(256).astype(np.float32))
             np.save(utt_dir / "acting_intent.npy", np.random.randn(64).astype(np.float32))
-            np.save(utt_dir / "prosody_targets.npy", np.random.randn(T, 64).astype(np.float32))
+            np.save(utt_dir / "prosody_targets.npy", np.random.randn(T, 128).astype(np.float32))
 
         if add_phonemes:
             from tmrvc_data.g2p import UNK_ID

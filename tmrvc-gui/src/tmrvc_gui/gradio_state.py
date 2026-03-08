@@ -150,6 +150,8 @@ class EvalPair:
     rater_role: str = ""
     timestamp: float = 0.0
     notes: str = ""
+    reference_audio_length: float = 0.0
+    baseline_version: str = ""
 
 
 class EvalSession:

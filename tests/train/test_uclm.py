@@ -65,7 +65,8 @@ def test_uclm_transformer():
     state_cond = torch.randn(B, d)
     
     model = CodecTransformer(d_model=d)
-    logits_a, logits_b, kv_out, _hidden = model(content, a_ctx, b_ctx, spk_embed, state_cond)
+    memory = torch.randn(B, 20, d)  # phoneme memory for cross-attention
+    logits_a, logits_b, kv_out, _hidden = model(content, memory, a_ctx, b_ctx, spk_embed, state_cond)
 
     assert logits_a.shape == (B, 8, T, 1024), (
         f"Transformer A_t shape mismatch: {logits_a.shape}"

@@ -10,7 +10,7 @@ The WebUI is the "cockpit" where humans make the final calls on acting quality a
 
 ## Primary Files
 
-- `tmrvc-gui/src/tmrvc_gui/gradio_app.py` (all tabs: Drama Workshop, Realtime VC, Curation Auditor, Dataset Manager, Evaluation Arena, Speaker Enrollment, Training Monitor, Batch Script, ONNX Export, Server Control, System Admin)
+- `tmrvc-gui/src/tmrvc_gui/gradio_app.py` (all tabs: Drama Workshop, Realtime VC, Curation Auditor, Dataset Manager, Evaluation Arena, Speaker Enrollment, Batch Script, ONNX Export, Server Control, System Admin; **Training Monitor is post-v3.0 scope**)
 - `tmrvc-gui/src/tmrvc_gui/gradio_state.py`
 - `tmrvc-serve/src/tmrvc_serve/routes/admin.py` (UI-specific management APIs)
 - `docs/design/gui-design.md`
@@ -18,7 +18,7 @@ The WebUI is the "cockpit" where humans make the final calls on acting quality a
 
 ## Required Outcomes
 
-- **Control Plane Infrastructure:** Implement authentication, RBAC, audit logging, and optimistic locking as defined in `docs/design/auth-spec.md`.
+- **Control Plane Infrastructure Integration:** Integrate with backend-owned authentication, RBAC, audit logging, and optimistic locking as defined in `docs/design/auth-spec.md`. Worker 12 consumes these capabilities; it does not become a second implementation owner for them.
 - **Drama Workshop:** Interactive sliders for `pace`, `hold_bias`, `boundary_bias`, and `context` injection with real-time audio comparison.
 - **Voice Cloning / Casting Gallery:** Upload reference audio, extract speaker prompts, and **save them to a persistent "Casting Gallery" using the canonical `SpeakerProfile` contract defined in `docs/design/speaker-profile-spec.md`.**
 - **Physical Control Panel:** First-class 8-D `voice_state` controls with reproducible presets and sweep logging.
@@ -31,6 +31,34 @@ The WebUI is the "cockpit" where humans make the final calls on acting quality a
 - **Audit Logs:** All state-changing actions (Casting Gallery saves, Curation promotions) must be logged with actor ID and rationale.
 - **Conflict Handling:** Use canonical `metadata_version` tags to prevent race conditions during collaborative curation or casting.
 - **Training Cockpit (Post-v3.0):** Only after runtime/admin and export contracts are stable; it is not part of the initial v3.0 proof obligations.
+
+## v3.0 Scope Prioritization
+
+The full feature set above is the target end state. To prevent Worker 12 scope from blocking the v3.0 core proof obligations, the following priority tiers apply:
+
+### Tier 1: v3.0 Minimum (must ship for core proof)
+
+- Drama Workshop: basic inference with pacing controls, `voice_state` sliders, and `speaker_profile_id` selection
+- Evaluation Arena: blind A/B comparison and MOS collection with rater assignment and result persistence
+- Casting Gallery: upload reference audio, encode `SpeakerProfile`, save/load profiles
+- System Admin: model load/unload and basic health display
+
+### Tier 2: v3.0 Extended (required for full human workflow claim)
+
+- Curation Auditor with optimistic locking and manifest browsing
+- Dataset Manager: upload, register, curation launch/monitor/resume
+- Take Management: multi-take generation, audition, pin/rank
+- Export Trigger and artifact download
+- Full RBAC enforcement and audit trail persistence
+- Approval queues and role-specific inboxes
+
+### Tier 3: Post-v3.0
+
+- Training Cockpit (already declared post-v3.0)
+- Advanced rater QC analytics
+- Split Manager leak detection dashboard
+
+Tier 1 items must not be blocked by Tier 2 development. If Tier 2 items slip, Tier 1 features must be independently deployable and sufficient for Worker 06 sign-off.
 
 ## Human Roles
 
@@ -53,25 +81,44 @@ The UI must not assume one super-user does every step.
 
 ### 1. Interactive Drama Workshop (Inference UI)
 - **Voice Cloning / Actor Casting:** Add a file upload component for `reference_audio` and a **"Casting Gallery"** to save/load/export **`SpeakerProfile`** objects.
+  - **Latency Mitigation:** The UI must encourage users to perform reference-audio encoding in the Casting Gallery *before* starting the Workshop session.
+  - When a new `reference_audio` is uploaded during a session, show a "Encoding Speaker Profile..." progress indicator and handle the `wait_for_prompt` API behavior.
 - `SpeakerProfile` is a backend-owned persistent object. The UI must consume the Worker 01 / Worker 04 schema and must not invent a divergent frontend-only shape.
 - **Session Persistence:** Implement "Save Project" to store all parameters, context history, and assigned actors for the workshop, subject to RBAC and audit.
 - Implement sliders for new v3 pacing controls.
 - Implement explicit 8-D `voice_state` controls and preset recall.
 - Implement dialogue context input as text-side history/context injection.
 - Add "Compare" mode to hear differences between parameter sets or model versions side-by-side.
-- Add **Take Management (Multi-Take Audition & Ranking System)**:
+- **Take Management (Multi-Take Audition & Ranking System)**:
   - generate multi-take variations by seed / `cfg_scale` / pacing sweeps in parallel
   - persist take lineage, notes, and selected-best take (saving parameters like Seed, Control-curve, Pacing as reproducible metadata)
   - support quick audition, blind A/B compare, pin/rank, and export of chosen takes
+- **Personal Voice Training (Few-Shot Fine-tuning):** Post-v3.0 scope only.
+  - if retained in the plan, it must be explicitly gated behind the post-v3.0 Training Cockpit workstream
+  - it must not become part of the initial v3.0 proof obligations or block mainline sign-off
+  - raw uploaded audio is not directly trainable for pointer-TTS. Any retained Personal Voice Training flow must first run a lightweight curation/preparation sub-pipeline that materializes the canonical training artifacts required by Worker 02:
+    - VAD / segmentation cleanup
+    - fast ASR or user-provided transcript verification
+    - text normalization + G2P
+    - canonical `phoneme_ids` and optional `text_suprasegmentals`
+    - bootstrap alignment / boundary refinement sufficient for the selected training recipe
+  - the UI must present this as an explicit staged job (`prepare -> review -> train`), not as "upload wav -> train LoRA" magic
+  - if transcript/G2P/bootstrap preparation fails or falls back, the job must block or downgrade visibly; silent best-effort training on raw wav is forbidden
 - Visualize pointer state (active text index) during playback if possible.
 
 ### 2. Curation Auditor (Data UI)
 - Build a manifest browser that displays waveform, transcript, and AI confidence scores.
-- **Optimistic Locking:** Implement version checks when submitting transcript fixes or promotion decisions to prevent lost updates.
+- **Optimistic Locking:** Surface backend `metadata_version` conflicts clearly when submitting transcript fixes or promotion decisions to prevent lost updates.
 - **Data Access:** Use the authoritative typed `/ui/*` API exposed by `tmrvc-serve`. Any local data service must sit behind the same typed contract and auth/concurrency rules. Direct filesystem reads are dev-only and are forbidden for the mainline multi-user path.
 - Implement "Quick Review" mode for rapid manual promotion/rejection.
 - Implement a simple text editor to fix ASR errors, feeding back into the refinement stage.
 - Visualize speaker clusters and diarization timelines.
+- Show provider provenance and trust state for each reviewable record:
+  - active `provider_id`
+  - `provider_revision`
+  - `calibration_version`
+  - `fallback_class` / downgrade reason when present
+  - `score_components` breakdown so auditors can see why a sample landed in `review` or `reject`
 - Support manual segment-boundary correction, speaker merge/split, and language-span correction.
 - Show per-record approval history, current owner, and blocking reasons.
 
@@ -81,7 +128,16 @@ The UI must not assume one super-user does every step.
   - registering existing server-side directories
   - bulk assigning legality/provenance metadata
 - **Health Dashboard:** Visual charts for phoneme coverage, speaker stats, and duration (based on Worker 03 metrics).
+- **Provider Health View:** Surface provider calibration/downgrade state at dataset/run level:
+  - how many records used fallback providers
+  - which provider/calibration versions are active
+  - how many records are blocked by unsupported-language or missing-calibration policy
 - **Pipeline Orchestrator:** Controls to start/resume/stop curation stages (Ingest -> ASR -> Refinement) with progress bars.
+- **Enrollment-to-Training Preparation:** If post-v3.0 Personal Voice Training is enabled, Dataset Manager / Training Cockpit must expose a lightweight preparation flow for user-uploaded adaptation audio:
+  - upload short personal-voice clips
+  - run the Worker 07-owned preparation job (`VAD -> ASR/transcript check -> G2P -> boundary/alignment refinement`)
+  - surface low-confidence items for human correction before any training job is allowed to start
+  - materialize the same canonical artifacts used by the mainline training pipeline rather than inventing a GUI-only fine-tune format
 - **Export Trigger:** One-click materialization of promoted subsets into TMRVC-cache for training.
 - **Artifact Download / Handoff:** Enable browser-side download or registration of exported evaluation/training bundles.
 - **Approval Queue:** Role-specific inboxes for `annotator`, `auditor`, and `admin`.
@@ -140,6 +196,7 @@ Each step must record:
 ## Guardrails
 
 - **Do not** replicate heavy logic in the UI; use `tmrvc-serve` APIs or the curation data service for heavy lifting.
+- **Do not** reimplement auth, audit, concurrency, or curation mutation semantics in frontend-only state.
 - **Do not** block request handling with long-running inference; use Gradio queue / generator patterns and background job dispatch.
 - **Do not** bypass the legality/split gates defined in Worker 09.
 - **Do not** invent audio-context injection if Worker 01 freezes text-side `dialogue_context` for the initial mainline.
@@ -147,6 +204,7 @@ Each step must record:
 - **Do not** treat human approvals as ephemeral UI state; all critical actions must be auditable.
 - **Do not** require humans to use CLI or desktop apps; all workflows are browser-based.
 - **Do not** require humans to switch to CLI for dataset upload, curation execution, export, or evaluation setup.
+- **Do not** advertise or implement "upload audio -> LoRA train" without the explicit preparation stages that produce canonical text/frontend/alignment artifacts. Personal voice training without this staging is non-functional by construction.
 
 ## Handoff Contract
 

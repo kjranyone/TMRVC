@@ -37,6 +37,9 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
 - CFG-style control scaling is exposed through a documented inference contract
 - multilingual / code-switch requests are supported through explicit language conditioning
 - `tmrvc-serve` is the single authoritative backend API surface for multi-user WebUI workflows
+- v3.0 claim scope is stratified by runtime class:
+  - Python serve may claim CFG-enhanced drama-grade acting after validation
+  - Rust / VST / strict real-time paths must claim pointer/control parity and causal latency first; CFG-enhanced drama claims are deferred until `lazy` or `distilled` CFG pass validation
 
 
 ## Concrete Tasks
@@ -59,21 +62,30 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - `tmrvc-engine-rs`
    - ONNX export wrappers
    - **VST parameter/control bridge (expose all 8-D controls and pacing to DAW automation).**
-6. Ensure streaming-safe cache update:
+   - **VST Deployment Constraint:** VST plugin distribution strictly requires an ONNX/Rust backend. Deploying full PyTorch inside a VST is forbidden due to binary size, dependency conflicts, and unpredictable latency. The VST runtime must execute the ONNX-exported graph exclusively.
+   - **Standalone Host Implementation:** Develop a lightweight, Python-free executable ("Standalone Host") using the `tmrvc-engine-rs` and a Rust-based GUI (e.g., `egui`). This serves as the primary real-time VC tool for general users/streamers, sharing the same ONNX backend and `SpeakerProfile` logic as the VST.
+   - **Rust-Native G2P Requirement:** To support TTS in VST/Standalone without Python, the Rust engine MUST integrate a native G2P library (e.g., `lindera` + `openjtalk-sys` or `rust-jieba`). Relying on a Python server for text analysis is forbidden due to network/IPC jitter breaking the 10ms budget.
+   - **Frozen frontend parity obligation:** A Rust-native G2P is acceptable only if it is proven to emit the same canonical `phoneme_ids` and `text_suprasegmentals` as the frozen Python training frontend on the same normalized text. "Close enough" segmentation or accent extraction is not acceptable for sign-off.
+   - Worker 04 must therefore expose or consume a shared golden-fixture suite for text frontend parity, including tokenization, accent/tone features, language routing, and fallback markers.
+6. **v3.0 `SpeakerProfile` boundary:**
+   - v3.0 runtime voice switching is prompt-based only: `speaker_embed`, `prompt_codec_tokens`, and optional `prompt_kv_cache`.
+   - `SpeakerProfile` must not carry runtime weight deltas or require model hot-swaps in the v3.0 mainline.
+   - post-v3.0 per-actor adaptor/model variants may be explored as a separate artifact-management track, but they must not change the canonical v3.0 `SpeakerProfile` serialization contract.
+7. Ensure streaming-safe cache update:
    - no hidden re-expansion of full text sequence per step
    - no full-sequence recomputation when not needed
-7. Add Zero-Shot / Few-Shot Voice Cloning API support:
+8. Add Zero-Shot / Few-Shot Voice Cloning API support:
    - accept `reference_audio` (base64 or file upload) and optional `reference_text` in the TTS request.
    - run the `Speaker Prompt Encoder` on the fly to extract `speaker_embed` and `prompt_kv_cache`.
    - **Persist or retrieve these prompt features via the canonical `SpeakerProfile` contract managed in `models/characters/` (Casting Gallery).**
    - cache these prompt features across conversational turns for the same speaker to avoid redundant extraction.
-8. Define text-side cache contract:
+9. Define text-side cache contract:
    - text frontend outputs (`phoneme_ids` and `text_suprasegmentals` when supported) are computed once per request or once per turn boundary
    - text encoder outputs are computed once per request or once per turn boundary
    - cross-attention keys/values for active text/context window are cached and reused across 10 ms steps
    - pointer advancement updates window indices or masks, not full encoded text recomputation
    - dialogue-context refresh happens only when the external turn/context input changes
-9. Freeze the runtime finite-state behavior:
+10. Freeze the runtime finite-state behavior:
    - max one text-unit advance per frame in the initial mainline
    - explicit EOS / stop condition
    - explicit behavior on terminal hold
@@ -88,20 +100,20 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - thresholding method for `advance_logit` / `advance_prob`
      - tie-break and near-threshold behavior
      - parity-safe comparison semantics shared by Python and Rust
-10. Review VC path for semantic-context hooks so the new runtime state shape does not block future VC improvements.
+11. Review VC path for semantic-context hooks so the new runtime state shape does not block future VC improvements.
    - define the causal fusion path for VC semantic features with optional dialogue/text context
    - ensure this path is explicit even when VC bypasses pointer progression
-11. Add dialogue-performance controls to runtime contract where supported:
+12. Add dialogue-performance controls to runtime contract where supported:
    - scene or context embedding input
    - phrase pressure / interruption pressure
    - optional breath tendency / release bias
-12. Implement `routes/admin.py` for Worker 12:
+13. Implement `routes/admin.py` for Worker 12:
    - `GET /admin/health` (detailed system health)
    - `GET /admin/telemetry` (VRAM, latency, model state)
    - `POST /admin/load_model` (switch checkpoints)
    - `GET /admin/models` (list available checkpoints)
    - `GET /admin/runtime_contract` (pointer / voice-state contract introspection)
-13. Implement WebUI-facing orchestration and evaluation routes:
+14. Implement WebUI-facing orchestration and evaluation routes:
    - `POST /ui/datasets/upload`
    - `POST /ui/datasets/register`
    - `GET /ui/jobs/{job_id}`
@@ -119,8 +131,13 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - `GET /ui/eval/assignments/{assignment_id}`
    - `POST /ui/eval/assignments/{assignment_id}/submit`
    - these routes are the authoritative multi-user contract; direct manifest file access is not a mainline API
-14. Define few-shot runtime behavior:
+   - Worker 04 owns HTTP transport, auth/middleware integration, and typed response semantics
+   - Worker 07 owns curation record storage semantics and mutation correctness behind this API boundary
+15. Define few-shot runtime behavior:
    - when `reference_audio` is encoded
+   - **Few-Shot Latency Management:** Acknowledge that encoding a 3-10s prompt takes >10ms.
+     - **Preferred Workflow:** Require humans to pre-encode and save profiles via the **Casting Gallery** (Worker 12) for production-grade low-latency starts.
+     - **Real-time extraction:** If `reference_audio` is provided on-the-fly, implement a `wait_for_prompt` API flag in the TTS request. When `true`, the server waits for encoding before starting the 10ms-step generation; when `false`, the server returns an error if encoding exceeds the budget.
    - how **`speaker_profile_id`** loads the precomputed embedding and prompt tokens from the Casting Gallery
    - how `speaker_embed` or prompt cache is reused across turns
    - freeze `max_prompt_seconds_active`, `max_prompt_frames`, `max_prompt_kv_tokens`, and `max_prompt_cache_bytes` as runtime-enforced limits owned by `configs/constants.yaml`
@@ -130,11 +147,12 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - how conflicts between `speaker_embed` and `prompt_codec_tokens` are resolved at runtime
    - how much authority prompt texture has relative to speaker-identity anchoring
    - how Rust/VST degrade deterministically to reduced prompt summary or `speaker_embed`-only mode when the prompt budget would break real-time guarantees
-14.1 Freeze runtime-budget constants in `configs/constants.yaml`:
+16. Freeze runtime-budget constants in `configs/constants.yaml`:
    - `max_text_units_active`
    - `max_dialogue_context_units`
    - `max_prompt_seconds_active`
    - `max_prompt_frames`
+   - `n_prompt_summary_tokens` (frozen initial value: 32)
    - `max_prompt_kv_tokens`
    - `max_prompt_cache_bytes`
    - `max_acoustic_history_frames`
@@ -142,7 +160,9 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - `streaming_latency_budget_ms`
    - `streaming_hardware_class_primary`
    - these constants are part of the public runtime contract and must not be re-declared independently in Python, Rust, ONNX, or VST
-15. Define CFG runtime behavior:
+   - these entries must be numeric and versioned before Worker 04 implementation is considered stable; placeholder names without values are not acceptable
+   - the measured values and the engineering margin used to choose them must be recorded in docs so Worker 06 can validate against the same budget
+17. Define CFG runtime behavior:
    - guidance must be defined for all conditioned outputs used by the runtime:
      - `guided_logits_a`
      - `guided_logits_b`
@@ -169,15 +189,18 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - `distilled` one-pass CFG-compatible path
    - define when VST / real-time engine must clamp or disable expensive CFG modes
    - real-time priority policy:
-     - Rust engine / VST default to `off` in v3.0 mainline
-     - `lazy` or `distilled` may become the default only after they ship and pass the full-mode validation gates
+     - Rust engine (ONNX) / VST default to `off` in v3.0 mainline; this means **drama-grade CFG-enhanced acting is available only via Python serve (GPU) in v3.0**. DAW / VST users receive pointer-driven pacing and 8-D physical control but not CFG-boosted expressiveness until `lazy` or `distilled` modes are validated and promoted, as running full 2-pass CFG on CPU/ONNX would severely violate the 10ms real-time budget.
+     - **CFG Circuit Breaker:** In all runtimes, implement a monitor for the 10ms budget. If frame-step latency exceeds 8ms, the runtime must automatically downgrade from `full` to `lazy` or `off` for the remainder of the utterance.
+     - **Benchmark / claim mode exception:** Any benchmark, parity, external-baseline, or release-signoff run must use a frozen CFG mode with the circuit breaker disabled. If the requested mode exceeds budget during a claim-valid run, the run fails or is marked invalid; it must not silently downgrade and remain eligible for comparison.
+     - `lazy` or `distilled` may become the default only after they ship and pass the full-mode validation gates; promotion is a priority for post-v3.0 because it directly gates the drama-grade claim for Rust/VST paths
      - `full` two-pass CFG is non-default in hard real-time paths and must justify itself against the 10 ms budget
+     - **Python serve GPU latency verification:** `full` two-pass CFG doubles the per-step compute (two forward passes per 10 ms frame). Worker 04 must measure whether GPU inference on the frozen primary hardware class can complete both passes within the 10 ms frame budget. If it cannot, the Python serve drama-grade CFG claim must either (a) accept increased latency with documented trade-off, or (b) adopt batch-wise guidance (compute unconditional pass every N frames) as the default `full` mode. Worker 06 must include this measurement in the latency benchmark suite before Stage B.
    - the pointer update rule must consume `guided_advance_logit` / `guided_progress_delta` in `full` mode; using guided acoustic logits with unguided pointer outputs is forbidden unless explicitly labeled an ablation
-16. Define cache synchronization behavior:
+18. Define cache synchronization behavior:
    - sliding-window text attention policy or deterministic cache re-indexing
    - explicit invalidation rules when the pointer crosses a window boundary
    - interaction between prompt cache, text cache, and autoregressive acoustic cache
-17. Define waveform-decoder runtime policy:
+19. Define waveform-decoder runtime policy:
    - initial v3 policy: the codec-native decoder (inverse RVQ + neural vocoder from the codec model) is the primary waveform path
    - candidates for future enhancement: `Vocos`, `HiFi-GAN` variants, or `DAC` decoder
    - streaming latency budget: waveform decoding must complete within the 10 ms frame budget; if an enhanced decoder exceeds this, fall back to the codec-native decoder
@@ -186,16 +209,23 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - **v3.1 acoustic refinement runtime preparation:**
      - define the runtime integration point for the v3.1 acoustic refinement module that takes coarse AR codec tokens and produces refined full-RVQ tokens
      - the codec-native decoder remains as fallback when refinement is disabled or latency-constrained
-18. Define multilingual / code-switch runtime policy:
+20. Define multilingual / code-switch runtime policy:
    - utterance-level vs token-level language conditioning inputs
    - cross-lingual few-shot prompting when prompt language differs from target language
-19. Define pointer fallback runtime policy:
+21. Add text frontend parity contract for Python vs Rust:
+   - freeze the exact normalization -> G2P -> `phoneme_ids` + `text_suprasegmentals` mapping used by training
+   - export a golden test corpus covering Japanese accent phrases, tonal-language examples, code-switch cases, punctuation/number normalization, and fallback cases
+   - Rust runtime must either:
+     - reproduce the frozen Python outputs exactly on that corpus, or
+     - reject the request / declare a downgraded fallback mode that is excluded from parity/claim-valid runs
+   - shipping a Rust text frontend without this proof is forbidden because it would create a train/serve contract split
+22. Define pointer fallback runtime policy:
    - configurable `max_frames_per_unit`
    - forced-advance after excessive stall
    - low-`boundary_confidence` fallback behavior
    - observability hooks so stalls/skips are visible in telemetry rather than silent
    - force-advance may update only serialized pointer fields and documented bias terms; runtime-only hidden-state smoothing, transformer-cache rewriting, or decoder cross-fade heuristics are forbidden in the mainline contract
-20. Define UI event-stream contract:
+23. Define UI event-stream contract:
    - SSE event types at minimum:
      - `job_progress`
      - `job_blocked_human`
@@ -211,7 +241,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - `timestamp`
      - `payload_version`
    - event stream must be resumable using `Last-Event-ID` or equivalent cursor
-21. Define API idempotency and conflict behavior for UI-originated writes:
+24. Define API idempotency and conflict behavior for UI-originated writes:
    - upload/register/run/export/create-session actions accept `idempotency_key`
    - review/edit/policy actions accept canonical `metadata_version`
    - conflict responses must be typed, not plain text:
@@ -219,7 +249,8 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - `locked_by_other`
      - `already_submitted`
      - `policy_forbidden`
-22. Define artifact download contract for WebUI:
+   - Worker 04 owns HTTP status codes, middleware, and response payload shapes; Worker 07 owns underlying record-version checks for curation data
+25. Define artifact download contract for WebUI:
    - artifact responses return:
      - `artifact_id`
      - `artifact_type`
@@ -227,11 +258,12 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - `expires_at`
      - `provenance_summary`
    - artifacts must be retrievable without shell access
-23. Define `SpeakerProfile` runtime behavior:
+26. Define `SpeakerProfile` runtime behavior:
    - canonical persistence keys and ownership metadata
    - exact prompt-cache invalidation rule when the prompt encoder or tokenizer changes
    - compatibility behavior for missing or stale `speaker_profile_id`
-24. Define frame-index contract for any runtime-visible alignment telemetry:
+   - explicit rule that v3.0 profile loading must not mutate model weights at request time
+27. Define frame-index contract for any runtime-visible alignment telemetry:
    - `sample_rate = 24000`
    - `hop_length = 240`
    - inclusive `start_frame`, exclusive `end_frame`
@@ -287,8 +319,8 @@ The engine must be able to do:
 - API parameters are documented and stable
 - Python serve, Rust runtime, ONNX export, and VST are all wired to the same control/state contract
 - worker 05 can wire `dev.py` serve defaults to the new mode
-- SSE event-stream implementation (task 20) is owned by worker 04 as part of `tmrvc-serve` routes; worker 12 is the consumer, not the implementer
-- idempotency and conflict handling (task 21) are enforced in `tmrvc-serve` middleware; worker 12 sends `idempotency_key` and canonical `metadata_version` but does not implement the check
+- SSE event-stream implementation (task 22) is owned by worker 04 as part of `tmrvc-serve` routes; worker 12 is the consumer, not the implementer
+- idempotency and conflict handling (task 23) are enforced in `tmrvc-serve` middleware; worker 12 sends `idempotency_key` and canonical `metadata_version` but does not implement the check
 
 
 ## Required Tests

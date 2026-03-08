@@ -14,6 +14,44 @@ class RecordStatus(str, Enum):
     PROMOTED = "promoted"
     REVIEW = "review"
     REJECTED = "rejected"
+    EXPORTED = "exported"
+
+
+# Valid status transitions.  Each key maps to the set of statuses it may
+# transition *to*.  Any transition not listed here is invalid and should
+# be rejected by the service layer.
+VALID_TRANSITIONS: Dict[RecordStatus, frozenset[RecordStatus]] = {
+    RecordStatus.INGESTED: frozenset({
+        RecordStatus.ANNOTATING,
+        RecordStatus.REJECTED,
+    }),
+    RecordStatus.ANNOTATING: frozenset({
+        RecordStatus.ANNOTATING,   # re-entering annotating on pass N
+        RecordStatus.SCORED,
+        RecordStatus.REJECTED,
+    }),
+    RecordStatus.SCORED: frozenset({
+        RecordStatus.PROMOTED,
+        RecordStatus.REVIEW,
+        RecordStatus.REJECTED,
+    }),
+    RecordStatus.PROMOTED: frozenset({
+        RecordStatus.EXPORTED,
+        RecordStatus.REVIEW,       # demotion after re-score
+        RecordStatus.ANNOTATING,   # re-enter for refinement pass
+    }),
+    RecordStatus.REVIEW: frozenset({
+        RecordStatus.ANNOTATING,   # re-process
+        RecordStatus.PROMOTED,
+        RecordStatus.REJECTED,
+    }),
+    RecordStatus.REJECTED: frozenset({
+        RecordStatus.ANNOTATING,   # rescued via re-process
+    }),
+    RecordStatus.EXPORTED: frozenset({
+        RecordStatus.ANNOTATING,   # re-ingest for new pass
+    }),
+}
 
 
 class PromotionBucket(str, Enum):
@@ -40,6 +78,20 @@ class Provenance:
     timestamp: float
     confidence: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StageResult:
+    """Outcome of running a single stage on a record.
+
+    Returned by ``CurationStage.process()``.
+    """
+    success: bool
+    outputs: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    error: Optional[str] = None
+    retryable: bool = False
 
 
 @dataclass

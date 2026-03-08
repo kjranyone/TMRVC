@@ -23,6 +23,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from tmrvc_core.dialogue_types import StyleParams
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 from tmrvc_serve.auth import (
     AuthContext,
     OptionalAuth,
@@ -90,7 +91,15 @@ async def vc_stats(ctx: AuthContext):
 class VCRequest(BaseModel):
     audio_base64: str
     character_id: str
-    explicit_voice_state: Optional[list[float]] = None
+    explicit_voice_state: Optional[list[float]] = Field(
+        None,
+        description=(
+            "Canonical 8-D voice_state vector ordered as: "
+            + ", ".join(CANONICAL_VOICE_STATE_IDS)
+        ),
+        min_length=8,
+        max_length=8,
+    )
     pitch_shift: float = 0.0
 
 
@@ -127,18 +136,13 @@ async def convert_vc(req: VCRequest):
     spk_embed = _load_speaker_embed(character)
     spk_t = spk_embed.to(device=engine.device, dtype=torch.float32).unsqueeze(0)
 
-    # 3. Build style
+    # 3. Build style / explicit physical control
     style = StyleParams.neutral()
-    if req.explicit_voice_state:
-        # Map list to StyleParams
-        style.breathiness = req.explicit_voice_state[0]
-        style.tension = req.explicit_voice_state[1]
-        style.arousal = req.explicit_voice_state[2]
-        style.valence = req.explicit_voice_state[3]
-        style.roughness = req.explicit_voice_state[4]
-        style.voicing = req.explicit_voice_state[5]
-        style.energy = req.explicit_voice_state[6]
-        style.speech_rate = req.explicit_voice_state[7]
+    explicit_voice_state = None
+    if req.explicit_voice_state is not None:
+        explicit_voice_state = torch.tensor(
+            req.explicit_voice_state, dtype=torch.float32, device=engine.device
+        )
 
     # 4. Perform conversion (Frame-by-frame simulation for streaming-model consistency)
     from tmrvc_serve.uclm_engine import EngineState
@@ -153,7 +157,12 @@ async def convert_vc(req: VCRequest):
         
         chunk_t = torch.from_numpy(chunk).float().unsqueeze(0).unsqueeze(0).to(engine.device)
         out_audio, state = engine.vc_frame(
-            chunk_t, spk_t, style, state, pitch_shift=req.pitch_shift
+            chunk_t,
+            spk_t,
+            style,
+            state,
+            pitch_shift=req.pitch_shift,
+            explicit_voice_state=explicit_voice_state,
         )
         output_chunks.append(out_audio.cpu().numpy())
 

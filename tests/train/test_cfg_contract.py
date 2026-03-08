@@ -39,7 +39,7 @@ class TestCFGMaskContract:
         spk = torch.randn(B, 192)
         ctx = torch.randn(B, 256)
         intent = torch.randn(B, 64)
-        prosody = torch.randn(B, 64)
+        prosody = torch.randn(B, 128)
         delta = torch.randn(B, T, D)
 
         result = DisentangledUCLM.apply_cfg_unconditional_mask(

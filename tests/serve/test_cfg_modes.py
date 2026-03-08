@@ -33,18 +33,23 @@ class _MockUCLMCoreModel:
 
     def forward_streaming(
         self,
-        content_features,
-        a_ctx,
-        b_ctx,
-        speaker_embed,
-        state_cond,
+        queries=None,
+        memory=None,
+        a_ctx=None,
+        b_ctx=None,
+        speaker_embed=None,
+        state_cond=None,
         cfg_scale=1.0,
         kv_caches=None,
         dialogue_context=None,
         acting_intent=None,
         prosody_latent=None,
+        prompt_summary_tokens=None,
+        # Legacy positional support
+        content_features=None,
     ):
-        B = content_features.shape[0]
+        q = queries if queries is not None else content_features
+        B = q.shape[0]
         # Deterministic logits seeded by cfg_scale so we can distinguish passes
         base = torch.full((B, 8, 1, 1024), cfg_scale * 0.01)
         base_b = torch.full((B, 4, 1, 64), cfg_scale * 0.01)
@@ -354,9 +359,9 @@ class TestDistilledCFGTrainingLoss:
         """DisentangledUCLM should have cfg_scale_embed module."""
         model = DisentangledUCLM(num_speakers=10)
         assert hasattr(model, "cfg_scale_embed")
-        # Should accept [B, 1] input and produce [B, d_model]
+        # Should accept [B, 1] input and produce [B, d_speaker]
         out = model.cfg_scale_embed(torch.tensor([[2.0]]))
-        assert out.shape == (1, 512)
+        assert out.shape == (1, 192)
 
 
 # ---------------------------------------------------------------------------

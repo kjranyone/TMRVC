@@ -269,6 +269,16 @@ def test_dev_module_importable():
     assert hasattr(dev, "cmd_full_training_legacy")
 
 
+def test_dev_module_has_v3_entrypoints():
+    """v3 curation and validation entrypoints exist."""
+    assert callable(dev.cmd_curate_ingest)
+    assert callable(dev.cmd_curate_run)
+    assert callable(dev.cmd_curate_resume)
+    assert callable(dev.cmd_curate_export)
+    assert callable(dev.cmd_curate_status)
+    assert callable(dev.validate_v3_config)
+
+
 def test_menu_labels_contain_v3_pointer(capsys):
     """Menu option 1 (full training) should reference v3 pointer mode."""
     dev.clear_screen = lambda: None  # suppress clear
@@ -276,14 +286,60 @@ def test_menu_labels_contain_v3_pointer(capsys):
     output = capsys.readouterr().out
     # Primary training options should mention pointer / v3
     assert "pointer" in output or "v3" in output
-    # Legacy option should mention legacy
-    assert "legacy" in output.lower()
+    # Legacy option should mention legacy and v2-legacy prefix
+    assert "[v2-legacy]" in output
+    # Curation entrypoints should be listed
+    assert "ingest" in output
+    assert "resume" in output
+    assert "status" in output
 
 
 def test_handlers_include_legacy_option():
     """The main loop handler dict should map '12' to cmd_full_training_legacy."""
     # We verify the function exists and is callable
     assert callable(dev.cmd_full_training_legacy)
+
+
+def test_validate_v3_config_accepts_valid():
+    """Valid v3 config produces no errors."""
+    cfg = {
+        "tts_mode": "pointer",
+        "pointer_loss_weight": 0.5,
+        "progress_loss_weight": 0.2,
+        "voice_state_loss_weight": 0.0,
+    }
+    assert dev.validate_v3_config(cfg) == []
+
+
+def test_validate_v3_config_rejects_missing_fields():
+    """Missing required fields produce errors."""
+    cfg = {"tts_mode": "pointer"}
+    errors = dev.validate_v3_config(cfg)
+    assert len(errors) > 0
+    assert any("pointer_loss_weight" in e for e in errors)
+
+
+def test_validate_v3_config_rejects_bad_tts_mode():
+    """Invalid tts_mode produces an error."""
+    cfg = {
+        "tts_mode": "invalid",
+        "pointer_loss_weight": 0.5,
+        "progress_loss_weight": 0.2,
+        "voice_state_loss_weight": 0.0,
+    }
+    errors = dev.validate_v3_config(cfg)
+    assert any("tts_mode" in e for e in errors)
+
+
+def test_v3_optional_defaults_keys():
+    """V3_OPTIONAL_DEFAULTS contains all expected v3 config fields."""
+    expected = {
+        "pointer_mode", "cfg_enabled", "cfg_drop_rate",
+        "voice_state_supervision", "prosody_flow_matching",
+        "training_stage", "bootstrap_alignment_path",
+        "few_shot_prompt_training", "replay_mix_ratio",
+    }
+    assert expected == set(dev.V3_OPTIONAL_DEFAULTS.keys())
 
 
 def test_mfa_align_propagates_heuristic_fallback_flag(monkeypatch, tmp_path: Path):

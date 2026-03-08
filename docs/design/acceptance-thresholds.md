@@ -5,6 +5,31 @@ These gates must stay consistent with `plan/worker_06_validation.md`.
 If a threshold changes here, the validation plan and benchmark scripts must be
 updated in the same change.
 
+Threshold ownership follows a tiered freeze policy:
+
+- `Tier 0`: must freeze before Stage B large-scale training
+- `Tier 1`: may be estimated from pilot runs, but must freeze before large-scale claim-making or release-candidate training
+- `Tier 2`: protocol freezes early, final numeric cutoffs freeze before release sign-off
+
+At minimum:
+
+- `Tier 0`
+  - runtime budgets
+  - parity tolerances
+  - frame/alignment conventions
+  - prompt-target evaluation pairings
+  - language set and code-switch pairs
+  - provider registry entries and hardware classes
+- `Tier 1`
+  - few-shot score bundle thresholds
+  - context-separation thresholds
+  - control-response thresholds
+  - leakage/disentanglement thresholds
+- `Tier 2`
+  - MOS/preference acceptance cutoffs
+  - rater QC cutoffs
+  - duplicate-consistency cutoffs
+
 ---
 
 ## 1. Pointer TTS Mainline Integrity
@@ -73,6 +98,8 @@ pointer update, `uclm_core`, and the active waveform decoder used in the real-ti
 | Human dramatic appropriateness | Above chance and above internal neutral baseline | Blind rating protocol |
 
 **Pass condition:** Objective metrics and human evaluation both show non-trivial context-driven delivery changes.
+
+**Scope note:** In v3.0 this section applies to the Python serve path. Rust / VST / strict real-time ONNX paths are validated under shared pointer/control parity and latency gates unless a validated fast-CFG path is shipped.
 
 ---
 

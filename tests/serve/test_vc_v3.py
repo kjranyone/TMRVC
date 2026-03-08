@@ -92,7 +92,7 @@ def test_vc_endpoint_batch_conversion(monkeypatch):
     # Mock engine
     class MockEngine:
         device = "cpu"
-        def vc_frame(self, chunk, spk, style, state, pitch_shift=0.0):
+        def vc_frame(self, chunk, spk, style, state, pitch_shift=0.0, explicit_voice_state=None):
             # Return same audio as input for simplicity
             return chunk.squeeze(0), state
 

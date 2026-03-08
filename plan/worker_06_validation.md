@@ -13,11 +13,12 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - `tests/scripts/`
 - `tmrvc-engine-rs/tests/`
 - `tmrvc-export/src/tmrvc_export/export_uclm.py`
-- `tmrvc-train/src/tmrvc_train/cli/train_codec.py`
+- `tmrvc-train/src/tmrvc_train/cli/train_codec.py` (codec trainer; v2-era module retained for codec model training/validation only, not part of the v3 UCLM pointer-TTS mainline)
 - `tmrvc-train/src/tmrvc_train/pipeline.py`
 - `docs/design/architecture.md`
 - `docs/design/unified-codec-lm.md`
 - `docs/design/external-baseline-registry.md`
+- `docs/design/provider-registry.md`
 
 
 ## Required Outcomes
@@ -37,6 +38,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - explicit blocking policy for every declared public claim (`MFA-free`, `10 ms causal`, `few-shot`, `drama-grade`, `SOTA-competitive`)
 - frozen primary and secondary external baselines before large-scale training
 - frozen hardware classes for all runtime and latency claims
+- explicit runtime-class claim stratification so Python serve, Rust, VST, and ONNX are not evaluated against claims they do not ship in v3.0
 
 
 ## Concrete Tasks
@@ -63,6 +65,11 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
    - PyTorch vs ONNX
    - Python serve vs Rust runtime on the same checkpoint
    - suprasegmental text-feature parity across Python / export / Rust paths
+   - Python text frontend vs Rust text frontend exact parity on frozen golden text fixtures:
+     - identical normalized text routing
+     - identical `phoneme_ids`
+     - identical `text_suprasegmentals`
+     - identical fallback / reject metadata
 5. Add evaluation protocol document:
    - TTS naturalness
    - turn-taking tempo/context sensitivity
@@ -70,6 +77,10 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
    - **Acting Alignment Score (Correlation with scene/dialogue intent)**
    - **Few-shot speaker similarity and disentanglement (Timbre vs Prosody) against the fixed pinned baseline artifact**
 6. Define acceptance thresholds for merging v3 mainline.
+   - separate:
+     - shared contract / parity gates
+     - Python-serve drama-grade gates
+     - Rust/VST real-time gates
 7. Add drama-acting evaluation protocol:
    - same text, different context responsiveness
    - same context, different control input responsiveness
@@ -96,27 +107,68 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 11. Add multilingual regression protocol:
    - after adding or reweighting a language, re-run frozen held-out tests for existing languages
    - block promotion if existing-language intelligibility or speaker similarity regresses beyond threshold
-12. Add explicit regression checks for known open issues:
+12. Add ReferenceEncoder validation:
+   - verify speaker-agnosticism: same-text, different-speaker inputs must produce prosody latents with cosine similarity above threshold (confirming speaker identity is not encoded)
+   - verify prosody discriminability: same-speaker, different-prosody inputs must produce latents with cosine distance above threshold
+   - verify output shape `[B, d_prosody]` and gradient flow to Prosody Predictor during joint training
+13. Add explicit regression checks for known open issues:
    - batch vs frame-by-frame CausalConv1d numerical drift
-   - `tmrvc-train-codec` `collate_fn` contract verification
+   - `tmrvc-train-codec` `collate_fn` contract verification (codec model data loader; this is a codec-level regression check, not a v3 UCLM pointer-TTS contract)
    - frame-index parity of `bootstrap_alignment.json` against `tmrvc-core`
    - `text_suprasegmentals.npy` index parity against `phoneme_ids.npy`
-13. Freeze external baseline policy:
+   - Python G2P vs Rust G2P golden-fixture parity for `phoneme_ids` and `text_suprasegmentals`
+14. Freeze external baseline policy:
    - freeze one `primary` public baseline and optionally one `secondary` baseline before large-scale Stage B training
    - baseline name, exact artifact or checkpoint, tokenizer or text-normalization settings, prompt rule, reference lengths, language set, inference settings, and hardware class must be fixed in the evaluation spec
    - baseline changes require an explicit version bump to the evaluation protocol; "or newer successor" is forbidden
    - no release-signoff run may start while the active registry entry is still placeholder or partially unspecified
    - recommended public candidates to evaluate before freezing the registry (must match `docs/design/external-baseline-registry.md`):
-     - **CosyVoice 2/3** (arXiv:2412.10117, arXiv:2505.17589): streaming, LLM + CFM, strong zero-shot, multilingual
+     - **CosyVoice 3 (0.5B)**: Frozen as the `primary` baseline due to scale alignment (0.5B vs TMRVC's ~300M target), streaming support, and strong multilingual zero-shot capability.
+     - **Qwen3-TTS (1.7B)**: Frozen as the `secondary` ceiling baseline. SOTA comparison against a 1.7B model with a 300M single-stage AR model carries immense risk. Scale-sensitive quality gaps must be handled via explicit narrow claims rather than considered a test failure.
      - **F5-TTS** (arXiv:2410.06885): flow-matching, non-AR, strong naturalness
      - **MaskGCT**: fully non-AR, no alignment needed, strong long-prompt performance
-     - **Qwen3-TTS** (arXiv:2601.15621): 2-stage AR + flow matching, block-wise streaming, multilingual, open-source weights available
      - any additional candidate recorded and justified in `plan/arxiv_survey_2026_03.md`
    - the primary baseline must be reproducible with public artifacts; proprietary-only systems are not acceptable as the primary sign-off target
-14. Freeze human-evaluation statistics policy:
+15. Freeze human-evaluation statistics policy:
    - pre-register sample count, rater count, duplicate-rate QC, and hypothesis test
    - report confidence intervals in addition to `p` values
    - name the exact statistical test used for merge sign-off
+16. Freeze the threshold schedule as a 3-tier policy rather than one monolithic late-stage freeze:
+   - `Tier 0` (must freeze before Stage B):
+     - runtime budgets
+     - parity tolerances
+     - frame/alignment conventions
+     - prompt-target evaluation pairings
+     - language set and code-switch pairs
+     - provider registry entries and hardware classes
+   - `Tier 1` (freeze after pilot runs but before large-scale claim-making):
+     - few-shot score bundle thresholds
+     - context-separation thresholds
+     - control-response thresholds
+     - leakage/disentanglement thresholds
+   - `Tier 2` (protocol frozen early, cutoff finalized from pilot distribution):
+     - MOS/preference acceptance cutoffs
+     - rater QC cutoffs
+     - duplicate-consistency cutoffs
+17. Freeze the multilingual evaluation language set before Stage B:
+   - the frozen external-comparison set must match the active baseline registry exactly until that registry is version-bumped
+   - for `v1_2026_03_08`, the frozen external-comparison set is:
+     - English, Mandarin Chinese, Japanese
+     - Korean, Spanish, French, German
+     - Italian, Russian
+   - Vietnamese/Thai or other lower-resource stress languages may run as supplementary internal architecture suites, but they must not be mixed into the frozen external sign-off protocol unless the baseline registry and evaluation set are bumped together
+   - language additions after freeze require an explicit protocol version bump
+   - code-switch evaluation pairs must be pre-registered (e.g., EN-JA, EN-ZH, ZH-JA)
+18. Freeze the v3.1 acoustic-refinement trigger diagnostic:
+   - define how to attribute a quality gap to "fine-grained acoustic detail" versus prosody/alignment:
+     - token-level alignment and prosody metrics are within acceptable range, AND
+     - waveform artifact rate or spectral detail metrics are measurably worse than the baseline, OR
+     - ablating the vocoder/codec-decoder with a higher-fidelity alternative closes a significant portion of the MOS gap
+   - this diagnostic must be frozen before Stage B
+19. Freeze prompt-target evaluation pairing:
+   - the exact prompt-target pairings used in holdout few-shot evaluation must be frozen at Stage A
+   - these pairings must be exported by Worker 10 and consumed by the evaluation arena (Worker 12) without runtime re-sampling
+   - the same frozen pairings must be used for external-baseline comparison to ensure reproducibility
 
 
 ## Acceptance Criteria
@@ -134,6 +186,12 @@ Release sign-off for v3 mainline requires all of the following:
 - human evaluation against `v2 legacy` passes only as an internal regression guard, not as evidence for SOTA claims
 - direct evaluation against the pinned external baseline is mandatory for any public quality claim
 
+Runtime-class claim policy:
+
+- Python serve is the only v3.0 runtime eligible for CFG-enhanced drama-grade acting claims.
+- Rust / VST / strict ONNX real-time paths must pass shared pointer/control parity and latency gates, but they are evaluated as control-faithful real-time runtimes rather than full-CFG drama runtimes.
+- no report may silently transfer a Python-only drama result onto Rust/VST without a dedicated validated fast-CFG path.
+
 SOTA-competitive claim policy:
 
 - if TMRVC claims overall SOTA competitiveness, it must match or exceed the pinned `primary` baseline on all declared primary claim axes
@@ -150,11 +208,28 @@ Primary claim axes must include at minimum:
 - runtime memory ceiling
 - prompt-prosody disentanglement leakage
 
+Scale-sensitivity classification (must be pre-registered before Stage B):
+
+- **scale-sensitive axes** (quality may be fundamentally limited by model/data scale; narrowed claims are acceptable if gap is attributable to scale):
+  - raw MOS on unseen languages
+  - zero-shot speaker similarity at very short references (3 s)
+- **architecture-sensitive axes** (TMRVC's architectural advantages should show regardless of scale; no scale excuse is accepted):
+  - controllability (8-D voice_state, pacing controls)
+  - dialogue-context responsiveness
+  - streaming latency
+  - prompt-prosody disentanglement leakage
+  - runtime memory ceiling
+
 
 ## Minimum Quantitative Thresholds
 
-Before sign-off, Worker 06 must replace all placeholders below with exact numeric thresholds and frozen hardware identifiers.
-Undefined thresholds are not acceptable for release.
+Threshold freeze follows the tier policy above:
+
+- Tier 0 thresholds and protocol constants must be frozen before Stage B.
+- Tier 1 thresholds may be estimated from pilot runs, but must be frozen before large-scale claim-making or release-candidate training.
+- Tier 2 human-evaluation procedures must be frozen before pilot collection, and their final numeric cutoffs must be frozen before release sign-off.
+
+Undefined thresholds are not acceptable once their tier freeze point is reached.
 
 - causal runtime:
   - p50, p95, and p99 per-step latency must satisfy the frozen 10 ms streaming budget on the frozen hardware class
@@ -176,6 +251,13 @@ Undefined thresholds are not acceptable for release.
     - boundary hold frequency
 - parity:
   - PyTorch vs ONNX and Python vs Rust paths must remain within the predefined tolerance on pointer outputs and state transitions
+- text frontend parity:
+  - for the frozen golden corpus, Python and Rust must match exactly on:
+    - normalized text
+    - `phoneme_ids`
+    - `text_suprasegmentals`
+    - fallback / reject classification
+  - any mismatch blocks the Rust/VST TTS claim because it invalidates the train/serve contract
 - suprasegmental parity:
   - exported `text_suprasegmentals` must survive roundtrip without length drift, reordering, or schema-version ambiguity
 - frame-alignment parity:
@@ -188,6 +270,8 @@ Undefined thresholds are not acceptable for release.
 - few-shot speaker adaptation:
   - evaluate with fixed short reference durations and matched prompts
   - enforce the same prompt-budget limits used by serving/runtime during evaluation
+  - prompt selection must come from the canonical exported eligibility contract rather than ad hoc runtime sampling
+  - evaluation protocol must state whether same-file, same-conversation, or cross-lingual prompts are allowed
   - TMRVC must match or exceed the pinned `primary` baseline on the frozen few-shot score bundle, unless the public claim is explicitly narrowed
   - "competitive with trade-offs" is not sufficient for an unqualified SOTA claim
 - human evaluation:
@@ -225,6 +309,7 @@ Worker 06 must freeze explicit formulas or scripts for the following before fina
     - combine speaker-similarity and intelligibility metrics under fixed short-reference conditions
 - **`acting_alignment_score`**
   - measure the semantic correlation between dialogue context embeddings and generated acoustic features (prosody embedding).
+  - the context encoder and prosody/style extractor used by this metric must be frozen, versioned, and external to the evaluated checkpoint's mutable training state
 - **`cfg_responsiveness_score`**
   - measure the change in acting intensity (e.g., F0 variance) relative to `cfg_scale` sweeps.
 - **`timbre_prosody_disentanglement_score`**
@@ -242,6 +327,12 @@ Worker 06 must freeze explicit formulas or scripts for the following before fina
 - `external_baseline_delta`
   - initial recommendation:
     - report the directional gap between TMRVC and the fixed public baseline on the same protocol
+
+Metric hygiene rules:
+
+- metrics must not depend on unfrozen internal embeddings from the exact checkpoint under evaluation unless the metric explicitly tests that internal space
+- when an external or auxiliary encoder is used for evaluation, its artifact/version must be pinned in the protocol
+- if a metric extractor changes, historical scores must be version-separated rather than compared directly
 
 The exact metric implementation may mature, but sign-off cannot rely on undefined names.
 
@@ -284,5 +375,5 @@ The exact metric implementation may mature, but sign-off cannot rely on undefine
 - pseudo-annotation audit checklist
 - separation-front-end comparison checklist
 - parity test report for Python / Rust / ONNX paths
-- `tmrvc-train-codec` data-loader validation report
+- `tmrvc-train-codec` data-loader validation report (codec regression only)
 - fixed external-baseline evaluation report with exact model/version/settings

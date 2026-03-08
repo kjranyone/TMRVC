@@ -52,6 +52,17 @@ class DatasetReport:
     voice_state_observed_ratio: float = 0.0
     voice_state_confidence_summary: dict[str, float] = field(default_factory=dict)
 
+    # Few-shot prompt pairing (Worker 03)
+    prompt_pairing_coverage: float = 0.0
+    prompt_leakage_risk_count: int = 0
+
+    # Suprasegmental and alignment coverage (Worker 03)
+    suprasegmental_coverage: float = 0.0
+    bootstrap_alignment_coverage: float = 0.0
+
+    # Curation asset consumption (Worker 03)
+    curation_record_coverage: float = 0.0
+
     def validate(self) -> list[str]:
         """Return list of validation errors (empty = valid)."""
         errors: list[str] = []
@@ -68,6 +79,10 @@ class DatasetReport:
             "alias_hit_ratio",
             "dialogue_context_coverage",
             "voice_state_supervision_coverage",
+            "prompt_pairing_coverage",
+            "suprasegmental_coverage",
+            "bootstrap_alignment_coverage",
+            "curation_record_coverage",
         ):
             val = getattr(self, name)
             if not (0.0 <= val <= 1.0):
@@ -123,4 +138,9 @@ REQUIRED_REPORT_FIELDS = frozenset({
     "voice_state_supervision_coverage",
     "voice_state_observed_ratio",
     "voice_state_confidence_summary",
+    "prompt_pairing_coverage",
+    "prompt_leakage_risk_count",
+    "suprasegmental_coverage",
+    "bootstrap_alignment_coverage",
+    "curation_record_coverage",
 })

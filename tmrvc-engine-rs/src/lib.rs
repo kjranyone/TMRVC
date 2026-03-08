@@ -2,6 +2,7 @@ pub mod character;
 pub mod constants;
 pub mod dsp;
 pub mod f0_tracker;
+pub mod g2p;
 pub mod mel_thumbnail;
 pub mod nam;
 pub mod ort_bundle;

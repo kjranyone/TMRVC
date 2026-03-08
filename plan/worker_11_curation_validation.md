@@ -13,6 +13,7 @@ This worker is the brake pedal. It prevents the project from claiming success be
 - evaluation scripts
 - validation reports
 - curation acceptance checklist
+- `docs/design/provider-registry.md`
 
 ## Required Outcomes
 
@@ -22,6 +23,7 @@ This worker is the brake pedal. It prevents the project from claiming success be
 - downstream uplift report
 - human-audit process report
 - `voice_state` pseudo-label validation report
+- provider confidence recalibration report
 
 ## Validation Layers
 
@@ -67,6 +69,7 @@ Measure:
 ## Concrete Tasks
 
 1. Define stage-by-stage benchmark protocol.
+   - include provider-by-provider audit buckets rather than one pooled confidence analysis
 2. Define sample audit protocol:
    - promoted sample audit
    - review sample audit
@@ -76,6 +79,8 @@ Measure:
    - naive raw ingestion baseline
    - curated subset baseline
 4. Define acceptance thresholds for adopting each provider stack.
+   - adoption thresholds must be issued per pinned `provider_id` / `calibration_version`
+   - pooled thresholds across different provider families are forbidden until calibration parity is demonstrated
 5. Define failure conditions that block rollout.
 6. Validate legality gating and split integrity:
    - no unknown-rights source in mainline export
@@ -87,6 +92,14 @@ Measure:
 8. Validate `voice_state` pseudo-label utility:
    - coverage and calibration are reported for promoted subsets
    - masked training with these labels improves or preserves held-out controllability metrics
+9. Recalibrate provider confidences before Worker 09 policy use:
+   - ASR confidence calibration per provider family
+   - diarization confidence / purity proxy calibration per provider
+   - alignment confidence calibration for bootstrap labels
+   - emit canonical `calibration_version` records consumed by Worker 08 and Worker 09
+10. Validate unsupported-language fallback behavior:
+   - samples from provider-unsupported languages must land in explicit fallback / review paths
+   - no silent promote path may rely on out-of-support provider outputs as if they were native-support results
 
 ## Acceptance Criteria
 
@@ -100,6 +113,7 @@ The curation system is acceptable only if:
 6. legality and split gates are enforced with zero critical violations
 7. human audit and rating records are sufficient to reconstruct who approved what and why
 8. `voice_state` pseudo-labels are calibrated enough to justify use in mainline training
+9. every provider-driven threshold used by promotion policy references a pinned `provider_id` and `calibration_version`
 
 ## Guardrails
 
@@ -109,6 +123,7 @@ The curation system is acceptable only if:
 - do not accept opaque score formulas
 - do not accept a HITL claim if approvals or ratings are not reconstructible from stored audit data
 - do not sign off on physical-control claims if curated `voice_state` labels were never utility-tested
+- do not allow Worker 09 to use raw provider confidence on an absolute shared scale before recalibration
 
 ## Deliverables
 

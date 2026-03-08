@@ -13,6 +13,7 @@ The curation system must not depend on one model family. It needs a provider lay
 - provider adapters under `tmrvc-data`
 - curation config files
 - `plan/ai_curation_system.md`
+- `docs/design/provider-registry.md`
 
 ## Required Outcomes
 
@@ -22,6 +23,7 @@ The curation system must not depend on one model family. It needs a provider lay
 - artifact translation into the manifest contract
 - explicit transcript-refinement engine contract
 - explicit `voice_state` pseudo-label estimator contract
+- provider artifact/version/runtime pinning contract shared with Worker 11 and Worker 09
 
 ## Recommended Provider Stack
 
@@ -39,12 +41,13 @@ Fallback:
 
 Primary:
 
-- `VibeVoice-ASR` if joint outputs are reliable enough
+- `pyannote/speaker-diarization-community-1`
 
 Fallbacks:
 
+- `VibeVoice-ASR` joint structure recovery when pinned and validated
 - `Reverb diarization`
-- `pyannote.audio`
+- older `pyannote.audio` baselines only as explicit fallback entries in the provider registry
 
 Additional required stage:
 
@@ -57,12 +60,23 @@ Additional required stage:
 
 Primary:
 
-- `VibeVoice-ASR` for long-form structure-rich audio
+- `Qwen3-ASR-1.7B`
 
 Fallbacks:
 
+- `Qwen3` family throughput/downscaled variants only when separately pinned
 - `Reverb ASR`
 - `faster-whisper`
+
+### Bootstrap Alignment
+
+Primary:
+
+- `Qwen3-ForcedAligner-0.6B`
+
+Fallback:
+
+- none for unsupported languages; export explicit absence and route the sample to fallback / review policy rather than synthesizing pseudo-truth
 
 ### Transcript Refinement
 
@@ -98,6 +112,11 @@ Use local extractors and classifiers for:
    - confidence
    - warnings
    - provenance
+   - `provider_id`
+   - `artifact_id`
+   - `provider_revision`
+   - `runtime_backend`
+   - `calibration_version`
 2. Normalize speaker identifiers across providers.
 3. Define cross-file speaker clustering contract:
    - extract speaker embeddings from diarized segments
@@ -105,6 +124,8 @@ Use local extractors and classifiers for:
    - record clustering confidence and provenance
 4. Normalize timestamps and segment boundaries.
 5. Normalize transcript confidence semantics.
+   - raw confidences from different providers must not be treated as one shared numeric scale
+   - every provider confidence used by Worker 09 must reference a Worker 11-issued calibration version
 6. Define provider comparison metrics:
    - ASR uplift
    - diarization uplift
@@ -121,6 +142,8 @@ Use local extractors and classifiers for:
    - provider missing
    - provider low-confidence
    - provider disagreement
+   - provider unsupported for the target language
+   - throughput fallback versus quality-mainline fallback must be distinguishable in provenance
 9. Define `voice_state` estimator contract:
    - canonical output tensor shape: `[T_frames, 8]`
    - observed mask shape: `[T_frames, 8]`
@@ -131,6 +154,16 @@ Use local extractors and classifiers for:
    - agreement across estimators where available
    - calibration quality
    - downstream controllability uplift correlation
+11. Freeze the provider registry contract in `docs/design/provider-registry.md`:
+   - one pinned entry per mainline provider
+   - no `latest`, `main`, or implicit default provider-revision references
+   - declare language support, license/gated-access status, runtime backend, and fallback policy per provider
+12. Define mainline provider policy:
+   - diarization mainline = `pyannote/speaker-diarization-community-1`
+   - ASR mainline = `Qwen3-ASR-1.7B`
+   - bootstrap-alignment mainline = `Qwen3-ForcedAligner-0.6B`
+   - throughput fallback = `faster-whisper`
+   - any deviation must be recorded as a provider-registry version bump or a per-run downgrade with provenance
 
 ## Guardrails
 
@@ -140,6 +173,8 @@ Use local extractors and classifiers for:
 - do not leave transcript refinement as an implied step without a concrete engine contract
 - do not confuse file-local diarization labels with persistent dataset-global speaker ids
 - do not emit dense zero `voice_state` labels when the estimator is uncertain; use masks and confidences
+- do not mix unsupported-language outputs into mainline thresholds as if the provider had native support
+- do not allow uncalibrated provider scores into promotion policy
 
 ## Handoff Contract
 

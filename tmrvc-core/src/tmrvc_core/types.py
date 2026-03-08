@@ -10,14 +10,18 @@ from typing import Optional, List
 import torch
 
 from tmrvc_core.constants import (
+    D_SUPRASEGMENTAL as D_SUPRASEGMENTAL_CONST,
+    MAX_FRAMES_PER_UNIT,
     MAX_PROMPT_CACHE_BYTES,
     MAX_PROMPT_FRAMES,
     MAX_PROMPT_KV_TOKENS,
     MAX_PROMPT_SECONDS_ACTIVE,
+    SKIP_PROTECTION_THRESHOLD,
 )
 
-# Suprasegmental feature dimensionality: [accent_type, tone_level, phrase_boundary, stress_level]
-D_SUPRASEGMENTAL = 4
+# Suprasegmental feature dimensionality:
+# [accent_upstep, accent_downstep, phrase_break, lexical_tone_id]
+D_SUPRASEGMENTAL = D_SUPRASEGMENTAL_CONST
 
 
 class CFGMode(str, Enum):
@@ -62,6 +66,8 @@ class PointerState:
         progress: [B] fractional progress within the current phoneme (0-1).
         boundary_confidence: confidence score for the last boundary decision.
         stall_frames: number of consecutive frames without pointer advance.
+        is_hard_bootstrapped: if True, the pointer is forced to external alignment
+            (Stage 2 Annealing - Hard Phase).
     """
 
     text_index: torch.Tensor  # [B]
@@ -69,11 +75,28 @@ class PointerState:
     finished: bool = False
     boundary_confidence: float = 0.0
     stall_frames: int = 0
-    max_frames_per_unit: int = 50
+    max_frames_per_unit: int = MAX_FRAMES_PER_UNIT
     frames_on_current_unit: int = 0
-    skip_protection_threshold: float = 0.3
+    skip_protection_threshold: float = SKIP_PROTECTION_THRESHOLD
     forced_advance_count: int = 0
     skip_protection_count: int = 0
+    is_hard_bootstrapped: bool = False
+    last_advance_score: float = 0.0
+
+    @property
+    def advance_logit(self) -> float:
+        """Compatibility accessor for the last pointer advance score."""
+        return self.last_advance_score
+
+    @property
+    def progress_delta(self) -> float:
+        """Alias: fractional progress accumulated so far on current unit."""
+        return float(self.progress.item()) if hasattr(self.progress, 'item') else float(self.progress)
+
+    @property
+    def progress_value(self) -> torch.Tensor:
+        """Alias for progress tensor — canonical name used in pointer contracts."""
+        return self.progress
 
     def clone(self) -> "PointerState":
         return PointerState(
@@ -87,6 +110,8 @@ class PointerState:
             skip_protection_threshold=self.skip_protection_threshold,
             forced_advance_count=self.forced_advance_count,
             skip_protection_count=self.skip_protection_count,
+            is_hard_bootstrapped=self.is_hard_bootstrapped,
+            last_advance_score=self.last_advance_score,
         )
 
     def step_pointer(
@@ -103,6 +128,9 @@ class PointerState:
         Returns:
             ``True`` if the pointer advanced to the next text unit.
         """
+        self.last_advance_score = float(advance_prob)
+        self.boundary_confidence = float(boundary_confidence)
+
         # 1. Track time on the current unit
         self.frames_on_current_unit += 1
 
@@ -184,6 +212,7 @@ class VoiceStateSupervision:
         observed_mask: [B, T, 8] — True where dimension has usable evidence
         confidence: [B, T, 8] or [B, T, 1] — numeric confidence per dimension
         provenance: str — estimator identity and calibration version
+        target_source: canonical source label such as direct/pseudo/absent
 
     Missing dimensions must be masked in loss, never treated as zero-valued neutral.
     """
@@ -191,6 +220,7 @@ class VoiceStateSupervision:
     observed_mask: torch.Tensor  # [B, T, 8] bool
     confidence: torch.Tensor     # [B, T, 8] or [B, T, 1]
     provenance: str = "unknown"
+    target_source: str = "unknown"
 
 
 @dataclass
@@ -198,13 +228,23 @@ class SpeakerProfile:
     """Canonical Speaker Profile contract for the Casting Gallery.
 
     Shared by Gradio UI, Python Serve, Rust Engine, and VST.
-    As defined in docs/design/speaker-profile-spec.md.
+    v3.0 mainline is prompt-based only. Legacy adaptor-related fields remain as
+    compatibility placeholders and are not part of the canonical v3.0 contract.
     """
     speaker_profile_id: str
     reference_audio_hash: str
     speaker_embed: torch.Tensor  # [d_speaker] (usually 192)
-    prompt_codec_tokens: torch.Tensor  # [T_prompt, n_codebooks] (usually 8 codebooks)
+    prompt_codec_tokens: torch.Tensor  # [T_prompt, n_codebooks] (original frames)
+    schema_version: int = 1
+    metadata_version: int = 1
+    prompt_kv_cache: Optional[torch.Tensor] = None
+    # Compressed summary tokens from Prompt Resampler (Q-Former)
+    prompt_summary_tokens: Optional[torch.Tensor] = None  # [n_prompt_summary_tokens, d_model]
+    # Deprecated compatibility placeholders: not canonical in v3.0.
+    adaptor_id: Optional[str] = None
+    adaptor_merged: bool = False
     prompt_text_tokens: Optional[torch.Tensor] = None  # [L_prompt]
+    prompt_encoder_fingerprint: str = ""
     display_name: str = ""
     language: str = "ja"
     gender: str = "other"  # male, female, other
@@ -270,6 +310,7 @@ class UCLM_Batch:
     voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
     voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool
     voice_state_confidence: Optional[torch.Tensor] = None     # [B, T, 8] or [B, T, 1]
+    voice_state_target_source: Optional[List[str] | torch.Tensor] = None
 
     def to(self, device: torch.device | str) -> UCLM_Batch:
         res = {}

@@ -1,18 +1,18 @@
 """Stage 6: Prosody / Event Recovery - Extract acting-relevant signals.
 
 Recovers pause spans, pitch (F0) statistics, energy statistics, speech rate,
-and computes 8-D voice_state pseudo-labels with per-dimension confidence
-and observed masks.
+and computes canonical 8-D voice_state pseudo-labels with per-dimension
+confidence and observed masks.
 
-The 8 voice_state dimensions are:
-  0: breathiness  - spectral tilt estimate
-  1: tension      - F0 variance estimate
-  2: arousal      - energy + speech rate
-  3: valence      - defaults to 0.5 (neutral) with low confidence
-  4: roughness    - jitter/shimmer estimate
-  5: voicing      - voiced frame ratio
-  6: energy       - direct RMS measurement
-  7: speech_rate  - phonemes-per-second estimate
+The canonical voice_state dimensions are:
+  0: pitch_level
+  1: pitch_range
+  2: energy_level
+  3: pressedness
+  4: spectral_tilt
+  5: breathiness
+  6: voice_irregularity
+  7: openness
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 
 from ..models import CurationRecord, Provenance, RecordStatus
 from ..providers import ProviderRegistry
@@ -33,10 +34,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 VOICE_STATE_DIM = 8
-VOICE_STATE_NAMES = [
-    "breathiness", "tension", "arousal", "valence",
-    "roughness", "voicing", "energy", "speech_rate",
-]
+VOICE_STATE_NAMES = list(CANONICAL_VOICE_STATE_IDS)
 SILENCE_DB = -50.0
 MIN_PAUSE_SEC = 0.15  # minimum pause duration to record
 F0_MIN_HZ = 50.0
@@ -345,7 +343,7 @@ def _estimate_spectral_tilt(audio: np.ndarray, sr: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Jitter/shimmer (roughness proxy)
+# Jitter/shimmer (voice-irregularity proxy)
 # ---------------------------------------------------------------------------
 
 def _estimate_jitter_shimmer(
@@ -411,65 +409,78 @@ def compute_voice_state(
     observed_mask = np.zeros(VOICE_STATE_DIM, dtype=bool)
     confidence = np.zeros(VOICE_STATE_DIM, dtype=np.float32)
 
-    # Dim 0: breathiness (spectral tilt)
-    breathiness = _estimate_spectral_tilt(audio, sr)
-    voice_state[0] = breathiness
-    observed_mask[0] = True
-    confidence[0] = 0.6  # moderate confidence for spectral heuristic
-
-    # Dim 1: tension (F0 variance)
     f0_std = pitch_stats.get("f0_std_hz", 0.0)
     f0_mean = pitch_stats.get("f0_mean_hz", 0.0)
+    voiced_ratio = pitch_stats.get("voiced_ratio", 0.0)
+    rms = energy_stats.get("rms", 0.0)
+    energy_norm = float(np.clip(rms / 0.2, 0.0, 1.0))
+    spectral_tilt = _estimate_spectral_tilt(audio, sr)
+    jitter, shimmer = _estimate_jitter_shimmer(audio, sr)
+    voice_irregularity = 0.5 * jitter + 0.5 * shimmer
+    breathiness = float(np.clip(0.7 * spectral_tilt + 0.3 * (1.0 - voiced_ratio), 0.0, 1.0))
+
+    # Dim 0: pitch_level (normalised F0 mean)
     if f0_mean > 0:
-        # Coefficient of variation of F0 maps to tension
-        f0_cv = f0_std / (f0_mean + 1e-6)
-        # Higher CV = more variable = potentially more tense
-        tension = float(np.clip(f0_cv / 0.3, 0.0, 1.0))
-        voice_state[1] = tension
-        observed_mask[1] = True
-        confidence[1] = 0.5
+        pitch_level = float(np.clip(np.log2(max(f0_mean, 50.0) / 50.0) / 4.0, 0.0, 1.0))
+        voice_state[0] = pitch_level
+        observed_mask[0] = True
+        confidence[0] = 0.7
     else:
-        voice_state[1] = 0.5
+        voice_state[0] = 0.5
+        observed_mask[0] = False
+        confidence[0] = 0.1
+
+    # Dim 1: pitch_range (F0 coefficient of variation)
+    if f0_mean > 0:
+        f0_cv = f0_std / (f0_mean + 1e-6)
+        voice_state[1] = float(np.clip(f0_cv / 0.35, 0.0, 1.0))
+        observed_mask[1] = True
+        confidence[1] = 0.6
+    else:
+        voice_state[1] = 0.3
         observed_mask[1] = False
         confidence[1] = 0.1
 
-    # Dim 2: arousal (energy + speech rate)
-    rms = energy_stats.get("rms", 0.0)
-    energy_norm = float(np.clip(rms / 0.2, 0.0, 1.0))
-    rate = speech_rate_info.get("speech_rate_estimate", 0.0)
-    rate_norm = float(np.clip(rate / 20.0, 0.0, 1.0))
-    arousal = 0.5 * energy_norm + 0.5 * rate_norm
-    voice_state[2] = arousal
+    # Dim 2: energy_level (direct RMS measurement)
+    voice_state[2] = energy_norm
     observed_mask[2] = True
-    confidence[2] = 0.5
+    confidence[2] = 0.8
 
-    # Dim 3: valence (default neutral - cannot be reliably estimated from audio alone)
-    voice_state[3] = 0.5
-    observed_mask[3] = False
-    confidence[3] = 0.1  # very low confidence
+    # Dim 3: pressedness (weak proxy from F0 level + energy + inverse breathiness)
+    if f0_mean > 0:
+        voice_state[3] = float(
+            np.clip(
+                0.4 * voice_state[0] + 0.35 * energy_norm + 0.25 * (1.0 - breathiness),
+                0.0,
+                1.0,
+            )
+        )
+        observed_mask[3] = True
+        confidence[3] = 0.35
+    else:
+        voice_state[3] = 0.35
+        observed_mask[3] = False
+        confidence[3] = 0.1
 
-    # Dim 4: roughness (jitter/shimmer)
-    jitter, shimmer = _estimate_jitter_shimmer(audio, sr)
-    roughness = 0.5 * jitter + 0.5 * shimmer
-    voice_state[4] = roughness
-    observed_mask[4] = jitter > 0 or shimmer > 0
-    confidence[4] = 0.4 if observed_mask[4] else 0.1
+    # Dim 4: spectral_tilt
+    voice_state[4] = spectral_tilt
+    observed_mask[4] = True
+    confidence[4] = 0.6
 
-    # Dim 5: voicing (voiced frame ratio)
-    voiced_ratio = pitch_stats.get("voiced_ratio", 0.0)
-    voice_state[5] = voiced_ratio
+    # Dim 5: breathiness
+    voice_state[5] = breathiness
     observed_mask[5] = True
-    confidence[5] = 0.7  # direct measurement, relatively reliable
+    confidence[5] = 0.45
 
-    # Dim 6: energy (direct measurement)
-    voice_state[6] = energy_norm
-    observed_mask[6] = True
-    confidence[6] = 0.8  # direct measurement, most reliable
+    # Dim 6: voice_irregularity (jitter/shimmer)
+    voice_state[6] = voice_irregularity
+    observed_mask[6] = jitter > 0 or shimmer > 0
+    confidence[6] = 0.4 if observed_mask[6] else 0.1
 
-    # Dim 7: speech_rate (direct measurement)
-    voice_state[7] = rate_norm
-    observed_mask[7] = rate > 0
-    confidence[7] = 0.5 if observed_mask[7] else 0.1
+    # Dim 7: openness (not robustly observable here; keep neutral unless stronger provider exists)
+    voice_state[7] = 0.5
+    observed_mask[7] = False
+    confidence[7] = 0.1
 
     return {
         "voice_state": [round(float(v), 4) for v in voice_state],

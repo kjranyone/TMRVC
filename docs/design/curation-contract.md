@@ -9,12 +9,14 @@
 - promotion buckets
 - cache / evaluation bundle への export contract
 - WebUI と backend の責務境界
+- provider artifact / provider-revision pinning は `docs/design/provider-registry.md` を参照する
 
 ## 2. Authoritative Boundary
 
 - multi-user 書き込みは `tmrvc-serve` の `/ui/*` と `/admin/*` を通す
 - `tmrvc-data` は内部 curation service として実装されてよいが、filesystem 直接更新は dev-only
 - UI は manifest を直接 mutate しない
+- provider artifact identity, language support, and fallback policy は `docs/design/provider-registry.md` の pinned entry に従う
 
 ## 3. Manifest Contract
 
@@ -37,11 +39,17 @@
 - `next_record_id`
 - `context_window_ids`
 - `quality_score`
+- `score_components`
 - `status`
 - `promotion_bucket`
 - `rejection_reasons`
 - `review_reasons`
 - `providers`
+- canonical provider decision provenance:
+  - `provider_id`
+  - `provider_revision`
+  - `calibration_version`
+  - optional `fallback_class`
 - `pass_index`
 - `source_legality`
 - `voice_state_target_source`
@@ -76,6 +84,10 @@ record の主状態は次を前提とする。
 - hard reject: transcript empty, severe overlap, wrong language, corruption, separation damage
 - review: provider disagreement, marginal transcript confidence, speaker uncertainty, partial event failure
 - promote: hard constraints を満たし、quality score と provenance が sufficient
+- fallback/review required:
+  - required provider が対象言語を未サポート
+  - provider confidence に `calibration_version` がない
+  - provider downgrade が入っているのに mainline threshold をそのまま適用しようとしている
 
 ## 6. Promotion Buckets
 
@@ -140,6 +152,7 @@ export 先にかかわらず最低限保持する。
 - source legality
 - quality score
 - provider provenance
+- provider decision provenance (`provider_id`, `provider_revision`, `calibration_version`, optional `fallback_class`)
 - promotion bucket
 - `voice_state` supervision status
 
@@ -162,6 +175,7 @@ cache-ready export は以下を materialize する。
 - `bootstrap_alignment.json` は canonical phoneme space に投影済みであること
 - frame convention は `24 kHz`, `hop_length = 240`, `T = ceil(num_samples / 240)`、`start_frame` inclusive / `end_frame` exclusive
 - `voice_state` supervision を export する場合、mask と provenance を必須とする
+- any exported score or bucket decision that depends on provider output must retain `provider_id`, `provider_revision`, and `calibration_version`
 
 ## 10. Separation Policy
 
@@ -189,3 +203,4 @@ audit-critical action は最低限以下を保存する。
 - review item を train bucket に混ぜること
 - provenance を落として export すること
 - shell access を export / download の前提にすること
+- `provider_id` / `provider_revision` / `calibration_version` を欠いた score を mainline promote policy に流すこと

@@ -24,5 +24,8 @@ if not _GEN_PATH.exists():
         f"実行してください: python scripts/codegen/generate_constants.py"
     )
 
-# Auto-generated from YAML - DO NOT EDIT THESE VALUES DIRECTLY
+# Auto-generated from YAML - the canonical runtime budget and tensor-layout
+# values must be defined there, not re-declared here.
+# Worker 04 Task 16: all runtime-budget constants are owned by
+# configs/constants.yaml and must NOT be re-declared in this file.
 from tmrvc_core._generated_constants import *  # noqa: F401, F403

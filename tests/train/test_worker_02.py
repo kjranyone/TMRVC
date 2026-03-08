@@ -127,7 +127,7 @@ class TestUCLMTrainerV3:
             "phoneme_ids": torch.randint(1, 200, (B, L)),
             "phoneme_lens": torch.full((B,), L, dtype=torch.long),
             "language_id": torch.zeros(B, dtype=torch.long),
-            "prosody_targets": torch.randn(B, 64), # matches default d_prosody
+            "prosody_targets": torch.randn(B, 128), # matches d_prosody from constants.yaml
         }
         
         metrics = trainer.train_step(batch)

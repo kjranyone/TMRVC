@@ -115,7 +115,7 @@ class ProsodyPredictor(nn.Module):
         Euler steps to produce a prosody latent.
     """
 
-    def __init__(self, d_model: int = 512, d_prosody: int = 64, n_ode_steps: int = 4):
+    def __init__(self, d_model: int = 512, d_prosody: int = 128, n_ode_steps: int = 4):
         super().__init__()
         self.d_prosody = d_prosody
         self.n_ode_steps = n_ode_steps
@@ -275,7 +275,7 @@ class DialogueContextProjector(nn.Module):
         d_model: int = 512,
         d_dialogue: int = 256,
         d_acting: int = 64,
-        d_prosody: int = 64,
+        d_prosody: int = 128,
     ):
         super().__init__()
         self.dialogue_proj = nn.Linear(d_dialogue, d_model)
@@ -335,7 +335,7 @@ class DisentangledUCLM(nn.Module):
         num_speakers: int = 1000,
         d_dialogue: int = 256,
         d_acting: int = 64,
-        d_prosody: int = 64,
+        d_prosody: int = 128,
     ):
         super().__init__()
         self.d_model = d_model
@@ -351,7 +351,7 @@ class DisentangledUCLM(nn.Module):
         )
 
         self.text_encoder = TextEncoder(
-            vocab_size=vocab_size, d_model=d_model, n_layers=4
+            vocab_size=vocab_size, d_model=d_model, n_layers=6
         )
 
         self.voice_state_enc = VoiceStateEncoder(
@@ -391,7 +391,8 @@ class DisentangledUCLM(nn.Module):
         self.delta_voice_state_proj = nn.Linear(d_explicit, d_model)
 
         # CFG scale embedding for distilled mode (v3).
-        self.cfg_scale_embed = nn.Linear(1, d_model)
+        # Projects to d_speaker so it can be added to speaker_embed directly.
+        self.cfg_scale_embed = nn.Linear(1, d_speaker)
 
     @staticmethod
     def apply_cfg_unconditional_mask(
@@ -431,9 +432,14 @@ class DisentangledUCLM(nn.Module):
             prompt_codec_tokens: [B, T_prompt, n_codebooks] from reference audio.
             speaker_embed: [B, d_speaker] optional external speaker embedding.
         Returns:
-            (refined_speaker_embed [B, d_model], prompt_features [B, T_prompt, d_model])
+            (refined_speaker_embed [B, d_model], prompt_summary_tokens [B, n_summary, d_model])
         """
-        return self.speaker_prompt_encoder(prompt_codec_tokens, speaker_embed)
+        refined_embed, prompt_feats = self.speaker_prompt_encoder(prompt_codec_tokens, speaker_embed)
+        
+        # Condense full prompt features into summary tokens for 10ms efficiency
+        summary_tokens = self.uclm_core.prompt_resampler(prompt_feats)
+        
+        return refined_embed, summary_tokens
 
     def predict_prosody(
         self,
@@ -531,6 +537,8 @@ class DisentangledUCLM(nn.Module):
         delta_voice_state: torch.Tensor | None = None,
         prompt_kv_cache: torch.Tensor | None = None,
         acoustic_history: tuple[torch.Tensor, torch.Tensor] | None = None,
+        bootstrap_alignment: dict | None = None,
+        text_suprasegmentals: torch.Tensor | None = None,
     ) -> dict:
         """Pointer-based TTS forward pass (UCLM v3).
 
@@ -555,6 +563,8 @@ class DisentangledUCLM(nn.Module):
             prompt_kv_cache: optional [B, T_prompt, d_model] cached prompt features
                 from encode_speaker_prompt, prepended to content for cross-attention.
             acoustic_history: optional tuple of (a_ctx, b_ctx) for causal decoding context.
+            bootstrap_alignment: optional dict with 'phoneme_indices' for hard bootstrap.
+            text_suprasegmentals: optional [B, L, d_suprasegmental] companion per-unit features.
 
         Returns:
             dict with keys ``logits_a``, ``logits_b``, ``advance_logit``,
@@ -574,29 +584,37 @@ class DisentangledUCLM(nn.Module):
 
         # 1. Encode phonemes
         phoneme_lens = (phoneme_ids != 0).sum(dim=1)
-        phoneme_features = self.text_encoder(phoneme_ids, language_ids, phoneme_lens)
+        phoneme_features = self.text_encoder(
+            phoneme_ids, language_ids, phoneme_lens,
+            text_suprasegmentals=text_suprasegmentals,
+        )
         phoneme_features = phoneme_features.transpose(1, 2)
 
         B, L, D = phoneme_features.shape
 
-        # 2. Base frame representation: Start with interpolated phonemes (augmented by Cross-Attention)
-        frame_indices = torch.arange(target_length, device=phoneme_features.device)
-        phoneme_indices = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
-        content_features = phoneme_features[:, phoneme_indices, :]
-
-        # 2b. Prepend prompt KV cache features if available
-        if prompt_kv_cache is not None:
-            content_features = torch.cat([prompt_kv_cache, content_features], dim=1)
+        # 2. Build base frame representation (Conditioning on text units)
+        if pointer_state is not None and pointer_state.is_hard_bootstrapped:
+            # Stage 2 Annealing - Hard Phase: Use external alignment as truth
+            if bootstrap_alignment is None:
+                raise ValueError("bootstrap_alignment required when is_hard_bootstrapped=True")
+            # bootstrap_alignment is expected to be [B, T] mapping frame -> phoneme index
+            phoneme_indices = bootstrap_alignment["phoneme_indices"]
+            content_features = phoneme_features[torch.arange(B).unsqueeze(1), phoneme_indices, :]
+        elif pointer_state is not None:
+            # Inference or Latent phase: Use pointer_state.text_index
+            # In streaming, text_index is usually [B], so we unsqueeze
+            idx = pointer_state.text_index
+            if idx.ndim == 1:
+                idx = idx.unsqueeze(1).expand(-1, target_length)
+            content_features = phoneme_features[torch.arange(B).unsqueeze(1), idx, :]
+        else:
+            # Teacher-forced training / Legacy fallback
+            frame_indices = torch.arange(target_length, device=phoneme_features.device)
+            phoneme_indices = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
+            content_features = phoneme_features[:, phoneme_indices, :]
 
         # 3. Apply F0 conditioning
         if f0_condition is not None:
-            if prompt_kv_cache is not None:
-                # Pad f0 to account for prepended prompt features
-                f0_pad = torch.zeros(
-                    B, prompt_kv_cache.shape[1], f0_condition.shape[-1],
-                    device=f0_condition.device,
-                )
-                f0_condition = torch.cat([f0_pad, f0_condition], dim=1)
             content_features = content_features + self.f0_proj(f0_condition)
 
         # 3b. Apply dialogue/acting/prosody conditioning
@@ -648,16 +666,10 @@ class DisentangledUCLM(nn.Module):
             b_ctx=b_ctx,
             state_cond=state_cond,
             speaker_embed=speaker_embed,
+            prompt_tokens=prompt_kv_cache, # Pass prompt features for condensation
             cfg_scale=cfg_scale,
             f0_condition=f0_condition,
         )
-
-        # If prompt was prepended, strip prompt positions from outputs
-        if prompt_kv_cache is not None:
-            T_prompt = prompt_kv_cache.shape[1]
-            logits_a = logits_a[:, :, T_prompt:, :]
-            logits_b = logits_b[:, :, T_prompt:, :]
-            x_out = x_out[:, T_prompt:, :]
 
         # 7. Pointer head
         advance_logit, progress_delta, boundary_confidence = self.pointer_head(x_out)
@@ -703,6 +715,7 @@ class DisentangledUCLM(nn.Module):
         return self.forward_tts_pointer(
             phoneme_ids=phoneme_ids,
             language_ids=language_ids,
+            pointer_state=None,  # distillation uses teacher-forced alignment
             speaker_embed=speaker_embed_with_cfg,
             explicit_state=explicit_state,
             ssl_state=ssl_state,
@@ -740,24 +753,28 @@ class DisentangledUCLM(nn.Module):
 
     def forward_streaming(
         self,
-        queries: torch.Tensor,
-        memory: torch.Tensor,
-        a_ctx: torch.Tensor,
-        b_ctx: torch.Tensor,
-        speaker_embed: torch.Tensor,
-        state_cond: torch.Tensor,
+        queries: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
+        a_ctx: torch.Tensor | None = None,
+        b_ctx: torch.Tensor | None = None,
+        speaker_embed: torch.Tensor | None = None,
+        state_cond: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         kv_caches: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
         prosody_latent: torch.Tensor | None = None,
         f0_condition: torch.Tensor | None = None,
+        prompt_summary_tokens: torch.Tensor | None = None,
+        content_features: torch.Tensor | None = None,
     ) -> dict:
         """Forward pass for streaming inference with KV cache list.
 
         Args:
             queries: [B, T_q, D] current frame base features.
+                Also accepts ``content_features`` as a backward-compatible alias.
             memory: [B, L_mem, D] full phoneme sequence for global cross-attention.
+                When None, queries are used as both query and memory.
             a_ctx: [B, n_codebooks, T_q] previous acoustic tokens.
             b_ctx: [B, n_slots, T_q] previous control tokens.
             speaker_embed: [B, d_speaker] speaker embedding.
@@ -768,7 +785,19 @@ class DisentangledUCLM(nn.Module):
             acting_intent: optional [B, D_act] acting intent vector.
             prosody_latent: optional [B, D_pro] or [B, T_q, D_pro] local prosody planning.
             f0_condition: optional [B, T_q, 2] F0 conditioning.
+            prompt_summary_tokens: [B, n_summary, D] pre-condensed prompt features.
+            content_features: backward-compatible alias for queries.
         """
+        # Backward-compatible alias: content_features -> queries
+        if queries is None and content_features is not None:
+            queries = content_features
+        if queries is None:
+            raise ValueError("Either 'queries' or 'content_features' must be provided")
+
+        # Default memory to queries if not provided
+        if memory is None:
+            memory = queries
+
         # Apply dialogue/acting/prosody conditioning
         queries = self.context_projector(
             queries,
@@ -785,6 +814,7 @@ class DisentangledUCLM(nn.Module):
             b_ctx=b_ctx,
             speaker_embed=speaker_embed,
             state_cond=state_cond,
+            prompt_summary_tokens=prompt_summary_tokens,
             cfg_scale=cfg_tensor,
             kv_caches=kv_caches,
             f0_condition=f0_condition,

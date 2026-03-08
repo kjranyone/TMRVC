@@ -1,22 +1,87 @@
+# TMRVC UCLM v3 Training Config Example
+# See plan/worker_02_training.md for full documentation.
+
 language: ja
-tts_mode: pointer
+
+# --- v3 pointer mode (mainline) ---
+tts_mode: pointer          # "pointer" (v3 mainline) or "legacy_duration" (v2)
+pointer_mode: true         # enable pointer-based text progression
 pointer_loss_weight: 0.5
 progress_loss_weight: 0.2
-alignment_loss_type: none
-pointer_target_source: heuristic_bootstrap
-legacy_duration_loss_weight: 0.0
+boundary_confidence_loss_weight: 0.1
+alignment_loss_type: none  # "none" | "aux_mas" | "aux_ctc"
+pointer_target_source: heuristic_bootstrap  # "none" | "heuristic_bootstrap" | "bootstrap_projection" | "legacy_duration" | "mas" | "ctc"
+pointer_supervision_mode: latent_only  # "latent_only" | "supervised"
+pointer_training_mode: local_expected  # "local_expected" | "local_expected_st_hardening"
+
+# --- pointer annealing schedule (cold-start protection) ---
+pointer_aux_alignment_warmup_steps: 2000   # Hard Bootstrap Phase: use external alignment
+pointer_aux_alignment_anneal_steps: 5000   # Soft Transition Phase: mix bootstrap with model
+pointer_hardening_start_step: 10000        # When to begin straight-through hardening
+pointer_hardening_ramp_steps: 5000         # Duration of hardening ramp
+
+# --- CFG (classifier-free guidance) ---
+cfg_enabled: true
+conditioning_dropout_prob: 0.15   # condition dropout probability during training
+conditioning_dropout_schema_version: 1
+cfg_distillation_weight: 0.0     # post-v3.0 optimization; set > 0 to enable
+cfg_distillation_scale_range: [1.0, 3.0]
+cfg_distillation_temperature: 2.0
+
+# --- voice state supervision ---
+voice_state_supervision: true
 voice_state_loss_weight: 0.0
+voice_state_confidence_floor: 0.1
+voice_state_teacher_mode: none  # "none" | "pseudo_labeled" | "direct_labeled" | "mixed"
 delta_voice_state_loss_weight: 0.0
+
+# --- prosody ---
+prosody_flow_matching: true
+prosody_loss_weight: 1.0
+
+# --- training stage ---
+# "base" — initial pointer training (Stage 1)
+# "align" — alignment refinement (Stage 2)
+# "drama" — dramatic acting / expressive fine-tuning (Stage 3)
+training_stage: "base"
+
+# --- 3-stage curriculum ---
+curriculum_stage2_start: 5000
+curriculum_stage3_start: 15000
+
+# --- optional bootstrap alignment ---
+# Path to pre-computed alignment for warm-starting pointer training.
+# Set to null to use heuristic bootstrap only.
+bootstrap_alignment_path: null
+bootstrap_alignment_required: false
+
+# --- few-shot prompt training ---
+few_shot_prompt_training: true
+prompt_sampling_prob: 0.0
+
+# --- replay buffer (Stage 3 anti-forgetting) ---
+stage3_replay_mix_ratio: 0.2
+stage3_dialogue_mix_ratio: 0.7
+
+# --- v2-legacy duration path (retained for ablation) ---
+legacy_duration_loss_weight: 0.0
+
+# --- suprasegmental features ---
+suprasegmental_required_languages: ["ja"]
+
+# --- training hyperparameters ---
 train_steps: 100000
 train_batch_size: 16
 train_device: cuda
 train_sampling_strategy: balanced
 
+# --- quality gate ---
 quality_gate_enabled: true
 quality_gate_max_invalid_ratio: 0.0
 quality_gate_min_utterances_per_dataset: 1
 quality_gate_min_speakers_per_dataset: 1
 quality_gate_token_samples: 64
 
+# --- codec ---
 rvq_vocab_size: 1024
 control_vocab_size: 64

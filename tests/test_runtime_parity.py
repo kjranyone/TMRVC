@@ -218,3 +218,169 @@ class TestPythonRustPointerStateFields:
 
         # finished must still be accessible as a property
         assert hasattr(pis, "finished")
+
+
+# ---------------------------------------------------------------------------
+# PyTorch Batch vs Streaming Numerical Parity (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestBatchVsStreamingNumericalParity:
+    """PyTorch batch and streaming must produce same output within tolerance."""
+
+    def test_batch_vs_rerun_pointer_head_parity(self):
+        """Running forward_tts_pointer and then re-running pointer_head on the
+        same hidden_states must produce numerically identical results."""
+        model = DisentangledUCLM()
+        model.eval()
+
+        inputs = _make_tts_inputs(model, target_length=15)
+
+        with torch.no_grad():
+            batch_out = model.forward_tts_pointer(**inputs)
+
+        hidden = batch_out["hidden_states"]
+        assert hidden is not None
+
+        with torch.no_grad():
+            ptr2, prog2, bc2 = model.pointer_head(hidden)
+
+        assert torch.allclose(
+            batch_out["pointer_logits"], ptr2, atol=1e-5
+        ), "Pointer logits differ on same hidden_states"
+        assert torch.allclose(
+            batch_out["progress_delta"], prog2, atol=1e-5
+        ), "Progress delta differs on same hidden_states"
+
+    def test_deterministic_forward_on_cpu(self):
+        """Two identical forward passes must produce identical results on CPU."""
+        model = DisentangledUCLM()
+        model.eval()
+
+        inputs = _make_tts_inputs(model, target_length=10)
+
+        with torch.no_grad():
+            out1 = model.forward_tts_pointer(**inputs)
+            out2 = model.forward_tts_pointer(**inputs)
+
+        assert torch.allclose(
+            out1["pointer_logits"], out2["pointer_logits"], atol=1e-6
+        ), "Non-deterministic pointer logits on CPU"
+        assert torch.allclose(
+            out1["hidden_states"], out2["hidden_states"], atol=1e-6
+        ), "Non-deterministic hidden states on CPU"
+
+
+# ---------------------------------------------------------------------------
+# Pointer State Serialization Roundtrip (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestPointerStateSerializationRoundtrip:
+    """PointerState serialization roundtrip must preserve all state."""
+
+    def test_pointer_inference_state_roundtrip(self):
+        """PointerInferenceState.to_dict -> reconstruct -> identical state."""
+        pis = PointerInferenceState(total_phonemes=20)
+        # Advance state
+        pis.text_index = 5
+        pis.progress = 0.7
+        pis.stall_frames = 3
+        pis.frames_on_current_unit = 8
+        pis.forced_advance_count = 1
+        pis.skip_protection_count = 2
+
+        d = pis.to_dict()
+
+        # Reconstruct
+        pis2 = PointerInferenceState(total_phonemes=d.get("total_phonemes", 20))
+        pis2.text_index = d["text_index"]
+        pis2.progress = d["progress"]
+        pis2.stall_frames = d["stall_frames"]
+        pis2.frames_on_current_unit = d["frames_on_current_unit"]
+        pis2.forced_advance_count = d["forced_advance_count"]
+        pis2.skip_protection_count = d["skip_protection_count"]
+        pis2.max_frames_per_unit = d["max_frames_per_unit"]
+        pis2.skip_protection_threshold = d["skip_protection_threshold"]
+
+        assert pis2.text_index == pis.text_index
+        assert pis2.progress == pis.progress
+        assert pis2.stall_frames == pis.stall_frames
+        assert pis2.frames_on_current_unit == pis.frames_on_current_unit
+        assert pis2.forced_advance_count == pis.forced_advance_count
+        assert pis2.skip_protection_count == pis.skip_protection_count
+
+    def test_core_pointer_state_clone_roundtrip(self):
+        """PointerState.clone must produce an independent identical copy."""
+        ps = PointerState(
+            text_index=torch.tensor([7]),
+            progress=torch.tensor([0.3]),
+            stall_frames=2,
+            max_frames_per_unit=40,
+            frames_on_current_unit=5,
+            forced_advance_count=1,
+            skip_protection_count=3,
+        )
+
+        ps_clone = ps.clone()
+
+        # Identical values
+        assert torch.equal(ps.text_index, ps_clone.text_index)
+        assert torch.equal(ps.progress, ps_clone.progress)
+        assert ps.stall_frames == ps_clone.stall_frames
+        assert ps.forced_advance_count == ps_clone.forced_advance_count
+        assert ps.skip_protection_count == ps_clone.skip_protection_count
+
+        # Independence: modifying clone should not affect original
+        ps_clone.text_index += 1
+        ps_clone.stall_frames = 99
+        assert ps.text_index.item() == 7
+        assert ps.stall_frames == 2
+
+
+# ---------------------------------------------------------------------------
+# voice_state Serialization Roundtrip (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceStateSerializationRoundtrip:
+    """voice_state fields must survive serialization roundtrip."""
+
+    def test_voice_state_tensor_roundtrip(self):
+        """voice_state as a tensor must survive save/load roundtrip."""
+        import io
+
+        voice_state = torch.randn(1, 10, 8)
+
+        buf = io.BytesIO()
+        torch.save(voice_state, buf)
+        buf.seek(0)
+        loaded = torch.load(buf, weights_only=True)
+
+        assert torch.equal(voice_state, loaded), "voice_state tensor roundtrip failed"
+
+    def test_voice_state_supervision_roundtrip(self):
+        """VoiceStateSupervision fields must be reconstructable."""
+        from tmrvc_core.types import VoiceStateSupervision
+
+        vs = VoiceStateSupervision(
+            targets=torch.randn(2, 10, 8),
+            observed_mask=torch.ones(2, 10, 8, dtype=torch.bool),
+            confidence=torch.rand(2, 10, 8),
+            provenance="test_roundtrip_v1",
+        )
+
+        # Simulate serialization by extracting and reconstructing
+        serialized = {
+            "targets": vs.targets.clone(),
+            "observed_mask": vs.observed_mask.clone(),
+            "confidence": vs.confidence.clone(),
+            "provenance": vs.provenance,
+        }
+
+        vs2 = VoiceStateSupervision(**serialized)
+
+        assert torch.equal(vs.targets, vs2.targets)
+        assert torch.equal(vs.observed_mask, vs2.observed_mask)
+        assert torch.equal(vs.confidence, vs2.confidence)
+        assert vs.provenance == vs2.provenance

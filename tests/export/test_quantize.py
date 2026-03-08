@@ -33,7 +33,7 @@ class TestQuantizeAll:
         for name in QUANTIZE_TARGETS:
             (fp32_dir / f"{name}.onnx").write_bytes(b"dummy")
 
-        mock_quantize.side_effect = lambda inp, out: Path(out)
+        mock_quantize.side_effect = lambda inp, out, **kw: Path(out)
 
         result = quantize_all(fp32_dir, int8_dir)
         assert len(result) == len(QUANTIZE_TARGETS)
@@ -47,7 +47,7 @@ class TestQuantizeAll:
 
         # Only create one model
         (fp32_dir / "converter.onnx").write_bytes(b"dummy")
-        mock_quantize.side_effect = lambda inp, out: Path(out)
+        mock_quantize.side_effect = lambda inp, out, **kw: Path(out)
 
         result = quantize_all(fp32_dir, int8_dir)
         assert len(result) == 1

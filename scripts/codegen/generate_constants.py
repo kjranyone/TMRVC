@@ -47,7 +47,7 @@ _RUNTIME_KEYS = {
     "ir_estimator_state_frames",
     "converter_state_frames",
     "vocoder_state_frames",
-    "max_lookahead_hops",
+    "max_lookahead_hops_v2_legacy",
     "converter_hq_state_frames",
     "hq_threshold_q",
     "crossfade_frames",
@@ -93,11 +93,15 @@ _RUNTIME_KEYS = {
     "f0_smoothing_frames",
     # Suprasegmental text features (v3)
     "d_suprasegmental",
+    "cfg_scale_default",
+    "cfg_scale_max",
     # Prompt budget limits (v3)
     "max_prompt_seconds_active",
     "max_prompt_frames",
     "max_prompt_kv_tokens",
     "max_prompt_cache_bytes",
+    "max_frames_per_unit",
+    "skip_protection_threshold",
     # Runtime budget limits (v3)
     "max_text_units_active",
     "max_dialogue_context_units",
@@ -276,7 +280,7 @@ def generate_rust(cfg: dict) -> str:
             "vocoder_state_frames",
         ],
         "hq": [
-            "max_lookahead_hops",
+            "max_lookahead_hops_v2_legacy",
             "converter_hq_state_frames",
             "hq_threshold_q",
             "crossfade_frames",
@@ -375,6 +379,13 @@ def generate_rust(cfg: dict) -> str:
                 )
             else:
                 lines.append(f"pub const {rust_name}: {rtype} = {rval};")
+
+    if "max_lookahead_hops_v2_legacy" in cfg:
+        lines.append("")
+        lines.append("// Backward-compat alias for legacy HQ latency consumers.")
+        lines.append(
+            "pub const MAX_LOOKAHEAD_HOPS: usize = MAX_LOOKAHEAD_HOPS_V2_LEGACY;"
+        )
 
     # Derived constants
     lines.append("")

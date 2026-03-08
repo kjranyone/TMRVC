@@ -32,6 +32,7 @@ tmrvc-extract-features = "tmrvc_data.cli.extract_features:main"
 tmrvc-verify-cache = "tmrvc_data.cli.verify_cache:main"
 tmrvc-prepare-uclm = "tmrvc_data.cli.prepare_uclm:main"
 tmrvc-curate = "tmrvc_data.cli.curate:main"
+tmrvc-curation = "tmrvc_data.cli.curation:main"
 
 [build-system]
 requires = ["hatchling"]

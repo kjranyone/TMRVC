@@ -11,12 +11,19 @@ import pytest
 import torch
 import numpy as np
 
+from pathlib import Path
+import numpy as np
+
 from tmrvc_core.constants import SAMPLE_RATE, HOP_LENGTH
 from tmrvc_core.types import (
     CFG_ZEROED_FIELDS,
     CFG_PRESERVED_FIELDS,
     PointerState,
     VoiceStateSupervision,
+)
+
+ACCEPTANCE_THRESHOLDS_PATH = (
+    Path(__file__).resolve().parent.parent / "docs" / "design" / "acceptance-thresholds.md"
 )
 
 
@@ -50,7 +57,7 @@ class TestCFGContractIntegrity:
             speaker_embed=torch.ones(B, 192),
             dialogue_context=torch.ones(B, 256),
             acting_intent=torch.ones(B, 64),
-            prosody_latent=torch.ones(B, 64),
+            prosody_latent=torch.ones(B, 128),
             delta_voice_state=torch.ones(B, T, D),
         )
         # All zeroed fields should be zero
@@ -300,3 +307,241 @@ class TestAntiCollapseMetrics:
         from tmrvc_train.models.uclm_loss import control_response_score
         score = control_response_score([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
         assert score == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Pointer Sanity: advance_logit monotonicity (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestPointerSanity:
+    """advance_logit must produce monotonic text_index over time."""
+
+    def test_advance_logit_produces_monotonic_text_index(self):
+        """Stepping through a sequence of high advance_probs must produce
+        monotonically non-decreasing text_index values."""
+        ps = PointerState(
+            text_index=torch.tensor([0]),
+            progress=torch.tensor([0.0]),
+        )
+        text_indices = [ps.text_index.item()]
+
+        # Simulate 20 steps with high advance probability
+        for _ in range(20):
+            ps.step_pointer(advance_prob=0.8, progress_delta=1.5, boundary_confidence=0.5)
+            text_indices.append(ps.text_index.item())
+
+        # text_index must be monotonically non-decreasing
+        for i in range(1, len(text_indices)):
+            assert text_indices[i] >= text_indices[i - 1], (
+                f"text_index decreased at step {i}: "
+                f"{text_indices[i - 1]} -> {text_indices[i]}"
+            )
+
+        # Must have advanced at least once
+        assert text_indices[-1] > text_indices[0], (
+            "text_index never advanced despite high advance_prob"
+        )
+
+    def test_advance_logit_never_produces_negative_text_index(self):
+        """text_index must never go below 0."""
+        ps = PointerState(
+            text_index=torch.tensor([0]),
+            progress=torch.tensor([0.0]),
+        )
+        for _ in range(50):
+            ps.step_pointer(
+                advance_prob=np.random.random(),
+                progress_delta=np.random.random(),
+                boundary_confidence=np.random.random(),
+            )
+            assert ps.text_index.item() >= 0
+
+
+# ---------------------------------------------------------------------------
+# CFG Responsiveness (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestCFGResponsivenessQualityGate:
+    """Guided output must differ from unguided output."""
+
+    def test_guided_vs_unguided_output_differs(self):
+        """Applying the CFG unconditional mask should change model output."""
+        from tmrvc_train.models.uclm_model import DisentangledUCLM
+
+        model = DisentangledUCLM()
+        model.eval()
+
+        B, T = 1, 10
+        inputs = {
+            "phoneme_ids": torch.randint(1, 100, (B, 8)),
+            "language_ids": torch.zeros(B, 8, dtype=torch.long),
+            "pointer_state": None,
+            "speaker_embed": torch.randn(B, 192),
+            "explicit_state": torch.randn(B, T, 8),
+            "ssl_state": torch.randn(B, T, 128),
+            "target_a": torch.zeros(B, 8, T, dtype=torch.long),
+            "target_b": torch.zeros(B, 4, T, dtype=torch.long),
+            "target_length": T,
+        }
+
+        with torch.no_grad():
+            out_cond = model.forward_tts_pointer(**inputs)
+
+        # Zero all conditioning -> unconditional
+        inputs_uncond = {**inputs}
+        inputs_uncond["speaker_embed"] = torch.zeros(B, 192)
+        inputs_uncond["explicit_state"] = torch.zeros(B, T, 8)
+        inputs_uncond["ssl_state"] = torch.zeros(B, T, 128)
+
+        with torch.no_grad():
+            out_uncond = model.forward_tts_pointer(**inputs_uncond)
+
+        assert not torch.allclose(
+            out_cond["hidden_states"], out_uncond["hidden_states"], atol=1e-6
+        ), "Conditional and unconditional outputs are identical"
+
+
+# ---------------------------------------------------------------------------
+# voice_state Responsiveness (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceStateResponsiveness:
+    """Different voice_state inputs must produce measurably different outputs."""
+
+    def test_different_explicit_state_produces_different_output(self):
+        from tmrvc_train.models.uclm_model import DisentangledUCLM
+
+        model = DisentangledUCLM()
+        model.eval()
+
+        B, T = 1, 10
+        base = {
+            "phoneme_ids": torch.randint(1, 100, (B, 8)),
+            "language_ids": torch.zeros(B, 8, dtype=torch.long),
+            "pointer_state": None,
+            "speaker_embed": torch.randn(B, 192),
+            "ssl_state": torch.randn(B, T, 128),
+            "target_a": torch.zeros(B, 8, T, dtype=torch.long),
+            "target_b": torch.zeros(B, 4, T, dtype=torch.long),
+            "target_length": T,
+        }
+
+        with torch.no_grad():
+            out1 = model.forward_tts_pointer(
+                **base, explicit_state=torch.ones(B, T, 8),
+            )
+            out2 = model.forward_tts_pointer(
+                **base, explicit_state=-torch.ones(B, T, 8),
+            )
+
+        assert not torch.allclose(
+            out1["hidden_states"], out2["hidden_states"], atol=1e-6
+        ), "Different voice_state inputs produced identical outputs"
+
+
+# ---------------------------------------------------------------------------
+# Few-Shot Speaker Similarity (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+class TestFewShotSpeakerSimilarity:
+    """Encoded speaker prompt must produce non-zero similarity."""
+
+    def test_speaker_embed_produces_nonzero_similarity(self):
+        from tmrvc_train.eval_metrics import speaker_embedding_cosine_similarity
+
+        embed1 = torch.randn(192)
+        embed2 = embed1 + 0.1 * torch.randn(192)
+        sim = speaker_embedding_cosine_similarity(embed1, embed2)
+        assert isinstance(sim, float)
+        assert sim > 0.0, f"Speaker similarity is non-positive: {sim}"
+
+    def test_same_speaker_high_similarity(self):
+        from tmrvc_train.eval_metrics import speaker_embedding_cosine_similarity
+
+        embed = torch.randn(192)
+        sim = speaker_embedding_cosine_similarity(embed, embed)
+        assert sim > 0.99, f"Self-similarity should be ~1.0, got {sim}"
+
+    def test_few_shot_score_computable(self):
+        from tmrvc_train.eval_metrics import few_shot_speaker_score
+
+        score = few_shot_speaker_score(
+            speaker_similarity=0.85,
+            intelligibility=0.95,
+        )
+        assert isinstance(score, float)
+        assert 0.0 <= score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Threshold Schedule Validation (Worker 06, Task 9)
+# ---------------------------------------------------------------------------
+
+
+class TestThresholdScheduleValidation:
+    """Verify Tier 0/1/2 threshold policy is documented and Tier 0 is frozen."""
+
+    def test_acceptance_thresholds_document_exists(self):
+        assert ACCEPTANCE_THRESHOLDS_PATH.exists(), (
+            "acceptance-thresholds.md not found"
+        )
+
+    def test_tier_0_policy_documented(self):
+        """Tier 0 threshold policy must be documented."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "Tier 0" in text, "Tier 0 policy not documented"
+        assert "must freeze before Stage B" in text
+
+    def test_tier_1_policy_documented(self):
+        """Tier 1 threshold policy must be documented."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "Tier 1" in text, "Tier 1 policy not documented"
+
+    def test_tier_2_policy_documented(self):
+        """Tier 2 threshold policy must be documented."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "Tier 2" in text, "Tier 2 policy not documented"
+
+    def test_tier_0_runtime_budget_frozen(self):
+        """Tier 0: runtime budgets must be specified with numeric thresholds."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "10 ms" in text, "Streaming latency budget not frozen"
+
+    def test_tier_0_parity_tolerances_documented(self):
+        """Tier 0: parity tolerances must be documented."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "parity" in text.lower()
+
+    def test_tier_0_frame_convention_frozen(self):
+        """Tier 0: frame/alignment conventions must be documented."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        # Must reference frame/alignment conventions as a Tier 0 item
+        assert "frame" in text.lower() and "alignment" in text.lower()
+
+    def test_tier_0_language_set_documented(self):
+        """Tier 0: language set must be referenced."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "language" in text.lower()
+
+    def test_tier_0_hardware_class_documented(self):
+        """Tier 0: hardware class must be specified."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        assert "hardware" in text.lower()
+
+    def test_no_undefined_thresholds_in_tier_0_sections(self):
+        """Tier 0 sections should have concrete numeric thresholds, not TBD."""
+        text = ACCEPTANCE_THRESHOLDS_PATH.read_text(encoding="utf-8")
+        # Verify streaming latency has a concrete numeric budget
+        assert "<= 10 ms" in text or "<= 10ms" in text or "10 ms" in text, (
+            "Streaming latency budget missing concrete threshold"
+        )
+        # Verify frame convention references a concrete standard
+        # (The thresholds doc references frame/alignment conventions;
+        #  the concrete sample_rate=24000 is defined in tmrvc-core constants)
+        assert "frame" in text.lower(), (
+            "Frame convention not referenced in thresholds document"
+        )

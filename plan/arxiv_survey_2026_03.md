@@ -160,14 +160,108 @@ Implication for TMRVC:
 - supports preserving breath / non-verbal metadata in the curation pipeline
 
 
+### 9. `CosyVoice 2: Scalable Streaming Speech Synthesis with Large Language Models`
+
+- arXiv: `2412.10117`
+- date: `2024-12-13`
+- link: <https://arxiv.org/abs/2412.10117>
+
+Relevance:
+
+- demonstrates that LLM-based codec language models with chunk-aware causal flow matching (CFM) can achieve strong zero-shot TTS quality with finite-lookahead streaming
+- proves that streaming and high zero-shot quality are not mutually exclusive in a public open-weight system
+
+Implication for TMRVC:
+
+- selected as the `primary` external baseline due to scale alignment (0.5B vs TMRVC's ~300M target), open weights, streaming support, and strong multilingual zero-shot capability
+- validates the plan's requirement for a streaming-capable external comparison
+- the chunk-aware CFM design is a reference point for evaluating whether TMRVC's 10 ms fully-causal pointer approach can match a finite-lookahead streaming system
+
+
+### 10. `CosyVoice 3: Towards Robust and Efficient Multi-Lingual Speech Synthesis`
+
+- arXiv: `2505.17589`
+- date: `2025-05-23`
+- link: <https://arxiv.org/abs/2505.17589>
+
+Relevance:
+
+- extends CosyVoice 2 with improved multilingual coverage, robustness, and efficiency
+- demonstrates scalable multilingual zero-shot TTS from a single model
+
+Implication for TMRVC:
+
+- strengthens the primary baseline choice by showing iterative improvement in the CosyVoice line
+- the multilingual improvements set a quality bar that TMRVC must meet on the frozen 9-language evaluation set
+
+
+### 11. `Qwen3-TTS Technical Report`
+
+- arXiv: `2601.15621`
+- date: `2026-01-28`
+- link: <https://arxiv.org/abs/2601.15621>
+
+Relevance:
+
+- 2-stage pipeline: AR LLM over semantic/codec tokens + flow-matching acoustic refinement
+- block-wise streaming with low latency
+- strong multilingual zero-shot quality with 10-language coverage
+- open-weight 1.7B model publicly available
+
+Implication for TMRVC:
+
+- selected as the `secondary` ceiling baseline due to public reproducibility, streaming support, 3-second voice cloning, and 10-language coverage; the 1.7B parameter scale versus TMRVC's ~300M target means scale-sensitive gaps must be attributed to scale, not architecture
+- the 2-stage AR + flow-matching architecture is the reference for the v3.1 acoustic refinement upgrade path
+- the 1.7B parameter scale versus TMRVC's 100M-300M target highlights the scale gap risk; TMRVC must either match quality through architectural efficiency or explicitly narrow claims
+
+
+### 12. `MiniMax-Speech: Intrinsic Zero-Shot Text-to-Speech with a Learnable Speaker Encoder`
+
+- arXiv: `2501.06282`
+- date: `2025-01-10`
+- link: <https://arxiv.org/abs/2501.06282>
+
+Relevance:
+
+- demonstrates that a learnable speaker encoder with explicit disentanglement achieves strong zero-shot quality at scale
+- relevant to TMRVC's timbre-prosody disentanglement bottleneck requirement
+
+Implication for TMRVC:
+
+- supports the plan decision that speaker prompt encoding requires an explicit information bottleneck
+- proprietary-only weights; not eligible as the primary pinned baseline, but useful as a quality reference
+- does **not** remove the need for TMRVC-specific disentanglement validation because the deployment contract differs
+
+
+### 13. `DiSTAR: Diffusion Speech-To-Audio Refinement for Naturalness and Speaker Faithfulness`
+
+- arXiv: `2502.17993`
+- date: `2025-02-25`
+- link: <https://arxiv.org/abs/2502.17993>
+
+Relevance:
+
+- demonstrates that diffusion-based post-hoc acoustic refinement can significantly improve both naturalness and speaker fidelity over AR-only baselines
+- directly relevant to the v3.1 acoustic refinement upgrade path
+
+Implication for TMRVC:
+
+- strengthens the case for a 2-stage pipeline as the quality ceiling lift
+- supports keeping the initial v3 flattened codec policy as a pragmatic scope trade-off with a clear upgrade path
+- does **not** replace the need to validate whether TMRVC's specific flattened policy is sufficient for initial release gates
+
+
 ## Synthesis
 
-As of **March 7, 2026**, the literature supports the following:
+As of **March 8, 2026**, the literature supports the following:
 
 - flow matching is a serious quality path for zero-shot TTS and prosody modeling
+- 2-stage AR + non-AR refinement is the dominant SOTA pattern (CosyVoice 2/3, Qwen3-TTS, DiSTAR, MiniMax-Speech)
 - dialogue context must remain explicit for conversational expressiveness
 - streamable prompt-conditioned VC/TTS-like systems are feasible, but only with carefully bounded causality and disentanglement
 - disentanglement is now a first-class design problem, not a cosmetic improvement
+- learnable speaker encoders with explicit information bottlenecks outperform naive prompt conditioning for zero-shot quality (MiniMax-Speech)
+- open-weight multilingual baselines with 10-language coverage and streaming support are now publicly available (Qwen3-TTS, CosyVoice3)
 
 The literature does **not** yet remove the need for TMRVC-specific proof on:
 

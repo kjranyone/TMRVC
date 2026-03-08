@@ -2,6 +2,20 @@
 
 TMRVC は、`10 ms` 因果クロックで動作する unified codec language model により、TTS と VC を単一系で扱う音声生成システムである。現行 mainline は `UCLM v3` であり、外部 forced alignment を中核に置かず、内部アライメント学習と pointer-based text progression を採用する。
 
+## v3 Quick Reference
+
+| Component | Section | Key Idea |
+|---|---|---|
+| Pointer Head | 3.4 | `advance/hold` decision per 10 ms frame; no MFA dependency |
+| 8-D Voice State | 3.5 | Physical-first supervision with masks, confidences, and provenance |
+| CFG | v3 Components: CFG-Compatible Conditioning | Condition dropout training + inference guidance scale |
+| Few-Shot Speaker Prompt | v3 Components: Speaker Prompt Encoder | 3-10 s reference -> speaker embed + prompt KV cache |
+| Prosody Predictor | v3 Components: Prosody Predictor | Preferred expressive path; fallback path retained until pointer-core proof closes |
+
+For training config fields, see `configs/train_uclm.yaml.example`.
+For ONNX export contracts, see `docs/design/onnx-contract.md`.
+For plan details, see `plan/worker_01_architecture.md`.
+
 ## 1. 設計原則
 
 ### 1.1 Unified
@@ -36,17 +50,33 @@ TMRVC は、`10 ms` 因果クロックで動作する unified codec language mod
 
 ### 1.6 Release Scope
 
-v3 リリースに必要な全項目。deferred tier は存在しない。
+v3 は以下の 3 層に分けて管理する。
+
+- `v3.0 core proof obligations`
+- `v3.0 quality amplifiers`
+- `post-v3.0 optimization tracks`
+
+`core proof obligations`:
 
 - pointer-based causal TTS
 - shared runtime/schema contract
 - 8-D physical control with masks/confidences/provenance
 - bounded dialogue context
 - few-shot speaker prompting under a reproducible contract
+- prompt-based `SpeakerProfile` contract with no runtime weight mutation
+
+`quality amplifiers`:
+
 - modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`)
 - flow-matching prosody predictor
-- CFG acceleration modes (`off`, `full`, `lazy`, `distilled`)
+- CFG modes `off` and `full`
+
+`post-v3.0 optimization tracks`:
+
+- CFG acceleration modes `lazy`, `distilled`
 - second-stage acoustic refinement (v3.1 upgrade path)
+
+品質増幅系が失敗しても pointer 主契約の成否が判定できるよう、release sign-off では `core proof` と `quality amplifier` を分けて報告する。
 
 ## 2. システム構成
 
@@ -87,7 +117,8 @@ Shared conditions:
 - monolingual dataset を default とする
 - multilingual / code-switch dataset も許可するが、`language_id` と `language_spans` を明示する
 - text normalization と text-unit 化を担当する
-- 出力は phoneme または grapheme based text units
+- mainline の canonical 出力は `phoneme_ids` と、利用可能な場合は `text_suprasegmentals`
+- grapheme / byte fallback は明示的な downgrade path としてのみ許可し、Python/Rust で異なる text contract を作ってはならない
 
 ### 3.2 Codec
 
@@ -106,12 +137,15 @@ Shared conditions:
 - 出力: `advance_logit`, `progress_delta`, optional local prosody signal
 - 役割: 現在の text unit を維持するか次へ進むかを 10 ms ごとに決める
 - duration 展開ではなく online progression を担う
+- teacher-forced `latent_only` 訓練では、runtime の hard pointer contract を変えずに、current/next text unit 上の局所的 differentiable surrogate を用いる
 
 ### 3.5 Voice State / Prosody
 
 - `explicit_voice_state`: 8 次元の物理パラメータ
 - `ssl_voice_state`: frame-level の潜在状態
 - `local_prosody_latent`: 局所的な間、勢い、語尾処理の自由度
+- timing の一次制御は `pace`, `hold_bias`, `boundary_bias` が担う
+- `voice_state` は timing と相関しうるが、runtime の primary timing-control path を二重化してはならない
 
 ## 4. タスク別動作
 
@@ -170,6 +204,24 @@ EOS / stop behavior は最終 text unit で明示的に定義される。`stall_
 | `hidden_states` | `[B, T, d_model]` | 診断・diversity loss 用の中間表現 |
 | `next_pointer_state` | dict | 推論時に生成される次ステップの pointer state |
 
+### Differentiable Pointer Training Contract
+
+runtime/export の pointer state は離散で serializable である。訓練時に別セマンティクスの hidden aligner を作ってはならない。
+
+- hard runtime state:
+  - `text_index`
+  - `progress_value`
+  - `advance_logit`
+  - optional `boundary_confidence`
+  - optional `stall_frames`
+- teacher-forced `latent_only` training:
+  - current unit `i_t` と next unit `i_t+1` のみを使う局所 differentiable surrogate を使う
+  - `advance_prob_t = sigmoid(advance_logit_t)` を用いて、text conditioning を 2-unit local expected mixture として構成する
+  - hidden argmax, offline duration expansion, full-sequence resampling は mainline recipe で禁止
+- scheduled hardening:
+  - 学習後半では straight-through または等価の hardening schedule により runtime semantics へ寄せる
+- supervised pointer loss がある場合も、同じ `advance_logit` / `progress_delta` に結びつくこと
+
 ### Physical Control Supervision
 
 | Tensor | Shape | Description |
@@ -205,6 +257,13 @@ canonical API 境界では 3D `[B, C_ctx, d_model]` 形式を使用する。2D `
 
 初期 v3 では utterance-global `[B, d_prosody]` を frozen policy とする。DialogueContextProjector は 2D 入力を `unsqueeze(1)` で T 方向にブロードキャストし、将来の 3D 入力もコード変更なしで受け入れ可能とする。
 
+time-local `[B, T_plan, d_prosody]` を将来有効化する場合も、addressing は absolute-time ではなく pointer-synchronous でなければならない。
+
+- local prosody plan は canonical text units / pointer neighborhood に紐づけて保存する
+- runtime `pace`, `hold_bias`, `boundary_bias` により wall-clock duration が変わっても、prosody event は対応する text unit からずれてはならない
+- current `text_index` と optional `progress_value` が active prosody slice を決める
+- elapsed frame count だけで固定 replay する absolute-time prosody plan は非準拠
+
 ### Acoustic History (ONNX runtime)
 
 | Tensor | Shape | Dtype | Description |
@@ -225,6 +284,8 @@ canonical API 境界では 3D `[B, C_ctx, d_model]` 形式を使用する。2D `
 ### Speaker Prompt Encoder (Few-Shot Voice Cloning)
 
 **Purpose**: 3-10 秒のリファレンス音声を speaker embedding と prompt KV features にエンコードする。few-shot voice cloning の基盤となるモジュール。
+
+**v3.0 boundary**: `SpeakerProfile` は prompt-based artifact のみを保持する。LoRA/adaptor delta や request-time の weight hot-swap は v3.0 mainline contract に含めない。
 
 **Architecture**:
 
@@ -258,6 +319,8 @@ prompt_codec_tokens [B, T_prompt, n_codebooks]
 ### Prosody Predictor (Flow-matching)
 
 **Purpose**: テキストとコンテキストから局所的な prosody latent を予測する。推論時に明示的な韻律制御を不要にしつつ、訓練時は多様な韻律パターンを学習する。
+
+**Release layering**: flow-matching prosody predictor は preferred expressive path だが、pointer-core proof を閉じるための絶対条件ではない。core proof fail/pass とこのモジュールの成否は分けて報告する。
 
 **Why Flow-matching**: VAE に比べて高い多様性と決定論的マッピングを両立し、Diffusion よりも 1-step 推論で効率的である。
 
@@ -337,6 +400,8 @@ output = uncond + cfg_scale * (cond - uncond)
 この drop 集合は PyTorch, ONNX, Rust, UI-facing runtime で一致しなければならない。
 
 **Safe bounds**: `cfg_scale` の範囲に安全制限を設ける。過大な `cfg_scale` は pointer/EOS の判定を不安定化させるため、実用上の上限を設定し、pointer logits と EOS 判定には CFG 補正を制限的に適用する。
+
+**Benchmark / claim mode**: 外部 baseline 比較、parity test、release-signoff の run では CFG mode を固定し、budget circuit breaker を無効化する。予算超過時は silent downgrade せず fail/invalid とする。
 
 ### Anti-Collapse Diagnostics
 
