@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+import torch
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal
@@ -92,17 +93,13 @@ class AuditTrail:
         return entries
 
 
+from tmrvc_core.types import SpeakerProfile, PointerState
+
+# ... ROLES and check_permission remain unchanged ...
+
 # ---------------------------------------------------------------------------
 # Casting Gallery (Speaker Profiles)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class SpeakerProfile:
-    name: str
-    source_audio: str = ""
-    profile_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    created_at: float = field(default_factory=time.time)
-
 
 class CastingGallery:
     """Persistent speaker profile store."""
@@ -119,18 +116,44 @@ class CastingGallery:
                 return
             data = json.loads(text)
             for pid, d in data.items():
+                # Reconstruct torch tensors from lists
+                if "speaker_embed" in d and d["speaker_embed"] is not None:
+                    d["speaker_embed"] = torch.tensor(d["speaker_embed"])
+                if "prompt_codec_tokens" in d and d["prompt_codec_tokens"] is not None:
+                    d["prompt_codec_tokens"] = torch.tensor(d["prompt_codec_tokens"])
+                if "prompt_text_tokens" in d and d["prompt_text_tokens"] is not None:
+                    d["prompt_text_tokens"] = torch.tensor(d["prompt_text_tokens"])
+                
                 self.profiles[pid] = SpeakerProfile(**d)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {pid: asdict(p) for pid, p in self.profiles.items()}
+        # Convert tensors to lists for JSON serialization
+        data = {}
+        for pid, p in self.profiles.items():
+            d = asdict(p)
+            if isinstance(d["speaker_embed"], torch.Tensor):
+                d["speaker_embed"] = d["speaker_embed"].tolist()
+            if isinstance(d["prompt_codec_tokens"], torch.Tensor):
+                d["prompt_codec_tokens"] = d["prompt_codec_tokens"].tolist()
+            if isinstance(d["prompt_text_tokens"], torch.Tensor):
+                d["prompt_text_tokens"] = d["prompt_text_tokens"].tolist()
+            data[pid] = d
+            
         self.path.write_text(
             json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-    def add(self, name: str, source_audio: str = "") -> SpeakerProfile:
-        profile = SpeakerProfile(name=name, source_audio=source_audio)
-        self.profiles[profile.profile_id] = profile
+    def add(self, name: str, speaker_embed: torch.Tensor, prompt_codec_tokens: torch.Tensor | None = None) -> SpeakerProfile:
+        profile = SpeakerProfile(
+            speaker_profile_id=uuid.uuid4().hex[:8],
+            display_name=name,
+            speaker_embed=speaker_embed,
+            prompt_codec_tokens=prompt_codec_tokens,
+            reference_audio_hash="sha256_placeholder",
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        self.profiles[profile.speaker_profile_id] = profile
         self.save()
         return profile
 

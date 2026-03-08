@@ -88,6 +88,11 @@ class TranscriptRefinementProvider(BaseProvider):
     stage = "transcript_refinement"
 
 
+class VoiceStateEstimationProvider(BaseProvider):
+    """Base class for 8-D voice state estimation."""
+    stage = "voice_state_estimation"
+
+
 class ProviderRegistry:
     """Registry for provider implementations per stage."""
 

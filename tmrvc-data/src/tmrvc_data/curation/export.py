@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
+from tmrvc_data.bootstrap_alignment import BootstrapAlignment, project_word_timestamps_acoustic
 from .models import CurationRecord, PromotionBucket, RecordStatus
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,7 @@ class ExportConfig:
     export_style_embedding: bool = True
     export_events: bool = True
     export_dialogue_graph: bool = True
+    export_bootstrap_alignment: bool = True
 
 
 class CurationExporter:
@@ -71,6 +74,10 @@ class CurationExporter:
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(entry, f, ensure_ascii=False, indent=2)
 
+            # Export bootstrap alignment if enabled
+            if self.config.export_bootstrap_alignment:
+                self._export_bootstrap_alignment(record, record_dir)
+
         # Write manifest
         manifest_path = out / "manifest.jsonl"
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -94,6 +101,33 @@ class CurationExporter:
             bucket.value,
         )
         return summary
+
+    def _export_bootstrap_alignment(self, record: CurationRecord, record_dir: Path) -> None:
+        """Project word timestamps and export bootstrap_alignment.json."""
+        word_ts = record.attributes.get("word_timestamps")
+        phoneme_ids = record.attributes.get("phoneme_ids_list") # list of ints
+        w2p_map = record.attributes.get("word_to_phoneme_map")
+        num_samples = record.attributes.get("num_samples")
+        
+        if not all([word_ts, phoneme_ids, w2p_map, num_samples]):
+            return
+
+        # Attempt acoustic-aware projection if energy_flux is present
+        import torch
+        ef_path = record_dir / "energy_flux.npy"
+        energy_flux = torch.from_numpy(np.load(ef_path)) if ef_path.exists() else None
+        
+        alignment = project_word_timestamps_acoustic(
+            word_ts, phoneme_ids, w2p_map, num_samples, energy_flux=energy_flux
+        )
+        
+        errors = alignment.validate()
+        if errors:
+            logger.warning("Alignment validation failed for %s: %s", record.record_id, errors)
+            
+        align_path = record_dir / "bootstrap_alignment.json"
+        with open(align_path, "w", encoding="utf-8") as f:
+            json.dump(alignment.to_dict(), f, ensure_ascii=False, indent=2)
 
     def _record_to_export(
         self, record: CurationRecord, bucket: PromotionBucket

@@ -75,6 +75,7 @@ class CurationRecord:
     # Evolution tracking
     providers: Dict[str, Provenance] = field(default_factory=dict)
     pass_index: int = 0
+    metadata_version: int = 1
     
     # Source legality
     source_legality: str = "unknown"
@@ -109,6 +110,7 @@ class CurationRecord:
             "rejection_reasons": self.rejection_reasons,
             "review_reasons": self.review_reasons,
             "pass_index": self.pass_index,
+            "metadata_version": self.metadata_version,
             "source_legality": self.source_legality,
             "conversation_id": self.conversation_id,
             "turn_index": self.turn_index,

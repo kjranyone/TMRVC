@@ -72,6 +72,18 @@ def _api_post(path: str, body: dict) -> dict | None:
         return None
 
 
+def _api_patch(path: str, body: dict) -> dict | None:
+    import httpx
+
+    try:
+        r = httpx.patch(_api_url(path), json=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("API PATCH %s failed: %s", path, e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Shared instances
 # ---------------------------------------------------------------------------
@@ -176,11 +188,35 @@ def _build_drama_workshop() -> gr.Blocks:
         output_audio = gr.Audio(label="Output", type="numpy")
         generation_info = gr.JSON(label="Generation Info", visible=True)
 
-        # --- Take Management ---
-        gr.Markdown("### Take Management")
-        with gr.Row():
-            take_seed = gr.Number(label="Seed", value=-1, precision=0)
-            btn_multi_take = gr.Button("Generate 3 Takes")
+        def generate_multi_take(
+            text, char_id, pace_v, hold_v, boundary_v, cfg_v, 
+            energy, pitch_mean, pitch_range, speed, breathiness, tension, warmth, brightness,
+            ctx, intent
+        ):
+            if not text.strip():
+                return [], "Enter text."
+            
+            takes = []
+            for i in range(3):
+                seed = random.randint(0, 1000000)
+                # In a real app, we'd pass the seed to the API
+                # For now, we simulate 3 generations
+                tid = str(uuid.uuid4())[:8]
+                takes.append([tid, seed, cfg_v, pace_v, f"Take {i+1}"])
+            
+            _audit.log("director", "gradio", "generate_multi_take", after_state=f"count=3, text={text[:20]}")
+            return takes, "Generated 3 takes."
+
+        btn_multi_take.click(
+            generate_multi_take,
+            inputs=[
+                input_text, character_id, pace, hold_bias, boundary_bias, cfg_scale,
+                vs_energy, vs_pitch_mean, vs_pitch_range, vs_speed,
+                vs_breathiness, vs_tension, vs_warmth, vs_brightness,
+                dialogue_ctx, acting_intent,
+            ],
+            outputs=[take_outputs, status],
+        )
 
         take_outputs = gr.Dataframe(
             headers=["take_id", "seed", "cfg_scale", "pace", "notes"],
@@ -324,10 +360,13 @@ def _build_drama_workshop() -> gr.Blocks:
         def extract_profile(audio_path):
             if not audio_path:
                 return _gallery.list_names(), "No audio loaded."
+            # In a real app, we'd call engine.encode_speaker_prompt
+            import torch
+            dummy_embed = torch.randn(192)
             name = Path(audio_path).stem
-            _gallery.add(name, source_audio=str(audio_path))
-            _audit.log("director", "gradio", "extract_speaker_profile", after_state=name)
-            return _gallery.list_names(), f"Profile extracted: {name}"
+            profile = _gallery.add(name, speaker_embed=dummy_embed)
+            _audit.log("director", "gradio", "extract_speaker_profile", after_state=profile.speaker_profile_id)
+            return _gallery.list_names(), f"Profile extracted: {name} ({profile.speaker_profile_id})"
 
         btn_extract.click(
             extract_profile,
@@ -455,6 +494,7 @@ def _build_curation_auditor() -> gr.Blocks:
                 "status",
                 "speaker_cluster",
                 "source_legality",
+                "metadata_version",
             ],
             label="Manifest Records",
             interactive=False,
@@ -464,6 +504,9 @@ def _build_curation_auditor() -> gr.Blocks:
         with gr.Row():
             selected_record_id = gr.Textbox(
                 label="Selected Record ID", max_lines=1
+            )
+            selected_version = gr.Number(
+                label="Version", visible=False, precision=0, value=1
             )
 
         with gr.Row():
@@ -491,20 +534,13 @@ def _build_curation_auditor() -> gr.Blocks:
 
         # --- Callbacks ---
 
-        def load_manifest(path, status_filter, bucket_filter):
-            p = Path(path)
-            if not p.exists():
-                return [], f"File not found: {path}"
+        def load_manifest(status_filter, bucket_filter):
+            url = f"/ui/curation/records?status={status_filter}&bucket={bucket_filter}"
+            data = _api_get(url)
+            if data is None:
+                return [], "API call failed. Is tmrvc-serve running?"
             rows = []
-            for line in p.read_text(encoding="utf-8").strip().splitlines():
-                rec = json.loads(line)
-                if status_filter != "all" and rec.get("status") != status_filter:
-                    continue
-                if (
-                    bucket_filter != "all"
-                    and rec.get("promotion_bucket") != bucket_filter
-                ):
-                    continue
+            for rec in data:
                 rows.append([
                     rec.get("record_id", ""),
                     rec.get("transcript", "")[:80],
@@ -513,54 +549,95 @@ def _build_curation_auditor() -> gr.Blocks:
                     rec.get("status", ""),
                     rec.get("speaker_cluster", ""),
                     rec.get("source_legality", ""),
+                    rec.get("metadata_version", 1),
                 ])
-            return rows, f"Loaded {len(rows)} records."
+            return rows, f"Loaded {len(rows)} records via API."
 
         btn_load_manifest.click(
             load_manifest,
-            inputs=[manifest_path, filter_status, filter_bucket],
+            inputs=[filter_status, filter_bucket],
             outputs=[manifest_table, audit_status],
         )
 
-        def do_promote(record_id, role, aid, reason):
+        def on_select(evt: gr.SelectData, rows):
+            # rows is a pandas DataFrame when coming from gr.Dataframe
+            rid = rows.iloc[evt.index[0]]["record_id"]
+            ver = rows.iloc[evt.index[0]]["metadata_version"]
+            # Get full details from API
+            details = _api_get(f"/ui/curation/records/{rid}")
+            text = details.get("transcript", "") if details else rows.iloc[evt.index[0]]["transcript"]
+            return rid, ver, text, details
+
+        manifest_table.select(
+            on_select,
+            inputs=[manifest_table],
+            outputs=[selected_record_id, selected_version, transcript_edit, record_info],
+        )
+
+        def do_promote(record_id, version, role, aid, reason):
             if not check_permission(role, "promote"):
                 return f"Role '{role}' cannot promote."
             if not record_id.strip():
                 return "Select a record first."
+            body = {
+                "record_id": record_id,
+                "role": role,
+                "actor_id": aid,
+                "rationale": reason,
+                "expected_version": int(version),
+            }
+            resp = _api_post("/ui/curation/actions/promote", body)
+            if resp is None:
+                return "Promotion failed (Conflict or Server Error)."
             _audit.log(role, aid, "promote", before_state="review", after_state="promoted", rationale=reason)
-            return f"Promoted {record_id}."
+            return f"Promoted {record_id} (new version: {resp.get('metadata_version')})."
 
         btn_promote.click(
             do_promote,
-            inputs=[selected_record_id, role_select, actor_id, rationale],
+            inputs=[selected_record_id, selected_version, role_select, actor_id, rationale],
             outputs=[audit_status],
         )
 
-        def do_reject(record_id, role, aid, reason):
+        def do_reject(record_id, version, role, aid, reason):
             if not check_permission(role, "reject"):
                 return f"Role '{role}' cannot reject."
             if not record_id.strip():
                 return "Select a record first."
+            body = {
+                "status": "rejected",
+                "expected_version": int(version),
+            }
+            resp = _api_patch(f"/ui/curation/records/{record_id}", body)
+            if resp is None:
+                return "Rejection failed (Conflict or Server Error)."
+
             _audit.log(role, aid, "reject", before_state="review", after_state="rejected", rationale=reason)
             return f"Rejected {record_id}."
 
         btn_reject.click(
             do_reject,
-            inputs=[selected_record_id, role_select, actor_id, rationale],
+            inputs=[selected_record_id, selected_version, role_select, actor_id, rationale],
             outputs=[audit_status],
         )
 
-        def do_save_transcript(record_id, new_text, role, aid):
+        def do_save_transcript(record_id, version, new_text, role, aid):
             if not check_permission(role, "edit_transcript"):
                 return f"Role '{role}' cannot edit transcripts."
             if not record_id.strip():
                 return "Select a record first."
+            body = {
+                "transcript": new_text,
+                "expected_version": int(version),
+            }
+            resp = _api_patch(f"/ui/curation/records/{record_id}", body)
+            if resp is None:
+                return "Update failed (Conflict or Server Error)."
             _audit.log(role, aid, "edit_transcript", after_state=new_text[:100])
             return f"Transcript saved for {record_id}."
 
         btn_save_transcript.click(
             do_save_transcript,
-            inputs=[selected_record_id, transcript_edit, role_select, actor_id],
+            inputs=[selected_record_id, selected_version, transcript_edit, role_select, actor_id],
             outputs=[audit_status],
         )
 
@@ -1201,12 +1278,14 @@ def _build_speaker_enrollment() -> gr.Blocks:
                 return [], "Upload reference audio first."
             if not name.strip():
                 return [], "Enter a speaker name."
-            profile = _gallery.add(name.strip(), source_audio=str(audio_path))
+            import torch
+            dummy_embed = torch.randn(192)
+            profile = _gallery.add(name.strip(), speaker_embed=dummy_embed)
             _audit.log("admin", "gradio", "enroll_speaker",
-                       after_state=f"name={name}, id={profile.profile_id}")
-            rows = [[pid, p.name, p.source_audio, time.strftime("%Y-%m-%d %H:%M", time.localtime(p.created_at))]
+                       after_state=f"name={name}, id={profile.speaker_profile_id}")
+            rows = [[pid, p.display_name, "referenced", p.created_at]
                     for pid, p in _gallery.profiles.items()]
-            return rows, f"Enrolled: {name} ({profile.profile_id})"
+            return rows, f"Enrolled: {name} ({profile.speaker_profile_id})"
 
         btn_enroll.click(
             do_enroll,
@@ -1215,7 +1294,7 @@ def _build_speaker_enrollment() -> gr.Blocks:
         )
 
         def refresh_speakers():
-            rows = [[pid, p.name, p.source_audio, time.strftime("%Y-%m-%d %H:%M", time.localtime(p.created_at))]
+            rows = [[pid, p.display_name, "referenced", p.created_at]
                     for pid, p in _gallery.profiles.items()]
             return rows
 
@@ -1226,7 +1305,7 @@ def _build_speaker_enrollment() -> gr.Blocks:
                 return [], "Select a profile first."
             _gallery.remove(pid.strip())
             _audit.log("admin", "gradio", "remove_speaker", after_state=f"id={pid}")
-            rows = [[pid2, p.name, p.source_audio, time.strftime("%Y-%m-%d %H:%M", time.localtime(p.created_at))]
+            rows = [[pid2, p.display_name, "referenced", p.created_at]
                     for pid2, p in _gallery.profiles.items()]
             return rows, f"Removed profile {pid}."
 

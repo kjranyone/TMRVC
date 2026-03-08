@@ -57,8 +57,27 @@ class CurationOrchestrator:
         tmp_path.replace(self.manifest_path)
         self._update_summary()
 
-    def update_record(self, record: CurationRecord) -> None:
-        """Update a single record in memory (call save_manifest to persist)."""
+    def update_record(self, record: CurationRecord, expected_version: int | None = None) -> None:
+        """Update a single record in memory with optimistic lock check.
+        
+        Args:
+            record: The updated record.
+            expected_version: The version the caller originally read.
+        
+        Raises:
+            ValueError: if expected_version doesn't match current metadata_version.
+        """
+        current = self.records.get(record.record_id)
+        if current is not None and expected_version is not None:
+            if current.metadata_version != expected_version:
+                raise ValueError(
+                    f"Conflict detected for {record.record_id}: "
+                    f"current version is {current.metadata_version}, "
+                    f"but update expected {expected_version}"
+                )
+        
+        # Increment version on update
+        record.metadata_version += 1
         self.records[record.record_id] = record
 
     def _update_summary(self) -> None:

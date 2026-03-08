@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import logging
+import torch
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -218,5 +219,102 @@ def project_word_timestamps(
         num_frames=num_frames,
         provenance="asr_word_timestamp",
         projection_method="uniform_within_word",
+    )
+    return alignment
+
+
+def project_word_timestamps_acoustic(
+    word_timestamps: list[dict[str, Any]],
+    phoneme_ids: list[int],
+    word_to_phoneme_map: list[tuple[int, int]],
+    num_samples: int,
+    energy_flux: torch.Tensor | None = None,
+    confidence: float = 0.7,
+) -> BootstrapAlignment:
+    """Project ASR word-level timestamps using Acoustic-Aware Heuristics.
+
+    Args:
+        word_timestamps: List of ASR word segments.
+        phoneme_ids: Canonical phoneme ID sequence.
+        word_to_phoneme_map: Word-to-phoneme index spans.
+        num_samples: Total audio samples.
+        energy_flux: [T] energy flux or spectral change tensor. If None,
+            falls back to uniform distribution.
+        confidence: Baseline confidence.
+
+    Returns:
+        BootstrapAlignment with refined spans.
+    """
+    if energy_flux is None:
+        return project_word_timestamps(
+            word_timestamps, phoneme_ids, word_to_phoneme_map, num_samples, confidence
+        )
+
+    num_frames = samples_to_frames(num_samples)
+    num_text_units = len(phoneme_ids)
+    spans: list[AlignmentSpan] = []
+
+    for word_idx, (word_ts, (ph_start, ph_end)) in enumerate(
+        zip(word_timestamps, word_to_phoneme_map)
+    ):
+        word_start_frame = seconds_to_frame(word_ts["start"])
+        word_end_frame = seconds_to_frame(word_ts["end"])
+        word_start_frame = max(0, min(word_start_frame, num_frames))
+        word_end_frame = max(word_start_frame, min(word_end_frame, num_frames))
+
+        n_phones = ph_end - ph_start
+        if n_phones <= 0:
+            continue
+
+        if n_phones == 1:
+            spans.append(
+                AlignmentSpan(
+                    ph_start, word_start_frame, word_end_frame,
+                    confidence, "acoustic_peak"
+                )
+            )
+            continue
+
+        # Find peaks in energy flux within the word segment to use as boundaries
+        flux_segment = energy_flux[word_start_frame:word_end_frame]
+        if flux_segment.numel() < n_phones:
+            # Not enough frames for peak finding, fallback to uniform
+            word_duration = word_end_frame - word_start_frame
+            for i in range(n_phones):
+                sf = word_start_frame + (i * word_duration) // n_phones
+                ef = word_start_frame + ((i + 1) * word_duration) // n_phones
+                spans.append(AlignmentSpan(ph_start + i, sf, max(sf + 1, ef), confidence))
+            continue
+
+        # Simple peak finding for boundaries
+        # We need n_phones - 1 boundaries
+        vals, indices = torch.topk(flux_segment, k=min(n_phones - 1, flux_segment.numel()))
+        boundaries = sorted(indices.tolist())
+        
+        curr_start = word_start_frame
+        for i in range(n_phones):
+            if i < len(boundaries):
+                curr_end = word_start_frame + boundaries[i]
+            else:
+                curr_end = word_end_frame
+            
+            # Ensure at least 1 frame
+            if curr_end <= curr_start:
+                curr_end = curr_start + 1
+            
+            spans.append(
+                AlignmentSpan(
+                    ph_start + i, curr_start, curr_end,
+                    confidence, "acoustic_flux_peak"
+                )
+            )
+            curr_start = curr_end
+
+    alignment = BootstrapAlignment(
+        spans=spans,
+        num_text_units=num_text_units,
+        num_frames=num_frames,
+        provenance="asr_word_timestamp_acoustic",
+        projection_method="energy_flux_peaks",
     )
     return alignment

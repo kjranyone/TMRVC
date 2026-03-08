@@ -32,6 +32,7 @@ app = FastAPI(
 _engine: UCLMEngine | None = None
 _characters: dict[str, CharacterProfile] = {}
 _context_predictor = None
+_curation_orchestrator = None
 
 
 def _load_persisted_characters() -> None:
@@ -96,11 +97,18 @@ def init_app(
     codec_checkpoint: str | Path | None = None,
     device: str = "cpu",
     api_key: str | None = None,
+    curation_dir: str | Path | None = "data/curation",
 ) -> None:
-    global _engine, _context_predictor
+    global _engine, _context_predictor, _curation_orchestrator
 
     # Load persisted characters from configs/characters.json
     _load_persisted_characters()
+
+    # Initialize Curation Orchestrator
+    if curation_dir:
+        from tmrvc_data.curation.orchestrator import CurationOrchestrator
+        _curation_orchestrator = CurationOrchestrator(curation_dir)
+        logger.info("Curation orchestrator initialized at %s", curation_dir)
 
     if uclm_checkpoint and codec_checkpoint:
         try:
@@ -135,6 +143,7 @@ from tmrvc_serve.routes.ws_chat import router as ws_router
 from tmrvc_serve.routes.vc_streaming import router as vc_router
 from tmrvc_serve.routes.auth import router as auth_router
 from tmrvc_serve.routes.admin import router as admin_router
+from tmrvc_serve.routes.ui import router as ui_router
 
 app.include_router(health_router)
 app.include_router(characters_router)
@@ -143,6 +152,7 @@ app.include_router(ws_router)
 app.include_router(vc_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(ui_router)
 
 
 # Helper for style prediction (async)
