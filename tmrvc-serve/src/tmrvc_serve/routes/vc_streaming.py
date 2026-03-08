@@ -82,6 +82,82 @@ async def vc_stats(ctx: AuthContext):
     }
 
 
+class VCRequest(BaseModel):
+    audio_base64: str
+    character_id: str
+    explicit_voice_state: Optional[list[float]] = None
+    pitch_shift: float = 0.0
+
+
+class VCResponse(BaseModel):
+    audio_base64: str
+    sample_rate: int = 24000
+
+
+@router.post("", response_model=VCResponse)
+async def convert_vc(req: VCRequest):
+    """Batch VC conversion endpoint (Worker 04, for single conversion in UI)."""
+    from tmrvc_serve.app import get_engine, _characters
+    from tmrvc_serve._helpers import _audio_to_wav_base64, _load_speaker_embed
+
+    engine = get_engine()
+    character = _characters.get(req.character_id)
+    if character is None:
+        raise HTTPException(status_code=404, detail=f"Character '{req.character_id}' not found.")
+
+    # 1. Decode audio
+    try:
+        audio_bytes = base64.b64decode(req.audio_base64)
+        import io
+        import soundfile as sf
+        audio_np, sr = sf.read(io.BytesIO(audio_bytes))
+        audio_np = audio_np.astype(np.float32)
+        if sr != 24000:
+            import librosa
+            audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=24000)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid audio: {e}")
+
+    # 2. Extract speaker embed
+    spk_embed = _load_speaker_embed(character)
+    spk_t = spk_embed.to(device=engine.device, dtype=torch.float32).unsqueeze(0)
+
+    # 3. Build style
+    style = StyleParams.neutral()
+    if req.explicit_voice_state:
+        # Map list to StyleParams
+        style.breathiness = req.explicit_voice_state[0]
+        style.tension = req.explicit_voice_state[1]
+        style.arousal = req.explicit_voice_state[2]
+        style.valence = req.explicit_voice_state[3]
+        style.roughness = req.explicit_voice_state[4]
+        style.voicing = req.explicit_voice_state[5]
+        style.energy = req.explicit_voice_state[6]
+        style.speech_rate = req.explicit_voice_state[7]
+
+    # 4. Perform conversion (Frame-by-frame simulation for streaming-model consistency)
+    from tmrvc_serve.uclm_engine import EngineState
+    state = EngineState()
+    output_chunks = []
+    
+    FRAME_SIZE = 240
+    for i in range(0, len(audio_np), FRAME_SIZE):
+        chunk = audio_np[i : i + FRAME_SIZE]
+        if len(chunk) < FRAME_SIZE:
+            chunk = np.pad(chunk, (0, FRAME_SIZE - len(chunk)))
+        
+        chunk_t = torch.from_numpy(chunk).float().unsqueeze(0).unsqueeze(0).to(engine.device)
+        out_audio, state = engine.vc_frame(
+            chunk_t, spk_t, style, state, pitch_shift=req.pitch_shift
+        )
+        output_chunks.append(out_audio.cpu().numpy())
+
+    final_audio = np.concatenate(output_chunks)
+    audio_b64 = _audio_to_wav_base64(final_audio)
+
+    return VCResponse(audio_base64=audio_b64)
+
+
 @router.websocket("/stream")
 async def vc_stream(
     websocket: WebSocket,

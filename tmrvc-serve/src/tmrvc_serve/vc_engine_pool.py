@@ -160,6 +160,7 @@ class VCEnginePool:
         session: SessionState,
         audio_frame: np.ndarray,
         style: StyleParams | None = None,
+        pitch_shift: float = 0.0,
     ) -> np.ndarray:
         acquired = self._model_pool.acquire()
         if not acquired:
@@ -178,6 +179,7 @@ class VCEnginePool:
                 speaker_embed=spk_t,
                 style=style,
                 state=session.engine_state,
+                pitch_shift=pitch_shift,
             )
 
             session.engine_state = new_engine_state

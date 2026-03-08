@@ -12,9 +12,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from tmrvc_core.constants import SAMPLE_RATE
+from tmrvc_core.constants import (
+    MAX_ACOUSTIC_HISTORY_FRAMES,
+    MAX_DIALOGUE_CONTEXT_UNITS,
+    MAX_PROMPT_CACHE_BYTES,
+    MAX_PROMPT_FRAMES,
+    MAX_PROMPT_KV_TOKENS,
+    MAX_TEXT_UNITS_ACTIVE,
+    SAMPLE_RATE,
+)
 from tmrvc_core.dialogue_types import StyleParams
-from tmrvc_core.types import PointerState, SpeakerProfile
+from tmrvc_core.types import CFGMode, PointerState, SpeakerProfile
 from tmrvc_train.models import (
     DisentangledUCLM,
     EmotionAwareDecoder,
@@ -64,6 +72,13 @@ class PointerInferenceState:
     frames_on_current_unit: int = 0
     forced_advance_count: int = 0
     skip_protection_count: int = 0
+    # Lazy CFG cache: stores unconditional logits and tracks cache freshness
+    cfg_uncond_cache_a: Optional[torch.Tensor] = None
+    cfg_uncond_cache_b: Optional[torch.Tensor] = None
+    cfg_uncond_cache_adv: Optional[torch.Tensor] = None
+    cfg_uncond_cache_prog: Optional[torch.Tensor] = None
+    cfg_uncond_cache_bc: Optional[torch.Tensor] = None
+    cfg_cache_age: int = 0
 
     @property
     def finished(self) -> bool:
@@ -81,6 +96,7 @@ class PointerInferenceState:
             "frames_on_current_unit": self.frames_on_current_unit,
             "forced_advance_count": self.forced_advance_count,
             "skip_protection_count": self.skip_protection_count,
+            "cfg_cache_age": self.cfg_cache_age,
         }
 
 
@@ -108,6 +124,7 @@ class UCLMEngine:
         self.vc_enc = None
         self.voice_state_enc = None
         self._loaded = False
+        self._has_distilled_cfg = False
 
     @property
     def models_loaded(self) -> bool:
@@ -173,8 +190,13 @@ class UCLMEngine:
         self.uclm_core = self.uclm_core_model.uclm_core
         self.vc_enc = self.uclm_core_model.vc_encoder
         self.voice_state_enc = self.uclm_core_model.voice_state_enc
+        self._has_distilled_cfg = hasattr(self.uclm_core_model, "cfg_scale_embed")
         self._loaded = True
-        logger.info("Loaded UCLM v3 checkpoints on %s", self.device)
+        logger.info(
+            "Loaded UCLM v3 checkpoints on %s (distilled_cfg=%s)",
+            self.device,
+            self._has_distilled_cfg,
+        )
 
     @torch.no_grad()
     def vc_frame(
@@ -185,6 +207,7 @@ class UCLMEngine:
         state: EngineState,
         cfg_scale: float = 1.0,
         temperature: float = 0.8,
+        pitch_shift: float = 0.0,
     ) -> Tuple[torch.Tensor, EngineState]:
         self._require_loaded()
 
@@ -199,11 +222,28 @@ class UCLMEngine:
         )
         ssl_state = torch.zeros(1, 1, 128, device=self.device)
 
+        # 1. Pitch-shift implementation via F0 conditioning
+        # In a real setup, we'd extract F0 from audio_frame. 
+        # Here we use a placeholder or derived F0 for v3 logic.
+        f0_condition = None
+        if pitch_shift != 0.0:
+            # Shift pitch in semitones (log2 domain)
+            # Placeholder: [B, 1, 2] -> [val, voiced_flag]
+            # Actual implementation would use a tracker.
+            f0_val = 0.0 + (pitch_shift / 12.0) 
+            f0_condition = torch.tensor([[[f0_val, 1.0]]], device=self.device)
+
         v_out = self.voice_state_enc(v_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
         logits_a, logits_b, new_kv, _ = self.uclm_core(
-            content_features, state.ctx_b, speaker_embed, state_cond, cfg_scale, state.kv_caches
+            content_features, 
+            state.ctx_b, 
+            speaker_embed, 
+            state_cond, 
+            cfg_scale, 
+            state.kv_caches,
+            f0_condition=f0_condition,
         )
 
         if temperature > 0:
@@ -252,6 +292,35 @@ class UCLMEngine:
         else:
             raise ValueError("Either reference_codec_tokens or speaker_embed must be provided")
 
+        # --- Prompt budget enforcement (v3) ---
+        if prompt_feats is not None:
+            n_frames = prompt_feats.shape[-2] if prompt_feats.dim() >= 2 else 0
+            if n_frames > MAX_PROMPT_FRAMES:
+                logger.warning(
+                    "Prompt features exceed MAX_PROMPT_FRAMES (%d > %d); "
+                    "truncating to last %d frames.",
+                    n_frames, MAX_PROMPT_FRAMES, MAX_PROMPT_FRAMES,
+                )
+                prompt_feats = prompt_feats[..., -MAX_PROMPT_FRAMES:, :]
+
+            # Check KV token budget (treat frames as tokens for KV cache)
+            n_kv = prompt_feats.shape[-2] if prompt_feats.dim() >= 2 else 0
+            if n_kv > MAX_PROMPT_KV_TOKENS:
+                logger.warning(
+                    "Prompt KV tokens exceed MAX_PROMPT_KV_TOKENS (%d > %d); "
+                    "truncating to last %d tokens.",
+                    n_kv, MAX_PROMPT_KV_TOKENS, MAX_PROMPT_KV_TOKENS,
+                )
+                prompt_feats = prompt_feats[..., -MAX_PROMPT_KV_TOKENS:, :]
+
+            # Check cache byte budget
+            cache_bytes = prompt_feats.nelement() * prompt_feats.element_size()
+            if cache_bytes > MAX_PROMPT_CACHE_BYTES:
+                logger.warning(
+                    "Prompt cache size exceeds MAX_PROMPT_CACHE_BYTES (%d > %d).",
+                    cache_bytes, MAX_PROMPT_CACHE_BYTES,
+                )
+
         encoding_time = (time.perf_counter() - t0) * 1000.0
         return refined_embed, prompt_feats, encoding_time
 
@@ -263,6 +332,8 @@ class UCLMEngine:
         speaker_embed: Optional[torch.Tensor] = None,
         style: StyleParams | None = None,
         cfg_scale: float = 1.5,
+        cfg_mode: CFGMode | str = CFGMode.FULL,
+        cfg_lazy_interval: int = 5,
         temperature: float = 0.8,
         language_id: int = 0,
         pace: float = 1.0,
@@ -276,6 +347,7 @@ class UCLMEngine:
         reference_audio_base64: str | None = None,
         reference_text: str | None = None,
         max_frames_per_unit: int = 50,
+        text_suprasegmentals: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Full causal pointer-based TTS generation (v3).
 
@@ -291,6 +363,9 @@ class UCLMEngine:
             speaker_embed: optional [1, d_speaker] direct speaker embedding fallback.
             style: StyleParams for voice state conditioning.
             cfg_scale: classifier-free guidance scale.
+            cfg_mode: CFG operating mode (off/full/lazy/distilled).
+            cfg_lazy_interval: for lazy mode, how many frames between
+                unconditional refreshes (default 5).
             temperature: sampling temperature.
             language_id: language identifier.
             pace: speech pace multiplier.
@@ -318,15 +393,80 @@ class UCLMEngine:
         self._require_loaded()
         t0 = time.perf_counter()
 
+        # Normalise cfg_mode to CFGMode enum
+        if isinstance(cfg_mode, str):
+            cfg_mode = CFGMode(cfg_mode)
+
+        # Distilled mode fallback: if distilled weights are not available,
+        # fall back to full two-pass CFG and log a warning.
+        if cfg_mode == CFGMode.DISTILLED and not self._has_distilled_cfg:
+            logger.warning(
+                "Distilled CFG requested but checkpoint lacks cfg_scale_embed; "
+                "falling back to FULL mode."
+            )
+            cfg_mode = CFGMode.FULL
+
+        # CFG safety clamping (Worker 04: default [1.0, 3.0])
+        cfg_scale = max(1.0, min(cfg_scale, 3.0))
+
+        # If cfg_mode is OFF, force scale to 1.0 regardless
+        if cfg_mode == CFGMode.OFF:
+            cfg_scale = 1.0
+
         style = style or StyleParams.neutral()
         v_state = torch.tensor(style.to_vector(), device=self.device).float().view(1, 1, -1)
         num_phonemes = phonemes.shape[1]
         phoneme_ids = phonemes.to(self.device)
-        
+
+        # --- Runtime budget enforcement: text units ---
+        if num_phonemes > MAX_TEXT_UNITS_ACTIVE:
+            logger.warning(
+                "Text units (%d) exceed MAX_TEXT_UNITS_ACTIVE (%d); truncating.",
+                num_phonemes, MAX_TEXT_UNITS_ACTIVE,
+            )
+            phoneme_ids = phoneme_ids[:, :MAX_TEXT_UNITS_ACTIVE]
+            num_phonemes = MAX_TEXT_UNITS_ACTIVE
+            if text_suprasegmentals is not None and text_suprasegmentals.shape[-2] > MAX_TEXT_UNITS_ACTIVE:
+                text_suprasegmentals = text_suprasegmentals[..., :MAX_TEXT_UNITS_ACTIVE, :]
+
+        # --- Runtime budget enforcement: dialogue context ---
+        if dialogue_context is not None and dialogue_context.shape[-1] > MAX_DIALOGUE_CONTEXT_UNITS:
+            logger.warning(
+                "Dialogue context units (%d) exceed MAX_DIALOGUE_CONTEXT_UNITS (%d); truncating.",
+                dialogue_context.shape[-1], MAX_DIALOGUE_CONTEXT_UNITS,
+            )
+            dialogue_context = dialogue_context[..., :MAX_DIALOGUE_CONTEXT_UNITS]
+
+        # --- Runtime budget enforcement: max generation frames ---
+        max_frames = min(max_frames, MAX_ACOUSTIC_HISTORY_FRAMES)
+
         prompt_kv_cache = None
         if speaker_profile is not None:
             speaker_embed = speaker_profile.speaker_embed.to(self.device).unsqueeze(0)
             if speaker_profile.prompt_codec_tokens is not None:
+                prompt_tokens = speaker_profile.prompt_codec_tokens.to(self.device)
+                # --- Prompt budget enforcement (v3) ---
+                n_prompt_frames = prompt_tokens.shape[0]
+                if n_prompt_frames > MAX_PROMPT_FRAMES:
+                    logger.warning(
+                        "TTS prompt_codec_tokens exceed MAX_PROMPT_FRAMES (%d > %d); "
+                        "truncating to last %d frames.",
+                        n_prompt_frames, MAX_PROMPT_FRAMES, MAX_PROMPT_FRAMES,
+                    )
+                    prompt_tokens = prompt_tokens[-MAX_PROMPT_FRAMES:]
+                if n_prompt_frames > MAX_PROMPT_KV_TOKENS:
+                    logger.warning(
+                        "TTS prompt_codec_tokens exceed MAX_PROMPT_KV_TOKENS (%d > %d); "
+                        "truncating to last %d tokens.",
+                        n_prompt_frames, MAX_PROMPT_KV_TOKENS, MAX_PROMPT_KV_TOKENS,
+                    )
+                    prompt_tokens = prompt_tokens[-MAX_PROMPT_KV_TOKENS:]
+                cache_bytes = prompt_tokens.nelement() * prompt_tokens.element_size()
+                if cache_bytes > MAX_PROMPT_CACHE_BYTES:
+                    logger.warning(
+                        "TTS prompt cache size exceeds MAX_PROMPT_CACHE_BYTES (%d > %d).",
+                        cache_bytes, MAX_PROMPT_CACHE_BYTES,
+                    )
                 # Precompute prompt KV cache using the encoder
                 # Note: Assuming encode_speaker_prompt or a helper can recreate the cache from tokens
                 # For now, we'll just encode the prompt codec tokens directly if model supports it
@@ -344,10 +484,16 @@ class UCLMEngine:
         kv_caches = None
         ctx_b = torch.zeros(1, 4, 1, dtype=torch.long, device=self.device)
 
+        # Move suprasegmentals to device if provided
+        _supra = text_suprasegmentals.to(self.device) if text_suprasegmentals is not None else None
+        if _supra is not None and _supra.dim() == 2:
+            _supra = _supra.unsqueeze(0)  # [L, d_supra] -> [1, L, d_supra]
+
         # Pre-compute text features once before the generation loop
         phoneme_lens = torch.tensor([num_phonemes], device=self.device)
         all_phoneme_features = self.uclm_core_model.text_encoder(
-            phoneme_ids, lang_id, phoneme_lens
+            phoneme_ids, lang_id, phoneme_lens,
+            text_suprasegmentals=_supra,
         ).transpose(1, 2)
 
         # Move optional expressive inputs to device once
@@ -370,16 +516,102 @@ class UCLMEngine:
                 b_ctx=ctx_b,
                 speaker_embed=speaker_embed,
                 state_cond=v_state,
-                cfg_scale=cfg_scale,
+                cfg_scale=1.0,  # Conditional pass always uses scale=1
                 kv_caches=kv_caches,
                 dialogue_context=_dlg_ctx,
                 acting_intent=_act_int,
             )
-            
+
             logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
             hidden_states = out["hidden_states"]
-            
-            p_adv_logit, p_delta, _p_bc = self.uclm_core_model.pointer_head(hidden_states)
+
+            # --- CFG blending (mode-aware) ---
+            # guided = uncond + cfg_scale * (cond - uncond)
+            if cfg_scale > 1.0 and cfg_mode != CFGMode.OFF:
+                if cfg_mode == CFGMode.DISTILLED:
+                    # Distilled mode: the conditional pass already used
+                    # cfg_scale as a model input; the model's output
+                    # approximates the blended logits directly.  We
+                    # re-run forward_streaming with cfg_scale injected so
+                    # the model can see it.
+                    out_dist = self.uclm_core_model.forward_streaming(
+                        content_features=content_features,
+                        a_ctx=ctx_a,
+                        b_ctx=ctx_b,
+                        speaker_embed=speaker_embed,
+                        state_cond=v_state,
+                        cfg_scale=cfg_scale,
+                        kv_caches=None,
+                        dialogue_context=_dlg_ctx,
+                        acting_intent=_act_int,
+                    )
+                    logits_a = out_dist["logits_a"]
+                    logits_b = out_dist["logits_b"]
+                    # Distilled pointer: run pointer_head on distilled hidden_states
+                    dist_hidden = out_dist["hidden_states"]
+                    p_adv_logit, p_delta, _p_bc = self.uclm_core_model.pointer_head(dist_hidden)
+
+                else:
+                    # FULL or LAZY: need unconditional logits
+                    need_uncond_refresh = True
+                    if cfg_mode == CFGMode.LAZY:
+                        # Reuse cached unconditional logits when fresh enough
+                        if (
+                            ptr.cfg_uncond_cache_a is not None
+                            and ptr.cfg_cache_age < cfg_lazy_interval
+                        ):
+                            need_uncond_refresh = False
+                            uncond_a = ptr.cfg_uncond_cache_a
+                            uncond_b = ptr.cfg_uncond_cache_b
+                            uncond_adv = ptr.cfg_uncond_cache_adv
+                            uncond_prog = ptr.cfg_uncond_cache_prog
+                            uncond_bc = ptr.cfg_uncond_cache_bc
+                            ptr.cfg_cache_age += 1
+
+                    if need_uncond_refresh:
+                        masked = DisentangledUCLM.apply_cfg_unconditional_mask(
+                            explicit_state=v_state,
+                            ssl_state=torch.zeros(1, 1, 128, device=self.device),
+                            speaker_embed=speaker_embed,
+                            dialogue_context=_dlg_ctx,
+                            acting_intent=_act_int,
+                        )
+                        out_uncond = self.uclm_core_model.forward_streaming(
+                            content_features=content_features,
+                            a_ctx=ctx_a,
+                            b_ctx=ctx_b,
+                            speaker_embed=masked["speaker_embed"],
+                            state_cond=masked["explicit_state"],
+                            cfg_scale=1.0,
+                            kv_caches=None,  # Don't share cache with unconditional
+                            dialogue_context=masked["dialogue_context"],
+                            acting_intent=masked["acting_intent"],
+                        )
+                        uncond_a = out_uncond["logits_a"]
+                        uncond_b = out_uncond["logits_b"]
+                        # Unconditional pointer outputs
+                        uncond_hidden = out_uncond["hidden_states"]
+                        uncond_adv, uncond_prog, uncond_bc = self.uclm_core_model.pointer_head(uncond_hidden)
+
+                        if cfg_mode == CFGMode.LAZY:
+                            ptr.cfg_uncond_cache_a = uncond_a.detach()
+                            ptr.cfg_uncond_cache_b = uncond_b.detach()
+                            ptr.cfg_uncond_cache_adv = uncond_adv.detach()
+                            ptr.cfg_uncond_cache_prog = uncond_prog.detach()
+                            ptr.cfg_uncond_cache_bc = uncond_bc.detach()
+                            ptr.cfg_cache_age = 1  # just refreshed, next frame is age=1
+
+                    logits_a = uncond_a + cfg_scale * (logits_a - uncond_a)
+                    logits_b = uncond_b + cfg_scale * (logits_b - uncond_b)
+
+                    # CFG-guided pointer outputs
+                    p_adv_logit_cond, p_delta_cond, p_bc_cond = self.uclm_core_model.pointer_head(hidden_states)
+                    p_adv_logit = uncond_adv + cfg_scale * (p_adv_logit_cond - uncond_adv)
+                    p_delta = uncond_prog + cfg_scale * (p_delta_cond - uncond_prog)
+                    _p_bc = uncond_bc + cfg_scale * (p_bc_cond - uncond_bc)
+            else:
+                # No CFG: use conditional pointer outputs directly
+                p_adv_logit, p_delta, _p_bc = self.uclm_core_model.pointer_head(hidden_states)
             # Combine all pacing controls:
             # - hold_bias: negative = hold longer, positive = advance sooner
             # - boundary_bias: positive = encourage boundary transitions
@@ -480,6 +712,7 @@ class UCLMEngine:
             "stall_events": 0,
             "forced_advance_count": ptr.forced_advance_count,
             "skip_protection_count": ptr.skip_protection_count,
+            "cfg_mode": cfg_mode.value,
         }
 
     def _tts_legacy_duration(
@@ -511,9 +744,10 @@ class UCLMEngine:
         from tmrvc_data.g2p import text_to_phonemes
         g2p_result = text_to_phonemes(text, language=language)
         phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+        supra_t = g2p_result.text_suprasegmentals  # [L, 4] or None
         spk_t = torch.from_numpy(np.asarray(spk_embed)).float().to(self.device) if not isinstance(spk_embed, torch.Tensor) else spk_embed.to(self.device)
         if spk_t.dim() == 1: spk_t = spk_t.unsqueeze(0)
-        audio_t, _ = self.tts(phonemes=phonemes_t, speaker_embed=spk_t, style=style or StyleParams.neutral(), language_id=g2p_result.language_id)
+        audio_t, _ = self.tts(phonemes=phonemes_t, speaker_embed=spk_t, style=style or StyleParams.neutral(), language_id=g2p_result.language_id, text_suprasegmentals=supra_t)
         audio = audio_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
         chunk_size = int(0.1 * SAMPLE_RATE)
         for i in range(0, audio.size, chunk_size):
