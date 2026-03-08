@@ -46,6 +46,21 @@ from tmrvc_train.models.emotion_codec import (
     EmotionAwareEncoder,
     EmotionAwareDecoder,
 )
+from tmrvc_train.models.reference_encoder import (
+    ReferenceEncoder,
+    ReferenceEncoderFromWaveform,
+)
+from tmrvc_train.models.acoustic_refinement import (
+    AcousticRefinementModule,
+    RefinementBlock,
+)
+from tmrvc_train.models.vocoder import (
+    VocoderBase,
+    CodecNativeDecoder,
+    VocosDecoder,
+    HiFiGANDecoder,
+    create_vocoder,
+)
 from tmrvc_train.models.disentangle_losses import (
     DisentanglementLoss,
     GradientReversalLayer,
@@ -112,4 +127,16 @@ __all__ = [
     "delta_state_consistency_loss",
     "long_event_consistency_loss",
     "duration_calibration_loss",
+    # Reference Encoder (GST-style prosody extraction)
+    "ReferenceEncoder",
+    "ReferenceEncoderFromWaveform",
+    # Acoustic Refinement (v3.1 coarse-to-full RVQ)
+    "AcousticRefinementModule",
+    "RefinementBlock",
+    # Vocoder Interface
+    "VocoderBase",
+    "CodecNativeDecoder",
+    "VocosDecoder",
+    "HiFiGANDecoder",
+    "create_vocoder",
 ]

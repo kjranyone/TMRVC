@@ -14,6 +14,7 @@ Define the `SpeakerProfile` as a first-class, serializable contract owned by `tm
 
 A `SpeakerProfile` must contain:
 - `schema_version`: Integer.
+- `metadata_version`: Integer (optimistic locking / mutation version).
 - `speaker_profile_id`: String (UUID or human-readable unique slug).
 - `reference_audio_hash`: String (SHA-256 of the source audio file).
 - `speaker_embed`: `[d_speaker]` float tensor (Timbre anchor).
@@ -52,4 +53,5 @@ The `SpeakerProfile` must be serializable to:
 - **Uniqueness:** No two profiles should share the same `speaker_profile_id`.
 - **Integrity:** The `reference_audio_hash` allows the system to verify that the extracted features match the intended source.
 - **Invalidation:** If `prompt_encoder_fingerprint` no longer matches the active tokenizer / encoder / checkpoint contract, the cached prompt representation must be treated as stale and re-encoded.
+- **Concurrency:** Updates and deletions must check `metadata_version` through the authoritative backend API.
 - **Audit:** Any creation or deletion of a `SpeakerProfile` must generate an entry in the Audit Log (see `docs/design/auth-spec.md`).

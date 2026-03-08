@@ -872,6 +872,299 @@ def _build_evaluation_arena() -> gr.Blocks:
 
 
 # ===================================================================
+# Tab 4b: Eval Tools (Reference Trimming / Control Sweeps / Rater Assignment)
+# ===================================================================
+
+
+def _build_eval_tools() -> gr.Blocks:
+    """Evaluation pipeline tools: trim references, run control sweeps,
+    generate rater assignments — all from the WebUI."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Eval Tools")
+        gr.Markdown(
+            "Pipeline tools for the frozen evaluation set "
+            "`tmrvc_eval_public_v1_2026_03_08`."
+        )
+
+        with gr.Tabs():
+            # ----- Sub-tab 1: Reference Trimming -----
+            with gr.Tab("Reference Trimming"):
+                gr.Markdown(
+                    "Trim few-shot reference audio to **3 s / 5 s / 10 s** "
+                    "using the highest-SNR voiced span (spec §4.2)."
+                )
+                trim_manifest = gr.File(
+                    label="manifest.jsonl", file_types=[".jsonl"]
+                )
+                trim_audio_dir = gr.Textbox(
+                    label="Source Audio Directory",
+                    placeholder="/path/to/reference_audio/",
+                    max_lines=1,
+                )
+                trim_output_dir = gr.Textbox(
+                    label="Output Directory",
+                    value="eval/trimmed_references",
+                    max_lines=1,
+                )
+                btn_trim = gr.Button("Trim References", variant="primary")
+                trim_log = gr.Textbox(
+                    label="Log", interactive=False, lines=10
+                )
+                trim_download = gr.File(label="Download Trimmed (zip)")
+
+                def _run_trim(manifest_file, audio_dir, output_dir):
+                    if manifest_file is None:
+                        return "Error: upload manifest.jsonl first.", None
+                    if not audio_dir or not audio_dir.strip():
+                        return "Error: specify source audio directory.", None
+                    audio_path = Path(audio_dir.strip())
+                    if not audio_path.is_dir():
+                        return f"Error: directory not found: {audio_path}", None
+
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts" / "eval"))
+                    try:
+                        from trim_references import process_manifest
+                    finally:
+                        sys.path.pop(0)
+
+                    manifest_path = Path(manifest_file.name)
+                    out_path = Path(output_dir.strip())
+
+                    trimmed, skipped = process_manifest(
+                        manifest_path, audio_path, out_path
+                    )
+                    log = f"Trimmed: {trimmed}, Skipped: {skipped}"
+                    if skipped > 0:
+                        log += "\nWARNING: some speakers excluded — check server logs."
+
+                    # Create zip for download
+                    zip_path = None
+                    wav_files = sorted(out_path.glob("*.wav"))
+                    if wav_files:
+                        import zipfile
+                        zip_file = out_path / "trimmed_references.zip"
+                        with zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for wf in wav_files:
+                                zf.write(wf, wf.name)
+                        zip_path = str(zip_file)
+
+                    _audit.log("admin", "gradio", "trim_references",
+                               after_state=f"trimmed={trimmed} skipped={skipped}")
+                    return log, zip_path
+
+                btn_trim.click(
+                    _run_trim,
+                    inputs=[trim_manifest, trim_audio_dir, trim_output_dir],
+                    outputs=[trim_log, trim_download],
+                )
+
+            # ----- Sub-tab 2: Control Sweeps -----
+            with gr.Tab("Control Sweeps"):
+                gr.Markdown(
+                    "Sweep **pace / hold_bias / boundary_bias** across 5 frozen "
+                    "levels for each control_sweeps item (spec §3.3). "
+                    "Total: 27 prompts × 5 = 135 renders."
+                )
+                sweep_manifest = gr.File(
+                    label="manifest.jsonl", file_types=[".jsonl"]
+                )
+                sweep_character = gr.Textbox(
+                    label="Character ID", value="default", max_lines=1
+                )
+                sweep_output_dir = gr.Textbox(
+                    label="Output Directory",
+                    value="eval/control_sweep_outputs",
+                    max_lines=1,
+                )
+                btn_sweep = gr.Button("Run Sweeps", variant="primary")
+                sweep_progress = gr.Textbox(
+                    label="Progress", interactive=False, lines=8
+                )
+                sweep_results = gr.Dataframe(
+                    headers=["item_id", "param", "level", "duration_sec", "status"],
+                    label="Results",
+                    interactive=False,
+                )
+
+                # Frozen sweep levels
+                _SWEEP_LEVELS: dict[str, list[float]] = {
+                    "pace": [0.85, 0.95, 1.00, 1.05, 1.15],
+                    "hold_bias": [-0.5, -0.25, 0.0, 0.25, 0.5],
+                    "boundary_bias": [-0.5, -0.25, 0.0, 0.25, 0.5],
+                }
+
+                def _detect_param(item: dict) -> str:
+                    if "control_param" in item:
+                        return item["control_param"]
+                    item_id = item.get("item_id", "")
+                    for p in _SWEEP_LEVELS:
+                        if p in item_id:
+                            return p
+                    return "pace"
+
+                def _run_sweeps(manifest_file, char_id, output_dir):
+                    if manifest_file is None:
+                        return "Error: upload manifest.jsonl first.", []
+
+                    items = []
+                    with open(manifest_file.name) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            row = json.loads(line)
+                            if row.get("subset") == "control_sweeps":
+                                items.append(row)
+
+                    if not items:
+                        return "No control_sweeps items in manifest.", []
+
+                    out_path = Path(output_dir.strip())
+                    out_path.mkdir(parents=True, exist_ok=True)
+
+                    results = []
+                    ok = 0
+                    fail = 0
+                    for item in items:
+                        item_id = item["item_id"]
+                        text = item["target_text"]
+                        param = _detect_param(item)
+                        levels = _SWEEP_LEVELS[param]
+                        for level in levels:
+                            payload = {
+                                "text": text,
+                                "character_id": char_id or "default",
+                                param: level,
+                            }
+                            resp = _api_post("/tts", payload)
+                            if resp and resp.get("audio_base64"):
+                                stem = f"{item_id}__{param}_{level}"
+                                audio_bytes = base64.b64decode(resp["audio_base64"])
+                                (out_path / f"{stem}.wav").write_bytes(audio_bytes)
+                                dur = resp.get("duration_sec", 0.0)
+                                results.append([item_id, param, level, dur, "OK"])
+                                ok += 1
+                            else:
+                                results.append([item_id, param, level, 0.0, "FAILED"])
+                                fail += 1
+
+                    status = f"Done. {ok} OK, {fail} FAILED out of {ok + fail} renders."
+                    _audit.log("admin", "gradio", "control_sweeps",
+                               after_state=f"ok={ok} fail={fail}")
+                    return status, results
+
+                btn_sweep.click(
+                    _run_sweeps,
+                    inputs=[sweep_manifest, sweep_character, sweep_output_dir],
+                    outputs=[sweep_progress, sweep_results],
+                )
+
+            # ----- Sub-tab 3: Rater Assignment -----
+            with gr.Tab("Rater Assignment"):
+                gr.Markdown(
+                    "Generate rater assignments for the 4 human-eval arms "
+                    "(spec §5). Balances languages, randomizes A/B order, "
+                    "injects 12.5 % duplicate QC items."
+                )
+                assign_manifest = gr.File(
+                    label="manifest.jsonl", file_types=[".jsonl"]
+                )
+                with gr.Row():
+                    assign_num_raters = gr.Number(
+                        label="Number of Raters", value=30, precision=0
+                    )
+                    assign_seed = gr.Number(
+                        label="Random Seed", value=42, precision=0
+                    )
+                btn_assign = gr.Button("Generate Assignments", variant="primary")
+                assign_summary = gr.Textbox(
+                    label="Coverage Summary", interactive=False, lines=12
+                )
+                assign_download = gr.File(label="Download assignments.json")
+
+                def _run_assign(manifest_file, num_raters, seed):
+                    if manifest_file is None:
+                        return "Error: upload manifest.jsonl first.", None
+
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts" / "eval"))
+                    try:
+                        from assign_raters import (
+                            load_manifest,
+                            build_arms,
+                            assign_items_to_raters,
+                            compute_coverage,
+                        )
+                    finally:
+                        sys.path.pop(0)
+
+                    rng = random.Random(int(seed))
+                    num_raters = max(1, int(num_raters))
+
+                    items = load_manifest(Path(manifest_file.name))
+                    if not items:
+                        return "No human_eval_eligible items found.", None
+
+                    arms = build_arms(items, rng)
+                    assignments = assign_items_to_raters(arms, num_raters, rng)
+                    coverage = compute_coverage(assignments, arms)
+
+                    # Build output JSON
+                    arms_summary: dict[str, Any] = {}
+                    for arm_name, arm_items in arms.items():
+                        from collections import Counter as _Counter
+                        lang_dist = _Counter(it.get("language_id", "?") for it in arm_items)
+                        arms_summary[arm_name] = {
+                            "total_items": len(arm_items),
+                            "language_distribution": dict(lang_dist),
+                        }
+
+                    output = {
+                        "seed": int(seed),
+                        "num_raters": num_raters,
+                        "arms": arms_summary,
+                        "assignments": assignments,
+                        "coverage_report": coverage,
+                    }
+
+                    out_path = Path(tempfile.mkdtemp()) / "assignments.json"
+                    with open(out_path, "w") as f:
+                        json.dump(output, f, indent=2, ensure_ascii=False)
+
+                    # Format summary text
+                    lines = [
+                        f"Raters:          {coverage['num_raters']}",
+                        f"Workload range:  {coverage['workload_min']}-{coverage['workload_max']} "
+                        f"(mean {coverage['workload_mean']})",
+                        f"In target range: {coverage['raters_in_target_range']}/{coverage['num_raters']}",
+                        f"A/B order:       {coverage['presentation_order_balance']}",
+                        "",
+                    ]
+                    for arm_name, report in coverage["arms"].items():
+                        status = "OK" if report["items_below_target"] == 0 else "BELOW"
+                        lines.append(
+                            f"  {arm_name:25s}  items={report['num_items']:3d}  "
+                            f"ratings={report['min_ratings']}-{report['max_ratings']} "
+                            f"(mean {report['mean_ratings']})  "
+                            f"target>={report['target_min_ratings']}  [{status}]"
+                        )
+
+                    _audit.log("admin", "gradio", "rater_assignment",
+                               after_state=f"raters={num_raters} seed={int(seed)}")
+                    return "\n".join(lines), str(out_path)
+
+                btn_assign.click(
+                    _run_assign,
+                    inputs=[assign_manifest, assign_num_raters, assign_seed],
+                    outputs=[assign_summary, assign_download],
+                )
+
+    return tab
+
+
+# ===================================================================
 # Tab 5: System Admin
 # ===================================================================
 
@@ -1548,6 +1841,8 @@ def create_app() -> gr.Blocks:
                 _build_dataset_manager()
             with gr.Tab("Evaluation Arena"):
                 _build_evaluation_arena()
+            with gr.Tab("Eval Tools"):
+                _build_eval_tools()
             with gr.Tab("Speaker Enrollment"):
                 _build_speaker_enrollment()
             with gr.Tab("Training Monitor"):

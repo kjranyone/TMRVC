@@ -31,6 +31,7 @@ Replace duration-centric TTS training with pointer-centric TTS training while pr
 - mainline release path includes at least one pointer-training configuration that does not depend on external aligners
 - runtime-friendly CFG fast paths are planned explicitly rather than assumed away
 - 8-D `voice_state` supervision, masks, and confidences are trainable when present and safely ignorable when absent
+- suprasegmental text features are trainable and validated for languages that require them
 
 
 ## Training Curriculum
@@ -54,6 +55,7 @@ Worker 02 must implement and document the following curriculum:
 - **Data:** High-expressivity dialogue datasets (curated).
 - **Task:** Dialogue-conditioned TTS with Prosody Predictor and CFG training.
 - **Note:** **Classifier-Free Guidance (CFG)** training is introduced here by randomly dropping conditioning (10-20% dropout) to allow inference-time guidance scaling.
+- **Note:** Stage 3 must train the exact pointer-aware CFG contract used at inference, including `advance_logit` / `progress_delta` guidance behavior.
 - **Quality gate at Stage B completion:** Evaluate whether utterance-global prosody `[B, d_prosody]` is sufficient for drama acting quality. If anti-collapse metrics (`context_separation_score`, `prosody_collapse_score`) indicate insufficient local variation, schedule time-local prosody `[B, T_plan, d_prosody]` upgrade for Stage C.
 
 
@@ -81,6 +83,8 @@ Worker 02 must implement and document the following curriculum:
    - `voice_state_loss_weight`
    - `voice_state_confidence_floor`
    - `voice_state_teacher_mode: none | pseudo_labeled | direct_labeled | mixed`
+   - `suprasegmental_loss_weight`
+   - `suprasegmental_required_languages`
 2. Refactor `trainer.py`:
    - separate VC step and TTS pointer step
    - remove assumption that TTS batch must have durations
@@ -123,16 +127,19 @@ Worker 02 must implement and document the following curriculum:
 9. **Implement CFG Training logic (conditioning dropout for speaker/style/context).**
    - use the exact unconditional mask contract frozen by Worker 01
    - dropping only a subset of conditioning paths is forbidden unless it is an explicit ablation mode
-10. Add CFG runtime-acceleration preparation **(Tier 2)**:
+   - trainer diagnostics must separately report acoustic-logit CFG behavior and pointer-output CFG behavior
+10. Add CFG runtime-acceleration preparation:
     - define whether runtime may use `off | full | lazy | distilled` CFG modes
     - if `distilled` is supported, implement **CFG Self-Distillation** hooks in Stage 3, allowing the model to approximate 2-pass guided outputs in a 1-pass inference step, ensuring high expressive capacity fits within real-time VST budgets.
     - if `lazy` CFG is supported, define the training-time assumption or robustness check for skipped guidance refreshes
-    - `off` and `full` are Tier 1; `lazy` and `distilled` are Tier 2 and must not block Tier 1 sign-off
+    - `off` and `full` are the v3.0 mainline requirements
+    - `lazy` and `distilled` are post-v3.0 optimization tracks unless explicitly promoted into the release checklist
 11. **Implement Flow-matching Loss for the Prosody Predictor.**
 12. Add expressive-training hooks:
     - dialogue-context conditioning batch fields
     - utterance-level style / acting labels when available
     - optional local prosody latent supervision
+    - optional `text_suprasegmentals`
     - optional `voice_state_targets`, `voice_state_observed_mask`, and `voice_state_confidence`
     - (CFG-based acting control is achieved via `cfg_scale` scalar and conditioning dropout, not a dedicated embedding)
 13. Add anti-collapse training losses or diagnostics:
@@ -174,6 +181,7 @@ The trainer must accept TTS examples with:
   - no external labels when `pointer_supervision_mode=latent_only`, or
   - temporary bootstrap alignment labels already projected onto canonical phoneme indices
 - optional `dialogue_context` as raw text-context tokens or deterministically derived embeddings
+- optional `text_suprasegmentals` aligned to `phoneme_ids`
 - optional `acting_intent`
 - optional `prosody_targets` (for Flow-matching)
 - optional `acoustic_history_teacher` or equivalent teacher-forced codec/control history source
@@ -227,6 +235,15 @@ MAS-derived pointer targets are structurally a form of duration supervision. Whi
 
 Worker 02 must validate at least one of these paths before release sign-off.
 
+### Suprasegmental Supervision Policy
+
+- `phoneme_ids` remain the canonical text-unit ids
+- `text_suprasegmentals` are companion per-unit features and must remain index-aligned with `phoneme_ids`
+- Japanese / tonal-language recipes must report explicit coverage for these features
+- if a sample belongs to a language/backend that declares suprasegmental support but the features are absent, training must either:
+  - drop the sample from the mainline recipe, or
+  - mark it as fallback-mode and exclude it from language-naturalness claims
+
 
 ## Early Anti-Collapse Metric Definitions
 
@@ -256,6 +273,7 @@ Exact production formulas may evolve, but these names and intents must be fixed 
 - do not treat low-confidence or missing `voice_state` targets as dense zero targets
 - do not enable supervised pointer loss without a concrete bootstrap target source
 - do not push ownership of canonical bootstrap projection into ad hoc dataset code
+- do not silently train Japanese/tonal recipes from `phoneme_ids` alone while claiming suprasegmental support
 
 
 ## Handoff Contract

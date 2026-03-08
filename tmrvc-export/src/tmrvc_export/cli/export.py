@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify ONNX export by running inference.",
     )
     parser.add_argument("--device", default="cpu", help="Device (cuda/cpu/xpu).")
+    parser.add_argument(
+        "--uclm",
+        type=Path,
+        default=None,
+        help="UCLM checkpoint path (exports pointer_head, prosody_predictor, etc.).",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -139,6 +145,41 @@ def main(argv: list[str] | None = None) -> None:
             speaker_encoder, args.output_dir / "speaker_encoder.onnx"
         )
 
+    if args.uclm:
+        logger.info("Loading UCLM checkpoint: %s", args.uclm)
+        from tmrvc_export.export_uclm import export_pointer_head, export_prosody_predictor
+        from tmrvc_train.models.uclm_model import DisentangledUCLM
+        from tmrvc_core.constants import (
+            D_MODEL, UCLM_N_HEADS, UCLM_N_LAYERS, RVQ_VOCAB_SIZE,
+            N_CODEBOOKS, CONTROL_VOCAB_SIZE, D_VOICE_STATE_EXPLICIT,
+            D_VOICE_STATE_SSL, D_SPEAKER, UCLM_VQ_BINS,
+        )
+
+        uclm_ckpt = torch.load(args.uclm, map_location=args.device, weights_only=False)
+        uclm_model = DisentangledUCLM(
+            d_model=D_MODEL,
+            n_heads=UCLM_N_HEADS,
+            n_layers=UCLM_N_LAYERS,
+            rvq_vocab_size=RVQ_VOCAB_SIZE,
+            n_codebooks=N_CODEBOOKS,
+            control_vocab_size=CONTROL_VOCAB_SIZE,
+            d_explicit=D_VOICE_STATE_EXPLICIT,
+            d_ssl=D_VOICE_STATE_SSL,
+            d_speaker=D_SPEAKER,
+            vq_bins=UCLM_VQ_BINS,
+        ).to(args.device)
+        if "model_state_dict" in uclm_ckpt:
+            uclm_model.load_state_dict(uclm_ckpt["model_state_dict"])
+        else:
+            uclm_model.load_state_dict(uclm_ckpt)
+        uclm_model.eval()
+
+        logger.info("Exporting pointer_head...")
+        export_pointer_head(uclm_model, args.output_dir, args.device, opset_version=18)
+
+        logger.info("Exporting prosody_predictor...")
+        export_prosody_predictor(uclm_model, args.output_dir, args.device, opset_version=18)
+
     if args.verify:
         logger.info("Verifying ONNX exports...")
         import onnxruntime as ort
@@ -147,6 +188,8 @@ def main(argv: list[str] | None = None) -> None:
             "codec_encoder.onnx",
             "codec_decoder.onnx",
             "token_model.onnx",
+            "pointer_head.onnx",
+            "prosody_predictor.onnx",
         ]:
             path = args.output_dir / onnx_file
             if not path.exists():

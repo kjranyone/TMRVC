@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the foundational infrastructure for the TMRVC Gradio-based control plane. This ensures that the high-level human workflows described in `worker_12_gradio_control_plane.md` are supported by a secure, auditable, and multi-user capable backend.
+Define the foundational infrastructure for the TMRVC Gradio-based control plane. This ensures that the high-level human workflows described in `plan/worker_12_gradio_control_plane.md` are supported by a secure, auditable, and multi-user capable backend.
 
 ## 1. Authentication & Session Management
 
@@ -40,18 +40,20 @@ Every state-changing action in the control plane must be logged to a persistent 
 To prevent "Lost Update" anomalies where multiple users modify the same record (e.g., two annotators fixing the same transcript), the system uses **Optimistic Locking**.
 
 ### Versioning Mechanism
-- Every mutable record (Curation Record, Speaker Profile) must have a `version_tag` (e.g., an incrementing integer or a UUID/Hash of the content).
-- **Update Request:** The UI must send the `version_tag` it originally read.
-- **Server Validation:** The backend compares the incoming `version_tag` with the current one in the store.
+- Canonical field name: `metadata_version`
+- Every mutable record (Curation Record, Speaker Profile, workshop take) must have `metadata_version` as an incrementing integer.
+- **Update Request:** The UI must send the `metadata_version` it originally read.
+- **Server Validation:** `tmrvc-serve` compares the incoming `metadata_version` with the current value in the authoritative store.
 - **Conflict Handling:**
-  - If tags match: Update the record and increment/refresh the `version_tag`.
-  - If tags differ: Reject the update with a `409 Conflict` error and prompt the user to refresh and merge.
+  - If values match: update the record and increment `metadata_version`.
+  - If values differ: reject the update with a typed `409 Conflict` response and prompt the user to refresh and merge.
 
 ## 4. Manifest Integrity
 
 The `manifest.jsonl` used for curation is the primary target for concurrency control.
-- Each record entry includes a `metadata_version` field.
-- The `tmrvc-data` curation service must enforce version checks on all `POST/PATCH` operations.
+- Each record entry includes a canonical `metadata_version` field.
+- `tmrvc-serve` is the sole authoritative `/ui/*` and `/admin/*` API boundary for multi-user writes.
+- `tmrvc-data` may implement internal curation services behind that boundary, but direct filesystem mutation is dev-only and not a mainline API.
 
 ## 5. Security Guardrails
 

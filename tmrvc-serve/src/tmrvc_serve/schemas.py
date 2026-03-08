@@ -8,6 +8,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 StylePreset = Literal["default", "asmr_soft", "asmr_intimate"]
+CFGModeStr = Literal["off", "full", "lazy", "distilled"]
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ class TTSRequest(BaseModel):
     delta_voice_state: Optional[list[float]] = Field(None, description="Delta voice state vector.", min_length=8, max_length=8)
     speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
     cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
+    cfg_mode: CFGModeStr = Field("full", description="CFG operating mode: off, full, lazy, or distilled.")
 
 
 class TTSResponse(BaseModel):
@@ -132,6 +134,7 @@ class TTSStreamRequest(BaseModel):
     delta_voice_state: Optional[list[float]] = Field(None, description="Delta voice state vector.", min_length=8, max_length=8)
     speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
     cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
+    cfg_mode: CFGModeStr = Field("full", description="CFG operating mode: off, full, lazy, or distilled.")
     chunk_duration_ms: int = Field(100, ge=20, le=500)
 
 
@@ -372,3 +375,32 @@ asyncio.run(stream_vc())
 WEBSOCKET_DOCS = {
     "vc_stream": WEBSOCKET_PROTOCOL_VC_STREAM,
 }
+
+
+# ---------------------------------------------------------------------------
+# Artifact download contract (Worker 04, task 22)
+# ---------------------------------------------------------------------------
+
+
+class ArtifactResponse(BaseModel):
+    """Artifact download envelope for WebUI-initiated exports.
+
+    Artifacts must be retrievable without shell access.  The ``download_url``
+    is a server-relative path that the UI can fetch directly.
+    """
+
+    artifact_id: str = Field(..., description="Unique artifact identifier.")
+    artifact_type: str = Field(
+        ...,
+        description='One of "training_bundle", "eval_bundle", "take_bundle".',
+    )
+    download_url: str = Field(
+        ..., description="Relative URL to download the artifact."
+    )
+    expires_at: Optional[str] = Field(
+        None, description="ISO-8601 expiry timestamp, or null if permanent."
+    )
+    provenance_summary: dict = Field(
+        default_factory=dict,
+        description="Key provenance metadata (source, versions, hashes).",
+    )

@@ -33,9 +33,8 @@ Define the new v3 model contract so every other worker can build against stable 
 - define whether VC consumes, bypasses, or emulates pointer state
 - freeze the canonical unconditional-conditioning contract used by CFG
 - define trainable 8-D `voice_state` target, mask, confidence, and provenance interfaces at the model boundary
-- define release-critical versus research-extension boundaries inside the model stack
-- evaluate but do not hard-block mainline on modernization features such as `RoPE`, `GQA`, `SwiGLU`
-- evaluate but do not hard-block mainline on flow-matching prosody variants beyond the minimum stable prosody path
+- adopt modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) as mainline
+- adopt flow-matching prosody predictor as the mainline prosody path
 - define the single source of truth for serializable pointer / `voice_state` / cache-state schemas in `tmrvc-core`
 
 
@@ -55,27 +54,9 @@ Worker 01 must freeze the canonical serializable state schema in one place.
 - model wrappers in train / serve / export may adapt this contract, but must not redefine it
 - exported docs must point back to the same `tmrvc-core` schema rather than prose-only duplication
 
-### Release-Critical vs Research Boundary
+### Modern Transformer Backbone
 
-Worker 01 must explicitly separate:
-
-- release-critical Tier 1:
-  - pointer state machine
-  - causal text/context conditioning
-  - 8-D physical-control contract
-  - few-shot prompt contract
-  - stable streaming/cache semantics
-- research-extension Tier 2:
-  - backbone modernization
-  - advanced prosody predictors
-  - CFG acceleration variants
-  - alternative acoustic refinement stages
-
-Tier 2 features may be adopted only if they preserve Tier 1 interfaces and keep a documented rollback path.
-
-### Modern Transformer Backbone (Tier 2)
-
-The UCLM v3 core should evaluate and adopt the following SOTA LLM practices if parity and latency gates hold. These are Tier 2 research-extensions; the mainline must not hard-block on them (see § Release-Critical vs Research Boundary).
+The UCLM v3 core adopts the following SOTA LLM practices as the mainline backbone. These are required for v3 release and must pass parity and latency gates.
 
 - **Positional Embedding:** **RoPE (Rotary Positional Embeddings)** for better extrapolation to long dialogues.
 - **Attention Mechanism:** **GQA (Grouped Query Attention)** to reduce KV-cache memory footprint by 4x-8x during 10ms-step serving.
@@ -84,6 +65,25 @@ The UCLM v3 core should evaluate and adopt the following SOTA LLM practices if p
 - **Training Acceleration:** Native **Flash Attention 2** support.
 - **Cross-Attention Layer:** To support global prosody planning and non-local text context, the decoder block must include a Cross-Attention layer against the full `phoneme_features` sequence, replacing or augmenting the naive uniform frame-level interpolation.
 - **Acoustic Autoregression:** The model must explicitly consume past emitted acoustic tokens (`a_ctx` from Stream A) in addition to control tokens (`b_ctx`), ensuring phase continuity and preventing waveform glitches during autoregressive generation.
+
+`phoneme_features` must be defined as a canonical text-side feature bundle rather than an informal placeholder:
+
+- required base field:
+  - `phoneme_ids`
+- required companion field when the language/backend provides suprasegmentals:
+  - `text_suprasegmentals`
+- canonical semantics of `text_suprasegmentals`:
+  - language-scoped per-text-unit features for accent / tone / phrase-boundary cues
+  - examples:
+    - Japanese: `accent_upstep`, `accent_downstep`, `accent_phrase_break`
+    - tonal languages: lexical tone id or equivalent normalized tone feature
+- canonical shape:
+  - `phoneme_ids`: `[B, L]`
+  - `text_suprasegmentals`: `[B, L, d_supra]`
+- implementation rule:
+  - `phoneme_ids` remain the canonical text-unit ids
+  - `text_suprasegmentals` are companion features, not a replacement vocabulary
+  - the same serializable contract must survive dataset export, training, serving, and ONNX/Rust consumption
 
 RoPE integration must be specified together with pointer execution:
 
@@ -117,8 +117,9 @@ Worker 01 must also freeze the invariants:
 - recovery behavior after pathological prolonged hold is explicit and serializable
 - force-advance semantics are explicit:
   - how `progress_value` is reset or clipped
-  - how `acoustic_history` continuity is preserved to avoid audible discontinuity
+  - how `acoustic_history` continuity is preserved without hidden-state surgery
   - how the runtime marks `forced_advance` in telemetry and serialized state
+  - force-advance may mutate only serialized pointer-state fields and documented threshold/bias terms; it must not perform ad hoc transformer-cache smoothing, cache rewriting, or decoder-state cross-fades that are absent from the shared contract
 - the advance decision rule is numeric and deterministic:
   - thresholding / comparison method for `advance_logit` or `advance_prob`
   - tie-break behavior at equality or near-equality
@@ -176,6 +177,17 @@ The unconditional pass contract must be frozen exactly here:
 
 This prevents CFG from leaking timbre or prosody through an undocumented side path.
 
+The CFG contract must explicitly cover pointer-side outputs, not only acoustic logits:
+
+- `guided_logits_a = uncond_logits_a + cfg_scale * (cond_logits_a - uncond_logits_a)`
+- `guided_logits_b = uncond_logits_b + cfg_scale * (cond_logits_b - uncond_logits_b)`
+- `guided_advance_logit = uncond_advance_logit + cfg_scale * (cond_advance_logit - uncond_advance_logit)`
+- `guided_progress_delta = uncond_progress_delta + cfg_scale * (cond_progress_delta - uncond_progress_delta)`
+- `guided_boundary_confidence = uncond_boundary_confidence + cfg_scale * (cond_boundary_confidence - uncond_boundary_confidence)` when boundary confidence is enabled
+- the pointer update rule in `full` CFG mode must consume the guided pointer outputs above
+- `off` mode consumes the conditional outputs directly
+- if `lazy` or `distilled` CFG are later enabled, they must approximate the same pointer-side semantics and pass the same parity tests; they are not initial v3.0 requirements
+
 `state_cond` may remain as an internal fused representation, but it must not be the only documented public conditioning contract.
 
 
@@ -225,6 +237,22 @@ Worker 01 must document how missing or low-confidence dimensions are masked in l
 The multi-turn `[B, C_ctx, d_model]` form is the canonical API-boundary contract. Internal projectors (e.g. `DialogueContextProjector`) may pool or reduce to `[B, d_model]` before injection into frame features. Both forms must be supported: the 3D form for full context fidelity, and the 2D pooled form as a convenience shorthand.
 
 This keeps the runtime causal and bounded in VRAM. Raw prior audio is not the default dialogue-context modality.
+
+### Suprasegmental Text Features
+
+Languages such as Japanese and tonal languages require structured suprasegmental cues that cannot be recovered from bare `phoneme_ids` alone.
+
+- canonical public input:
+  - `text_suprasegmentals`
+- canonical storage policy:
+  - exported as a text-unit-aligned artifact derived deterministically from the text frontend
+- canonical semantics:
+  - every row aligns to one canonical text unit
+  - missing features must be represented explicitly with masks or sentinel values, not silently dropped
+- canonical training/runtime rule:
+  - if a language/backend declares suprasegmental support, the mainline batch/request contract must either provide `text_suprasegmentals` or mark the sample/request as downgraded fallback mode
+- validation rule:
+  - Worker 06 must include at least one parity test proving that suprasegmental features survive Python -> export -> Rust/ONNX roundtrips without index drift
 
 VC semantic-context policy:
 
@@ -308,16 +336,16 @@ The `ProsodyPredictor` outputs `[B, d_prosody]`. When injecting into frame featu
 Utterance-global prosody is insufficient for fine-grained drama-grade acting (mid-sentence emotion shifts, selective emphasis, trailing-off). Recent surveyed work supports token-level or segment-level prosody granularity. The upgrade to time-local `[B, T_plan, d_prosody]` must be evaluated at Stage B completion and scheduled for Stage C if drama acting quality gates are not met with the utterance-global form.
 
 **Prosody Predictor Requirement:**
-The architecture must define a stable prosody-prediction interface in Tier 1 and may satisfy it with a flow-matching predictor if the latency/parity gates hold.
+The architecture must define a stable prosody-prediction interface and satisfy it with a flow-matching predictor.
 
-Tier 1 minimum:
+Required interface:
 
 - one stable `predict_prosody(...)` API
 - deterministic seed handling
 - serializable latent contract
 - bounded runtime cost compatible with the 10 ms serving budget
 
-Tier 2 preferred path:
+Required implementation:
 
 - a flow-matching based prosody predictor that predicts the `local_prosody_latent` from text tokens and dialogue context during inference
 
@@ -336,6 +364,22 @@ To support SOTA zero-shot/few-shot voice cloning while maintaining drama-grade a
 - **Speaker Encoder (Global Timbre):** A dedicated `Speaker Encoder` (e.g., integrating pre-trained WavLM/Wespeaker or a custom neural feature extractor) to extract a highly robust continuous `speaker_embed` from the prompt audio.
 - **Disentanglement Constraint:** The model must explicitly disentangle *Timbre* from *Prosody*. When cloning a voice from a neutral read speech prompt, the model must borrow only the timbre from the `speaker_embed` and `prompt_codec_tokens`, while allowing the `dialogue_context` and the `Prosody Predictor` to override the acting/prosody.
 - **Disentanglement Bottleneck:** To enforce this separation, the `Speaker Prompt Encoder` must incorporate an Information Bottleneck or Vector Quantization (VQ) layer, ensuring that attention mechanisms are restricted to low-frequency timbre components and cannot silently copy the prompt's prosody.
+
+The few-shot contract must also freeze strict runtime budgets so prompt conditioning cannot silently violate the 10 ms causal target:
+
+- persisted `SpeakerProfile` evidence may retain up to the raw enrollment clip and derived prompt artifacts for reproducibility
+- active real-time conditioning must obey constants owned in `configs/constants.yaml`:
+  - `max_prompt_seconds_active`
+  - `max_prompt_frames`
+  - `max_prompt_kv_tokens`
+  - `max_prompt_cache_bytes`
+- when enrollment audio exceeds the active runtime budget, Worker 04 must apply a deterministic prompt-selection/compression policy and record that policy in `SpeakerProfile`
+- Rust/VST hard-real-time paths must have a documented downgrade path:
+  - preferred order:
+    - bounded `prompt_kv_cache`
+    - reduced prompt summary
+    - `speaker_embed`-only fallback
+- prompt-budget enforcement is part of the public contract, not an implementation detail
 
 Worker 01 must define the injection points for prompt tokens and ensure the attention masks (and bottleneck layers) prevent the prompt's neutral prosody from flattening the target utterance's dramatic intent.
 
@@ -372,7 +416,7 @@ The dominant SOTA pattern (CosyVoice 3, MiniMax-Speech, DiSTAR, Qwen3-TTS) uses 
 - Stage 2 takes coarse codec tokens (e.g., first 1-2 RVQ layers) from the AR model and refines to full RVQ depth
 - the AR model's responsibility shifts to semantic/coarse token prediction, improving both quality and inference efficiency
 - design references:
-  - see `plan/arxiv_survey_2026_03.md` for the dated evidence supporting flow-matching and low-latency refinement as a research-track direction
+  - see `plan/arxiv_survey_2026_03.md` for the dated evidence supporting flow-matching and low-latency refinement
 - streaming compatibility:
   - block-wise refinement (à la Qwen3-TTS) preserves low-latency streaming
   - the 10 ms causal AR core remains unchanged; refinement operates on buffered blocks
@@ -432,7 +476,7 @@ Worker 01 must ensure that the initial v3 flattened codec output can serve as in
    - same text under different context must not map to a single delivery due to dialogue-context and prosody-latent variation.
    - Zero-shot prompting must not flatten the acting; same text under different context must still vary despite using the exact same speaker prompt.
 16. **Specify Quantization Policy:**
-    - ensure the model graph is compatible with **FP8** or **INT8 (SmoothQuant/Weight-only)** for the Rust engine.
+    - define quantization compatibility constraints, but treat FP8 / INT8 deployment optimization as post-v3.0 unless explicitly promoted into the release checklist.
 17. Freeze the canonical public API boundary:
    - training/model API accepts raw state inputs (`explicit_voice_state`, `delta_voice_state`, optional `ssl_voice_state`)
    - export/runtime wrappers may consume or emit fused `state_cond`, but only if the mapping to raw state inputs is documented and tested
@@ -440,10 +484,12 @@ Worker 01 must ensure that the initial v3 flattened codec output can serve as in
     - evaluate VoiceStar PM-RoPE (arXiv:2505.19462) as a candidate or comparison point
     - document whether PM-RoPE can replace or simplify the explicit pointer head
 19. Freeze the unconditional-conditioning mask schema shared by CFG training and inference.
+    - freeze the guided pointer-output formulas and post-guidance clamps used by `full` CFG mode
 20. Freeze the `SpeakerProfile` serialization contract in `tmrvc-core/src/tmrvc_core/types.py` and ownership fields used by Worker 04 and Worker 12. The canonical field list (prompt evidence, speaker embedding metadata, ownership, reproducibility) must be frozen here and referenced by `docs/design/speaker-profile-spec.md`.
+    - include prompt-budget metadata and deterministic prompt-selection/compression provenance
 21. Document how `voice_state_targets`, masks, and confidences enter the model or loss path without conflating unknown with neutral.
 22. Evaluate time-local prosody as a Stage C upgrade only if Worker 06 quality gates show the utterance-global latent is insufficient.
-23. Define the v3.1 acoustic refinement interface contract so future research-track modules can attach without breaking Tier 1.
+23. Define the v3.1 acoustic refinement interface contract so future modules can attach without breaking mainline contracts.
 24. Document codec-level disentanglement as a future investigation path rather than an initial v3 requirement.
 
 
@@ -469,6 +515,7 @@ prosody_latent = model.predict_prosody(
 # Decoding Phase
 out = model.forward_tts_pointer(
     phoneme_ids=...,
+    text_suprasegmentals=...,   # [B, L, d_supra], optional only for unsupported-language fallback
     language_ids=...,
     pointer_state=...,
     acoustic_history=...,        # past a_ctx (Stream A) AND b_ctx (Stream B)
@@ -491,6 +538,7 @@ Notes:
 - `acoustic_history` is not optional in the causal decoding contract, even if a wrapper builds it from cache state. The implementation must actually consume this input, not accept and ignore it.
 - `prompt_kv_cache` must be consumed by the model when provided (e.g., prepended to the transformer's key/value sequences). The implementation must not accept and silently ignore it.
 - `dialogue_context` is text-side context embedding in the initial v3 contract; raw audio context must not be implied silently. The canonical shape is `[B, C_ctx, d_model]` but `[B, d_model]` (pooled) is also accepted.
+- `text_suprasegmentals` is the canonical companion feature tensor for accent / tone / phrase-boundary cues. `phoneme_ids` without this tensor is not considered fully train-ready for languages/backends that declare suprasegmental support.
 - `predict_prosody` and `encode_speaker_prompt` must be efficient. `prompt_kv_cache` enables retaining the zero-shot voice across long conversational turns without re-encoding the reference audio.
 - `state_cond` is an internal/export-facing fused representation, not the canonical model-level public input contract.
 - `n_codebooks` scheduling policy is frozen as flattened per-frame prediction (see Codec / Token Hierarchy section).
@@ -519,11 +567,13 @@ Expected output keys:
 - do not treat missing `voice_state` supervision as zero-valued physical neutrality
 - do not claim drama-grade acting from pointer alone; prosody predictor and context paths must be explicit
 - **do not let the speaker prompt dictate prosody; ensure architectural bottlenecking or disentanglement separates timbre from timing/pitch curves.**
+- do not claim Japanese/tonal naturalness while discarding `text_suprasegmentals` after G2P
 - do not reintroduce target-length estimation as a runtime dependency
 - do not define `dialogue_context` as an ambiguous placeholder; modality and shape must be explicit
 - do not leave teacher-forced and autoregressive pointer loops semantically mismatched
 - do not force initial v3 VC onto pointer progression unless a concrete validated use case justifies it
-- do not make Tier 1 release contingent on a Tier 2 backbone swap unless a rollback path is documented
+- do not introduce backbone changes that break parity gates without a documented rollback path
+- do not use force-advance to justify undocumented hidden-state edits that Python/Rust/ONNX/VST cannot serialize identically
 
 
 ## Handoff Contract

@@ -106,6 +106,31 @@ class TestCurriculumScheduler:
         config = cs.get_config(0)
         assert config["pointer_loss_weight"] == 0.0
 
+    def test_stage3_replay_default(self):
+        cs = CurriculumScheduler(stage2_start=100, stage3_start=200)
+        assert cs.stage3_replay_mix_ratio == 0.2
+
+    def test_stage3_replay_no_replay_in_stage1(self):
+        cs = CurriculumScheduler(stage2_start=100, stage3_start=200, stage3_replay_mix_ratio=1.0)
+        assert not cs.should_replay(50)
+
+    def test_stage3_replay_no_replay_in_stage2(self):
+        cs = CurriculumScheduler(stage2_start=100, stage3_start=200, stage3_replay_mix_ratio=1.0)
+        assert not cs.should_replay(150)
+
+    def test_stage3_replay_always_replays_at_ratio_1(self):
+        cs = CurriculumScheduler(stage2_start=100, stage3_start=200, stage3_replay_mix_ratio=1.0)
+        assert cs.should_replay(300)
+
+    def test_stage3_replay_never_replays_at_ratio_0(self):
+        cs = CurriculumScheduler(stage2_start=100, stage3_start=200, stage3_replay_mix_ratio=0.0)
+        # Run 100 times — should never replay
+        assert not any(cs.should_replay(300) for _ in range(100))
+
+    def test_stage3_replay_invalid_ratio_raises(self):
+        with pytest.raises(ValueError, match="stage3_replay_mix_ratio"):
+            CurriculumScheduler(stage3_replay_mix_ratio=1.5)
+
 
 # ---------------------------------------------------------------------------
 # CFG Dropout uses Worker 01 contract

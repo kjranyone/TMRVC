@@ -14,6 +14,9 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Literal
 
+from tmrvc_core.types import SpeakerProfile, PointerState
+from tmrvc_data.speaker_profile import CastingGalleryStore
+
 Role = Literal["annotator", "auditor", "director", "rater", "admin"]
 
 ROLES: list[Role] = ["annotator", "auditor", "director", "rater", "admin"]
@@ -93,56 +96,23 @@ class AuditTrail:
         return entries
 
 
-from tmrvc_core.types import SpeakerProfile, PointerState
-
-# ... ROLES and check_permission remain unchanged ...
-
 # ---------------------------------------------------------------------------
 # Casting Gallery (Speaker Profiles)
 # ---------------------------------------------------------------------------
 
 class CastingGallery:
-    """Persistent speaker profile store."""
+    """Wrapper for persistent speaker profile store."""
 
-    def __init__(self, path: Path | str = "data/casting_gallery.json"):
-        self.path = Path(path)
-        self.profiles: dict[str, SpeakerProfile] = {}
-        self._load()
+    def __init__(self, path: Path | str = "models/characters"):
+        self.store = CastingGalleryStore(root_dir=path)
 
-    def _load(self) -> None:
-        if self.path.exists():
-            text = self.path.read_text(encoding="utf-8").strip()
-            if not text:
-                return
-            data = json.loads(text)
-            for pid, d in data.items():
-                # Reconstruct torch tensors from lists
-                if "speaker_embed" in d and d["speaker_embed"] is not None:
-                    d["speaker_embed"] = torch.tensor(d["speaker_embed"])
-                if "prompt_codec_tokens" in d and d["prompt_codec_tokens"] is not None:
-                    d["prompt_codec_tokens"] = torch.tensor(d["prompt_codec_tokens"])
-                if "prompt_text_tokens" in d and d["prompt_text_tokens"] is not None:
-                    d["prompt_text_tokens"] = torch.tensor(d["prompt_text_tokens"])
-                
-                self.profiles[pid] = SpeakerProfile(**d)
+    @property
+    def profiles(self) -> dict[str, SpeakerProfile]:
+        return self.store._profiles
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Convert tensors to lists for JSON serialization
-        data = {}
-        for pid, p in self.profiles.items():
-            d = asdict(p)
-            if isinstance(d["speaker_embed"], torch.Tensor):
-                d["speaker_embed"] = d["speaker_embed"].tolist()
-            if isinstance(d["prompt_codec_tokens"], torch.Tensor):
-                d["prompt_codec_tokens"] = d["prompt_codec_tokens"].tolist()
-            if isinstance(d["prompt_text_tokens"], torch.Tensor):
-                d["prompt_text_tokens"] = d["prompt_text_tokens"].tolist()
-            data[pid] = d
-            
-        self.path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        # Store saves individual files now
+        pass
 
     def add(self, name: str, speaker_embed: torch.Tensor, prompt_codec_tokens: torch.Tensor | None = None) -> SpeakerProfile:
         profile = SpeakerProfile(
@@ -153,16 +123,14 @@ class CastingGallery:
             reference_audio_hash="sha256_placeholder",
             created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
-        self.profiles[profile.speaker_profile_id] = profile
-        self.save()
+        self.store.save_profile(profile)
         return profile
 
-    def remove(self, profile_id: str) -> None:
-        self.profiles.pop(profile_id, None)
-        self.save()
-
     def list_names(self) -> list[str]:
-        return [f"{p.name} ({pid})" for pid, p in self.profiles.items()]
+        return [f"{p.display_name} ({p.speaker_profile_id})" for p in self.store.list_profiles()]
+
+    def remove(self, profile_id: str) -> None:
+        self.store.delete_profile(profile_id)
 
 
 # ---------------------------------------------------------------------------

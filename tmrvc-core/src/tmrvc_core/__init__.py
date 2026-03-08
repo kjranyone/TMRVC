@@ -15,6 +15,7 @@ from tmrvc_core.device import get_device, pin_memory_for_device
 from tmrvc_core.types import (
     CFG_PRESERVED_FIELDS,
     CFG_ZEROED_FIELDS,
+    CFGMode,
     PointerState,
     SpeakerProfile,
     VoiceStateSupervision,
@@ -23,6 +24,7 @@ from tmrvc_core.types import (
 __all__ = [
     "CFG_PRESERVED_FIELDS",
     "CFG_ZEROED_FIELDS",
+    "CFGMode",
     "D_MODEL",
     "D_SPEAKER",
     "HOP_LENGTH",

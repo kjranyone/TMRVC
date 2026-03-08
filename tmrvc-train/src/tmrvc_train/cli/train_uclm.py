@@ -186,6 +186,7 @@ def train_uclm(
     curriculum_stage2_start: int = 5000,
     curriculum_stage3_start: int = 15000,
     prompt_sampling_prob: float = 0.0,
+    stage3_replay_mix_ratio: float = 0.2,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     include_datasets = None
@@ -285,6 +286,7 @@ def train_uclm(
     curriculum = CurriculumScheduler(
         stage2_start=curriculum_stage2_start,
         stage3_start=curriculum_stage3_start,
+        stage3_replay_mix_ratio=stage3_replay_mix_ratio,
     )
     trainer = UCLMTrainer(
         model, optimizer, device=device, tts_mode=tts_mode,
@@ -418,6 +420,12 @@ def main(argv: list[str] | None = None):
         type=float,
         default=0.0,
         help="Probability of zeroing speaker_embed during TTS for prompt diversity (default: 0.0).",
+    )
+    p.add_argument(
+        "--stage3-replay-mix-ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of Stage 3 batches replaced with Stage 1/2 stability data for anti-forgetting (default: 0.2).",
     )
     args = p.parse_args(argv)
     

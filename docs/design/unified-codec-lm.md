@@ -147,11 +147,11 @@ mainline 正本として固定するもの:
 - `SpeakerProfile` による few-shot prompt contract
 - `sample_rate = 24000`, `hop_length = 240`, `T = ceil(num_samples / 240)` の frame 規約
 
-research-track として切り離すもの:
+v3 リリースに含まれるが、段階的に統合するもの:
 
-- backbone modernization bundles
-- advanced CFG acceleration
-- second-stage acoustic refinement
+- modern transformer backbone（RoPE, GQA, SwiGLU, RMSNorm, FlashAttention2）— 実装済み
+- CFG 全モード（off, full, lazy, distilled）
+- second-stage acoustic refinement（v3.1 upgrade path）
 
 ## v3 Pointer Contract
 

@@ -516,7 +516,8 @@ class UCLMEngine:
             content_features = all_phoneme_features[:, ptr.text_index : ptr.text_index + 1, :]
 
             out = self.uclm_core_model.forward_streaming(
-                content_features=content_features,
+                queries=content_features,
+                memory=all_phoneme_features,
                 a_ctx=ctx_a,
                 b_ctx=ctx_b,
                 speaker_embed=speaker_embed,
@@ -540,7 +541,8 @@ class UCLMEngine:
                     # re-run forward_streaming with cfg_scale injected so
                     # the model can see it.
                     out_dist = self.uclm_core_model.forward_streaming(
-                        content_features=content_features,
+                        queries=content_features,
+                        memory=all_phoneme_features,
                         a_ctx=ctx_a,
                         b_ctx=ctx_b,
                         speaker_embed=speaker_embed,
@@ -582,7 +584,8 @@ class UCLMEngine:
                             acting_intent=_act_int,
                         )
                         out_uncond = self.uclm_core_model.forward_streaming(
-                            content_features=content_features,
+                            queries=content_features,
+                            memory=all_phoneme_features,
                             a_ctx=ctx_a,
                             b_ctx=ctx_b,
                             speaker_embed=masked["speaker_embed"],

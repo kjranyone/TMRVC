@@ -36,7 +36,7 @@ from tmrvc_core.constants import (
     UCLM_VQ_BINS,
     UCLM_TEXT_VOCAB_SIZE,
 )
-from tmrvc_train.models.uclm_model import DisentangledUCLM
+from tmrvc_train.models.uclm_model import DisentangledUCLM, PointerHead, ProsodyPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +162,164 @@ class UCLMCoreExportWrapper(nn.Module):
         logits_b = logits_b_full[:, :, -1, :]
 
         return logits_a, logits_b, kv_cache_out
+
+
+class PointerHeadExportWrapper(nn.Module):
+    """Wraps PointerHead for ONNX export.
+
+    Inputs:
+        hidden_states: [B, T, d_model] - transformer hidden states
+
+    Outputs:
+        advance_logit: [B, T, 1] - advance vs hold logit
+        progress_delta: [B, T, 1] - pointer progress (sigmoid, 0-1)
+        boundary_confidence: [B, T, 1] - boundary confidence (sigmoid, 0-1)
+    """
+
+    def __init__(self, pointer_head: PointerHead):
+        super().__init__()
+        self.pointer_head = pointer_head
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.pointer_head(hidden_states)
+
+
+class ProsodyPredictorExportWrapper(nn.Module):
+    """Wraps ProsodyPredictor for ONNX export (inference mode only).
+
+    The ODE integration loop is unrolled at export time with a fixed number
+    of Euler steps so that the entire computation graph is captured by the
+    ONNX tracer without dynamic control flow.
+
+    Inputs:
+        text_features: [B, L, d_model] - text encoder output
+        dialogue_context: [B, d_model] - optional dialogue context (zeros if unused)
+        speaker_embed: [B, d_model] - optional speaker embedding (zeros if unused)
+
+    Outputs:
+        prosody_latent: [B, d_prosody] - predicted prosody latent
+    """
+
+    def __init__(self, predictor: ProsodyPredictor, num_steps: int = 4):
+        super().__init__()
+        self.num_steps = num_steps
+        self.d_prosody = predictor.d_prosody
+        # Copy sub-modules so the wrapper owns them for tracing
+        self.time_embed = predictor.time_embed
+        self.velocity_net = predictor.velocity_net
+        self.context_proj = predictor.context_proj
+
+    def forward(
+        self,
+        text_features: torch.Tensor,
+        dialogue_context: torch.Tensor,
+        speaker_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        # Build conditioning (mirrors ProsodyPredictor._build_condition)
+        h = text_features.mean(dim=1)  # [B, d_model]
+        # dialogue_context: [B, D] -- add if non-zero
+        if dialogue_context.shape[-1] < h.shape[-1]:
+            dc = torch.nn.functional.pad(
+                dialogue_context, (0, h.shape[-1] - dialogue_context.shape[-1])
+            )
+        else:
+            dc = dialogue_context[:, : h.shape[-1]]
+        h = h + self.context_proj(dc)
+        # speaker_embed
+        if speaker_embed.shape[-1] != h.shape[-1]:
+            se = torch.nn.functional.pad(
+                speaker_embed, (0, h.shape[-1] - speaker_embed.shape[-1])
+            )
+        else:
+            se = speaker_embed
+        h = h + se
+
+        B = h.shape[0]
+        # Euler ODE integration (unrolled for ONNX tracing)
+        x = torch.zeros(B, self.d_prosody, device=h.device)
+        dt = 1.0 / self.num_steps
+        for i in range(self.num_steps):
+            t_val = i * dt
+            t = torch.full((B, 1), t_val, device=h.device)
+            t_emb = self.time_embed(t)
+            h_cond = h + t_emb
+            inp = torch.cat([x, h_cond], dim=-1)
+            v = self.velocity_net(inp)
+            x = x + dt * v
+        return x
+
+
+def export_pointer_head(
+    model: DisentangledUCLM,
+    output_dir: Path,
+    device: str,
+    opset_version: int,
+) -> Path:
+    """Export PointerHead to ONNX."""
+    wrapper = PointerHeadExportWrapper(model.pointer_head).eval()
+    onnx_path = output_dir / "pointer_head.onnx"
+
+    d_model = model.d_model
+    dummy_hidden = torch.zeros(1, 10, d_model, device=device)
+
+    torch.onnx.export(
+        wrapper,
+        (dummy_hidden,),
+        onnx_path,
+        input_names=["hidden_states"],
+        output_names=["advance_logit", "progress_delta", "boundary_confidence"],
+        dynamic_axes={
+            "hidden_states": {0: "batch", 1: "seq_len"},
+            "advance_logit": {0: "batch", 1: "seq_len"},
+            "progress_delta": {0: "batch", 1: "seq_len"},
+            "boundary_confidence": {0: "batch", 1: "seq_len"},
+        },
+        opset_version=opset_version,
+        do_constant_folding=True,
+    )
+
+    logger.info("Exported pointer_head to %s", onnx_path)
+    return onnx_path
+
+
+def export_prosody_predictor(
+    model: DisentangledUCLM,
+    output_dir: Path,
+    device: str,
+    opset_version: int,
+    num_ode_steps: int = 4,
+) -> Path:
+    """Export ProsodyPredictor to ONNX (inference mode, unrolled ODE)."""
+    wrapper = ProsodyPredictorExportWrapper(
+        model.prosody_predictor, num_steps=num_ode_steps
+    ).eval()
+    onnx_path = output_dir / "prosody_predictor.onnx"
+
+    d_model = model.d_model
+    d_prosody = model.prosody_predictor.d_prosody
+
+    dummy_text_features = torch.zeros(1, 20, d_model, device=device)
+    dummy_dialogue_ctx = torch.zeros(1, d_model, device=device)
+    dummy_speaker_embed = torch.zeros(1, d_model, device=device)
+
+    torch.onnx.export(
+        wrapper,
+        (dummy_text_features, dummy_dialogue_ctx, dummy_speaker_embed),
+        onnx_path,
+        input_names=["text_features", "dialogue_context", "speaker_embed"],
+        output_names=["prosody_latent"],
+        dynamic_axes={
+            "text_features": {0: "batch", 1: "seq_len"},
+            "dialogue_context": {0: "batch"},
+            "speaker_embed": {0: "batch"},
+            "prosody_latent": {0: "batch"},
+        },
+        opset_version=opset_version,
+        do_constant_folding=True,
+    )
+
+    logger.info("Exported prosody_predictor to %s (ode_steps=%d)", onnx_path, num_ode_steps)
+    return onnx_path
 
 
 def export_vc_encoder(
@@ -464,6 +622,14 @@ def export_uclm(
 
     onnx_paths["uclm_core"], kv_cache_size = export_uclm_core(
         model, output_dir, context_frames, device, opset_version
+    )
+
+    onnx_paths["pointer_head"] = export_pointer_head(
+        model, output_dir, device, opset_version
+    )
+
+    onnx_paths["prosody_predictor"] = export_prosody_predictor(
+        model, output_dir, device, opset_version
     )
 
     if verify:

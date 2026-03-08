@@ -34,6 +34,7 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
 
 1. Refactor dataset loading:
    - `phoneme_ids.npy` remains the canonical initial v3 trainable text-unit artifact whenever text supervision exists
+   - `text_suprasegmentals.npy` is the canonical companion artifact for accent / tone / phrase-boundary cues when the text frontend provides them
    - transcript-only or alternate text-token records are not train-ready until they are normalized into the canonical text-unit contract
    - `durations.npy` never required in v3 mode
 2. Add dataset-level supervision report utilities:
@@ -63,8 +64,10 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - **Pitch Accent / Tone coverage (Critical for Japanese/Chinese naturalness)**
 
 8. **Japanese G2P Policy Requirement:** The `tmrvc_data/g2p.py` backend must parse and retain **Pitch Accent information** (e.g., Upstep, Downstep) from the OpenJTalk fullcontext labels. Stripping accent data to raw phonemes (`a, i, u`) is explicitly forbidden for the v3 mainline, as it destroys the ability to learn natural Japanese prosody.
+   - these cues must be exported into the canonical `text_suprasegmentals.npy` artifact aligned 1:1 with canonical text units rather than remaining trapped inside backend-specific fullcontext strings
 9. Define curated-asset consumption contract for the data loader:
    - consume `text`, `language`, and `phoneme_ids` from exported cache
+   - consume `text_suprasegmentals` when the exported text frontend declares suprasegmental support
    - consume `speaker_cluster` and `speaker_embedding` from metadata
    - consume optional `voice_state_targets`, `voice_state_observed_mask`, and `voice_state_confidence` from curated export
    - consume raw conversation graph / context text as the canonical dialogue-context source
@@ -168,7 +171,7 @@ Non-goal for initial v3:
 
 ## Canonical Text-Unit Policy
 
-Chosen policy: `phoneme_ids` remain the initial v3 mainline text-unit interface.
+Chosen policy: `phoneme_ids` remain the initial v3 mainline text-unit ids, paired with optional-but-canonical companion suprasegmental features.
 
 Rationale:
 
@@ -179,11 +182,35 @@ Rationale:
 Rules:
 
 - if transcript text exists, the dataset must either:
-  - convert it into canonical `phoneme_ids`, or
+  - convert it into canonical `phoneme_ids` plus `text_suprasegmentals` when the language/backend supports them, or
   - mark the record as not yet train-ready for mainline pointer TTS
 - alternate text-token backends may exist only as explicit ablation or future-extension paths
 - dataset reports must distinguish `text_supervision_coverage` from `canonical_text_unit_coverage`
+- dataset reports must separately expose `suprasegmental_coverage` for languages/backends that declare support
 - retain normalized text so later fallback or dual-input experiments remain possible without rebuilding the whole dataset
+
+### Canonical Suprasegmental Artifact Policy
+
+- required artifact name:
+  - `text_suprasegmentals.npy`
+- canonical shape:
+  - `[L, d_supra]`
+- canonical alignment:
+  - row `i` must align exactly to `phoneme_ids[i]`
+- canonical metadata:
+  - feature schema version
+  - language/backend identity
+  - whether features are direct, projected, or absent
+- example dimensions:
+  - Japanese:
+    - `accent_upstep`
+    - `accent_downstep`
+    - `accent_phrase_break`
+  - tonal languages:
+    - normalized lexical tone id or equivalent tone feature
+- forbidden behavior:
+  - storing accent/tone only inside backend-specific strings while exporting bare `phoneme_ids`
+  - losing unit alignment during cache export/import
 
 
 ## G2P Fallback Policy
@@ -191,7 +218,7 @@ Rules:
 Worker 03 must define a safety path for multilingual and code-switch instability.
 
 - preferred path:
-  - normalized text -> canonical phoneme ids
+  - normalized text -> canonical `phoneme_ids` + `text_suprasegmentals` when available
 - fallback path when G2P is weak or ambiguous:
   - normalized text + explicit fallback marker
   - optional byte/grapheme-level side input artifact for later-stage experiments

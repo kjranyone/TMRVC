@@ -23,11 +23,16 @@ from tmrvc_serve.uclm_engine import UCLMEngine
 
 logger = logging.getLogger(__name__)
 
+from tmrvc_serve.middleware import IdempotencyMiddleware
+
 app = FastAPI(
     title="TMRVC TTS/VC Server",
     description="Real-time Unified TTS/VC using UCLM v3 pointer-based architecture.",
     version="0.2.0",
 )
+
+# Idempotency middleware for UI-originated write endpoints (Worker 04, task 21)
+app.add_middleware(IdempotencyMiddleware, ttl=300, max_cache_size=4096)
 
 _engine: UCLMEngine | None = None
 _characters: dict[str, CharacterProfile] = {}

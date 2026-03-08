@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from tmrvc_core.constants import (
     D_MODEL,
+    D_SUPRASEGMENTAL,
     N_LANGUAGES,
     PHONEME_VOCAB_SIZE,
     UCLM_N_HEADS,
@@ -38,6 +39,7 @@ class TextEncoder(nn.Module):
         n_heads: int = 8,
         ff_dim: int = 1024,
         n_languages: int = N_LANGUAGES,
+        d_supra: int = D_SUPRASEGMENTAL,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -47,6 +49,9 @@ class TextEncoder(nn.Module):
         self.pos_enc = SinusoidalPositionalEncoding(d_model)
         self.embed_dropout = nn.Dropout(dropout)
 
+        # Suprasegmental projection: [B, L, d_supra] -> [B, L, d_model]
+        self.suprasegmental_proj = nn.Linear(d_supra, d_model)
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=ff_dim,
             dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
@@ -54,18 +59,23 @@ class TextEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.output_norm = nn.LayerNorm(d_model)
 
-    def forward(self, phoneme_ids, language_ids, phoneme_lengths=None):
+    def forward(self, phoneme_ids, language_ids, phoneme_lengths=None, text_suprasegmentals=None):
         B, L = phoneme_ids.shape
         lang = self.lang_embed(language_ids)
         if lang.dim() == 2:
             # language_ids was (B,) scalar per sample — broadcast over sequence
             lang = lang.unsqueeze(1)
         x = self.phoneme_embed(phoneme_ids) + lang
+
+        # Add suprasegmental features if provided
+        if text_suprasegmentals is not None:
+            x = x + self.suprasegmental_proj(text_suprasegmentals)
+
         x = self.embed_dropout(self.pos_enc(x))
-        
+
         mask = None
         if phoneme_lengths is not None:
             mask = (torch.arange(L, device=x.device).unsqueeze(0) >= phoneme_lengths.unsqueeze(1))
-            
+
         x = self.encoder(x, src_key_padding_mask=mask)
         return self.output_norm(x).transpose(1, 2)

@@ -13,16 +13,29 @@ from .models import CurationRecord, RecordStatus
 
 logger = logging.getLogger(__name__)
 
+# Stage name -> provenance key mapping.  Used by run_named_stage() to look up
+# the correct processor function from the built-in stage registry.
+_STAGE_ORDER: List[str] = [
+    "ingest",           # 0
+    "cleanup",          # 1
+    "separation",       # 2
+    "speaker_recovery", # 3
+    "transcript_recovery",   # 4
+    "transcript_refinement", # 5
+    "prosody_recovery",      # 6
+]
+
 
 class CurationOrchestrator:
     """Manages the curation pipeline stages and manifest persistence."""
 
-    def __init__(self, output_dir: Path | str):
+    def __init__(self, output_dir: Path | str, registry: "ProviderRegistry | None" = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.output_dir / "manifest.jsonl"
         self.summary_path = self.output_dir / "summary.json"
-        
+        self.registry = registry
+
         self.records: Dict[str, CurationRecord] = {}
         self.load_manifest()
 
@@ -144,3 +157,88 @@ class CurationOrchestrator:
 
         self.save_manifest()
         logger.info("Finished stage: %s (Processed: %d, Updated: %d)", stage_name, count, updated)
+
+    # ------------------------------------------------------------------
+    # Named-stage convenience API
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def available_stages() -> List[str]:
+        """Return the ordered list of built-in stage names."""
+        return list(_STAGE_ORDER)
+
+    def _get_builtin_processor(
+        self, stage_name: str,
+    ) -> Callable[[CurationRecord], Optional[CurationRecord]]:
+        """Resolve a stage name to its built-in processor function.
+
+        The import is deferred so that orchestrator.py itself has no hard
+        dependency on the stage modules (avoids circular imports).
+        """
+        if stage_name == "cleanup":
+            from .stages.cleanup import run_cleanup
+            return run_cleanup
+
+        if stage_name == "separation":
+            from .stages.separation import run_separation
+            reg = self.registry
+            return lambda record: run_separation(record, registry=reg)
+
+        if stage_name == "speaker_recovery":
+            from .stages.speaker_recovery import run_speaker_recovery
+            reg = self.registry
+            return lambda record: run_speaker_recovery(record, registry=reg)
+
+        if stage_name == "transcript_recovery":
+            from .stages.transcript_recovery import run_transcript_recovery
+            reg = self.registry
+            return lambda record: run_transcript_recovery(record, registry=reg)
+
+        if stage_name == "transcript_refinement":
+            from .stages.transcript_refinement import run_transcript_refinement
+            reg = self.registry
+            return lambda record: run_transcript_refinement(record, registry=reg)
+
+        if stage_name == "prosody_recovery":
+            from .stages.prosody_recovery import run_prosody_recovery
+            reg = self.registry
+            return lambda record: run_prosody_recovery(record, registry=reg)
+
+        raise ValueError(
+            f"Unknown stage '{stage_name}'. "
+            f"Available: {', '.join(_STAGE_ORDER)}"
+        )
+
+    def run_named_stage(self, stage_name: str, *, force: bool = False) -> None:
+        """Run a built-in curation stage by name.
+
+        Example::
+
+            orchestrator.run_named_stage("cleanup")
+            orchestrator.run_named_stage("separation", force=True)
+
+        Args:
+            stage_name: One of the names in ``available_stages()``.
+            force: Re-process records even if they already have provenance
+                   for the given stage.
+        """
+        processor = self._get_builtin_processor(stage_name)
+        self.run_stage(stage_name, processor, force=force)
+
+    def run_pipeline(
+        self,
+        stages: Optional[List[str]] = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Run multiple stages in sequence.
+
+        Args:
+            stages: List of stage names.  Defaults to all stages except
+                    ``ingest`` (which has its own entry point).
+            force: Re-process records even if already handled.
+        """
+        if stages is None:
+            stages = [s for s in _STAGE_ORDER if s != "ingest"]
+        for stage_name in stages:
+            self.run_named_stage(stage_name, force=force)

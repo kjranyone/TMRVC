@@ -72,28 +72,10 @@ class TestPointerTargetSource:
         trainer = _make_trainer(pointer_target_source="ctc")
         assert trainer.pointer_target_source == "ctc"
 
-    def test_invalid_source_raises_during_train_step(self):
-        """An invalid pointer_target_source should raise RuntimeError during training."""
-        trainer = _make_trainer(pointer_target_source="nonexistent_source")
-
-        B, L, T = 2, 10, 30
-        batch = {
-            "source_a_t": torch.randint(0, 128, (B, 8, T)),
-            "target_a": torch.randint(0, 128, (B, 8, T)),
-            "target_b": torch.randint(0, 32, (B, 4, T)),
-            "explicit_state": torch.randn(B, T, 8),
-            "ssl_state": torch.randn(B, T, 32),
-            "speaker_embed": torch.randn(B, 32),
-            "speaker_id": torch.zeros(B, dtype=torch.long),
-            "phoneme_ids": torch.randint(1, 64, (B, L)),
-            "phoneme_lens": torch.full((B,), L, dtype=torch.long),
-            "language_id": torch.zeros((B,), dtype=torch.long),
-        }
-
-        # Force TTS mode by setting tts_prob=1.0
-        trainer.tts_prob = 1.0
-        with pytest.raises(RuntimeError, match="Unknown pointer_target_source"):
-            trainer.train_step(batch)
+    def test_invalid_source_raises_at_init(self):
+        """An invalid pointer_target_source should raise ValueError at init."""
+        with pytest.raises(ValueError, match="pointer_target_source"):
+            _make_trainer(pointer_target_source="nonexistent_source")
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ pub struct OrtBundle {
     duration_predictor: Option<Session>,
     f0_predictor: Option<Session>,
     pointer_head: Option<Session>,
+    prosody_predictor: Option<Session>,
 }
 
 impl OrtBundle {
@@ -77,6 +78,7 @@ impl OrtBundle {
         let duration_predictor = load_optional(model_dir, "duration_predictor.onnx");
         let f0_predictor = load_optional(model_dir, "f0_predictor.onnx");
         let pointer_head = load_optional(model_dir, "pointer_head.onnx");
+        let prosody_predictor = load_optional(model_dir, "prosody_predictor.onnx");
 
         Ok(Self {
             codec_encoder,
@@ -88,6 +90,7 @@ impl OrtBundle {
             duration_predictor,
             f0_predictor,
             pointer_head,
+            prosody_predictor,
         })
     }
 
@@ -416,7 +419,42 @@ impl OrtBundle {
             && self.pointer_head.is_some()
     }
 
-    /// Run pointer head: hidden_states → advance_logit + progress_delta
+    /// Run prosody predictor: text_features + context -> prosody_latent
+    ///
+    /// Inputs:
+    /// - text_features: `[1, seq_len, d_model]` text encoder output
+    /// - dialogue_context: `[1, d_model]` dialogue context (zeros if unused)
+    /// - speaker_embed: `[1, d_model]` speaker embedding (zeros if unused)
+    ///
+    /// Output (RT-safe, written to pre-allocated buffer):
+    /// - prosody_latent_out: `[1, d_prosody]` predicted prosody latent
+    pub fn run_prosody_predictor(
+        &mut self,
+        text_features: &[f32],
+        seq_len: usize,
+        dialogue_context: &[f32],
+        speaker_embed: &[f32],
+        prosody_latent_out: &mut [f32],
+    ) -> Result<()> {
+        let session = self
+            .prosody_predictor
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("prosody_predictor not loaded"))?;
+
+        let outputs = session.run(ort::inputs![
+            "text_features" => TensorRef::from_array_view(([1usize, seq_len, D_MODEL], text_features))?,
+            "dialogue_context" => TensorRef::from_array_view(([1usize, D_MODEL], dialogue_context))?,
+            "speaker_embed" => TensorRef::from_array_view(([1usize, D_MODEL], speaker_embed))?,
+        ])?;
+
+        let prosody = outputs["prosody_latent"].try_extract_tensor::<f32>()?;
+        let p_len = prosody.1.len().min(prosody_latent_out.len());
+        prosody_latent_out[..p_len].copy_from_slice(&prosody.1[..p_len]);
+
+        Ok(())
+    }
+
+    /// Run pointer head: hidden_states → advance_logit + progress_delta + boundary_confidence
     ///
     /// Inputs:
     /// - hidden_states: `[1, seq_len, d_model]` flattened hidden states from UCLM core
@@ -425,12 +463,14 @@ impl OrtBundle {
     /// Outputs (RT-safe, written to pre-allocated buffers):
     /// - advance_logit_out: `[1, seq_len, 1]` advance vs hold logit
     /// - progress_delta_out: `[1, seq_len, 1]` pointer progress update (sigmoid, 0-1)
+    /// - boundary_confidence_out: `[1, seq_len, 1]` boundary trust score (sigmoid, 0-1)
     pub fn run_pointer_head(
         &mut self,
         hidden_states: &[f32],
         seq_len: usize,
         advance_logit_out: &mut [f32],
         progress_delta_out: &mut [f32],
+        boundary_confidence_out: &mut [f32],
     ) -> Result<()> {
         let session = self
             .pointer_head
@@ -448,6 +488,10 @@ impl OrtBundle {
         let progress_delta = outputs["progress_delta"].try_extract_tensor::<f32>()?;
         let pd_len = progress_delta.1.len().min(progress_delta_out.len());
         progress_delta_out[..pd_len].copy_from_slice(&progress_delta.1[..pd_len]);
+
+        let boundary_confidence = outputs["boundary_confidence"].try_extract_tensor::<f32>()?;
+        let bc_len = boundary_confidence.1.len().min(boundary_confidence_out.len());
+        boundary_confidence_out[..bc_len].copy_from_slice(&boundary_confidence.1[..bc_len]);
 
         Ok(())
     }

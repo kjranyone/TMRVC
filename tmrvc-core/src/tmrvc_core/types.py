@@ -3,10 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional, List
 
 import torch
+
+from tmrvc_core.constants import (
+    MAX_PROMPT_CACHE_BYTES,
+    MAX_PROMPT_FRAMES,
+    MAX_PROMPT_KV_TOKENS,
+    MAX_PROMPT_SECONDS_ACTIVE,
+)
+
+# Suprasegmental feature dimensionality: [accent_type, tone_level, phrase_boundary, stress_level]
+D_SUPRASEGMENTAL = 4
+
+
+class CFGMode(str, Enum):
+    """Classifier-Free Guidance operating modes.
+
+    OFF: No guidance -- single conditional pass only.
+    FULL: Two-pass guidance (unconditional + conditional), blended via cfg_scale.
+    LAZY: Cached guidance -- unconditional logits are refreshed every N frames
+        and reused in between, reducing compute by ~(N-1)/N vs full mode.
+    DISTILLED: Single-pass guidance -- the model has been trained to approximate
+        the blended output internally given cfg_scale as an input signal.
+        Falls back to FULL if distilled weights are not available.
+    """
+    OFF = "off"
+    FULL = "full"
+    LAZY = "lazy"
+    DISTILLED = "distilled"
 
 
 @dataclass
@@ -209,6 +237,7 @@ class UCLMFeatureSet(FeatureSet):
     durations: Optional[torch.Tensor] = None
     language_id: int = 0
     text: str = ""
+    text_suprasegmentals: Optional[torch.Tensor] = None  # [L, D_SUPRASEGMENTAL]
 
 
 @dataclass
@@ -235,6 +264,8 @@ class UCLM_Batch:
     context_groups: Optional[torch.Tensor] = None
     prompt_codec_tokens: Optional[torch.Tensor] = None
     bootstrap_alignment: Optional[dict] = None
+    # Suprasegmental features (v3 accent/tone/boundary/stress)
+    text_suprasegmentals: Optional[torch.Tensor] = None  # [B, L, D_SUPRASEGMENTAL]
     # Voice state supervision (Worker 01 § Physical-First Control)
     voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
     voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool

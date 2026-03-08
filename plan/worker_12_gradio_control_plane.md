@@ -29,8 +29,8 @@ The WebUI is the "cockpit" where humans make the final calls on acting quality a
 - **No-CLI Human Operation:** A human can upload dataset material, curate, export, audition, and rate entirely from the browser.
 - **Multi-device Support:** Gradio app must handle multiple concurrent sessions with independent states.
 - **Audit Logs:** All state-changing actions (Casting Gallery saves, Curation promotions) must be logged with actor ID and rationale.
-- **Conflict Handling:** Use object-version tags to prevent race conditions during collaborative curation or casting.
-- **Training Cockpit (Deferred):** Only after runtime/admin and export contracts are stable.
+- **Conflict Handling:** Use canonical `metadata_version` tags to prevent race conditions during collaborative curation or casting.
+- **Training Cockpit (Post-v3.0):** Only after runtime/admin and export contracts are stable; it is not part of the initial v3.0 proof obligations.
 
 ## Human Roles
 
@@ -124,7 +124,7 @@ Each step must record:
 - actor role
 - actor identity
 - timestamp
-- **`object_version`** (for concurrency check)
+- **`metadata_version`** (for concurrency check)
 - before/after state
 - reason or note
 

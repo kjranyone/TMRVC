@@ -243,6 +243,60 @@ class G2PResult:
     phoneme_ids: torch.Tensor  # [L] int64
     phonemes: list[str]  # Human-readable phoneme list
     language_id: int
+    text_suprasegmentals: torch.Tensor | None = None  # [L, 4] float32
+
+
+# Accent marker set used for suprasegmental extraction
+_ACCENT_MARKERS = {"^", "=", "_"}
+
+# Accent marker -> accent_type value mapping
+_ACCENT_TYPE_MAP = {
+    "^": 1.0,   # Upstep / accent nucleus
+    "=": 0.5,   # Hold
+    "_": 0.0,   # Downstep / low
+}
+
+# Default accent_type when no marker precedes a phoneme
+_ACCENT_DEFAULT = 0.5
+
+
+def _extract_suprasegmentals(
+    phonemes: list[str],
+) -> tuple[list[str], torch.Tensor]:
+    """Strip accent markers from phoneme list and build suprasegmental tensor.
+
+    The suprasegmental tensor has 4 dimensions per phoneme:
+        [accent_type, tone_level, phrase_boundary, stress_level]
+
+    For Japanese, accent markers (^, =, _) set accent_type on the following
+    phoneme.  tone_level, phrase_boundary, and stress_level are reserved
+    (zeroed) for future use.
+
+    Args:
+        phonemes: raw phoneme list potentially containing accent markers.
+
+    Returns:
+        (clean_phonemes, suprasegmentals) where clean_phonemes has accent
+        markers removed and suprasegmentals is [L_clean, 4].
+    """
+    clean: list[str] = []
+    accents: list[float] = []
+    pending_accent: float | None = None
+
+    for p in phonemes:
+        if p in _ACCENT_MARKERS:
+            pending_accent = _ACCENT_TYPE_MAP[p]
+        else:
+            accent_val = pending_accent if pending_accent is not None else _ACCENT_DEFAULT
+            clean.append(p)
+            accents.append(accent_val)
+            pending_accent = None
+
+    L = len(clean)
+    supra = torch.zeros(L, 4, dtype=torch.float32)
+    if accents:
+        supra[:, 0] = torch.tensor(accents, dtype=torch.float32)
+    return clean, supra
 
 
 def _g2p_japanese(text: str) -> list[str]:
@@ -440,14 +494,23 @@ def text_to_phonemes(
     else:
         raise ValueError(f"Unsupported language: {language}")
 
-    # Add BOS/EOS
-    phonemes = ["<bos>"] + phonemes + ["<eos>"]
+    # Extract suprasegmental features and strip accent markers from phonemes.
+    # For Japanese this converts ^/=/ _ markers into the accent_type dimension.
+    # For other languages the tensor is all-zeros (reserved for future use).
+    clean_phonemes, supra = _extract_suprasegmentals(phonemes)
+
+    # Add BOS/EOS to the clean phoneme list and extend suprasegmentals to match
+    clean_phonemes = ["<bos>"] + clean_phonemes + ["<eos>"]
+    # BOS/EOS get default suprasegmental values (zeros)
+    bos_eos_pad = torch.zeros(1, 4, dtype=torch.float32)
+    supra = torch.cat([bos_eos_pad, supra, bos_eos_pad], dim=0)
 
     # Convert to IDs
-    ids = [PHONE2ID.get(p, UNK_ID) for p in phonemes]
+    ids = [PHONE2ID.get(p, UNK_ID) for p in clean_phonemes]
 
     return G2PResult(
         phoneme_ids=torch.tensor(ids, dtype=torch.long),
-        phonemes=phonemes,
+        phonemes=clean_phonemes,
         language_id=lang_id,
+        text_suprasegmentals=supra,
     )

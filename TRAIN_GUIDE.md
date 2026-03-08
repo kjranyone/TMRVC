@@ -31,7 +31,7 @@ mainline の TTS 監督は次を使います。
 
 - `text`: 発話テキスト
 - `phoneme_ids.npy` または同等の text units
-- 音声側の `codec_tokens.npy`, `control_tokens.npy`, `explicit_state.npy`, `ssl_state.npy`
+- 音声側の `codec_tokens.npy`, `control_tokens.npy`, `voice_state.npy`, `ssl_state.npy`
 
 使わないもの:
 
@@ -49,11 +49,15 @@ mainline の TTS 監督は次を使います。
 |---|---|---|
 | `codec_tokens.npy` | yes | acoustic tokens `[8, T]` |
 | `control_tokens.npy` | yes | control tokens `[4, T]` |
-| `explicit_state.npy` | yes | 8-dim physical voice state `[T, 8]` |
+| `voice_state.npy` | optional | canonical physical-control supervision `[T, 8]` |
 | `ssl_state.npy` | yes | frame-level latent state `[T, D]` |
 | `spk_embed.npy` | yes | speaker embedding |
 | `meta.json` | yes | text, language, frame stats |
 | `phoneme_ids.npy` | tts | text unit ids |
+
+互換 alias:
+
+- `explicit_state.npy` (`voice_state.npy` の legacy / compatibility alias)
 
 互換用 legacy artifact:
 

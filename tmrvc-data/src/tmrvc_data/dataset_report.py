@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from tmrvc_data.code_switch import code_switch_ratio
+
 
 @dataclass
 class DatasetReport:
@@ -76,6 +78,26 @@ class DatasetReport:
         """Serialize to plain dict for JSON export."""
         import dataclasses
         return dataclasses.asdict(self)
+
+    def compute_code_switch_coverage(
+        self,
+        texts: list[str],
+        primary_language: str = "ja",
+    ) -> float:
+        """Compute and update code_switch_coverage from a list of utterance texts.
+
+        Uses Unicode script detection to identify language switches within
+        each text. Updates self.code_switch_coverage in place.
+
+        Args:
+            texts: List of utterance text strings from the dataset.
+            primary_language: Expected primary language of the dataset.
+
+        Returns:
+            The computed code_switch_coverage ratio.
+        """
+        self.code_switch_coverage = code_switch_ratio(texts, primary_language)
+        return self.code_switch_coverage
 
 
 # All fields required by the Worker 03 spec

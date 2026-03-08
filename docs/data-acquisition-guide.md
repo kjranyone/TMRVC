@@ -1,6 +1,6 @@
 # データ取得・前処理ガイド
 
-このガイドは、TMRVC mainline 学習に必要なデータ取得と整備の原則をまとめる。焦点は `再現可能な dataset registration` と `MFA 非依存の text supervision` である。
+このガイドは、TMRVC mainline 学習に必要なデータ取得と整備の原則をまとめる。焦点は `再現可能な dataset registration`、`MFA 非依存の text supervision`、`curation/export 契約との接続` である。
 
 ## 1. 前提
 
@@ -45,17 +45,20 @@ mainline では次を使う。
 
 ## 5. 実行
 
-### dev.py
+### WebUI-first
+
+1. `Dataset Manager` で dataset を upload / register
+2. legality / provenance を設定
+3. curation run を開始
+4. `Curation Auditor` で review / promote
+5. promoted subset を export
+
+### CLI / 開発者経路
 
 ```bash
 uv run python dev.py
+uv run tmrvc-train-pipeline --output-dir experiments --workers 2 --tts-mode pointer
 ```
-
-推奨順:
-
-1. `6` 設定初期化
-2. `4` データセット追加
-3. `1` フル学習
 
 ### CLI
 
@@ -69,11 +72,13 @@ mainline cache の代表 artifact:
 
 - `codec_tokens.npy`
 - `control_tokens.npy`
-- `explicit_state.npy`
+- `voice_state.npy`
 - `ssl_state.npy`
 - `spk_embed.npy`
 - `meta.json`
 - `phoneme_ids.npy` when TTS supervision exists
+
+`explicit_state.npy` は compatibility alias としてのみ扱う。
 
 ## 7. 参考
 

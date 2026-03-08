@@ -8,6 +8,7 @@ from typing import Optional
 
 from .models import DisentangledUCLM
 from .models.uclm_loss import uclm_loss, monotonic_alignment_search, voice_state_supervision_loss
+from .models.reference_encoder import ReferenceEncoderFromWaveform
 
 
 class CurriculumScheduler:
@@ -16,11 +17,25 @@ class CurriculumScheduler:
     Stage 1 (Base LM): Next-token codec prediction, VC-focused. Steps 0 to stage2_start.
     Stage 2 (Alignment & Pointer): Text-aligned pointer training. Steps stage2_start to stage3_start.
     Stage 3 (Drama & Dialogue): Expressive finetuning with CFG. Steps stage3_start onwards.
+
+    Anti-forgetting: ``stage3_replay_mix_ratio`` controls the fraction of
+    Stage 3 batches that are replaced with Stage 1/2 stability data to
+    prevent base-quality regression during drama finetuning.
     """
 
-    def __init__(self, stage2_start: int = 5000, stage3_start: int = 15000):
+    def __init__(
+        self,
+        stage2_start: int = 5000,
+        stage3_start: int = 15000,
+        stage3_replay_mix_ratio: float = 0.2,
+    ):
         self.stage2_start = stage2_start
         self.stage3_start = stage3_start
+        if not 0.0 <= stage3_replay_mix_ratio <= 1.0:
+            raise ValueError(
+                f"stage3_replay_mix_ratio must be in [0, 1], got {stage3_replay_mix_ratio}"
+            )
+        self.stage3_replay_mix_ratio = stage3_replay_mix_ratio
 
     def get_stage(self, step: int) -> int:
         if step < self.stage2_start:
@@ -28,6 +43,16 @@ class CurriculumScheduler:
         if step < self.stage3_start:
             return 2
         return 3
+
+    def should_replay(self, step: int) -> bool:
+        """Return True if this step should use stability replay data.
+
+        Only applies during Stage 3.  The caller is responsible for
+        substituting a Stage 1/2 batch when this returns True.
+        """
+        if self.get_stage(step) < 3:
+            return False
+        return random.random() < self.stage3_replay_mix_ratio
 
     def get_config(self, step: int) -> dict:
         """Return training hyper-parameter overrides for the current step."""
@@ -81,10 +106,20 @@ class UCLMTrainer:
         prompt_sampling_prob: float = 0.0,
         pointer_aux_alignment_warmup_steps: int = 2000,
         pointer_aux_alignment_anneal_steps: int = 5000,
+        cfg_distillation_weight: float = 0.0,
+        cfg_distillation_scale_range: tuple[float, float] = (1.0, 3.0),
+        cfg_distillation_temperature: float = 2.0,
+        reference_encoder: ReferenceEncoderFromWaveform | None = None,
     ):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.device = device
+        # Reference encoder for on-the-fly prosody target extraction
+        # from ground-truth audio when prosody_targets.npy is not available.
+        if reference_encoder is not None:
+            self.reference_encoder: ReferenceEncoderFromWaveform | None = reference_encoder.to(device)
+        else:
+            self.reference_encoder = None
         self.tts_prob = tts_prob
         self.tts_mode = tts_mode
         self.pointer_loss_weight = pointer_loss_weight
@@ -100,6 +135,9 @@ class UCLMTrainer:
         self.prompt_sampling_prob = prompt_sampling_prob
         self.pointer_aux_alignment_warmup_steps = pointer_aux_alignment_warmup_steps
         self.pointer_aux_alignment_anneal_steps = pointer_aux_alignment_anneal_steps
+        self.cfg_distillation_weight = cfg_distillation_weight
+        self.cfg_distillation_scale_range = cfg_distillation_scale_range
+        self.cfg_distillation_temperature = cfg_distillation_temperature
         self._global_step = 0
         self._validate_config()
 
@@ -183,12 +221,23 @@ class UCLMTrainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
+        # Stage 3 anti-forgetting replay: override drama config with
+        # Stage 1/2 stability settings when the scheduler says so.
+        is_replay = (
+            self.curriculum is not None
+            and self.curriculum.should_replay(self._global_step)
+        )
+
         # Apply curriculum overrides for this step
         tts_prob = self.tts_prob
         pointer_loss_weight = self.pointer_loss_weight
         conditioning_dropout_prob = self.conditioning_dropout_prob
         if self.curriculum is not None:
-            overrides = self.curriculum.get_config(self._global_step)
+            if is_replay:
+                # Use Stage 2 config to maintain base quality
+                overrides = self.curriculum.get_config(self.curriculum.stage2_start)
+            else:
+                overrides = self.curriculum.get_config(self._global_step)
             tts_prob = overrides.get("tts_prob", tts_prob)
             pointer_loss_weight = overrides.get("pointer_loss_weight", pointer_loss_weight)
             conditioning_dropout_prob = overrides.get(
@@ -287,9 +336,17 @@ class UCLMTrainer:
             prosody_targets = batch.get("prosody_targets")
             if prosody_targets is not None:
                 prosody_targets = prosody_targets.to(self.device)
+            elif self.reference_encoder is not None and batch.get("audio") is not None:
+                # On-the-fly prosody target extraction from ground-truth audio
+                with torch.no_grad():
+                    audio = batch["audio"].to(self.device)
+                    prosody_targets = self.reference_encoder(audio)
             delta_voice_state = batch.get("delta_voice_state")
             if delta_voice_state is not None:
                 delta_voice_state = delta_voice_state.to(self.device)
+            text_suprasegmentals = batch.get("text_suprasegmentals")
+            if text_suprasegmentals is not None:
+                text_suprasegmentals = text_suprasegmentals.to(self.device)
 
             out = self.model.forward_tts_pointer(
                 phoneme_ids=phonemes,
@@ -306,6 +363,7 @@ class UCLMTrainer:
                 acting_intent=acting_intent,
                 prosody_latent=prosody_targets,
                 delta_voice_state=delta_voice_state,
+                text_suprasegmentals=text_suprasegmentals,
             )
 
             # Alignment Target Generation
@@ -313,7 +371,7 @@ class UCLMTrainer:
                 # Compute log-likelihood for MAS
                 with torch.no_grad():
                     phoneme_lens = (phonemes != 0).sum(dim=1)
-                    x_text = self.model.text_encoder(phonemes, language_ids, phoneme_lens).transpose(1, 2)
+                    x_text = self.model.text_encoder(phonemes, language_ids, phoneme_lens, text_suprasegmentals=text_suprasegmentals).transpose(1, 2)
                     x_acoustic = out["hidden_states"]
                     dist = torch.cdist(x_text, x_acoustic)
                     log_probs = -0.5 * (dist ** 2)
@@ -367,12 +425,93 @@ class UCLMTrainer:
                 lambda_progress=self.progress_loss_weight,
                 # Flow-matching loss for ProsodyPredictor
                 prosody_predictor=self.model.prosody_predictor,
-                phoneme_features=self.model.text_encoder(phonemes, language_ids, (phonemes != 0).sum(dim=1)).transpose(1, 2),
+                phoneme_features=self.model.text_encoder(phonemes, language_ids, (phonemes != 0).sum(dim=1), text_suprasegmentals=text_suprasegmentals).transpose(1, 2),
                 target_prosody=prosody_targets,
                 prosody_dialogue_context=dialogue_context,
                 prosody_speaker_embed=speaker_embed,
                 lambda_prosody=1.0 if prosody_targets is not None else 0.0,
             )
+
+            # CFG distillation loss (Stage 3 only)
+            if (
+                self.cfg_distillation_weight > 0
+                and self.curriculum is not None
+                and self.curriculum.get_stage(self._global_step) >= 3
+            ):
+                # Sample a random cfg_scale from the configured range
+                cfg_lo, cfg_hi = self.cfg_distillation_scale_range
+                sampled_cfg_scale = cfg_lo + random.random() * (cfg_hi - cfg_lo)
+
+                # Teacher: full two-pass guided logits (detached)
+                with torch.no_grad():
+                    # Conditional pass (already computed: out["logits_a"], out["logits_b"])
+                    cond_a = out["logits_a"]
+                    cond_b = out["logits_b"]
+
+                    # Unconditional pass
+                    masked_distill = DisentangledUCLM.apply_cfg_unconditional_mask(
+                        explicit_state=explicit_state,
+                        ssl_state=ssl_state,
+                        speaker_embed=speaker_embed,
+                        dialogue_context=dialogue_context,
+                        acting_intent=acting_intent,
+                        prosody_latent=prosody_targets,
+                        delta_voice_state=delta_voice_state,
+                    )
+                    out_uncond = self.model.forward_tts_pointer(
+                        phoneme_ids=phonemes,
+                        language_ids=language_ids,
+                        pointer_state=None,
+                        speaker_embed=masked_distill["speaker_embed"],
+                        explicit_state=masked_distill["explicit_state"],
+                        ssl_state=masked_distill["ssl_state"],
+                        target_a=target_a,
+                        target_b=target_b,
+                        target_length=target_length,
+                        f0_condition=f0_condition,
+                        dialogue_context=masked_distill["dialogue_context"],
+                        acting_intent=masked_distill["acting_intent"],
+                        prosody_latent=masked_distill["prosody_latent"],
+                        delta_voice_state=masked_distill["delta_voice_state"],
+                        text_suprasegmentals=text_suprasegmentals,
+                    )
+                    uncond_a = out_uncond["logits_a"]
+                    uncond_b = out_uncond["logits_b"]
+
+                    # Full CFG blend (teacher targets)
+                    teacher_a = uncond_a + sampled_cfg_scale * (cond_a - uncond_a)
+                    teacher_b = uncond_b + sampled_cfg_scale * (cond_b - uncond_b)
+
+                # Student: single-pass with cfg_scale as input (gradients flow)
+                student_out = self.model.forward_tts_distilled_cfg(
+                    phoneme_ids=phonemes,
+                    language_ids=language_ids,
+                    speaker_embed=speaker_embed,
+                    explicit_state=explicit_state,
+                    ssl_state=ssl_state,
+                    target_a=target_a,
+                    target_b=target_b,
+                    cfg_scale=sampled_cfg_scale,
+                    target_length=target_length,
+                    f0_condition=f0_condition,
+                    dialogue_context=dialogue_context,
+                    acting_intent=acting_intent,
+                    prosody_latent=prosody_targets,
+                    delta_voice_state=delta_voice_state,
+                    text_suprasegmentals=text_suprasegmentals,
+                )
+                student_a = student_out["logits_a"]
+                student_b = student_out["logits_b"]
+
+                loss_cfg_distill = DisentangledUCLM.cfg_distillation_loss(
+                    teacher_logits_a=teacher_a.detach(),
+                    teacher_logits_b=teacher_b.detach(),
+                    student_logits_a=student_a,
+                    student_logits_b=student_b,
+                    temperature=self.cfg_distillation_temperature,
+                )
+                losses["loss"] = losses["loss"] + self.cfg_distillation_weight * loss_cfg_distill
+                losses["loss_cfg_distillation"] = loss_cfg_distill
 
             # Voice state supervision with observed_mask and confidence (Worker 02)
             if (
@@ -398,6 +537,7 @@ class UCLMTrainer:
         
         res = {k: v.item() for k, v in losses.items() if isinstance(v, torch.Tensor)}
         res["mode"] = 1 if mode == "tts" else 0
+        res["is_replay"] = 1 if is_replay else 0
         return res
 
     def train_epoch(self, dataloader: DataLoader):

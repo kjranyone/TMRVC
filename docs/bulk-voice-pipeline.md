@@ -27,11 +27,13 @@
 - mainline cache
   - `codec_tokens.npy`
   - `control_tokens.npy`
-  - `explicit_state.npy`
+  - `voice_state.npy`
   - `ssl_state.npy`
   - `spk_embed.npy`
   - `meta.json`
   - `phoneme_ids.npy` when TTS supervision is available
+
+`explicit_state.npy` は compatibility alias としてのみ扱う。
 
 ## 4. 注意点
 

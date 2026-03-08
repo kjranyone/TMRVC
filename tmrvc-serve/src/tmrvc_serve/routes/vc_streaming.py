@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+import torch
 from fastapi import (
     APIRouter,
     Depends,
@@ -17,7 +20,9 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from pydantic import BaseModel, Field
 
+from tmrvc_core.dialogue_types import StyleParams
 from tmrvc_serve.auth import (
     AuthContext,
     OptionalAuth,

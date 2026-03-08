@@ -179,24 +179,23 @@ The literature does **not** yet remove the need for TMRVC-specific proof on:
 
 ## Decisions Taken for the Plan
 
-### Tier 1 Mainline
-
-Keep in the release-critical path:
+### Required for v3.0 Mainline
 
 - causal pointer-driven TTS
 - shared serializable runtime contract
 - explicit 8-D `voice_state` supervision path
 - bounded dialogue context
-- few-shot speaker adaptation with disentanglement checks
+- canonical suprasegmental text-feature contract where the language requires accent/tone cues
+- few-shot speaker adaptation with disentanglement checks and explicit prompt-budget limits
+- modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`) if parity/latency gates hold, with explicit rollback path otherwise
+- flow-matching prosody predictor
+- CFG mainline modes (`off`, `full`)
 
-### Tier 2 Research
+### Post-v3.0 Optimization Tracks
 
-Keep behind a research boundary until parity and latency proof exists:
-
-- backbone modernization swaps
-- CFG acceleration variants such as `lazy` and `distilled`
-- flow-matching upgrades beyond the minimum stable prosody path
-- alternate vocoders or second-stage acoustic refinement
+- CFG acceleration modes (`lazy`, `distilled`)
+- alternate vocoders / second-stage acoustic refinement (`v3.1` upgrade path)
+- advanced quantization strategies
 
 
 ## Known Research Gaps

@@ -34,21 +34,19 @@ TMRVC は、`10 ms` 因果クロックで動作する unified codec language mod
 - 抽象ラベルより、連続的で編集可能な制御量を優先する
 - 8 次元 voice state は UI 上のつまみではなく、data -> export -> train -> runtime を貫く supervision contract として扱う
 
-### 1.6 Release Tiers
+### 1.6 Release Scope
 
-- Tier 1 (release-critical):
-  - pointer-based causal TTS
-  - shared runtime/schema contract
-  - 8-D physical control with masks/confidences/provenance
-  - bounded dialogue context
-  - few-shot speaker prompting under a reproducible contract
-- Tier 2 (research-track):
-  - backbone modernization bundles
-  - advanced prosody predictors
-  - CFG acceleration variants
-  - second-stage acoustic refinement
+v3 リリースに必要な全項目。deferred tier は存在しない。
 
-Tier 2 は Tier 1 の契約を壊してはならず、rollback path を持つ。
+- pointer-based causal TTS
+- shared runtime/schema contract
+- 8-D physical control with masks/confidences/provenance
+- bounded dialogue context
+- few-shot speaker prompting under a reproducible contract
+- modern transformer backbone (`RoPE`, `GQA`, `SwiGLU`, `RMSNorm`, `FlashAttention2`)
+- flow-matching prosody predictor
+- CFG acceleration modes (`off`, `full`, `lazy`, `distilled`)
+- second-stage acoustic refinement (v3.1 upgrade path)
 
 ## 2. システム構成
 

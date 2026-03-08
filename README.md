@@ -77,7 +77,7 @@ uv run python dev.py
 | `tmrvc-train-codec` | Emotion-Aware Codec 学習 |
 | `tmrvc-serve` | 統合推論サーバー起動 |
 | `tmrvc-export` | ONNX エクスポート |
-| `tmrvc-gui` | 開発・デモ用 GUI (UCLM v3 対応) |
+| `tmrvc-gui` | mainline Gradio Control Plane / HITL UI |
 
 ## ドキュメント
 
