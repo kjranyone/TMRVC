@@ -1,6 +1,7 @@
 """Dual-stream UCLM Transformer with Contract-compliant I/O.
 
 Modern LLM-style backbone: RMSNorm, RoPE, GQA, SwiGLU, pre-norm, Cross-Attention.
+Supports FlashAttention2 when available for faster training/serving on CUDA GPUs.
 """
 
 from __future__ import annotations
@@ -11,6 +12,16 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ---------------------------------------------------------------------------
+# FlashAttention2 conditional import
+# ---------------------------------------------------------------------------
+try:
+    from flash_attn import flash_attn_func  # type: ignore[import-untyped]
+
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +143,7 @@ class CausalGQAttention(nn.Module):
         n_kv_heads: Optional[int] = None,
         dropout: float = 0.0,
         max_seq_len: int = 4096,
+        use_flash_attn: bool = True,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -155,6 +167,9 @@ class CausalGQAttention(nn.Module):
 
         # Check for SDPA availability (PyTorch >= 2.0)
         self._use_sdpa = hasattr(F, "scaled_dot_product_attention")
+
+        # FlashAttention2: only usable on CUDA with fp16/bf16, not during ONNX export
+        self._use_flash_attn = use_flash_attn and HAS_FLASH_ATTN
 
     @staticmethod
     def _expand_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -196,16 +211,40 @@ class CausalGQAttention(nn.Module):
         k_exp = self._expand_kv(k, self.n_rep)
         v_exp = self._expand_kv(v, self.n_rep)
 
-        # Compute attention
-        if self._use_sdpa and T > 1 and k_cache is None:
-            # Use Flash / Memory-efficient attention for training (no cache)
+        # Compute attention -- choose the fastest available backend
+        _is_onnx_export = torch.onnx.is_in_onnx_export() if hasattr(torch.onnx, "is_in_onnx_export") else False
+        _on_cuda = x.is_cuda
+        _dtype_ok = x.dtype in (torch.float16, torch.bfloat16)
+
+        if (
+            self._use_flash_attn
+            and _on_cuda
+            and _dtype_ok
+            and not _is_onnx_export
+            and T > 1
+            and k_cache is None
+        ):
+            # FlashAttention2 path: expects (B, T, n_heads, head_dim) layout
+            # q is [B, n_heads, T, hd], k_exp/v_exp are [B, n_heads, S, hd]
+            q_fa = q.transpose(1, 2)  # [B, T, n_heads, hd]
+            k_fa = k_exp.transpose(1, 2)  # [B, S, n_heads, hd]
+            v_fa = v_exp.transpose(1, 2)  # [B, S, n_heads, hd]
+            out = flash_attn_func(
+                q_fa, k_fa, v_fa,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                causal=True,
+            )  # [B, T, n_heads, hd]
+            out = out.reshape(B, T, C)
+        elif self._use_sdpa and T > 1 and k_cache is None and not _is_onnx_export:
+            # Use PyTorch SDPA (Flash / Memory-efficient) for training (no cache)
             out = F.scaled_dot_product_attention(
                 q, k_exp, v_exp,
                 attn_mask=None,
                 dropout_p=self.dropout_p if self.training else 0.0,
                 is_causal=True,
             )
-        elif self._use_sdpa and T == 1:
+            out = out.transpose(1, 2).contiguous().view(B, T, C)
+        elif self._use_sdpa and T == 1 and not _is_onnx_export:
             # Single-step decoding: no causal mask needed
             out = F.scaled_dot_product_attention(
                 q, k_exp, v_exp,
@@ -213,8 +252,9 @@ class CausalGQAttention(nn.Module):
                 dropout_p=0.0,
                 is_causal=False,
             )
+            out = out.transpose(1, 2).contiguous().view(B, T, C)
         else:
-            # Manual fallback (covers cached multi-step and old PyTorch)
+            # Manual fallback (covers ONNX export, cached multi-step, old PyTorch, CPU fp32)
             S = k_exp.shape[2]
             attn = torch.matmul(q, k_exp.transpose(-2, -1)) * self.scale
             if T > 1 and k_cache is None:
@@ -225,8 +265,8 @@ class CausalGQAttention(nn.Module):
             attn = F.softmax(attn, dim=-1)
             attn = self.dropout(attn)
             out = torch.matmul(attn, v_exp)
+            out = out.transpose(1, 2).contiguous().view(B, T, C)
 
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(out), k, v
 
 
@@ -357,6 +397,7 @@ class CodecTransformer(nn.Module):
         self.head_dim = d_model // n_heads
 
         self.speaker_proj = nn.Linear(d_speaker, d_model)
+        self.f0_proj = nn.Linear(2, d_model)  # F0 fusion layer (UCLM v3)
 
         # Acoustic context embeds (Stream A) - past A_{t-1}
         self.a_ctx_embeds = nn.ModuleList(
@@ -392,7 +433,8 @@ class CodecTransformer(nn.Module):
 
     def forward(
         self,
-        content_features,  # Used as 'memory' for cross-attention
+        queries,  # [B, T_q, d_model] current frames
+        memory,   # [B, L_mem, d_model] phoneme sequence for cross-attn
         a_ctx,
         b_ctx,
         speaker_embed,
@@ -400,11 +442,21 @@ class CodecTransformer(nn.Module):
         cfg_scale=1.0,
         kv_caches=None,
         max_seq_len=200,
+        f0_condition=None,
     ):
-        # x starts as a base frame representation (conditioning + history)
-        # We also support augment mode where x starts with interpolated content_features
-        x = content_features
+        # x starts as the queries (temporal frame base)
+        x = queries
         B, T, _ = x.shape
+
+        # Add F0 conditioning if provided
+        if f0_condition is not None:
+            # Ensure f0_condition matches sequence length T
+            if f0_condition.shape[1] > T:
+                f0_condition = f0_condition[:, :T, :]
+            elif f0_condition.shape[1] < T:
+                # Pad if necessary (unlikely in streaming but safe)
+                f0_condition = F.pad(f0_condition, (0, 0, 0, T - f0_condition.shape[1]))
+            x = x + self.f0_proj(f0_condition)
 
         # a_ctx: [B, 8, T] - past acoustic tokens A_{t-1}
         # Slice to match current frame sequence length T
@@ -465,8 +517,8 @@ class CodecTransformer(nn.Module):
         for i, layer in enumerate(self.layers):
             k_in = kv_list[i][0] if kv_list else None
             v_in = kv_list[i][1] if kv_list else None
-            # layer now takes 'content_features' as memory for cross-attention
-            x, nk, nv = layer(x, memory=content_features, k_cache=k_in, v_cache=v_in)
+            # layer now takes 'memory' (full phonemes) for cross-attention
+            x, nk, nv = layer(x, memory=memory, k_cache=k_in, v_cache=v_in)
 
             if nk.shape[2] > max_seq_len:
                 nk = nk[:, :, -max_seq_len:, :]
@@ -497,15 +549,17 @@ class CodecTransformer(nn.Module):
 
     def forward_no_cache(
         self,
-        content_features,
+        queries,
+        memory,
         a_ctx,
         b_ctx,
         state_cond,
         speaker_embed,
         cfg_scale=1.0,
+        f0_condition=None,
     ):
         """Non-streaming forward for training. History must be shifted."""
         la, lb, _, x = self.forward(
-            content_features, a_ctx, b_ctx, speaker_embed, state_cond, cfg_scale
+            queries, memory, a_ctx, b_ctx, speaker_embed, state_cond, cfg_scale, f0_condition=f0_condition
         )
         return la, lb, x
