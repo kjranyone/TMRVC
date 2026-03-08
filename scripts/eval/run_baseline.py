@@ -48,6 +48,7 @@ class SynthesisResult:
     audio: np.ndarray  # [samples] float32 waveform
     sample_rate: int
     baseline_id: str
+    registry_baseline_id: str
     prompt_id: str
     settings: dict[str, Any]
     duration_sec: float
@@ -62,6 +63,7 @@ class BaselineRunner(ABC):
     """Abstract base class for external baseline inference runners."""
 
     baseline_id: str = "unknown"
+    registry_baseline_id: str = ""  # must match baseline_id in external-baseline-registry.md
 
     @abstractmethod
     def load_model(self, model_path: str | None = None) -> None:
@@ -120,6 +122,7 @@ class BaselineRunner(ABC):
             audio=audio,
             sample_rate=self.sample_rate,
             baseline_id=self.baseline_id,
+            registry_baseline_id=self.registry_baseline_id,
             prompt_id=prompt_id,
             settings=asdict(settings),
             duration_sec=len(audio) / self.sample_rate,
@@ -345,6 +348,7 @@ class Qwen3TTSRunner(BaselineRunner):
     """
 
     baseline_id = "qwen3tts_12hz_1p7b"
+    registry_baseline_id = "primary_qwen3_tts_12hz_1p7b_base_hf_fd4b254"
 
     def __init__(self) -> None:
         self._model = None
@@ -427,11 +431,11 @@ class Qwen3TTSRunner(BaselineRunner):
 class CosyVoice3Runner(BaselineRunner):
     """CosyVoice3 baseline runner (zero-shot mode).
 
-    Matches frozen registry entry: secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4
     Requires: ``pip install cosyvoice``
     """
 
     baseline_id = "cosyvoice3_0p5b"
+    registry_baseline_id = "secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4"
 
     def __init__(self) -> None:
         self._model = None
@@ -540,6 +544,7 @@ def _save_result(result: SynthesisResult, output_dir: Path) -> Path:
     # Metadata
     meta = {
         "baseline_id": result.baseline_id,
+        "registry_baseline_id": result.registry_baseline_id,
         "prompt_id": result.prompt_id,
         "settings": result.settings,
         "duration_sec": result.duration_sec,
