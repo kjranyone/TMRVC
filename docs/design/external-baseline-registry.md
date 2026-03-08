@@ -22,10 +22,14 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `model_name` | Public model / system name |
 | `artifact_id` | Exact checkpoint, commit, or release artifact |
 | `tokenizer_version` | Tokenizer / normalization version |
+| `language_set` | Frozen language coverage used for comparison |
 | `prompt_rule` | Prompt trimming and text normalization rule |
 | `reference_lengths_sec` | Frozen reference lengths used in few-shot evaluation |
 | `inference_settings` | Temperature, top-k, cfg, decoding mode, etc. |
+| `hardware_class` | Frozen hardware class used for runtime and latency claims |
+| `task_scope` | Which public claim axes this baseline blocks or informs |
 | `evaluation_set_version` | Frozen prompt-set identifier |
+| `source_refs` | Official source URLs used to justify the entry |
 | `date_frozen` | Date the baseline entry was frozen |
 | `notes` | Any caveats needed for reproducibility |
 
@@ -33,34 +37,49 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 
 ## Active Entries
 
-### `baseline_pending_freeze`
+### `primary_qwen3_tts_12hz_1p7b_base_hf_fd4b254`
 
 | Field | Value |
 |------|-------|
-| `baseline_id` | `baseline_pending_freeze` |
-| `model_name` | `TBD` |
-| `artifact_id` | `TBD` |
-| `tokenizer_version` | `TBD` |
-| `prompt_rule` | `TBD` |
+| `baseline_id` | `primary_qwen3_tts_12hz_1p7b_base_hf_fd4b254` |
+| `model_name` | `Qwen3-TTS-12Hz-1.7B-Base` |
+| `artifact_id` | `hf:Qwen/Qwen3-TTS-12Hz-1.7B-Base@fd4b254` |
+| `tokenizer_version` | `hf:Qwen/Qwen3-TTS-Tokenizer-12Hz@7dd38ad` |
+| `language_set` | `Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian` |
+| `prompt_rule` | `Voice-clone mode only. Reference audio is trimmed to a voiced 3 s / 5 s / 10 s span with matched verbatim reference transcript. Reusable prompt path uses create_voice_clone_prompt. Pass explicit target language for the main evaluation set; allow language=auto only for subsets explicitly marked auto-language stress.` |
 | `reference_lengths_sec` | `3, 5, 10` |
-| `inference_settings` | `TBD` |
-| `evaluation_set_version` | `TBD` |
-| `date_frozen` | `TBD` |
-| `notes` | `Replace this placeholder before any release-signoff comparison.` |
+| `inference_settings` | `Use the official qwen-tts package in voice-clone mode; dtype=torch.bfloat16; attn_implementation=flash_attention_2; max_new_tokens=2048; all other sampling parameters from the checkpoint generate_config.json; no manual prompt embellishment or hidden decoding retuning.` |
+| `hardware_class` | `single_nvidia_rtx_4090_24gb_cuda12_flashattn2` |
+| `task_scope` | `Primary blocker for broad public quality claims: few-shot speaker similarity, intelligibility, overall naturalness, multilingual zero-shot quality, and streaming-capable public-baseline comparison.` |
+| `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
+| `source_refs` | `https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/main ; https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz/tree/main ; https://github.com/QwenLM/Qwen3-TTS` |
+| `date_frozen` | `2026-03-08` |
+| `notes` | `Chosen as primary because it is an official open-weight baseline with streaming support, 3-second voice cloning, 10-language coverage, and explicit evaluation settings published by the model authors.` |
+
+### `secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4`
+
+| Field | Value |
+|------|-------|
+| `baseline_id` | `secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4` |
+| `model_name` | `Fun-CosyVoice3-0.5B-2512` |
+| `artifact_id` | `hf:FunAudioLLM/Fun-CosyVoice3-0.5B-2512@29e01c4` |
+| `tokenizer_version` | `bundled CosyVoice3 tokenizer in artifact @29e01c4; text normalization path = default WeText; optional ttsfrd disabled for sign-off reproducibility` |
+| `language_set` | `Chinese, English, Japanese, Korean, German, Spanish, French, Italian, Russian` |
+| `prompt_rule` | `Zero-shot mode only. Reference audio is trimmed to a voiced 3 s / 5 s / 10 s span with matched verbatim reference transcript. Prefix the reference transcript as 'You are a helpful assistant.<|endofprompt|>{reference_text}' to match the official CosyVoice3 zero-shot example contract. Pass target language/content explicitly. If Japanese is evaluated, transliterate prompts to katakana to match the official usage guidance.` |
+| `reference_lengths_sec` | `3, 5, 10` |
+| `inference_settings` | `Use the official CosyVoice3 inference_zero_shot path; stream=False for offline quality comparison and stream=True only in the streaming-latency suite; default released checkpoint config; no undocumented RAS/decoder overrides; no ttsfrd dependency in the sign-off path.` |
+| `hardware_class` | `single_nvidia_rtx_4090_24gb_cuda12_flashattn2` |
+| `task_scope` | `Secondary blocker for streaming-first and multilingual zero-shot comparison. Used to stress-test whether TMRVC's causal path remains competitive against a public streaming-native baseline.` |
+| `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
+| `source_refs` | `https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/tree/main ; https://github.com/FunAudioLLM/CosyVoice ; https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/example.py` |
+| `date_frozen` | `2026-03-08` |
+| `notes` | `Chosen as secondary because it is an official open-weight streaming-native baseline with published multilingual and zero-shot claims, direct Hugging Face artifact availability, and an explicit repo example for CosyVoice3 zero-shot prompting.` |
 
 ---
 
-## Candidate Baselines (to be frozen before Stage D)
+## Other Candidate Baselines
 
-The following systems are recommended candidates based on the 2026-03 arxiv survey. At least one must be selected and frozen with full artifact details before any release-signoff comparison begins.
-
-### CosyVoice 2 / CosyVoice 3
-
-- **Paper:** arXiv:2412.10117 (v2), arXiv:2505.17589 (v3)
-- **Architecture:** LLM (0.5B-1.5B) + Conditional Flow Matching (DiT)
-- **Strengths:** Streaming support, strong zero-shot speaker similarity, multilingual (9 languages + 18 Chinese dialects), x-vector based timbre-prosody separation
-- **Reproducibility:** Open-source model weights available
-- **Rationale:** Most directly comparable to TMRVC's streaming + zero-shot + expressive goals
+The following systems remain relevant comparison candidates from the 2026-03 arxiv survey, but they are not the active pinned sign-off entries unless promoted by an explicit protocol version bump.
 
 ### F5-TTS
 
@@ -76,14 +95,6 @@ The following systems are recommended candidates based on the 2026-03 arxiv surv
 - **Strengths:** No explicit alignment or duration prediction needed, strong long-prompt performance
 - **Reproducibility:** Open-source
 - **Rationale:** Alternative non-AR paradigm; performs better with longer prompts
-
-### Qwen3-TTS
-
-- **Paper:** arXiv:2601.15621
-- **Architecture:** 2-stage AR codec LM (Qwen2.5-based) + Conditional Flow Matching, block-wise streaming
-- **Strengths:** Multilingual (>30 languages), strong zero-shot similarity, block-wise refinement preserves streaming, large-scale training (1M+ hours)
-- **Reproducibility:** Open-source model weights and inference code available via Hugging Face / ModelScope
-- **Rationale:** Represents the 2-stage AR + Non-AR SOTA quality ceiling; directly validates whether TMRVC's v3.1 refinement upgrade path is competitive. The block-wise streaming design is architecturally comparable to TMRVC's planned refinement integration.
 
 ### Selection criteria
 

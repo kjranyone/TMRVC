@@ -143,12 +143,14 @@ pointer update, `uclm_core`, and the active waveform decoder used in the real-ti
 
 | Gate | Threshold | Method |
 |------|-----------|--------|
-| Baseline artifact pinning | Required | Must reference `docs/design/external-baseline-registry.md` |
-| Human preference vs external baseline | >= 40% non-inferiority target | Blind A/B test with the pinned baseline artifact |
-| Naturalness MOS gap | <= 0.3 MOS below pinned baseline | 5-point MOS protocol |
-| Controllability advantage | Significant win in at least 2 control dimensions, or explicitly documented trade-off | Control sweep benchmark |
+| Baseline artifact pinning | Required | Must reference the active `primary` and `secondary` entries in `docs/design/external-baseline-registry.md` |
+| Primary-axis deficit vs primary baseline | None allowed on declared primary claim axes | Frozen evaluation bundle against the pinned `primary` baseline |
+| Human preference vs primary baseline | >= 50% win rate on declared preference axes | Blind A/B test with the pinned `primary` baseline artifact |
+| Naturalness MOS gap vs primary baseline | >= 0.0 delta on declared primary naturalness axis | 5-point MOS protocol |
+| Few-shot score bundle vs primary baseline | >= 0.0 normalized delta on the frozen few-shot bundle | Speaker similarity + intelligibility + leakage bundle |
+| Streaming comparison vs secondary baseline | No unexplained deficit on declared streaming claim axes | Streaming latency and streaming quality protocol against the pinned `secondary` baseline |
 
-**Pass condition:** External-baseline comparison is reproducible, pinned, and competitive on the declared release protocol.
+**Pass condition:** External-baseline comparison is reproducible, pinned, and shows no deficit on any declared primary claim axis. If a deficit exists, the corresponding public claim is blocked until the claim scope is narrowed and re-approved.
 
 ---
 

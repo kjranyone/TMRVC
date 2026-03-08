@@ -3,6 +3,9 @@
 **Report date:** _YYYY-MM-DD_
 **Prepared by:** _Name / Worker ID_
 **Release candidate:** _RC tag or commit hash_
+**Primary external baseline:** _baseline_id from external-baseline-registry_
+**Secondary external baseline:** _baseline_id from external-baseline-registry_
+**Frozen hardware class:** _hardware_class id_
 
 ---
 
