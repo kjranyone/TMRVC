@@ -48,8 +48,8 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `language_set` | `Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian` |
 | `prompt_rule` | `Voice-clone mode only. Reference audio is trimmed to a voiced 3 s / 5 s / 10 s span with matched verbatim reference transcript. Reusable prompt path uses create_voice_clone_prompt. Pass explicit target language for the main evaluation set; allow language=auto only for subsets explicitly marked auto-language stress.` |
 | `reference_lengths_sec` | `3, 5, 10` |
-| `inference_settings` | `Use the official qwen-tts package in voice-clone mode; dtype=torch.bfloat16; attn_implementation=flash_attention_2; max_new_tokens=2048; all other sampling parameters from the checkpoint generate_config.json; no manual prompt embellishment or hidden decoding retuning.` |
-| `hardware_class` | `single_nvidia_rtx_4090_24gb_cuda12_flashattn2` |
+| `inference_settings` | `Use the official qwen-tts package in voice-clone mode; dtype=torch.float16; attn_implementation=sdpa; max_new_tokens=2048; all other sampling parameters from the checkpoint generate_config.json; no manual prompt embellishment or hidden decoding retuning.` |
+| `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
 | `task_scope` | `Primary blocker for broad public quality claims: few-shot speaker similarity, intelligibility, overall naturalness, multilingual zero-shot quality, and streaming-capable public-baseline comparison.` |
 | `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
 | `source_refs` | `https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/main ; https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz/tree/main ; https://github.com/QwenLM/Qwen3-TTS` |
@@ -68,7 +68,7 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `prompt_rule` | `Zero-shot mode only. Reference audio is trimmed to a voiced 3 s / 5 s / 10 s span with matched verbatim reference transcript. Prefix the reference transcript as 'You are a helpful assistant.<|endofprompt|>{reference_text}' to match the official CosyVoice3 zero-shot example contract. Pass target language/content explicitly. If Japanese is evaluated, transliterate prompts to katakana to match the official usage guidance.` |
 | `reference_lengths_sec` | `3, 5, 10` |
 | `inference_settings` | `Use the official CosyVoice3 inference_zero_shot path; stream=False for offline quality comparison and stream=True only in the streaming-latency suite; default released checkpoint config; no undocumented RAS/decoder overrides; no ttsfrd dependency in the sign-off path.` |
-| `hardware_class` | `single_nvidia_rtx_4090_24gb_cuda12_flashattn2` |
+| `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
 | `task_scope` | `Secondary blocker for streaming-first and multilingual zero-shot comparison. Used to stress-test whether TMRVC's causal path remains competitive against a public streaming-native baseline.` |
 | `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
 | `source_refs` | `https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/tree/main ; https://github.com/FunAudioLLM/CosyVoice ; https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/example.py` |
