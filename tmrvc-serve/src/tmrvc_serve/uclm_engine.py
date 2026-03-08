@@ -46,6 +46,9 @@ class EngineState:
     )
     dec_states: List[torch.Tensor] = field(default_factory=lambda: [torch.empty(0)] * 4)
     kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+    ctx_a: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(1, 8, 200, dtype=torch.long)
+    )
     ctx_b: torch.Tensor = field(
         default_factory=lambda: torch.zeros(1, 4, 200, dtype=torch.long)
     )
@@ -238,6 +241,7 @@ class UCLMEngine:
 
         logits_a, logits_b, new_kv, _ = self.uclm_core(
             content_features, 
+            state.ctx_a,
             state.ctx_b, 
             speaker_embed, 
             state_cond, 
@@ -261,6 +265,7 @@ class UCLMEngine:
             enc_states=new_enc_states,
             dec_states=new_dec_states,
             kv_caches=new_kv,
+            ctx_a=torch.cat([state.ctx_a[:, :, 1:], a_t], dim=-1),
             ctx_b=torch.cat([state.ctx_b[:, :, 1:], b_t], dim=-1),
             prev_voice_state=v_state,
         )

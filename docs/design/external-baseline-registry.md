@@ -29,6 +29,7 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `hardware_class` | Frozen hardware class used for runtime and latency claims |
 | `task_scope` | Which public claim axes this baseline blocks or informs |
 | `evaluation_set_version` | Frozen prompt-set identifier defined in `docs/design/evaluation-set-spec.md` |
+| `evaluation_protocol_version` | Version of the evaluation protocol under which this entry was frozen |
 | `source_refs` | Official source URLs used to justify the entry |
 | `date_frozen` | Date the baseline entry was frozen |
 | `notes` | Any caveats needed for reproducibility |
@@ -52,9 +53,10 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
 | `task_scope` | `Primary blocker for broad public quality claims: few-shot speaker similarity, intelligibility, overall naturalness, multilingual zero-shot quality, and streaming-capable public-baseline comparison.` |
 | `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
+| `evaluation_protocol_version` | `v1_2026_03_08` |
 | `source_refs` | `https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/main ; https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz/tree/main ; https://github.com/QwenLM/Qwen3-TTS` |
 | `date_frozen` | `2026-03-08` |
-| `notes` | `Chosen as primary because it is an official open-weight baseline with streaming support, 3-second voice cloning, 10-language coverage, and explicit evaluation settings published by the model authors.` |
+| `notes` | `Chosen as primary because it is an official open-weight baseline with streaming support, 3-second voice cloning, 10-language coverage, and explicit evaluation settings published by the model authors. Portuguese is in this model's language_set but excluded from sign-off because it is not in the secondary baseline intersection.` |
 
 ### `secondary_fun_cosyvoice3_0p5b_2512_hf_29e01c4`
 
@@ -71,6 +73,7 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
 | `task_scope` | `Secondary blocker for streaming-first and multilingual zero-shot comparison. Used to stress-test whether TMRVC's causal path remains competitive against a public streaming-native baseline.` |
 | `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
+| `evaluation_protocol_version` | `v1_2026_03_08` |
 | `source_refs` | `https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/tree/main ; https://github.com/FunAudioLLM/CosyVoice ; https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/example.py` |
 | `date_frozen` | `2026-03-08` |
 | `notes` | `Chosen as secondary because it is an official open-weight streaming-native baseline with published multilingual and zero-shot claims, direct Hugging Face artifact availability, and an explicit repo example for CosyVoice3 zero-shot prompting.` |
