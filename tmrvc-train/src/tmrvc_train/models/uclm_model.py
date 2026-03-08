@@ -630,8 +630,17 @@ class DisentangledUCLM(nn.Module):
             )
 
         # 6. Run through the codec transformer (now with Stream A history + Cross-Attention)
+        # Note: we pass phoneme_features (L tokens) as memory for global cross-attention,
+        # while content_features (T frames) acts as the query/base.
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
-            content_features, a_ctx, b_ctx, state_cond, speaker_embed, cfg_scale
+            queries=content_features,
+            memory=phoneme_features,
+            a_ctx=a_ctx,
+            b_ctx=b_ctx,
+            state_cond=state_cond,
+            speaker_embed=speaker_embed,
+            cfg_scale=cfg_scale,
+            f0_condition=f0_condition,
         )
 
         # If prompt was prepended, strip prompt positions from outputs
@@ -656,9 +665,68 @@ class DisentangledUCLM(nn.Module):
             "next_pointer_state": None,  # populated at inference time
         }
 
+    def forward_tts_distilled_cfg(
+        self,
+        phoneme_ids: torch.Tensor,
+        language_ids: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        target_a: torch.Tensor,
+        target_b: torch.Tensor,
+        cfg_scale: float,
+        target_length: int | None = None,
+        f0_condition: torch.Tensor | None = None,
+        dialogue_context: torch.Tensor | None = None,
+        acting_intent: torch.Tensor | None = None,
+        prosody_latent: torch.Tensor | None = None,
+        delta_voice_state: torch.Tensor | None = None,
+        text_suprasegmentals: torch.Tensor | None = None,
+    ) -> dict:
+        """Single-pass forward with cfg_scale injected for distillation training."""
+        return self.forward_tts_pointer(
+            phoneme_ids=phoneme_ids,
+            language_ids=language_ids,
+            pointer_state=None,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            target_length=target_length,
+            f0_condition=f0_condition,
+            cfg_scale=cfg_scale,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_latent,
+            delta_voice_state=delta_voice_state,
+        )
+
+    @staticmethod
+    def cfg_distillation_loss(
+        teacher_logits_a: torch.Tensor,
+        teacher_logits_b: torch.Tensor,
+        student_logits_a: torch.Tensor,
+        student_logits_b: torch.Tensor,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Kullback-Leibler divergence for CFG distillation."""
+        def _kl(t, s):
+            p = F.softmax(t / temperature, dim=-1)
+            return F.kl_div(
+                F.log_softmax(s / temperature, dim=-1),
+                p,
+                reduction="batchmean"
+            ) * (temperature ** 2)
+        
+        loss_a = _kl(teacher_logits_a, student_logits_a)
+        loss_b = _kl(teacher_logits_b, student_logits_b)
+        return (loss_a + loss_b) * 0.5
+
     def forward_streaming(
         self,
-        content_features: torch.Tensor,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
         a_ctx: torch.Tensor,
         b_ctx: torch.Tensor,
         speaker_embed: torch.Tensor,
@@ -668,38 +736,43 @@ class DisentangledUCLM(nn.Module):
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
         prosody_latent: torch.Tensor | None = None,
+        f0_condition: torch.Tensor | None = None,
     ) -> dict:
         """Forward pass for streaming inference with KV cache list.
 
         Args:
-            content_features: [B, T, D] text/VC content features (memory for Cross-Attn).
-            a_ctx: [B, n_codebooks, T] previous acoustic tokens.
-            b_ctx: [B, n_slots, T] previous control tokens.
+            queries: [B, T_q, D] current frame base features.
+            memory: [B, L_mem, D] full phoneme sequence for global cross-attention.
+            a_ctx: [B, n_codebooks, T_q] previous acoustic tokens.
+            b_ctx: [B, n_slots, T_q] previous control tokens.
             speaker_embed: [B, d_speaker] speaker embedding.
-            state_cond: [B, T, D] voice state conditioning.
+            state_cond: [B, T_q, D] voice state conditioning.
             cfg_scale: classifier-free guidance scale.
             kv_caches: optional KV caches from previous step.
             dialogue_context: optional [B, D_ctx] or [B, C_ctx, D_ctx] scene/dialogue embedding.
             acting_intent: optional [B, D_act] acting intent vector.
-            prosody_latent: optional [B, D_pro] or [B, T, D_pro] local prosody planning.
+            prosody_latent: optional [B, D_pro] or [B, T_q, D_pro] local prosody planning.
+            f0_condition: optional [B, T_q, 2] F0 conditioning.
         """
         # Apply dialogue/acting/prosody conditioning
-        content_features = self.context_projector(
-            content_features,
+        queries = self.context_projector(
+            queries,
             dialogue_context=dialogue_context,
             acting_intent=acting_intent,
             prosody_latent=prosody_latent,
         )
 
-        cfg_tensor = torch.tensor([cfg_scale], device=content_features.device)
+        cfg_tensor = torch.tensor([cfg_scale], device=queries.device)
         logits_a, logits_b, next_kv_caches, x_out = self.uclm_core(
-            content_features,
-            a_ctx,
-            b_ctx,
-            speaker_embed,
-            state_cond,
-            cfg_tensor,
-            kv_caches,
+            queries=queries,
+            memory=memory,
+            a_ctx=a_ctx,
+            b_ctx=b_ctx,
+            speaker_embed=speaker_embed,
+            state_cond=state_cond,
+            cfg_scale=cfg_tensor,
+            kv_caches=kv_caches,
+            f0_condition=f0_condition,
         )
 
         # Pointer head for streaming pointer-driven progression
