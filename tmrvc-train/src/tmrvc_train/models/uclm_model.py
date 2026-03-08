@@ -487,7 +487,13 @@ class DisentangledUCLM(nn.Module):
         b_ctx = b_ctx.clamp_min(0)
 
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
-            content_features, a_ctx, b_ctx, state_cond, speaker_embed, cfg_scale
+            queries=content_features,
+            memory=content_features, # VC cross-attends to its own latent sequence
+            a_ctx=a_ctx,
+            b_ctx=b_ctx,
+            state_cond=state_cond,
+            speaker_embed=speaker_embed,
+            cfg_scale=cfg_scale,
         )
 
         return {
