@@ -390,6 +390,9 @@ class DisentangledUCLM(nn.Module):
         # Delta voice state projection (v3).
         self.delta_voice_state_proj = nn.Linear(d_explicit, d_model)
 
+        # CFG scale embedding for distilled mode (v3).
+        self.cfg_scale_embed = nn.Linear(1, d_model)
+
     @staticmethod
     def apply_cfg_unconditional_mask(
         explicit_state: torch.Tensor,
@@ -684,18 +687,24 @@ class DisentangledUCLM(nn.Module):
         text_suprasegmentals: torch.Tensor | None = None,
     ) -> dict:
         """Single-pass forward with cfg_scale injected for distillation training."""
+        # Project cfg_scale to model dimension and add to global speaker/style conditioning
+        cfg_tensor = torch.tensor([[cfg_scale]], device=speaker_embed.device, dtype=torch.float32)
+        cfg_emb = self.cfg_scale_embed(cfg_tensor)
+        
+        # Add cfg_emb to speaker_embed for distillation (simple injection hack)
+        speaker_embed_with_cfg = speaker_embed + cfg_emb.squeeze(1)
+        
         return self.forward_tts_pointer(
             phoneme_ids=phoneme_ids,
             language_ids=language_ids,
-            pointer_state=None,
-            speaker_embed=speaker_embed,
+            speaker_embed=speaker_embed_with_cfg,
             explicit_state=explicit_state,
             ssl_state=ssl_state,
             target_a=target_a,
             target_b=target_b,
             target_length=target_length,
             f0_condition=f0_condition,
-            cfg_scale=cfg_scale,
+            cfg_scale=1.0, # scale is already baked into speaker_embed_with_cfg
             dialogue_context=dialogue_context,
             acting_intent=acting_intent,
             prosody_latent=prosody_latent,
