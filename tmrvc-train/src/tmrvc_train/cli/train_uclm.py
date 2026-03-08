@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from tmrvc_train.models import DisentangledUCLM
 from tmrvc_train.dataset import DisentangledUCLMDataset
-from tmrvc_train.trainer import UCLMTrainer
+from tmrvc_train.trainer import CurriculumScheduler, UCLMTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,10 @@ def train_uclm(
     legacy_duration_loss_weight: float = 0.0,
     voice_state_loss_weight: float = 0.0,
     delta_voice_state_loss_weight: float = 0.0,
+    conditioning_dropout_prob: float = 0.15,
+    curriculum_stage2_start: int = 5000,
+    curriculum_stage3_start: int = 15000,
+    prompt_sampling_prob: float = 0.0,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     include_datasets = None
@@ -278,6 +282,10 @@ def train_uclm(
     
     model = DisentangledUCLM(num_speakers=num_speakers).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    curriculum = CurriculumScheduler(
+        stage2_start=curriculum_stage2_start,
+        stage3_start=curriculum_stage3_start,
+    )
     trainer = UCLMTrainer(
         model, optimizer, device=device, tts_mode=tts_mode,
         pointer_loss_weight=pointer_loss_weight,
@@ -287,6 +295,9 @@ def train_uclm(
         legacy_duration_loss_weight=legacy_duration_loss_weight,
         voice_state_loss_weight=voice_state_loss_weight,
         delta_voice_state_loss_weight=delta_voice_state_loss_weight,
+        conditioning_dropout_prob=conditioning_dropout_prob,
+        curriculum=curriculum,
+        prompt_sampling_prob=prompt_sampling_prob,
     )
 
     pbar = tqdm(total=max_steps, desc="Training UCLM")
@@ -383,6 +394,30 @@ def main(argv: list[str] | None = None):
         type=float,
         default=0.0,
         help="Weight for delta voice state supervision loss (default: 0.0).",
+    )
+    p.add_argument(
+        "--conditioning-dropout-prob",
+        type=float,
+        default=0.15,
+        help="Probability of CFG conditioning dropout (default: 0.15).",
+    )
+    p.add_argument(
+        "--curriculum-stage2-start",
+        type=int,
+        default=5000,
+        help="Step at which curriculum stage 2 (alignment & pointer) begins (default: 5000).",
+    )
+    p.add_argument(
+        "--curriculum-stage3-start",
+        type=int,
+        default=15000,
+        help="Step at which curriculum stage 3 (drama & dialogue) begins (default: 15000).",
+    )
+    p.add_argument(
+        "--prompt-sampling-prob",
+        type=float,
+        default=0.0,
+        help="Probability of zeroing speaker_embed during TTS for prompt diversity (default: 0.0).",
     )
     args = p.parse_args(argv)
     

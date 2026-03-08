@@ -1,11 +1,6 @@
 """Entry point for `uv run tmrvc-gui` or `python -m tmrvc_gui`."""
 
-from tmrvc_gui.app import run_app
-
-
-def main() -> None:
-    run_app()
-
+from tmrvc_gui.gradio_app import main
 
 if __name__ == "__main__":
     main()

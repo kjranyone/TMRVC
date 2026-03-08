@@ -30,6 +30,7 @@ Replace duration-centric TTS training with pointer-centric TTS training while pr
 - **Define CFG (Classifier-Free Guidance) Training Policy**
 - mainline release path includes at least one pointer-training configuration that does not depend on external aligners
 - runtime-friendly CFG fast paths are planned explicitly rather than assumed away
+- 8-D `voice_state` supervision, masks, and confidences are trainable when present and safely ignorable when absent
 
 
 ## Training Curriculum
@@ -53,6 +54,7 @@ Worker 02 must implement and document the following curriculum:
 - **Data:** High-expressivity dialogue datasets (curated).
 - **Task:** Dialogue-conditioned TTS with Prosody Predictor and CFG training.
 - **Note:** **Classifier-Free Guidance (CFG)** training is introduced here by randomly dropping conditioning (10-20% dropout) to allow inference-time guidance scaling.
+- **Quality gate at Stage B completion:** Evaluate whether utterance-global prosody `[B, d_prosody]` is sufficient for drama acting quality. If anti-collapse metrics (`context_separation_score`, `prosody_collapse_score`) indicate insufficient local variation, schedule time-local prosody `[B, T_plan, d_prosody]` upgrade for Stage C.
 
 
 ## Concrete Tasks
@@ -74,7 +76,11 @@ Worker 02 must implement and document the following curriculum:
    - `stage3_replay_mix_ratio`
    - `stage3_dialogue_mix_ratio`
    - **`conditioning_dropout_prob`** (for CFG training)
+   - `conditioning_dropout_schema_version`
    - **`prosody_loss_weight`** (for Flow-matching)
+   - `voice_state_loss_weight`
+   - `voice_state_confidence_floor`
+   - `voice_state_teacher_mode: none | pseudo_labeled | direct_labeled | mixed`
 2. Refactor `trainer.py`:
    - separate VC step and TTS pointer step
    - remove assumption that TTS batch must have durations
@@ -115,15 +121,19 @@ Worker 02 must implement and document the following curriculum:
 8. **Implement the 3-stage Training Pipeline and logic for Stage 1/2/3 transitions.**
    - Stage 2 must document the warmup-to-latent-only schedule explicitly
 9. **Implement CFG Training logic (conditioning dropout for speaker/style/context).**
-10. Add CFG runtime-acceleration preparation:
+   - use the exact unconditional mask contract frozen by Worker 01
+   - dropping only a subset of conditioning paths is forbidden unless it is an explicit ablation mode
+10. Add CFG runtime-acceleration preparation **(Tier 2)**:
     - define whether runtime may use `off | full | lazy | distilled` CFG modes
     - if `distilled` is supported, implement **CFG Self-Distillation** hooks in Stage 3, allowing the model to approximate 2-pass guided outputs in a 1-pass inference step, ensuring high expressive capacity fits within real-time VST budgets.
     - if `lazy` CFG is supported, define the training-time assumption or robustness check for skipped guidance refreshes
+    - `off` and `full` are Tier 1; `lazy` and `distilled` are Tier 2 and must not block Tier 1 sign-off
 11. **Implement Flow-matching Loss for the Prosody Predictor.**
 12. Add expressive-training hooks:
     - dialogue-context conditioning batch fields
     - utterance-level style / acting labels when available
     - optional local prosody latent supervision
+    - optional `voice_state_targets`, `voice_state_observed_mask`, and `voice_state_confidence`
     - (CFG-based acting control is achieved via `cfg_scale` scalar and conditioning dropout, not a dedicated embedding)
 13. Add anti-collapse training losses or diagnostics:
     - same-text different-context separation metric
@@ -167,17 +177,29 @@ The trainer must accept TTS examples with:
 - optional `acting_intent`
 - optional `prosody_targets` (for Flow-matching)
 - optional `acoustic_history_teacher` or equivalent teacher-forced codec/control history source
+- optional `voice_state_targets`
+- optional `voice_state_observed_mask`
+- optional `voice_state_confidence`
+- optional `voice_state_target_source`
 
-## Alignment Learning Policy (Pointer Target Generation)
+## Alignment and Pointer Supervision Policy
 
-To avoid learning a robotic, uniform-duration rhythm, the model must **NOT** use naive uniform temporal distribution (`target_length // L`) for pointer targets during early training.
+This section defines both the allowed/forbidden pointer-target types and the supervision lifecycle. The two concerns are tightly coupled and must be read together.
 
-- **Stage 2 Requirement:** The trainer must use **Monotonic Alignment Search (MAS)** or a dynamic programming equivalent (e.g., Forward-Sum) to align `phoneme_features` with the actual acoustic features (`target_b` / `target_a`) dynamically.
-- The pointer head's target (`advance_targets`, `progress_targets`) must be derived from this MAS path, ensuring the model learns the natural variance in phoneme durations.
-- Uniform distribution is explicitly forbidden as a training target, as it guarantees prosody collapse.
+### Allowed and Forbidden Pointer Targets
 
+To avoid learning a robotic, uniform-duration rhythm, the model must **NOT** use naive uniform temporal distribution (`target_length // L`) as a release recipe.
 
-## Training Policy For Pointer Supervision
+- allowed:
+  - `aux_mas`
+  - `aux_ctc`
+  - deterministic bootstrap projections exported by Worker 10
+- forbidden as release truth:
+  - uniform `target_length // L` targets
+- research-only scaffolding:
+  - a temporary heuristic bootstrap may exist for smoke-testing interfaces, but it must be labeled non-release and excluded from final convergence claims
+
+### Supervision Lifecycle
 
 - steady-state target:
   - pointer progression is learnable in `latent_only` mode with no external frame-level aligner dependency
@@ -185,13 +207,25 @@ To avoid learning a robotic, uniform-duration rhythm, the model must **NOT** use
   - monotonic regularization may use `aux_mas` or `aux_ctc`
 - transitional target:
   - supervised pointer loss may come from `bootstrap_projection` or `legacy_duration`
+- alternative alignment-free candidate:
+  - a progress-aware positional scheme may provide implicit alignment without explicit pointer targets (see Worker 01 § RoPE / pointer interaction)
 - forbidden state:
   - supervised pointer loss enabled while pointer targets are absent
 - release condition:
   - bootstrap and legacy-duration supervision must be demoted to transitional or ablation-only once the alignment-free pointer recipe is validated
+  - a progress-aware positional alignment recipe is acceptable only if it meets the same quality gates
 - recommended convergence recipe:
   - warm up pointer learning with auxiliary alignment regularization for the first configured step window
   - anneal auxiliary alignment toward zero before declaring the recipe alignment-free
+
+### Tension with Alignment-Free Release Criterion
+
+MAS-derived pointer targets are structurally a form of duration supervision. While they are superior to uniform distribution, relying on MAS indefinitely contradicts the plan's release exit criterion of at least one alignment-free recipe. Two resolution paths exist:
+
+1. **Annealing path (current plan):** Use MAS targets during warmup, then anneal toward `latent_only` mode where the pointer head learns to align without external targets. This requires the pointer head to bootstrap alignment from the acoustic-text cross-attention signal alone.
+2. **Progress-aware positional path (alternative):** If Worker 01 adopts a progress-aware positional scheme, alignment progress may be encoded directly into position structure and reduce the need for explicit pointer targets. This remains a research-track alternative until validated.
+
+Worker 02 must validate at least one of these paths before release sign-off.
 
 
 ## Early Anti-Collapse Metric Definitions
@@ -218,6 +252,8 @@ Exact production formulas may evolve, but these names and intents must be fixed 
 - do not remove current VC training path
 - do not equate low reconstruction loss with expressive success
 - do not turn MAS/CTC into an unexamined permanent dependency of the released v3 path
+- do not let CFG training and inference disagree on which conditioning fields are dropped
+- do not treat low-confidence or missing `voice_state` targets as dense zero targets
 - do not enable supervised pointer loss without a concrete bootstrap target source
 - do not push ownership of canonical bootstrap projection into ad hoc dataset code
 
@@ -230,6 +266,7 @@ Exact production formulas may evolve, but these names and intents must be fixed 
 - **CFG training capability confirmed.**
 - **CFG fast-path contract (`full | lazy | distilled | off`) documented and aligned with Worker 04.**
 - **Flow-matching prosody prediction trained.**
+- `voice_state` supervision path is documented and masked correctly when pseudo-label confidence is partial
 - at least one documented recipe trains pointer mode without requiring external aligners at release time
 - Stage 3 replay-mix policy is documented and prevents drama finetuning from collapsing base quality
 
@@ -242,8 +279,10 @@ Exact production formulas may evolve, but these names and intents must be fixed 
 - latent-only pointer mode config is accepted without bootstrap labels
 - auxiliary-alignment warmup / anneal schedule config test
 - **CFG training test (ensure conditioning is dropped per configured probability).**
+- CFG conditioning-schema parity test against Worker 01 contract
 - CFG fast-path config validation test
 - **Flow-matching loss test (ensure gradient flows to Prosody Predictor).**
+- `voice_state` mask/confidence loss test
 - config parsing tests for new flags
 - quality gate tests renamed or expanded for new supervision semantics
 - test that context-conditioned batches are accepted without breaking non-context batches

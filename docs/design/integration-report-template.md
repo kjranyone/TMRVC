@@ -10,62 +10,90 @@
 
 | Worker | Scope | Status | Notes |
 |--------|-------|--------|-------|
-| W01 | UCLM architecture & training loop | _TODO / IN PROGRESS / DONE_ | |
-| W02 | Data pipeline & pseudo-annotation | _TODO / IN PROGRESS / DONE_ | |
-| W03 | Forced alignment & MFA removal | _TODO / IN PROGRESS / DONE_ | |
-| W04 | Streaming TTS serving | _TODO / IN PROGRESS / DONE_ | |
-| W05 | Voice conversion integration | _TODO / IN PROGRESS / DONE_ | |
-| W06 | Validation & evaluation | _TODO / IN PROGRESS / DONE_ | |
+| W01 | Architecture and model contract | _TODO / IN PROGRESS / DONE_ | |
+| W02 | Training pipeline and losses | _TODO / IN PROGRESS / DONE_ | |
+| W03 | Dataset contract, text supervision, and metrics | _TODO / IN PROGRESS / DONE_ | |
+| W04 | Serving and runtime pointer execution | _TODO / IN PROGRESS / DONE_ | |
+| W05 | DevOps and operator docs | _TODO / IN PROGRESS / DONE_ | |
+| W06 | Validation and release gates | _TODO / IN PROGRESS / DONE_ | |
+| W07 | Curation orchestration | _TODO / IN PROGRESS / DONE_ | |
+| W08 | Curation providers | _TODO / IN PROGRESS / DONE_ | |
+| W09 | Curation selection policy | _TODO / IN PROGRESS / DONE_ | |
+| W10 | Curation export contract | _TODO / IN PROGRESS / DONE_ | |
+| W11 | Curation validation | _TODO / IN PROGRESS / DONE_ | |
+| W12 | Gradio / WebUI control plane | _TODO / IN PROGRESS / DONE_ | |
 
-For each worker that is not DONE, list the remaining items in the Notes
-column or in the Remaining Blockers section below.
+For each worker that is not `DONE`, list the remaining items in the Notes column or in the Remaining Blockers section below.
 
 ---
 
 ## 2. Test Results Summary
 
-### 2a. Unit and Integration Tests
+### 2.1 Unit and Integration Tests
 
 | Test suite | Passed | Failed | Skipped | Total | Notes |
 |------------|--------|--------|---------|-------|-------|
 | `tests/data/` | | | | | |
 | `tests/train/` | | | | | |
 | `tests/serve/` | | | | | |
-| `tests/scripts/` | | | | | |
+| `tests/runtime/` | | | | | |
+| `tmrvc-engine-rs/tests/` | | | | | |
 
 **Command used:**
+
 ```bash
-pytest --tb=short -q 2>&1 | tail -20
+pytest --tb=short -q
 ```
 
-### 2b. Evaluation Script Results
+### 2.2 Evaluation / Benchmark Results
 
 | Evaluation | Passed | Key metric | Value | Threshold |
 |------------|--------|-----------|-------|-----------|
-| `evaluate_drama_acting.py` — context_sensitivity | | mean CV | | >= 0.10 |
-| `evaluate_drama_acting.py` — control_responsiveness | | pace ratio | | >= 1.30 |
-| `evaluate_drama_acting.py` — pause_realism | | mean pause (s) | | 0.05-0.40 |
+| Pointer monotonicity | | violation count | | 0 |
+| Real-time frame compute | | p95 ms | | <= 10 ms |
+| Streaming chunk latency | | p95 ms | | <= 50 ms |
+| Time-to-first-audio | | ms | | < 200 ms |
+| Voice-state responsiveness | | directional dims | | 8 / 8 required |
+| Few-shot leakage | | leakage score | | below frozen threshold |
+| Curation pseudo-label utility | | utility score | | non-negative vs ablation |
 
-Attach or link the full JSON output:
-- Path: `_results/drama_eval.json_`
+Attach or link the full outputs:
+
+- Path: `_results/release_eval.json_`
+- Path: `_results/latency.json_`
+- Path: `_results/curation_validation.json_`
 
 ---
 
-## 3. Quality Gate Results
+## 3. Acceptance Threshold Results
 
-### 3a. Acceptance Thresholds (from `docs/design/acceptance-thresholds.md`)
+### 3.1 Release Gates
 
 | # | Criterion | Pass/Fail | Evidence |
 |---|-----------|-----------|----------|
-| 1 | TTS training without MFA artifacts | | _Link to alignment error report_ |
-| 2 | Streaming TTS < 50 ms per frame step | | _p95 latency value_ |
-| 3 | No VC regression | | _Cosine similarity, MOS, CER values_ |
-| 4 | Pacing controls directional | | _evaluate_drama_acting.py output_ |
-| 5 | Context sensitivity measurable | | _evaluate_drama_acting.py output_ |
-| 6 | Human evaluation preference | | _MOS and preference % with CIs_ |
-| 7 | Pseudo-annotation audit | | _Validation protocol results_ |
+| 1 | Pointer TTS mainline integrity | | |
+| 2 | Streaming latency budget | | |
+| 3 | Pointer runtime robustness | | |
+| 4 | TTS quality and control responsiveness | | |
+| 5 | Context sensitivity and drama acting | | |
+| 6 | Few-shot speaker adaptation | | |
+| 7 | Voice conversion stability | | |
+| 8 | Multilingual and code-switch regression | | |
+| 9 | Pseudo-annotation and curation quality | | |
+| 10 | Separation policy | | |
+| 11 | External baseline parity | | |
+| 12 | Human evaluation quality control | | |
 
-### 3b. Pseudo-Annotation Validation (from `docs/design/pseudo-annotation-validation.md`)
+### 3.2 Latency Detail
+
+| Path | Pass/Fail | Measured value | Threshold |
+|------|-----------|----------------|-----------|
+| Real-time steady-state frame compute | | | <= 10 ms p95 |
+| Streaming server end-to-end chunk | | | <= 50 ms p95 |
+| TTFA | | | < 200 ms |
+| Rust / VST default CFG mode | | | `off`, `lazy`, or `distilled` |
+
+### 3.3 Curation / Supervision Detail
 
 | Gate | Pass/Fail | Measured value | Threshold |
 |------|-----------|----------------|-----------|
@@ -73,14 +101,28 @@ Attach or link the full JSON output:
 | Text normalization audit | | | >= 95% pass |
 | Speaker clustering NMI | | | >= 0.80 |
 | Quality-score threshold | | | FR < 5%, FA < 10% |
-| Confidence calibration ECE | | | < 0.05 |
-| Separation front-end selected | | | Composite score documented |
+| `voice_state` calibration ECE | | | frozen threshold |
+| `voice_state` utility uplift | | | non-negative vs no-label ablation |
+| Export contract completeness | | | masks + provenance present |
 
 ---
 
-## 4. Remaining Blockers
+## 4. Contract Parity Checklist
 
-List anything that prevents promotion of this RC to production.
+| Contract | Pass/Fail | Evidence |
+|----------|-----------|----------|
+| PyTorch / ONNX / Rust share canonical CFG mask set | | |
+| `uclm_core` uses canonical raw-state inputs, not divergent `state_cond` public API | | |
+| Pointer state update parity near threshold | | |
+| `SpeakerProfile` fingerprint invalidation works | | |
+| Frame convention parity (`24kHz`, `240`, inclusive/exclusive) | | |
+| WebUI uses `tmrvc-serve` authoritative API, not direct manifest mutation | | |
+
+---
+
+## 5. Remaining Blockers
+
+List anything that prevents promotion of this RC.
 
 | ID | Blocker | Owner | Severity | ETA |
 |----|---------|-------|----------|-----|
@@ -91,31 +133,31 @@ If there are no blockers, write: **No remaining blockers.**
 
 ---
 
-## 5. Acceptance Criteria Pass/Fail Checklist
+## 6. Final Sign-Off Checklist
 
-This is the final sign-off checklist. Every item must be marked PASS before the
-RC is promoted.
-
-- [ ] **AC-1** TTS training completes without MFA artifacts
-- [ ] **AC-2** Streaming TTS p95 frame-step latency < 50 ms
-- [ ] **AC-3** VC metrics equal or exceed v2 baselines
-- [ ] **AC-4** Pacing controls produce significant directional changes
-- [ ] **AC-5** Context sensitivity CV >= 0.10 on held-out dialogue
-- [ ] **AC-6** Human evaluation: v3 preferred >= 50% (non-inferiority)
-- [ ] **AC-7** Pseudo-annotation audit: all six gates passed
-- [ ] **AC-8** All unit and integration tests pass
-- [ ] **AC-9** No critical or high-severity blockers remain open
-- [ ] **AC-10** This report is reviewed and signed off by at least two team members
+- [ ] **AC-1** Pointer TTS train / serve path runs without MFA artifacts
+- [ ] **AC-2** Real-time steady-state frame compute latency is <= 10 ms p95
+- [ ] **AC-3** Streaming server chunk latency is <= 50 ms p95
+- [ ] **AC-4** VC metrics match or exceed the pinned regression target
+- [ ] **AC-5** All 8 explicit `voice_state` dimensions show directional responsiveness
+- [ ] **AC-6** Context-sensitive acting metrics and human ratings pass the frozen threshold
+- [ ] **AC-7** Few-shot prompt leakage remains below the frozen threshold
+- [ ] **AC-8** Multilingual / code-switch regression gates pass
+- [ ] **AC-9** Curation audit and `voice_state` supervision utility gates pass
+- [ ] **AC-10** All unit, integration, parity, and runtime tests pass
+- [ ] **AC-11** No critical or high-severity blockers remain open
+- [ ] **AC-12** This report is reviewed and signed off by the required leads
 
 ---
 
-## 6. Sign-Off
+## 7. Sign-Off
 
 | Role | Name | Date | Signature |
 |------|------|------|-----------|
 | Validation lead | | | |
 | Training lead | | | |
 | Serving lead | | | |
+| Curation lead | | | |
 | Project lead | | | |
 
 ---

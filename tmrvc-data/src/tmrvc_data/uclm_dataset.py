@@ -14,7 +14,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -40,6 +40,10 @@ class UCLMBatch:
     dialogue_context: Optional[torch.Tensor] = None
     acting_intent: Optional[torch.Tensor] = None
     prosody_targets: Optional[torch.Tensor] = None
+    # v3 voice state supervision (Worker 01/03)
+    voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
+    voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool
+    voice_state_confidence: Optional[torch.Tensor] = None     # [B, T, 8]
 
 
 class UCLMDataset(Dataset):
@@ -62,6 +66,8 @@ class UCLMDataset(Dataset):
         include_datasets: If set, only include these datasets.
         exclude_speakers: Speaker IDs to exclude.
         tts_mode: "auto", "pointer", or "legacy_duration".
+        quality_score_threshold: Minimum quality_score to include (0.0 = no filter).
+        provenance_filter: If set, only include utterances with this provenance_class.
     """
 
     def __init__(
@@ -73,6 +79,8 @@ class UCLMDataset(Dataset):
         include_datasets: list[str] | None = None,
         exclude_speakers: list[str] | None = None,
         tts_mode: str = "auto",
+        quality_score_threshold: float = 0.0,
+        provenance_filter: str | None = None,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.datasets = datasets or []
@@ -81,6 +89,8 @@ class UCLMDataset(Dataset):
         self.include_datasets = include_datasets
         self.exclude_speakers = set(exclude_speakers or [])
         self.tts_mode = tts_mode
+        self.quality_score_threshold = quality_score_threshold
+        self.provenance_filter = provenance_filter
 
         self.utterances: list[dict[str, Any]] = []
         self._scan_utterances()
@@ -140,6 +150,15 @@ class UCLMDataset(Dataset):
                     if n_frames < self.min_frames:
                         continue
 
+                    # Quality filtering (Worker 03)
+                    if self.quality_score_threshold > 0.0:
+                        qs = meta.get("quality_score", 1.0)
+                        if qs < self.quality_score_threshold:
+                            continue
+                    if self.provenance_filter is not None:
+                        if meta.get("provenance_class", "") != self.provenance_filter:
+                            continue
+
                     self.utterances.append(
                         {
                             "utterance_id": meta.get("utterance_id", utt_dir.name),
@@ -156,42 +175,95 @@ class UCLMDataset(Dataset):
         return len(self.utterances)
 
     def supervision_report(self) -> dict:
-        """Return dataset-level supervision statistics (Worker 03 requirement)."""
-        from tmrvc_data.g2p import UNK_ID, PHONE2ID
+        """Return dataset-level supervision statistics (Worker 03 requirement).
+
+        Returns a dict compatible with DatasetReport fields.
+        """
+        from tmrvc_data.g2p import UNK_ID, PHONE2ID, ID2PHONE
 
         total = len(self.utterances)
         with_text = 0
+        with_canonical_text_units = 0
         with_legacy_duration = 0
+        with_voice_state = 0
+        with_dialogue_context = 0
         total_phones = 0
         unk_phones = 0
-        
+        active_ids: set[int] = set()
+        vs_observed_sum = 0.0
+        vs_observed_count = 0
+        vs_confidence_values: list[float] = []
+
         # JA Accent tracking
         accents = [PHONE2ID.get(a) for a in ["^", "=", "_"] if a in PHONE2ID]
         accent_count = 0
+        multi_take_texts: dict[str, int] = {}
 
         for utt in self.utterances:
             utt_path = utt["path"]
             has_phonemes = (utt_path / "phoneme_ids.npy").exists()
             has_durations = (utt_path / "durations.npy").exists()
-            if has_phonemes:
+            has_vs_targets = (utt_path / "voice_state_targets.npy").exists()
+            has_dialogue = (utt_path / "dialogue_context.npy").exists()
+
+            if utt.get("text"):
                 with_text += 1
-                if has_durations:
-                    with_legacy_duration += 1
+                multi_take_texts[utt["text"]] = multi_take_texts.get(utt["text"], 0) + 1
+            if has_phonemes:
+                with_canonical_text_units += 1
                 try:
                     pids = np.load(utt_path / "phoneme_ids.npy")
                     total_phones += len(pids)
                     unk_phones += int((pids == UNK_ID).sum())
+                    active_ids.update(int(p) for p in pids)
                     if accents:
                         accent_count += sum(1 for p in pids if p in accents)
                 except Exception:
                     pass
+            if has_durations:
+                with_legacy_duration += 1
+            if has_vs_targets:
+                with_voice_state += 1
+                try:
+                    mask_path = utt_path / "voice_state_observed_mask.npy"
+                    if mask_path.exists():
+                        mask = np.load(mask_path)
+                        vs_observed_sum += float(mask.mean())
+                        vs_observed_count += 1
+                    conf_path = utt_path / "voice_state_confidence.npy"
+                    if conf_path.exists():
+                        conf = np.load(conf_path)
+                        vs_confidence_values.append(float(conf.mean()))
+                except Exception:
+                    pass
+            if has_dialogue:
+                with_dialogue_context += 1
+
+        active_phone_inventory = sorted(
+            ID2PHONE.get(i, f"id:{i}") for i in active_ids if i != UNK_ID
+        )
+        multi_context_count = sum(1 for c in multi_take_texts.values() if c > 1)
 
         return {
-            "total": total,
+            "num_utterances": total,
             "text_supervision_coverage": with_text / max(total, 1),
+            "canonical_text_unit_coverage": with_canonical_text_units / max(total, 1),
             "legacy_duration_coverage": with_legacy_duration / max(total, 1),
             "unknown_phone_ratio": unk_phones / max(total_phones, 1),
+            "direct_hit_ratio": (total_phones - unk_phones) / max(total_phones, 1),
+            "alias_hit_ratio": 0.0,  # Requires normalization pass to compute
+            "active_phone_inventory": active_phone_inventory,
             "pitch_accent_coverage": accent_count / max(total_phones, 1),
+            "voice_state_supervision_coverage": with_voice_state / max(total, 1),
+            "voice_state_observed_ratio": (
+                vs_observed_sum / vs_observed_count if vs_observed_count > 0 else 0.0
+            ),
+            "voice_state_confidence_summary": {
+                "mean": sum(vs_confidence_values) / len(vs_confidence_values) if vs_confidence_values else 0.0,
+                "count": len(vs_confidence_values),
+            },
+            "dialogue_context_coverage": with_dialogue_context / max(total, 1),
+            "same_text_multi_context_coverage": multi_context_count / max(len(multi_take_texts), 1) if multi_take_texts else 0.0,
             "tts_mode": self.tts_mode,
         }
 
@@ -273,6 +345,20 @@ class UCLMDataset(Dataset):
         if (utt_path / "prosody_targets.npy").exists():
             prosody_targets = torch.from_numpy(np.load(utt_path / "prosody_targets.npy")).float()
 
+        # Voice state supervision artifacts (Worker 03)
+        voice_state_targets = None
+        voice_state_observed_mask = None
+        voice_state_confidence = None
+        vs_targets_path = utt_path / "voice_state_targets.npy"
+        if vs_targets_path.exists():
+            voice_state_targets = torch.from_numpy(np.load(vs_targets_path)).float()
+            vs_mask_path = utt_path / "voice_state_observed_mask.npy"
+            if vs_mask_path.exists():
+                voice_state_observed_mask = torch.from_numpy(np.load(vs_mask_path)).bool()
+            vs_conf_path = utt_path / "voice_state_confidence.npy"
+            if vs_conf_path.exists():
+                voice_state_confidence = torch.from_numpy(np.load(vs_conf_path)).float()
+
         return {
             "codec_tokens": codec_tokens,
             "voice_state": voice_state,
@@ -285,6 +371,9 @@ class UCLMDataset(Dataset):
             "dialogue_context": dialogue_context,
             "acting_intent": acting_intent,
             "prosody_targets": prosody_targets,
+            "voice_state_targets": voice_state_targets,
+            "voice_state_observed_mask": voice_state_observed_mask,
+            "voice_state_confidence": voice_state_confidence,
         }
 
 

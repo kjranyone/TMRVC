@@ -5,7 +5,7 @@
 ## 1. 実装の正本
 
 - 全体計画: `../../plan/README.md`
-- ワーカー分割: `../../plan/worker_01_architecture.md` から `worker_06_validation.md`
+- ワーカー分割: `../../plan/worker_01_architecture.md` から `worker_12_gradio_control_plane.md`
 
 このファイルに段階別ロードマップや旧前提の詳細は持たない。
 
@@ -39,9 +39,9 @@
 
 ### 3.3 Data
 
-- dataset language isolation
+- monolingual default with explicit multilingual / code-switch metadata
 - text units without forced alignment
-- cache quality metrics for text coverage
+- cache quality metrics for text coverage and `voice_state` supervision coverage
 
 ### 3.4 Serving
 
@@ -54,4 +54,5 @@
 - `dev.py` の主経路で `MFA` なし学習が完結する
 - TTS 学習が `phoneme_ids` のみで成立する
 - serve が pointer-state TTS を動かせる
+- `docs/design/acceptance-thresholds.md` の release gates と矛盾しない
 - legacy 機能は mainline と明確に分離される

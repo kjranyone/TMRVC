@@ -63,27 +63,20 @@ Rule:
 
 ## SOTA Landscape Awareness (2025-2026)
 
-This plan is informed by the dominant trends in SOTA TTS systems as of early 2026. The following architectural patterns are acknowledged and explicitly positioned against:
+This plan is informed by the dominant trends in SOTA TTS systems as of early 2026. Exact paper references and dates are tracked in `plan/arxiv_survey_2026_03.md`. The high-level conclusions used by this plan are:
 
 ### Dominant pattern: 2-stage AR + Non-AR
 
-Almost all top-performing systems (MiniMax-Speech, CosyVoice 3, DiSTAR, Qwen3-TTS, GLM-TTS, IndexTTS 2.5) use a two-stage pipeline:
+Many recent strong systems use a two-stage pipeline:
 1. AR language model over discrete semantic/codec tokens
 2. Non-AR refinement (flow matching, diffusion, or DiT) for high-fidelity continuous acoustic generation
 
 TMRVC v3 initial mainline uses flattened single-stage codec prediction for simplicity and streaming compatibility. A 2-stage flow-matching acoustic refinement module is planned as the v3.1 quality upgrade path (see worker_01 § Acoustic Refinement Roadmap).
 
-### Relevant prior art for pointer alignment
+### Additional implications
 
-- **VoiceStar (arXiv:2505.19462)**: Progress-Monitoring RoPE (PM-RoPE) embeds text-speech alignment progress directly into position encoding. Validates the pointer + RoPE direction and provides a reference design for Worker 01.
-- **VALL-E R (arXiv:2406.07855)**: Monotonic alignment strategy in decoder-only codec LM. Demonstrates robustness gains from explicit alignment constraints in AR TTS.
-
-### Disentanglement state of the art
-
-- **Vevo (ICLR 2025, arXiv:2502.07243)**: Self-supervised progressive disentanglement of timbre/style/content via VQ-VAE information bottleneck.
-- **DisCo-Speech (arXiv:2512.13251)**: Codec-level tri-factor disentanglement (content, prosody, timbre). Resolves entanglement at the tokenizer rather than the model level.
-
-These approaches inform but do not replace TMRVC's model-level bottleneck design. Codec-level disentanglement is a future investigation path.
+- progress-aware alignment structure is a promising direction, but it does not remove the need for explicit parity gates in a 10 ms causal runtime
+- disentanglement is now a first-class design problem, but TMRVC still needs repository-local proof that prompt conditioning does not leak prosody through hidden paths
 
 ### Scale reality
 
@@ -105,7 +98,7 @@ The plan must operate under explicit scale assumptions so architecture, data, an
 - plans must target the existing monorepo structure first
 - shared runtime and tensor contracts live in `tmrvc-core`
 - dataset and cache contracts live in `tmrvc-data`
-- the repository currently contains `tmrvc-gui` (PySide6 / Qt), but the v3 HITL control plane is a separate Gradio/WebUI mainline because multi-user audit, blind evaluation, and role separation are first-class requirements
+- `tmrvc-gui` is a Gradio-only WebUI; PySide6/Qt has been fully deprecated and removed. The Gradio control plane is the sole HITL surface for multi-user audit, blind evaluation, role separation, and all operational workflows
 - `plan/arxiv_survey_2026_03.md` records the dated research survey used to justify Tier 1 vs Tier 2 boundaries; workers should update it when a new paper materially changes a design choice
 
 
@@ -230,17 +223,23 @@ worker_01_architecture   worker_03_dataset_alignment
         |    \                     |
         v     +-------+    +------+
 worker_04_serving     |    |
-        |             v    v
-        |       worker_02_training ---> worker_12_gradio
-        |             |                 (WebUI Control Plane)
-        v             v
+        |    \        v    v
+        |     +-> worker_02_training
+        |             |
+        |             v
+        +-------> worker_12_gradio
+        |         (WebUI Control Plane)
+        |             ^
+        |             | (artifact schema)
+        |         worker_10_curation_export
+        v
      worker_06_validation
 ```
 
 - `worker_01` and `worker_03` may start in parallel: `worker_01` fixes the model/runtime contract; `worker_03` fixes the dataset/batch contract.
 - `worker_02` depends on both `worker_01` (pointer/state interfaces) and `worker_03` (batch/cache schema).
 - `worker_04` consumes the final model/checkpoint/runtime contract across Python serve, Rust engine, ONNX export, and VST. It also depends on `worker_02` for checkpoint schema.
-- `worker_12` depends on `worker_02` (training artifacts) and `worker_04` (runtime/admin APIs).
+- `worker_12` depends on `worker_02` (training artifacts), `worker_04` (runtime/admin APIs, SSE, idempotency), and `worker_10` (exported artifact schema).
 - `worker_06` is the final proof layer for the integrated v3 path.
 
 ### AI Curation Path
@@ -270,13 +269,13 @@ worker_11_curation_validation
 ### Cross-Cutting Tooling and Policy
 
 ```text
-worker_05_devops_docs
-   ^            ^
-   |            |
-worker_04    worker_10
+     worker_05_devops_docs
+      ^       ^        ^
+      |       |        |
+worker_04  worker_10  worker_12
 ```
 
-- `worker_05` should not freeze menus, docs, or operator flows until runtime and export contracts are stable.
+- `worker_05` should not freeze menus, docs, or operator flows until runtime, export, and WebUI contracts are stable.
 - `dramatic_acting_requirements.md` and `ai_curation_system.md` constrain all workers and are not optional reference material.
 
 
@@ -311,7 +310,8 @@ Use this section as the handoff gate. A worker should not start coding until its
 
 ### worker_05_devops_docs
 
-- starts in draft mode early, but final operator-facing flow waits for `worker_04` and `worker_10`
+- starts in draft mode early, but final operator-facing flow waits for `worker_04`, `worker_10`, and `worker_12`
+- WebUI operator guides (tasks 7-10) must not freeze until `worker_12` UI contract is stable
 - must present `v3 pointer` as the default forward path and `v2 legacy` as compatibility
 - must not document workflows that depend on MFA in the mainline
 
@@ -356,6 +356,15 @@ Use this section as the handoff gate. A worker should not start coding until its
 - always in force
 - any worker that drops dialogue context, local prosody capacity, or controllable pacing is non-compliant
 - any worker that hides or demotes the 8-D physical `voice_state` behind vague style labels is non-compliant
+
+### worker_12_gradio_control_plane
+
+- may draft minimum admin/eval UI contracts early (Stage A)
+- must not freeze unsupported control inputs before `worker_01` and `worker_04` stabilize runtime contracts
+- depends on `worker_02` for training artifacts and evaluation data
+- depends on `worker_04` for runtime/admin API contracts, SSE event schema, and idempotency middleware
+- depends on `worker_10` for exported artifact schema and manifest browsing contract
+- must consume backend-owned schemas (`SpeakerProfile`, `voice_state`, pointer state) rather than inventing frontend-only shapes
 
 ### ai_curation_system.md
 

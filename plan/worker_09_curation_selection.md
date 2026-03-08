@@ -23,6 +23,7 @@ The system is only useful if it can say "use this", "re-run this", or "throw thi
 - subset promotion lists
 - bucket-specific numeric thresholds encoded in config
 - explicit human-override and approval policy
+- explicit policy for partial or missing `voice_state` supervision
 
 ## Scoring Dimensions
 
@@ -37,6 +38,8 @@ Each sample should be scored on:
 - separation damage estimate
 - separation confidence
 - style / event extraction completeness
+- `voice_state` supervision density
+- `voice_state` confidence quality
 - audio technical quality
 
 ## Decision Policy
@@ -106,6 +109,10 @@ Not all promoted data belong in the same training path.
    - which buckets require auditor approval
    - which buckets require double approval or admin override
    - how overrides are justified and logged
+8. Define `voice_state` promotion policy:
+   - which buckets require minimum `voice_state` coverage
+   - when missing `voice_state` is acceptable with explicit absence metadata
+   - when low-confidence `voice_state` forces `review` rather than `promote`
 
 ## Guardrails
 
@@ -116,6 +123,7 @@ Not all promoted data belong in the same training path.
 - do not let separated waveforms silently enter initial mainline teacher sets
 - do not let workers invent bucket thresholds ad hoc
 - do not leave human override rules implicit if the UI exposes promotion controls
+- do not promote samples as physical-control-ready when `voice_state` coverage/confidence is unknown
 
 ## Handoff Contract
 

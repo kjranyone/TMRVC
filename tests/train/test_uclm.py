@@ -59,12 +59,13 @@ def test_vc_encoder():
 def test_uclm_transformer():
     B, T, d = 1, 50, 512
     content = torch.randn(B, T, d) # Corrected shape [B, T, d]
+    a_ctx = torch.randint(0, 1024, (B, 8, T))
     b_ctx = torch.randint(0, 64, (B, 4, T))
     spk_embed = torch.randn(B, 192)
     state_cond = torch.randn(B, d)
     
     model = CodecTransformer(d_model=d)
-    logits_a, logits_b, kv_out, _hidden = model(content, b_ctx, spk_embed, state_cond)
+    logits_a, logits_b, kv_out, _hidden = model(content, a_ctx, b_ctx, spk_embed, state_cond)
 
     assert logits_a.shape == (B, 8, T, 1024), (
         f"Transformer A_t shape mismatch: {logits_a.shape}"

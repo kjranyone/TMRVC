@@ -36,6 +36,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
 - runtime supports short-reference few-shot speaker adaptation in a reproducible way
 - CFG-style control scaling is exposed through a documented inference contract
 - multilingual / code-switch requests are supported through explicit language conditioning
+- `tmrvc-serve` is the single authoritative backend API surface for multi-user WebUI workflows
 
 
 ## Concrete Tasks
@@ -116,6 +117,7 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - `POST /ui/eval/sessions`
    - `GET /ui/eval/assignments/{assignment_id}`
    - `POST /ui/eval/assignments/{assignment_id}/submit`
+   - these routes are the authoritative multi-user contract; direct manifest file access is not a mainline API
 14. Define few-shot runtime behavior:
    - when `reference_audio` is encoded
    - how **`speaker_profile_id`** loads the precomputed embedding and prompt tokens from the Casting Gallery
@@ -126,7 +128,15 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - how much authority prompt texture has relative to speaker-identity anchoring
 15. Define CFG runtime behavior:
    - guidance blends logits: `guided_logits = uncond_logits + cfg_scale * (cond_logits - uncond_logits)`
-   - unconditional pass is produced by zeroing out: `explicit_voice_state`, `ssl_voice_state`, `speaker_embed`, and `dialogue_context` (the same conditioning inputs dropped during CFG training dropout)
+   - unconditional pass is produced by zeroing out or dropping exactly the Worker 01 mask set:
+     - `explicit_voice_state`
+     - `delta_voice_state`
+     - `ssl_voice_state`
+     - `speaker_embed`
+     - `prompt_codec_tokens` or `prompt_kv_cache`
+     - `dialogue_context`
+     - `acting_intent`
+     - `local_prosody_latent`
    - unconditional pass may reuse the same KV cache structure but with zeroed conditioning; it must not require a separate model instance
    - safe `cfg_scale` bounds: clamp to `[1.0, 3.0]` by default to avoid pointer instability; values above 3.0 require explicit opt-in
    - low-latency runtime modes:
@@ -148,6 +158,9 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
    - streaming latency budget: waveform decoding must complete within the 10 ms frame budget; if an enhanced decoder exceeds this, fall back to the codec-native decoder
    - fallback path: always maintain the codec-native decoder as a guaranteed-available fast path
    - quality measurement: Worker 06 must include waveform artifact rate (clicks, buzzing, metallic artifacts) in the TTS quality gate
+   - **v3.1 acoustic refinement runtime preparation:**
+     - define the runtime integration point for a future research-track refinement module that takes coarse AR codec tokens and produces refined full-RVQ tokens
+     - the codec-native decoder remains as fallback when refinement is disabled or latency-constrained
 18. Define multilingual / code-switch runtime policy:
    - utterance-level vs token-level language conditioning inputs
    - cross-lingual few-shot prompting when prompt language differs from target language
@@ -188,6 +201,15 @@ Replace duration expansion in runtime TTS with causal pointer execution and exte
      - `expires_at`
      - `provenance_summary`
    - artifacts must be retrievable without shell access
+23. Define `SpeakerProfile` runtime behavior:
+   - canonical persistence keys and ownership metadata
+   - exact prompt-cache invalidation rule when the prompt encoder or tokenizer changes
+   - compatibility behavior for missing or stale `speaker_profile_id`
+24. Define frame-index contract for any runtime-visible alignment telemetry:
+   - `sample_rate = 24000`
+   - `hop_length = 240`
+   - inclusive `start_frame`, exclusive `end_frame`
+   - parity with `tmrvc-core` frame alignment tests is mandatory
 
 
 ## Runtime Contract
@@ -221,6 +243,7 @@ The engine must be able to do:
 - do not let runtime invent pointer-state semantics that differ from Worker 01 state-transition definitions
 - do not let Python, Rust, ONNX, and VST drift into separate runtime contracts
 - do not expose `cfg_scale` without defining unconditional-pass semantics and safety limits
+- do not let unconditional CFG retain prompt or prosody conditioning through an undocumented side path
 - do not expose lazy or distilled CFG modes without numerical and perceptual validation against the full mode
 - do not make `full` two-pass CFG the default in Rust/VST unless latency proof exists on the target budget
 - do not leave waveform quality to an unspecified decoder fallback
@@ -233,6 +256,8 @@ The engine must be able to do:
 - API parameters are documented and stable
 - Python serve, Rust runtime, ONNX export, and VST are all wired to the same control/state contract
 - worker 05 can wire `dev.py` serve defaults to the new mode
+- SSE event-stream implementation (task 20) is owned by worker 04 as part of `tmrvc-serve` routes; worker 12 is the consumer, not the implementer
+- idempotency and conflict handling (task 21) are enforced in `tmrvc-serve` middleware; worker 12 sends `idempotency_key` and `object_version` but does not implement the check
 
 
 ## Required Tests
@@ -247,6 +272,7 @@ The engine must be able to do:
 - route/engine test for dialogue-performance control propagation
 - route/engine test for short-reference speaker adaptation path
 - route/engine test for CFG parameter propagation and safety clamping
+- route/engine test for full unconditional-conditioning mask parity
 - route/engine test for lazy-CFG refresh policy and mode clamping
 - cache-behavior test for sliding-window or cache re-indexing under pointer movement
 - route/engine test for multilingual/code-switch propagation
@@ -259,3 +285,4 @@ The engine must be able to do:
 - Python vs Rust pointer-state parity smoke test
 - PyTorch vs ONNX runtime-contract parity test for pointer / `voice_state` fields
 - streaming numerical parity test for batch vs frame-by-frame CausalConv1d path
+- `SpeakerProfile` stale-version / invalidation test

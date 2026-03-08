@@ -1,5 +1,10 @@
 # Emotion-Aware Neural Codec for UCLM
 
+> **Status:** codec-focused research/design archive. When this document conflicts with
+> current UCLM v3 mainline contracts, `plan/worker_01_architecture.md`,
+> `docs/design/architecture.md`, `docs/design/unified-codec-lm.md`, and
+> `docs/design/onnx-contract.md` take precedence.
+
 Kojiro Tanaka — Codec Design
 Created: 2026-03-01 (Asia/Tokyo)
 Updated: 2026-03-07

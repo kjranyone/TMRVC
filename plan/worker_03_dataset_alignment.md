@@ -27,6 +27,7 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
 - local-model pseudo-annotation pipeline is defined for raw short-utterance corpora
 - multilingual and code-switch readiness is measurable before training starts
 - bootstrap alignment projection from ASR timestamps into canonical phoneme space is deterministic and measurable
+- 8-D `voice_state` supervision readiness is measurable before training starts
 
 
 ## Concrete Tasks
@@ -62,15 +63,17 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - **Pitch Accent / Tone coverage (Critical for Japanese/Chinese naturalness)**
 
 8. **Japanese G2P Policy Requirement:** The `tmrvc_data/g2p.py` backend must parse and retain **Pitch Accent information** (e.g., Upstep, Downstep) from the OpenJTalk fullcontext labels. Stripping accent data to raw phonemes (`a, i, u`) is explicitly forbidden for the v3 mainline, as it destroys the ability to learn natural Japanese prosody.
+9. Define curated-asset consumption contract for the data loader:
    - consume `text`, `language`, and `phoneme_ids` from exported cache
    - consume `speaker_cluster` and `speaker_embedding` from metadata
+   - consume optional `voice_state_targets`, `voice_state_observed_mask`, and `voice_state_confidence` from curated export
    - consume raw conversation graph / context text as the canonical dialogue-context source
    - allow optional derived context caches only when versioned by encoder/checkpoint hash
    - consume `quality_score` for dynamic batch filtering
-9. Define quality filtering policy for the data loader:
+10. Define quality filtering policy for the data loader:
    - allow runtime thresholding based on `quality_score`
    - support filtering by `provenance_class` or `legality_gate`
-10. Define canonical phone alias mapping artifacts:
+11. Define canonical phone alias mapping artifacts:
    - source phone symbol
    - normalized source symbol
    - canonical target symbol
@@ -78,7 +81,7 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - language scope
    - confidence or rule provenance
    - explicit `drop` / `map_to_unk` / `map_to_canonical` action
-11. Define dataset reporting outputs for phone normalization quality:
+12. Define dataset reporting outputs for phone normalization quality:
    - `active_phone_inventory`
    - `alias_hit_ratio`
    - `direct_hit_ratio`
@@ -86,20 +89,32 @@ Rewrite the dataset and cache assumptions so v3 training no longer depends on MF
    - `unmapped_phone_counts`
    - `top_unmapped_examples`
    - per-language breakdown for all of the above
-12. Define multilingual / code-switch metadata artifacts:
+13. Define multilingual / code-switch metadata artifacts:
    - utterance-level `language_id`
    - token-span or segment-level `language_spans`
    - prompt-language metadata for few-shot speaker prompts
    - cross-lingual train/eval split tags
-13. Define long-horizon G2P fallback policy for multilingual robustness:
+14. Define long-horizon G2P fallback policy for multilingual robustness:
    - preserve normalized text alongside canonical phoneme ids
    - allow byte-level or grapheme-level fallback artifacts when G2P confidence is too low
    - mark fallback mode explicitly in metadata so training/validation can stratify on it
-14. Define canonical bootstrap-alignment projection artifacts:
+15. Define canonical bootstrap-alignment projection artifacts:
    - preserve raw ASR token/word timestamps for provenance
    - deterministically project those timestamps onto canonical `phoneme_ids`
    - export `bootstrap_alignment.json` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance
    - fail validation if projection skips, reorders, or ambiguously duplicates canonical text units
+16. Define canonical `voice_state` supervision artifacts:
+   - `voice_state.npy`
+     - canonical shape: `[T_frames, 8]`
+   - `voice_state_observed_mask.npy`
+     - canonical shape: `[T_frames, 8]`
+   - `voice_state_confidence.npy`
+     - canonical shape: `[T_frames, 8]` or `[T_frames, 1]`
+   - `voice_state_meta.json`
+     - estimator identity
+     - calibration version
+     - provenance
+     - whether labels are direct, pseudo-labeled, or absent
 
 
 ## Important Design Decision
@@ -120,6 +135,9 @@ For drama-grade TTS, the dataset should also distinguish:
 - `curated provenance available`
 - `code_switch_metadata_available`
 - `cross_lingual_prompt_coverage_available`
+- `voice_state_supervision_available`
+- `voice_state_supervision_density`
+- `voice_state_supervision_source`
 
 Those are different states and must not be conflated.
 
@@ -194,6 +212,13 @@ Bootstrap alignment is transitional supervision, not a hidden replacement for th
 - required derived artifact:
   - `bootstrap_alignment.json` already indexed in canonical phoneme space
   - projection must use **Acoustic-Aware Phoneme Boundary Heuristics** (e.g., energy flux or spectral changes) rather than naive uniform time-splitting, to provide sharper initial targets for pointer learning.
+  - frame convention is frozen:
+    - `sample_rate = 24000`
+    - `hop_length = 240`
+    - `start_frame` is inclusive
+    - `end_frame` is exclusive
+    - utterance frame count must satisfy `T = ceil(num_samples / 240)`
+    - all exported frame indices must match `tmrvc-core` frame-alignment tests exactly
 - ownership split:
   - Worker 03 defines deterministic projection and validation rules
   - Worker 10 exports the validated artifact
@@ -263,6 +288,9 @@ Minimum report fields:
 - `code_switch_coverage`
 - `cross_lingual_prompt_coverage`
 - `g2p_fallback_coverage`
+- `voice_state_supervision_coverage`
+- `voice_state_observed_ratio`
+- `voice_state_confidence_summary`
 
 Interpretation requirements:
 
@@ -301,6 +329,7 @@ Fail / warn policy:
 - do not let legacy alignment files leak into required batch fields
 - keep legacy analysis tools loadable for comparison
 - do not call a dataset drama-ready if it only has plain read speech
+- do not call a dataset physical-control-ready unless `voice_state` supervision density and confidence are reported
 - do not trust ASR output blindly; assume the curation system (Worker 11) has already validated it
 - do not conflate per-file diarization labels with dataset-global speaker identity
 - do not leave v2 versus v3 phone inventory migration unspecified
@@ -334,4 +363,6 @@ Fail / warn policy:
 - multilingual/code-switch report field-completeness test
 - G2P fallback reporting test
 - bootstrap-alignment projection determinism test
+- bootstrap-alignment frame-convention parity test against `tmrvc-core`
+- `voice_state` artifact shape/reporting test
 - canonical context-graph fields present even when no derived context cache is exported

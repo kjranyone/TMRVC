@@ -311,24 +311,49 @@ def voice_state_supervision_loss(
     predicted_state: torch.Tensor,
     target_state: torch.Tensor,
     mask: torch.Tensor | None = None,
+    observed_mask: torch.Tensor | None = None,
+    confidence: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MSE loss for voice state prediction (explicit or delta).
+    """MSE loss for voice state prediction with proper masking.
+
+    Missing or low-confidence dimensions are excluded from loss, never
+    treated as zero-valued neutral.
 
     Args:
         predicted_state: [B, T, D] predicted voice state.
         target_state: [B, T, D] target voice state.
-        mask: [B, T] padding mask (True = ignore).
+        mask: [B, T] padding mask (True = ignore frame entirely).
+        observed_mask: [B, T, D] bool — True where dimension has usable evidence.
+            When None, all dimensions are assumed observed.
+        confidence: [B, T, D] or [B, T, 1] — per-dimension confidence weights.
+            When None, uniform confidence of 1.0 is used.
     """
+    device = predicted_state.device
+
+    # Per-element squared error
+    sq_err = (predicted_state - target_state).pow(2)  # [B, T, D]
+
+    # Build combined weight mask
+    weight = torch.ones_like(sq_err)
+
+    if observed_mask is not None:
+        weight = weight * observed_mask.float()
+
+    if confidence is not None:
+        if confidence.shape[-1] == 1 and sq_err.shape[-1] > 1:
+            confidence = confidence.expand_as(sq_err)
+        weight = weight * confidence
+
     if mask is not None:
-        valid = ~mask
-        pred = predicted_state[valid]
-        tgt = target_state[valid]
-    else:
-        pred = predicted_state.reshape(-1, predicted_state.shape[-1])
-        tgt = target_state.reshape(-1, target_state.shape[-1])
-    if pred.numel() == 0:
-        return torch.tensor(0.0, device=predicted_state.device)
-    return F.mse_loss(pred, tgt)
+        # mask: [B, T] True = ignore → expand to [B, T, D]
+        frame_mask = (~mask).float().unsqueeze(-1).expand_as(sq_err)
+        weight = weight * frame_mask
+
+    total_weight = weight.sum()
+    if total_weight < 1e-8:
+        return torch.tensor(0.0, device=device)
+
+    return (sq_err * weight).sum() / total_weight
 
 
 def uclm_loss(

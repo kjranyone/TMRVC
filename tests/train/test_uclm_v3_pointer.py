@@ -8,7 +8,8 @@ import copy
 import pytest
 import torch
 
-from tmrvc_train.models.uclm_model import DisentangledUCLM, PointerHead, PointerState
+from tmrvc_core.types import PointerState
+from tmrvc_train.models.uclm_model import DisentangledUCLM, PointerHead
 from tmrvc_train.models.uclm_loss import (
     pointer_advance_loss,
     progress_regression_loss,
@@ -47,6 +48,7 @@ def _make_pointer_inputs(model: DisentangledUCLM) -> dict:
     speaker_embed = torch.randn(_B, 192)
     explicit_state = torch.randn(_B, _T, 8)
     ssl_state = torch.randn(_B, _T, 128)
+    target_a = torch.randint(0, 1024, (_B, _N_CODEBOOKS, _T))
     target_b = torch.randint(0, 60, (_B, _N_CONTROL, _T))
     return dict(
         phoneme_ids=phoneme_ids,
@@ -55,6 +57,7 @@ def _make_pointer_inputs(model: DisentangledUCLM) -> dict:
         speaker_embed=speaker_embed,
         explicit_state=explicit_state,
         ssl_state=ssl_state,
+        target_a=target_a,
         target_b=target_b,
         target_length=_T,
     )
@@ -142,16 +145,17 @@ class TestPointerHead:
     def test_output_shapes(self):
         head = PointerHead(d_model=_D_MODEL)
         x = torch.randn(2, 50, _D_MODEL)
-        advance_logit, progress_delta = head(x)
+        advance_logit, progress_delta, boundary_confidence = head(x)
 
         assert advance_logit.shape == (2, 50, 1)
         assert progress_delta.shape == (2, 50, 1)
+        assert boundary_confidence.shape == (2, 50, 1)
 
     def test_progress_delta_bounded(self):
         """progress_delta should be in [0, 1] because of Sigmoid."""
         head = PointerHead(d_model=_D_MODEL)
         x = torch.randn(2, 50, _D_MODEL)
-        _, progress_delta = head(x)
+        _, progress_delta, _ = head(x)
 
         assert progress_delta.min() >= 0.0
         assert progress_delta.max() <= 1.0

@@ -2,108 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tmrvc_core.types import PointerState
+
 from .text_encoder import TextEncoder
 from .uclm import VCEncoder, VoiceStateEncoder
 from .uclm_transformer import CodecTransformer
-
-
-@dataclass
-class PointerState:
-    """Tracks the current phoneme pointer position for streaming TTS.
-
-    Attributes:
-        text_index: [B] current phoneme index (integer).
-        progress: [B] fractional progress within the current phoneme (0-1).
-        boundary_confidence: confidence score for the last boundary decision.
-        stall_frames: number of consecutive frames without pointer advance.
-    """
-
-    text_index: torch.Tensor  # [B]
-    progress: torch.Tensor  # [B]
-    finished: bool = False
-    boundary_confidence: float = 0.0
-    stall_frames: int = 0
-    max_frames_per_unit: int = 50
-    frames_on_current_unit: int = 0
-    skip_protection_threshold: float = 0.3
-    forced_advance_count: int = 0
-    skip_protection_count: int = 0
-
-    def clone(self) -> "PointerState":
-        return PointerState(
-            text_index=self.text_index.clone(),
-            progress=self.progress.clone(),
-            finished=self.finished,
-            boundary_confidence=self.boundary_confidence,
-            stall_frames=self.stall_frames,
-            max_frames_per_unit=self.max_frames_per_unit,
-            frames_on_current_unit=self.frames_on_current_unit,
-            skip_protection_threshold=self.skip_protection_threshold,
-            forced_advance_count=self.forced_advance_count,
-            skip_protection_count=self.skip_protection_count,
-        )
-
-    def step_pointer(
-        self,
-        advance_prob: float,
-        progress_delta: float,
-        boundary_confidence: float = 0.0,
-    ) -> bool:
-        """Canonical pointer state-transition logic.
-
-        Implements forced advance on stall, skip-protection against premature
-        advance, and normal advance/hold behaviour.
-
-        Returns:
-            ``True`` if the pointer advanced to the next text unit.
-        """
-        # 1. Track time on the current unit
-        self.frames_on_current_unit += 1
-
-        # 2. Accumulate progress
-        self.progress += progress_delta
-
-        # 3. Forced advance when stuck too long on one unit
-        if self.frames_on_current_unit >= self.max_frames_per_unit:
-            self.text_index += 1
-            self.progress = self.progress * 0 + 0.0  # keep tensor type if applicable
-            self.frames_on_current_unit = 0
-            self.stall_frames = 0
-            self.forced_advance_count += 1
-            return True
-
-        # 4. High-confidence advance with skip-protection
-        if advance_prob > 0.5 and self.progress >= 1.0:
-            if boundary_confidence >= self.skip_protection_threshold:
-                # Normal boundary advance
-                self.text_index += 1
-                self.progress = self.progress * 0 + 0.0
-                self.frames_on_current_unit = 0
-                self.stall_frames = 0
-                return True
-            else:
-                # Skip-protection blocks the advance
-                self.skip_protection_count += 1
-                return False
-
-        # 5. Advance on either signal alone
-        if advance_prob > 0.5 or self.progress >= 1.0:
-            self.text_index += 1
-            self.progress = self.progress * 0 + 0.0
-            self.frames_on_current_unit = 0
-            self.stall_frames = 0
-            return True
-
-        # 6. Hold — no advance
-        self.stall_frames += 1
-        return False
 
 
 class PointerHead(nn.Module):
@@ -128,10 +37,16 @@ class PointerHead(nn.Module):
             nn.Linear(d_model // 4, 1),
             nn.Sigmoid(),
         )
+        self.boundary_proj = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, 1),
+            nn.Sigmoid(),
+        )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (advance_logit, progress_delta), each [B, T, 1]."""
-        return self.advance_proj(x), self.progress_proj(x)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (advance_logit, progress_delta, boundary_confidence), each [B, T, 1]."""
+        return self.advance_proj(x), self.progress_proj(x), self.boundary_proj(x)
 
 
 class SpeakerPromptEncoder(nn.Module):
@@ -191,41 +106,53 @@ class SpeakerPromptEncoder(nn.Module):
 
 
 class ProsodyPredictor(nn.Module):
-    """Predicts local prosody latent from text and context during inference.
+    """Flow-Matching based prosody predictor.
 
-    Training: target latent extracted from reference audio (teacher forcing).
-    Inference: generates prosody latent from text + context.
+    Training: learns a velocity field v(x_t, t, cond) via conditional flow matching.
+        Sample t~U(0,1), compute x_t = (1-t)*noise + t*target, predict velocity,
+        loss = MSE(v_predicted, target - noise).
+    Inference: starts from Gaussian noise and integrates the learned ODE with
+        Euler steps to produce a prosody latent.
     """
 
-    def __init__(self, d_model: int = 512, d_prosody: int = 64):
+    def __init__(self, d_model: int = 512, d_prosody: int = 64, n_ode_steps: int = 4):
         super().__init__()
         self.d_prosody = d_prosody
-        self.encoder = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_prosody * 2),  # mu and log_var
+        self.n_ode_steps = n_ode_steps
+
+        # Velocity network: predicts v(x_t, t, cond) -> d_prosody
+        # Input: concatenation of x_t (d_prosody) and conditioning h (d_model)
+        # The timestep t is broadcast-added after a small embedding.
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, d_model // 4),
+            nn.SiLU(),
+            nn.Linear(d_model // 4, d_model),
         )
+        self.velocity_net = nn.Sequential(
+            nn.Linear(d_prosody + d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, d_prosody),
+        )
+
         self.context_proj = nn.Linear(d_model, d_model)
 
-    def forward(
+    def _build_condition(
         self,
         phoneme_features: torch.Tensor,
         dialogue_context: torch.Tensor | None = None,
         speaker_embed: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict prosody latent from text features.
+        """Build conditioning vector h from text, dialogue context, and speaker embed.
 
-        Args:
-            phoneme_features: [B, L, d_model] text encoder output.
-            dialogue_context: [B, D_ctx] optional dialogue context.
-            speaker_embed: [B, d_model] optional speaker embedding.
         Returns:
-            prosody_latent: [B, d_prosody] predicted prosody.
+            h: [B, d_model]
         """
-        # Pool text features
         h = phoneme_features.mean(dim=1)  # [B, d_model]
 
         if dialogue_context is not None:
+            # Handle both 2D [B, D] and 3D [B, C, D] dialogue context
+            if dialogue_context.ndim == 3:
+                dialogue_context = dialogue_context.mean(dim=1)
             h = h + self.context_proj(
                 F.pad(dialogue_context, (0, h.shape[-1] - dialogue_context.shape[-1]))
                 if dialogue_context.shape[-1] < h.shape[-1]
@@ -237,14 +164,98 @@ class ProsodyPredictor(nn.Module):
                 speaker_embed = F.pad(speaker_embed, (0, h.shape[-1] - speaker_embed.shape[-1]))
             h = h + speaker_embed
 
-        params = self.encoder(h)  # [B, d_prosody * 2]
-        mu, log_var = params.chunk(2, dim=-1)
+        return h
+
+    def _predict_velocity(
+        self, x_t: torch.Tensor, t: torch.Tensor, h: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict velocity field v(x_t, t, h).
+
+        Args:
+            x_t: [B, d_prosody] noisy sample at time t.
+            t: [B, 1] timestep in [0, 1].
+            h: [B, d_model] conditioning vector.
+        Returns:
+            v: [B, d_prosody] predicted velocity.
+        """
+        t_emb = self.time_embed(t)  # [B, d_model]
+        h_cond = h + t_emb  # [B, d_model]
+        inp = torch.cat([x_t, h_cond], dim=-1)  # [B, d_prosody + d_model]
+        return self.velocity_net(inp)
+
+    def forward(
+        self,
+        phoneme_features: torch.Tensor,
+        dialogue_context: torch.Tensor | None = None,
+        speaker_embed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict prosody latent from text features.
+
+        During training, returns a dummy sample (use ``flow_matching_loss`` for
+        the actual training objective). During inference, integrates the learned
+        ODE from noise to produce a prosody latent.
+
+        Args:
+            phoneme_features: [B, L, d_model] text encoder output.
+            dialogue_context: [B, D_ctx] or [B, C_ctx, D_ctx] optional dialogue context.
+            speaker_embed: [B, d_model] optional speaker embedding.
+        Returns:
+            prosody_latent: [B, d_prosody] predicted prosody.
+        """
+        h = self._build_condition(phoneme_features, dialogue_context, speaker_embed)
+        B = h.shape[0]
 
         if self.training:
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu
+            # During training forward, return zeros; actual loss computed via
+            # flow_matching_loss() which is called separately.
+            return torch.zeros(B, self.d_prosody, device=h.device)
+
+        # Inference: Euler ODE integration from noise (t=0) to signal (t=1)
+        x = torch.randn(B, self.d_prosody, device=h.device)
+        dt = 1.0 / self.n_ode_steps
+        for i in range(self.n_ode_steps):
+            t_val = i * dt
+            t = torch.full((B, 1), t_val, device=h.device)
+            v = self._predict_velocity(x, t, h)
+            x = x + dt * v
+        return x
+
+    def flow_matching_loss(
+        self,
+        phoneme_features: torch.Tensor,
+        target_prosody: torch.Tensor,
+        dialogue_context: torch.Tensor | None = None,
+        speaker_embed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute conditional flow matching loss.
+
+        Args:
+            phoneme_features: [B, L, d_model] text encoder output.
+            target_prosody: [B, d_prosody] ground-truth prosody latent.
+            dialogue_context: [B, D_ctx] or [B, C_ctx, D_ctx] optional dialogue context.
+            speaker_embed: [B, d_model] optional speaker embedding.
+        Returns:
+            Scalar MSE loss between predicted and true velocity.
+        """
+        h = self._build_condition(phoneme_features, dialogue_context, speaker_embed)
+        B = h.shape[0]
+
+        # Sample random timestep t ~ U(0, 1)
+        t = torch.rand(B, 1, device=h.device)
+
+        # Sample noise
+        noise = torch.randn_like(target_prosody)
+
+        # Interpolate: x_t = (1 - t) * noise + t * target
+        x_t = (1.0 - t) * noise + t * target_prosody
+
+        # True velocity = target - noise (straight-line OT path)
+        v_target = target_prosody - noise
+
+        # Predict velocity
+        v_pred = self._predict_velocity(x_t, t, h)
+
+        return F.mse_loss(v_pred, v_target)
 
 
 class DialogueContextProjector(nn.Module):
@@ -254,9 +265,9 @@ class DialogueContextProjector(nn.Module):
     to the content features.  When absent, a zero contribution is used.
 
     Inputs (all optional):
-        dialogue_context: [B, D_ctx] — scene/dialogue embedding.
+        dialogue_context: [B, D_ctx] or [B, C_ctx, D_ctx] — scene/dialogue embedding.
         acting_intent: [B, D_act] — utterance-level acting intent vector.
-        prosody_latent: [B, T, D_pro] — local prosody planning signal.
+        prosody_latent: [B, D_pro] or [B, T, D_pro] — local prosody planning signal.
     """
 
     def __init__(
@@ -280,20 +291,28 @@ class DialogueContextProjector(nn.Module):
     ) -> torch.Tensor:
         """Add projected conditioning to content_features [B, T, D]."""
         if dialogue_context is not None:
+            # Handle both 2D [B, D_ctx] and 3D [B, C_ctx, D_ctx]
+            if dialogue_context.ndim == 3:
+                dialogue_context = dialogue_context.mean(dim=1)
             # [B, D_ctx] -> [B, 1, d_model] broadcast over T
             content_features = content_features + self.dialogue_proj(dialogue_context).unsqueeze(1)
         if acting_intent is not None:
             # [B, D_act] -> [B, 1, d_model] broadcast over T
             content_features = content_features + self.acting_proj(acting_intent).unsqueeze(1)
         if prosody_latent is not None:
-            # [B, T, D_pro] -> [B, T, d_model]
-            T_content = content_features.shape[1]
-            T_pro = prosody_latent.shape[1]
-            if T_pro != T_content:
-                prosody_latent = F.interpolate(
-                    prosody_latent.transpose(1, 2), size=T_content, mode="nearest"
-                ).transpose(1, 2)
-            content_features = content_features + self.prosody_proj(prosody_latent)
+            # Handle both 2D [B, D_pro] and 3D [B, T, D_pro]
+            if prosody_latent.ndim == 2:
+                # Utterance-global: [B, D_pro] -> [B, 1, d_model] broadcast over T
+                content_features = content_features + self.prosody_proj(prosody_latent).unsqueeze(1)
+            else:
+                # Time-local: [B, T_pro, D_pro] -> [B, T, d_model]
+                T_content = content_features.shape[1]
+                T_pro = prosody_latent.shape[1]
+                if T_pro != T_content:
+                    prosody_latent = F.interpolate(
+                        prosody_latent.transpose(1, 2), size=T_content, mode="nearest"
+                    ).transpose(1, 2)
+                content_features = content_features + self.prosody_proj(prosody_latent)
         return content_features
 
 
@@ -368,6 +387,36 @@ class DisentangledUCLM(nn.Module):
         # Prosody predictor for inference-time prosody generation (v3).
         self.prosody_predictor = ProsodyPredictor(d_model=d_model, d_prosody=d_prosody)
 
+        # Delta voice state projection (v3).
+        self.delta_voice_state_proj = nn.Linear(d_explicit, d_model)
+
+    @staticmethod
+    def apply_cfg_unconditional_mask(
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        dialogue_context: torch.Tensor | None = None,
+        acting_intent: torch.Tensor | None = None,
+        prosody_latent: torch.Tensor | None = None,
+        delta_voice_state: torch.Tensor | None = None,
+        prompt_kv_cache: torch.Tensor | None = None,
+    ) -> dict:
+        """Apply CFG unconditional mask: zero all conditioning fields.
+
+        Preserves phoneme_ids, language_ids, acoustic_history, and pointer_state.
+        Returns a dict of zeroed tensors ready for the unconditional forward pass.
+        """
+        return {
+            "explicit_state": torch.zeros_like(explicit_state),
+            "ssl_state": torch.zeros_like(ssl_state),
+            "speaker_embed": torch.zeros_like(speaker_embed),
+            "dialogue_context": torch.zeros_like(dialogue_context) if dialogue_context is not None else None,
+            "acting_intent": torch.zeros_like(acting_intent) if acting_intent is not None else None,
+            "prosody_latent": torch.zeros_like(prosody_latent) if prosody_latent is not None else None,
+            "delta_voice_state": torch.zeros_like(delta_voice_state) if delta_voice_state is not None else None,
+            "prompt_kv_cache": torch.zeros_like(prompt_kv_cache) if prompt_kv_cache is not None else None,
+        }
+
     def encode_speaker_prompt(
         self,
         prompt_codec_tokens: torch.Tensor,
@@ -395,7 +444,7 @@ class DisentangledUCLM(nn.Module):
         Args:
             phoneme_ids: [B, L] phoneme token ids.
             language_ids: [B, L] language token ids.
-            dialogue_context: [B, D_ctx] optional dialogue context.
+            dialogue_context: [B, D_ctx] or [B, C_ctx, D_ctx] optional dialogue context.
             speaker_embed: [B, d_model] optional refined speaker embedding.
         Returns:
             prosody_latent: [B, d_prosody]
@@ -424,14 +473,18 @@ class DisentangledUCLM(nn.Module):
         if f0_condition is not None:
             content_features = content_features + self.f0_proj(f0_condition)
 
-        # Shift target_b to use as context B_{t-1}.
-        B, n_slots, T = target_b.shape
+        # Shift target_a and target_b to use as context A_{t-1}, B_{t-1}.
+        # VC uses source_a_t as content, but still needs self-history for Stream A continuity.
+        a_ctx = torch.zeros_like(source_a_t)
+        a_ctx[:, :, 1:] = source_a_t[:, :, :-1]
+        a_ctx = a_ctx.clamp_min(0)
+
         b_ctx = torch.zeros_like(target_b)
         b_ctx[:, :, 1:] = target_b[:, :, :-1]
         b_ctx = b_ctx.clamp_min(0)
 
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
-            content_features, b_ctx, state_cond, speaker_embed, cfg_scale
+            content_features, a_ctx, b_ctx, state_cond, speaker_embed, cfg_scale
         )
 
         return {
@@ -458,15 +511,17 @@ class DisentangledUCLM(nn.Module):
         speaker_embed: torch.Tensor,
         explicit_state: torch.Tensor,
         ssl_state: torch.Tensor,
-        target_b: torch.Tensor,
-        target_length: int,
+        target_a: torch.Tensor | None = None,
+        target_b: torch.Tensor | None = None,
+        target_length: int | None = None,
         f0_condition: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
         prosody_latent: torch.Tensor | None = None,
+        delta_voice_state: torch.Tensor | None = None,
         prompt_kv_cache: torch.Tensor | None = None,
-        acoustic_history: torch.Tensor | None = None,
+        acoustic_history: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict:
         """Pointer-based TTS forward pass (UCLM v3).
 
@@ -477,18 +532,37 @@ class DisentangledUCLM(nn.Module):
             speaker_embed: [B, d_speaker] speaker embedding.
             explicit_state: [B, T, d_explicit] explicit voice state features.
             ssl_state: [B, T, d_ssl] SSL voice state features.
-            target_b: [B, n_codebooks, T] ground-truth codec tokens.
-            target_length: number of acoustic frames to produce.
+            target_a: [B, n_codebooks, T] ground-truth acoustic tokens.
+            target_b: [B, n_slots, T] ground-truth control tokens.
+            target_length: number of acoustic frames. Optional; derived from
+                target_b when None (teacher-forced training). Runtime must not
+                require a precomputed target length.
             f0_condition: optional [B, T, 2] F0 conditioning tensor.
             cfg_scale: classifier-free guidance scale.
-            dialogue_context: optional [B, D_ctx] scene/dialogue embedding.
+            dialogue_context: optional [B, D_ctx] or [B, C_ctx, D_ctx] scene/dialogue embedding.
             acting_intent: optional [B, D_act] utterance-level acting intent.
-            prosody_latent: optional [B, T, D_pro] local prosody planning.
+            prosody_latent: optional [B, D_pro] or [B, T, D_pro] local prosody planning.
+            delta_voice_state: optional [B, T, d_explicit] delta voice state.
+            prompt_kv_cache: optional [B, T_prompt, d_model] cached prompt features
+                from encode_speaker_prompt, prepended to content for cross-attention.
+            acoustic_history: optional tuple of (a_ctx, b_ctx) for causal decoding context.
 
         Returns:
-            dict with keys ``logits_a``, ``logits_b``, ``pointer_logits``,
-            ``progress_delta``, and ``adv_logits``.
+            dict with keys ``logits_a``, ``logits_b``, ``advance_logit``,
+            ``progress_delta``, ``boundary_confidence``, ``hidden_states``,
+            ``adv_logits``, and ``next_pointer_state``.
         """
+        # Derive target_length from targets if not explicitly provided
+        if target_length is None:
+            if target_b is not None:
+                target_length = target_b.shape[-1]
+            elif target_a is not None:
+                target_length = target_a.shape[-1]
+            else:
+                raise ValueError(
+                    "target_length must be provided when target_a and target_b are None"
+                )
+
         # 1. Encode phonemes
         phoneme_lens = (phoneme_ids != 0).sum(dim=1)
         phoneme_features = self.text_encoder(phoneme_ids, language_ids, phoneme_lens)
@@ -496,13 +570,24 @@ class DisentangledUCLM(nn.Module):
 
         B, L, D = phoneme_features.shape
 
-        # 2. Uniformly distribute phonemes across target_length (initial signal)
+        # 2. Base frame representation: Start with interpolated phonemes (augmented by Cross-Attention)
         frame_indices = torch.arange(target_length, device=phoneme_features.device)
         phoneme_indices = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
         content_features = phoneme_features[:, phoneme_indices, :]
 
+        # 2b. Prepend prompt KV cache features if available
+        if prompt_kv_cache is not None:
+            content_features = torch.cat([prompt_kv_cache, content_features], dim=1)
+
         # 3. Apply F0 conditioning
         if f0_condition is not None:
+            if prompt_kv_cache is not None:
+                # Pad f0 to account for prepended prompt features
+                f0_pad = torch.zeros(
+                    B, prompt_kv_cache.shape[1], f0_condition.shape[-1],
+                    device=f0_condition.device,
+                )
+                f0_condition = torch.cat([f0_pad, f0_condition], dim=1)
             content_features = content_features + self.f0_proj(f0_condition)
 
         # 3b. Apply dialogue/acting/prosody conditioning
@@ -517,34 +602,64 @@ class DisentangledUCLM(nn.Module):
         v_out = self.voice_state_enc(explicit_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
-        # 5. Shift target_b for causal context
-        b_ctx = torch.zeros_like(target_b)
-        b_ctx[:, :, 1:] = target_b[:, :, :-1]
-        b_ctx = b_ctx.clamp_min(0)
+        # 4b. Apply delta voice state if provided
+        if delta_voice_state is not None:
+            delta_proj = self.delta_voice_state_proj(delta_voice_state)
+            state_cond = state_cond + delta_proj
 
-        # 6. Run through the codec transformer
+        # 5. Shift targets for causal history context (A_{t-1}, B_{t-1})
+        if acoustic_history is not None:
+            a_ctx, b_ctx = acoustic_history
+        elif target_a is not None and target_b is not None:
+            a_ctx = torch.zeros_like(target_a)
+            a_ctx[:, :, 1:] = target_a[:, :, :-1]
+            a_ctx = a_ctx.clamp_min(0)
+
+            b_ctx = torch.zeros_like(target_b)
+            b_ctx[:, :, 1:] = target_b[:, :, :-1]
+            b_ctx = b_ctx.clamp_min(0)
+        else:
+            # Inference mode: no targets, use zero context
+            a_ctx = torch.zeros(
+                B, self.n_codebooks, target_length,
+                dtype=torch.long, device=phoneme_features.device,
+            )
+            b_ctx = torch.zeros(
+                B, 4, target_length,
+                dtype=torch.long, device=phoneme_features.device,
+            )
+
+        # 6. Run through the codec transformer (now with Stream A history + Cross-Attention)
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
-            content_features, b_ctx, state_cond, speaker_embed, cfg_scale
+            content_features, a_ctx, b_ctx, state_cond, speaker_embed, cfg_scale
         )
 
+        # If prompt was prepended, strip prompt positions from outputs
+        if prompt_kv_cache is not None:
+            T_prompt = prompt_kv_cache.shape[1]
+            logits_a = logits_a[:, :, T_prompt:, :]
+            logits_b = logits_b[:, :, T_prompt:, :]
+            x_out = x_out[:, T_prompt:, :]
+
         # 7. Pointer head
-        pointer_logits, progress_delta = self.pointer_head(x_out)
+        advance_logit, progress_delta, boundary_confidence = self.pointer_head(x_out)
 
         return {
             "logits_a": logits_a,
             "logits_b": logits_b,
-            "pointer_logits": pointer_logits,
+            "advance_logit": advance_logit,
             "progress_delta": progress_delta,
+            "boundary_confidence": boundary_confidence,
             "adv_logits": v_out[1] if isinstance(v_out, tuple) else None,
             "hidden_states": x_out,
-            "advance_logit": pointer_logits,  # alias for pointer_logits
-            "boundary_confidence": torch.zeros(B, target_length, 1, device=phoneme_features.device),
+            "pointer_logits": advance_logit,  # backward-compat alias
             "next_pointer_state": None,  # populated at inference time
         }
 
     def forward_streaming(
         self,
         content_features: torch.Tensor,
+        a_ctx: torch.Tensor,
         b_ctx: torch.Tensor,
         speaker_embed: torch.Tensor,
         state_cond: torch.Tensor,
@@ -557,15 +672,16 @@ class DisentangledUCLM(nn.Module):
         """Forward pass for streaming inference with KV cache list.
 
         Args:
-            content_features: [B, T, D] text/VC content features.
+            content_features: [B, T, D] text/VC content features (memory for Cross-Attn).
+            a_ctx: [B, n_codebooks, T] previous acoustic tokens.
             b_ctx: [B, n_slots, T] previous control tokens.
             speaker_embed: [B, d_speaker] speaker embedding.
             state_cond: [B, T, D] voice state conditioning.
             cfg_scale: classifier-free guidance scale.
             kv_caches: optional KV caches from previous step.
-            dialogue_context: optional [B, D_ctx] scene/dialogue embedding.
+            dialogue_context: optional [B, D_ctx] or [B, C_ctx, D_ctx] scene/dialogue embedding.
             acting_intent: optional [B, D_act] acting intent vector.
-            prosody_latent: optional [B, T, D_pro] local prosody planning.
+            prosody_latent: optional [B, D_pro] or [B, T, D_pro] local prosody planning.
         """
         # Apply dialogue/acting/prosody conditioning
         content_features = self.context_projector(
@@ -578,6 +694,7 @@ class DisentangledUCLM(nn.Module):
         cfg_tensor = torch.tensor([cfg_scale], device=content_features.device)
         logits_a, logits_b, next_kv_caches, x_out = self.uclm_core(
             content_features,
+            a_ctx,
             b_ctx,
             speaker_embed,
             state_cond,
@@ -585,9 +702,15 @@ class DisentangledUCLM(nn.Module):
             kv_caches,
         )
 
+        # Pointer head for streaming pointer-driven progression
+        advance_logit, progress_delta, boundary_confidence = self.pointer_head(x_out)
+
         return {
             "logits_a": logits_a,
             "logits_b": logits_b,
+            "advance_logit": advance_logit,
+            "progress_delta": progress_delta,
+            "boundary_confidence": boundary_confidence,
             "kv_cache_out": next_kv_caches,
             "hidden_states": x_out,
         }

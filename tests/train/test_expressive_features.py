@@ -94,6 +94,7 @@ class TestModelExpressiveInputs:
             speaker_embed=torch.randn(B, 192),
             explicit_state=torch.randn(B, T, 8),
             ssl_state=torch.randn(B, T, 128),
+            target_a=torch.zeros(B, 8, T, dtype=torch.long),
             target_b=torch.zeros(B, 4, T, dtype=torch.long),
             target_length=T,
             dialogue_context=torch.randn(B, 256),
@@ -111,6 +112,7 @@ class TestModelExpressiveInputs:
             speaker_embed=torch.randn(B, 192),
             explicit_state=torch.randn(B, T, 8),
             ssl_state=torch.randn(B, T, 128),
+            target_a=torch.zeros(B, 8, T, dtype=torch.long),
             target_b=torch.zeros(B, 4, T, dtype=torch.long),
             target_length=T,
             dialogue_context=torch.randn(B, 256),
@@ -124,6 +126,7 @@ class TestModelExpressiveInputs:
         B = 1
         out = model.forward_streaming(
             content_features=torch.randn(B, 1, 256),
+            a_ctx=torch.zeros(B, 8, 1, dtype=torch.long),
             b_ctx=torch.zeros(B, 4, 1, dtype=torch.long),
             speaker_embed=torch.randn(B, 192),
             state_cond=torch.randn(B, 1, 256),

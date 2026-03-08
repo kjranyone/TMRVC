@@ -25,6 +25,7 @@ This worker makes the curation system resumable, parallelizable, and auditable. 
 - provider provenance written for every stage
 - human action provenance written for every audit-critical state change
 - **Concurrency Control:** Implement optimistic locking via record-level versioning to support multi-user WebUI workflows.
+- one authoritative API contract between multi-user WebUI and curation state; direct manifest file reads are dev-only
 
 ## Manifest Contract
 
@@ -84,6 +85,9 @@ Each record must include:
    - before / after state summary
    - rationale or note
 8. Wire `dev.py` eventually to call this system as a first-class operation.
+9. Publish the authoritative service boundary:
+   - `tmrvc-serve` hosts the typed `/ui/*` and `/admin/*` network APIs
+   - filesystem-direct manifest access is allowed only for local debugging, never as the mainline multi-user contract
 
 ## Guardrails
 
@@ -92,6 +96,7 @@ Each record must include:
 - do not use implicit state hidden outside the manifest
 - do not leave promotion/export decisions without durable human-action provenance when they are human-driven
 - **Do not** allow record updates that bypass the `metadata_version` check.
+- do not let Worker 12 build a second authoritative data plane around direct manifest reads
 
 ## Handoff Contract
 

@@ -7,7 +7,7 @@ from tqdm import tqdm
 from typing import Optional
 
 from .models import DisentangledUCLM
-from .models.uclm_loss import uclm_loss, monotonic_alignment_search
+from .models.uclm_loss import uclm_loss, monotonic_alignment_search, voice_state_supervision_loss
 
 
 class CurriculumScheduler:
@@ -71,7 +71,7 @@ class UCLMTrainer:
         pointer_loss_weight: float = 0.5,
         progress_loss_weight: float = 0.2,
         alignment_loss_type: str = "none",
-        pointer_target_source: str = "mas",
+        pointer_target_source: str = "heuristic_bootstrap",
         legacy_duration_loss_weight: float = 0.0,
         bootstrap_alignment_required: bool = False,
         voice_state_loss_weight: float = 0.0,
@@ -101,7 +101,26 @@ class UCLMTrainer:
         self.pointer_aux_alignment_warmup_steps = pointer_aux_alignment_warmup_steps
         self.pointer_aux_alignment_anneal_steps = pointer_aux_alignment_anneal_steps
         self._global_step = 0
-        
+        self._validate_config()
+
+    def _validate_config(self) -> None:
+        """Validate training configuration at init time."""
+        valid_tts_modes = {"pointer", "legacy_duration"}
+        if self.tts_mode not in valid_tts_modes:
+            raise ValueError(f"tts_mode must be one of {valid_tts_modes}, got {self.tts_mode!r}")
+
+        valid_sources = {"none", "heuristic_bootstrap", "bootstrap_projection", "legacy_duration", "mas", "ctc"}
+        if self.pointer_target_source not in valid_sources:
+            raise ValueError(
+                f"pointer_target_source must be one of {valid_sources}, got {self.pointer_target_source!r}"
+            )
+
+        valid_alignment_types = {"none", "aux_mas", "aux_ctc"}
+        if self.alignment_loss_type not in valid_alignment_types:
+            raise ValueError(
+                f"alignment_loss_type must be one of {valid_alignment_types}, got {self.alignment_loss_type!r}"
+            )
+
     def _generate_pointer_targets(
         self, durations: torch.Tensor, target_length: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -199,19 +218,29 @@ class UCLMTrainer:
         if f0_condition is not None:
             f0_condition = f0_condition.to(self.device)
 
-        # Classifier-Free Guidance Dropout
-        if random.random() < conditioning_dropout_prob:
-            explicit_state = torch.zeros_like(explicit_state)
-            ssl_state = torch.zeros_like(ssl_state)
-            speaker_embed = torch.zeros_like(speaker_embed)
-            if batch.get("dialogue_context") is not None:
-                batch["dialogue_context"] = torch.zeros_like(batch["dialogue_context"])
-            if batch.get("acting_intent") is not None:
-                batch["acting_intent"] = torch.zeros_like(batch["acting_intent"])
-            if batch.get("delta_voice_state") is not None:
-                batch["delta_voice_state"] = torch.zeros_like(batch["delta_voice_state"])
-            if batch.get("prosody_targets") is not None:
-                batch["prosody_targets"] = torch.zeros_like(batch["prosody_targets"])
+        # Classifier-Free Guidance Dropout (Worker 01 frozen contract)
+        cfg_dropped = random.random() < conditioning_dropout_prob
+        if cfg_dropped:
+            masked = DisentangledUCLM.apply_cfg_unconditional_mask(
+                explicit_state=explicit_state,
+                ssl_state=ssl_state,
+                speaker_embed=speaker_embed,
+                dialogue_context=batch.get("dialogue_context"),
+                acting_intent=batch.get("acting_intent"),
+                delta_voice_state=batch.get("delta_voice_state"),
+                prosody_latent=batch.get("prosody_targets"),
+            )
+            explicit_state = masked["explicit_state"]
+            ssl_state = masked["ssl_state"]
+            speaker_embed = masked["speaker_embed"]
+            if masked["dialogue_context"] is not None:
+                batch["dialogue_context"] = masked["dialogue_context"]
+            if masked["acting_intent"] is not None:
+                batch["acting_intent"] = masked["acting_intent"]
+            if masked["delta_voice_state"] is not None:
+                batch["delta_voice_state"] = masked["delta_voice_state"]
+            if masked["prosody_latent"] is not None:
+                batch["prosody_targets"] = masked["prosody_latent"]
 
         # Multi-task sampling: decide vc vs tts
         mode = "vc"
@@ -282,35 +311,44 @@ class UCLMTrainer:
             # Alignment Target Generation
             if self.pointer_target_source == "mas":
                 # Compute log-likelihood for MAS
-                # Use phoneme encoder output vs transformer hidden states
-                # (Detached hidden states to avoid circular gradients if needed, 
-                # but standard MAS uses them together)
                 with torch.no_grad():
-                    # x_text: [B, L, D]
                     phoneme_lens = (phonemes != 0).sum(dim=1)
                     x_text = self.model.text_encoder(phonemes, language_ids, phoneme_lens).transpose(1, 2)
-                    # x_acoustic: [B, T, D]
                     x_acoustic = out["hidden_states"]
-                    
-                    # Log-probs based on negative distance
-                    # [B, L, T]
                     dist = torch.cdist(x_text, x_acoustic)
                     log_probs = -0.5 * (dist ** 2)
-                    
                     path = monotonic_alignment_search(log_probs)
                     adv_targets, prog_targets = self._generate_pointer_targets_from_path(path)
-            elif self.pointer_target_source == "legacy_duration" and has_durations:
-                durations = batch["durations"].to(self.device)
-                adv_targets, prog_targets = self._generate_pointer_targets(durations, target_length)
-            else:
-                # Uniform fallback
+            elif self.pointer_target_source == "ctc":
+                # CTC alignment placeholder — falls back to heuristic
                 L = phonemes.shape[1]
                 dummy_durations = torch.full((phonemes.shape[0], L), target_length // L, device=self.device)
                 adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
+            elif self.pointer_target_source == "legacy_duration" and has_durations:
+                durations = batch["durations"].to(self.device)
+                adv_targets, prog_targets = self._generate_pointer_targets(durations, target_length)
+            elif self.pointer_target_source == "heuristic_bootstrap":
+                # Uniform heuristic fallback
+                L = phonemes.shape[1]
+                dummy_durations = torch.full((phonemes.shape[0], L), target_length // L, device=self.device)
+                adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
+            else:
+                raise RuntimeError(f"Unknown pointer_target_source: {self.pointer_target_source}")
 
             context_groups = batch.get("context_groups")
             if context_groups is not None:
                 context_groups = context_groups.to(self.device)
+
+            # Voice state supervision (Worker 01/03 contract)
+            vs_targets = batch.get("voice_state_targets")
+            vs_observed_mask = batch.get("voice_state_observed_mask")
+            vs_confidence = batch.get("voice_state_confidence")
+            if vs_targets is not None:
+                vs_targets = vs_targets.to(self.device)
+                if vs_observed_mask is not None:
+                    vs_observed_mask = vs_observed_mask.to(self.device)
+                if vs_confidence is not None:
+                    vs_confidence = vs_confidence.to(self.device)
 
             losses = uclm_loss(
                 logits_a=out["logits_a"],
@@ -335,7 +373,25 @@ class UCLMTrainer:
                 prosody_speaker_embed=speaker_embed,
                 lambda_prosody=1.0 if prosody_targets is not None else 0.0,
             )
-            
+
+            # Voice state supervision with observed_mask and confidence (Worker 02)
+            if (
+                self.voice_state_loss_weight > 0
+                and vs_targets is not None
+                and out.get("hidden_states") is not None
+            ):
+                # Use hidden_states[:, :, :8] as proxy for voice state prediction
+                # (real implementation uses a dedicated head)
+                vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :8]
+                loss_vs = voice_state_supervision_loss(
+                    vs_pred,
+                    vs_targets,
+                    observed_mask=vs_observed_mask,
+                    confidence=vs_confidence,
+                )
+                losses["loss"] = losses["loss"] + self.voice_state_loss_weight * loss_vs
+                losses["loss_voice_state"] = loss_vs
+
         # Optimization
         losses["loss"].backward()
         self.optimizer.step()

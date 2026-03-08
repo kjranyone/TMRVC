@@ -1,244 +1,244 @@
 # UCLM v3 Evaluation Protocol
 
-## 1. Automated Metrics
+This document defines the reproducible evaluation procedure for UCLM v3.
+It must remain consistent with:
 
-### 1.1 Training Quality Gates
+- `plan/worker_06_validation.md`
+- `docs/design/acceptance-thresholds.md`
+- `docs/design/external-baseline-registry.md`
 
-| Metric | Threshold | Source |
-|--------|-----------|--------|
-| Text supervision coverage | > 80% per dataset | `supervision_report()` |
-| Pointer-state sanity | advance_prob in (0,1) | `test_uclm_v3_pointer.py` |
-| Checkpoint schema validity | All pointer_head keys present | `strict=False` load test |
-| Token range validity | `0 <= A_t < 1024`, `0 <= B_t < 64` | Quality gate |
+---
 
-### 1.2 Latency
+## 1. Evaluation Principles
+
+- use frozen held-out prompt sets and report their version IDs
+- pin the external baseline artifact before any comparison run starts
+- separate exploratory runs from release-sign-off runs
+- report both automatic metrics and human evaluation
+- report failure counters such as `forced_advance_count` and `skip_protection_count`
+
+---
+
+## 2. Automated Metrics
+
+### 2.1 Training Quality Gates
+
+| Metric | Target | Source |
+|--------|--------|--------|
+| Text supervision coverage | > 80% per dataset | dataset supervision report |
+| Pointer-state sanity | no monotonicity violation | pointer contract tests |
+| Checkpoint schema validity | all required pointer-head keys present | checkpoint load test |
+| Bootstrap projection validity | 100% monotonic in canonical phoneme space | bootstrap alignment projection tests |
+
+### 2.2 Latency and Runtime
 
 | Metric | Target | Tool |
 |--------|--------|------|
-| Per-step inference (CPU) | < 10 ms / frame | `scripts/benchmark_latency.py` |
-| Steady-state VRAM (GPU) | < 2 GB | Manual measurement |
-| RTF (real-time factor) | < 0.5 on GPU | Engine metrics `rtf` |
+| Steady-state frame compute p95 | <= 10 ms on the release real-time path | `scripts/benchmark_latency.py` or equivalent |
+| End-to-end chunk latency p95 | <= 50 ms on the release streaming server path | streaming endpoint latency harness |
+| Time-to-first-audio | < 200 ms | streaming endpoint measurement |
+| Steady-state VRAM | within pinned deployment budget | runtime telemetry |
+| RTF | < 1.0 on streaming path | engine metrics |
 
-### 1.3 Pointer Diagnostics
+Measure prompt extraction / `SpeakerProfile` re-encode latency separately from steady-state generation.
+
+### 2.3 Pointer Diagnostics
 
 | Metric | Description |
 |--------|-------------|
-| Completion ratio | Fraction of phonemes consumed before max_frames |
-| Average frames per phoneme | Should correlate with reference speech rate |
-| Advance probability histogram | Should be bimodal (hold vs advance) |
+| Completion ratio | fraction of canonical text units consumed before stop |
+| Average frames per text unit | should correlate with reference speech rate |
+| Advance probability histogram | should separate hold vs advance modes |
+| `forced_advance_count` | fallback trigger count during evaluation |
+| `skip_protection_count` | skip-protection trigger count during evaluation |
 
-## 2. Integration Matrix
+---
+
+## 3. Integration Matrix
 
 | Config | Train | Serve | Status |
 |--------|-------|-------|--------|
-| v3 pointer, no durations | `--tts-mode pointer` | `tts_mode="pointer"` | Primary |
-| v3 pointer, with durations | `--tts-mode pointer` (uses dur as targets) | `tts_mode="pointer"` | Supported |
-| v2 legacy | `--tts-mode legacy_duration` | `tts_mode="legacy_duration"` | Legacy |
+| v3 pointer, alignment-free release recipe | `--tts-mode pointer` | `tts_mode=\"pointer\"` | Primary |
+| v3 pointer, transitional bootstrap supervision | `--tts-mode pointer` with supervised bootstrap source | `tts_mode=\"pointer\"` | Transitional / ablation |
+| v2 legacy | `--tts-mode legacy_duration` | `tts_mode=\"legacy_duration\"` | Legacy |
 
-## 3. TTS Quality Evaluation
+Release sign-off must include the alignment-free release recipe, not only transitional recipes.
 
-### 3.1 Naturalness (MOS)
+---
 
-- 20+ sentences, 3+ listeners
-- Compare: v3 pointer vs v2 legacy vs ground truth
-- Report: mean MOS with 95% CI
+## 4. TTS Quality Evaluation
 
-### 3.2 Intelligibility
+### 4.1 Naturalness
 
-- CER/WER on ASR re-transcription of synthesized audio
-- Target: CER < 5% (Japanese), WER < 10% (English)
+- evaluate on a frozen prompt set spanning neutral, dialogue, and expressive cases
+- report MOS with 95% confidence intervals
+- release-signoff subjective runs require at least 30 unique raters
 
-### 3.3 Speaker Similarity
+### 4.2 Intelligibility
 
-- Cosine similarity between synthesized and reference speaker embeddings
-- Target: > 0.85
+- compute CER / WER on ASR re-transcription of synthesized audio
+- stratify by language and by code-switch subset
 
-## 4. VC Quality Evaluation
+### 4.3 Control Responsiveness
 
-- Speaker similarity: cosine > 0.80
-- Intelligibility: CER degradation < 2% vs source
-- Latency: RTF < 1.0 for streaming
+For each exposed control (`pace`, `hold_bias`, `boundary_bias`, selected `voice_state` dimensions):
 
-## 5. Pacing Control Responsiveness
+1. generate a frozen control sweep
+2. measure duration, pause behavior, and selected acoustic metrics
+3. compute monotonic correlation and significance
+4. report both aggregate and failure cases
 
-For each control parameter (`pace`, `hold_bias`, `boundary_bias`):
+### 4.4 Context Sensitivity
 
-1. Generate same text with control = {-1.0, -0.5, 0.0, 0.5, 1.0}
-2. Measure output duration
-3. Verify monotonic relationship (higher pace = shorter output)
-4. Report Spearman correlation
+- same text, different dialogue context
+- measure:
+  - `context_separation_score`
+  - `prosody_collapse_score`
+  - pause / boundary placement differences
+- include human appropriateness rating on the same frozen subset
 
-## 6. Drama-Acting Evaluation (Future)
+---
 
-### 6.1 Context Sensitivity
+## 5. Few-Shot Speaker Adaptation
 
-- Same text, different dialogue context
-- Measure: F0 variance, duration variance, pause placement difference
-- Pass: statistically significant difference (p < 0.05)
+### 5.1 Reference Lengths
 
-### 6.2 Human Preference
+- fixed reference durations: 3 s, 5 s, 10 s
+- trimmed from the same source session where possible
+- reuse the same frozen prompt set across all systems
 
-- Paired comparison: dramatic vs neutral delivery
-- 10+ dialogue excerpts, 5+ raters
-- Report: preference rate with binomial CI
+### 5.2 Metrics
 
-### 6.3 Collapse Detection
+- `few_shot_speaker_score`
+- CER degradation vs text-prompted synthesis
+- `timbre_prosody_disentanglement_score`
+- `prosody_transfer_leakage_score`
 
-- Same text, 5 different contexts
-- Measure: pairwise cosine distance of mel spectrograms
-- Fail: all pairs < 0.1 distance (collapsed)
+### 5.3 Leakage Protocol
 
-## 7. Pseudo-Annotation Audit Checklist
+- use the same speaker prompt while varying target text and dialogue context
+- compare generated pitch / duration contours against the reference prompt contours
+- low leakage is required when the target context differs materially from the prompt context
 
-- [ ] ASR spot-check: 50 random utterances, manual CER < 10%
-- [ ] Text normalization: no systematic errors in numbers/dates/abbreviations
-- [ ] Speaker clustering: purity > 0.9 on sampled clusters
-- [ ] Confidence calibration: low-confidence items are genuinely worse
-- [ ] Quality score threshold: selected threshold rejects < 20% of data
+---
 
-## 8. Few-Shot Speaker Adaptation Evaluation
+## 6. External Baseline Comparison
 
-### 8.1 Speaker Similarity Under Short References
+### 6.1 Frozen Baseline Requirement
 
-- `few_shot_speaker_score`: combine speaker-similarity (cosine of speaker
-  embeddings) and intelligibility (CER) under fixed short-reference conditions.
-- Reference audio lengths: **3 s**, **5 s**, **10 s**.
-- For each reference length, synthesise the same set of evaluation prompts and
-  compute:
-  - Cosine similarity between synthesised and reference speaker embeddings.
-  - CER via ASR re-transcription of synthesised audio.
-- Pass criteria:
-  - Speaker similarity >= 0.80 at 3 s reference, >= 0.85 at 10 s reference.
-  - CER degradation < 3% compared to text-prompted (no speaker reference).
+Every release-signoff run must cite an entry in
+`docs/design/external-baseline-registry.md`.
 
-### 8.2 Timbre-Prosody Disentanglement
+The following must be frozen:
 
-- `timbre_prosody_disentanglement_score`: for the same speaker-prompt, vary the
-  dialogue context and measure F0 and duration variance across contexts.
-- High variance indicates good disentanglement (the model adapts prosody to
-  context while preserving speaker timbre).
-- Extract F0 with CREPE or WORLD; compute coefficient of variation (CV) across
-  contexts.
-- Pass: F0 CV >= 0.08 across contexts with the same speaker prompt.
+- baseline model name
+- exact artifact / checkpoint identifier
+- tokenizer / text normalization settings
+- prompt trimming rules
+- inference parameters
+- evaluation prompt set version
 
-### 8.3 Protocol
-
-- Fixed reference audio lengths (3 s, 5 s, 10 s) trimmed from the same source
-  recording.
-- Matched evaluation prompts across all conditions.
-- Comparison against external baseline (see Section 9) on the same protocol.
-
-## 9. External Baseline Comparison Protocol
-
-### 9.1 Frozen Baseline
-
-- Frozen baseline system: **Qwen3-TTS** (or stronger public successor at time
-  of evaluation).
-- Both TMRVC and the baseline must be evaluated on the identical prompt set,
-  reference audio set, and inference configuration.
-
-### 9.2 Metrics
-
-- `external_baseline_delta`: directional gap between TMRVC and the baseline on
-  each metric (speaker similarity, CER, MOS, preference rate).
-- Positive delta = TMRVC is better; negative delta = TMRVC is worse.
-
-### 9.3 Fixed Evaluation Settings
-
-All of the following must be recorded and held constant across systems:
-
-- Checkpoint version / model identifier.
-- Reference audio prompt length.
-- Inference parameters (temperature, cfg_scale, top-k, etc.).
-- Decoding strategy (greedy / sampling / beam).
-
-### 9.4 Mandatory Blind A/B Preference Test
-
-- Minimum 30 raters, randomised presentation order.
-- Forced-choice preference with optional "no preference".
-- Both **naturalness** and **controllability/acting** must be evaluated as
-  separate dimensions.
-
-### 9.5 Evaluation Dimensions
+### 6.2 Dimensions
 
 | Dimension | Description |
 |-----------|-------------|
-| Naturalness | Overall speech quality and human-likeness |
-| Controllability / Acting | Ability to express different emotions, pacing, and dramatic delivery via dialogue context and voice_state controls |
+| Naturalness | overall speech quality and human-likeness |
+| Controllability / Acting | ability to respond to dialogue context and explicit controls |
+| Few-shot similarity | speaker identity retention under short references |
+| Leakage resistance | ability to avoid copying prompt prosody when context differs |
 
-## 10. CFG and Guidance Stability
+### 6.3 Blind Preference Protocol
 
-### 10.1 Controllability Under Guidance
+- minimum 30 unique raters for release sign-off
+- randomize order and hide system identities
+- allow `no preference`, but report it separately
+- separate `director` notes from blinded rater judgments
 
-- `cfg_stability_score`: measure the controllability gain under classifier-free
-  guidance (CFG) sweeps, penalised by pointer/EOS failures.
-- Sweep cfg_scale over the range [1.0, 1.5, 2.0, 2.5, 3.0].
+---
 
-### 10.2 Safe Bounds
+## 7. CFG Evaluation
 
-- Identify cfg_scale safe bounds: the range of cfg_scale values where pointer
-  monotonicity is maintained and EOS is reached within max_frames.
+### 7.1 Modes
 
-### 10.3 Pointer Monotonicity Check Under Guidance
+Evaluate all enabled runtime modes explicitly:
 
-- For each cfg_scale in the sweep, verify that the pointer index is
-  non-decreasing across frames.
-- Any monotonicity violation is a hard failure for that cfg_scale value.
+- `off`
+- `full`
+- `lazy`
+- `distilled`
 
-### 10.4 Cache Consistency Check Under Guidance
+### 7.2 Checks
 
-- Compare KV-cache state at pointer-boundary transitions across different
-  cfg_scale values.
-- Verify that cache entries remain valid and do not produce divergent outputs
-  when recomputed without caching.
+- pointer monotonicity under CFG sweeps
+- EOS reachability under CFG sweeps
+- cache consistency under CFG sweeps
+- perceptual delta between `full` and any accelerated mode
 
-## 11. Cache and Waveform Quality
+`full` two-pass CFG is not the default for hard real-time Rust / VST paths unless latency proof is recorded.
 
-### 11.1 Cache Synchronisation
+---
 
-- `cache_sync_error_rate`: compare cached vs recomputed outputs across
-  pointer-boundary transitions.
-- Run 100+ utterances; flag any output mismatch exceeding a tolerance of 1e-5
-  in logit space.
-- Target: < 0.1% mismatch rate.
+## 8. VC Evaluation
 
-### 11.2 Waveform Artifact Detection
+### 8.1 Core Metrics
 
-- `waveform_artifact_score`: combine automatic artifact detectors (energy
-  spikes, spectral discontinuities, click detection) with human artifact tags.
-- Automatic pass: < 2% of frames flagged by energy-spike detector (threshold:
-  > 6 dB jump between adjacent frames).
-- Human audit: spot-check 50 utterances; < 5% contain audible artifacts.
+- speaker similarity
+- intelligibility
+- streaming stability
+- semantic-context contract coverage
 
-### 11.3 Code-Switch Intelligibility
+### 8.2 Context Protocol
 
-- `code_switch_intelligibility_score`: evaluate intelligibility and
-  language-boundary preservation on mixed-language utterances (e.g.
-  Japanese-English code-switching).
-- Measure CER independently for each language segment.
-- Verify that language-boundary transitions do not produce audible glitches or
-  intelligibility drops.
-- Pass: per-segment CER within 2% of monolingual baseline.
+- if VC semantic-context fusion is enabled, evaluate with and without surrounding turn context
+- confirm the path remains causal and does not rely on offline look-ahead
 
-## 12. Pointer Fallback Evaluation
+---
 
-| Counter | Description | Warning Threshold |
-|---------|-------------|-------------------|
-| `forced_advance_count` | 評価実行中の forced advance 発動回数 | 全 advance の 5% 超で警告 |
-| `skip_protection_count` | 評価実行中の skip protection 発動回数 | 全 hold の 10% 超で警告 |
+## 9. Multilingual and Code-Switch Regression
 
-- 各評価実行ごとに `forced_advance_count` と `skip_protection_count` を報告すること
-- "clean" 評価の基準: 両カウンタがゼロであること
+- after adding or reweighting a language, rerun the frozen multilingual held-out suite
+- report regression deltas for previously supported languages
+- block sign-off if existing-language metrics fall beyond the documented regression budget
 
-## 13. Rater QC Protocol
+---
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Duplicate sample ratio | 10-15% of total | 評価セットに挿入する重複サンプルの割合 |
-| Self-consistency metric | Cohen's kappa or agreement rate | rater の自己一貫性の測定指標 |
-| Consistency threshold | >= 0.7 | この閾値を下回る rater はフラグする |
+## 10. Curation and Separation Evaluation
 
-- 重複サンプル (全体の 10-15%) を評価セットに挿入し、rater の自己一貫性を測定する
-- Cohen's kappa または一致率で rater 自己一貫性を計測する
-- 一貫性が 0.7 を下回る rater をフラグする
-- director の定性的ノートとブラインド rater スコアは分離して管理する
+### 10.1 Pseudo-Annotation Audit
+
+- ASR spot-check
+- text normalization audit
+- speaker clustering audit
+- quality-score calibration
+
+### 10.2 Separation Policy
+
+- separation is evaluated first as an annotation aid
+- initial mainline release does not use separated waveforms as default waveform teachers
+- any research-bucket use of separated waveforms must report:
+  - `separation_confidence`
+  - `waveform_artifact_score`
+  - speaker / timbre preservation result
+  - explicit human approval record
+
+---
+
+## 11. Statistical Procedure
+
+- pre-register sample count, rater count, duplicate ratio, and hypothesis test
+- report confidence intervals alongside `p` values
+- store the protocol version with every release-signoff result bundle
+
+---
+
+## 12. Required Artifacts
+
+Every sign-off bundle must include:
+
+- metric report
+- latency report
+- pointer fallback counters
+- external-baseline registry reference
+- human evaluation export
+- rater QC report
+- failure-case appendix

@@ -8,7 +8,6 @@ Covers:
 - DialogueContextProjector with all input combinations
 - DisentangledUCLM.encode_speaker_prompt() smoke test
 - DisentangledUCLM.predict_prosody() smoke test
-- DisentangledUCLM.forward_tts() legacy wrapper
 - forward_tts_pointer output includes v3 pointer fields
 """
 
@@ -17,10 +16,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tmrvc_core.types import PointerState
 from tmrvc_train.models.uclm_model import (
     DialogueContextProjector,
     DisentangledUCLM,
-    PointerState,
     ProsodyPredictor,
     SpeakerPromptEncoder,
 )
@@ -118,6 +117,7 @@ def test_uclm_tts_pointer_forward():
     ssl_state = torch.randn(B, T, 128)
     speaker_embed = torch.randn(B, 192)
 
+    target_a = torch.randint(0, 1024, (B, 8, T))
     target_b = torch.randint(0, 64, (B, 4, T))
     out = model.forward_tts_pointer(
         phoneme_ids=phoneme_ids,
@@ -126,6 +126,7 @@ def test_uclm_tts_pointer_forward():
         speaker_embed=speaker_embed,
         explicit_state=explicit_state,
         ssl_state=ssl_state,
+        target_a=target_a,
         target_b=target_b,
         target_length=T,
     )
@@ -211,32 +212,45 @@ class TestProsodyPredictor:
         assert out.shape == (B, _D_PROSODY)
 
     def test_eval_mode_deterministic(self):
-        """Eval mode should return mu (deterministic), not sampled."""
+        """Eval mode should return deterministic output given the same seed."""
         B, L = 2, 20
         pred = ProsodyPredictor(d_model=_D_MODEL, d_prosody=_D_PROSODY)
         pred.eval()
         phoneme_feats = torch.randn(B, L, _D_MODEL)
 
+        torch.manual_seed(0)
         out1 = pred(phoneme_feats)
+        torch.manual_seed(0)
         out2 = pred(phoneme_feats)
 
-        # In eval mode, outputs should be identical (no sampling noise)
-        assert torch.allclose(out1, out2), "Eval mode should be deterministic (return mu)"
+        # With same seed, flow-matching ODE steps produce identical output
+        assert torch.allclose(out1, out2), "Eval mode should be deterministic given same seed"
 
-    def test_training_mode_stochastic(self):
-        """Training mode should produce different outputs due to reparameterization."""
+    def test_training_mode_returns_zeros(self):
+        """Training mode forward() returns zeros; actual loss via flow_matching_loss()."""
         B, L = 4, 20
         pred = ProsodyPredictor(d_model=_D_MODEL, d_prosody=_D_PROSODY)
         pred.train()
         phoneme_feats = torch.randn(B, L, _D_MODEL)
 
-        torch.manual_seed(42)
-        out1 = pred(phoneme_feats)
-        torch.manual_seed(99)
-        out2 = pred(phoneme_feats)
+        out = pred(phoneme_feats)
+        assert torch.allclose(out, torch.zeros_like(out)), \
+            "Training forward() should return zeros (use flow_matching_loss for training)"
 
-        # With different random seeds, outputs should differ
-        assert not torch.allclose(out1, out2), "Training mode should be stochastic"
+    def test_flow_matching_loss_produces_gradient(self):
+        """flow_matching_loss() should produce non-zero loss with gradients."""
+        B, L = 4, 20
+        pred = ProsodyPredictor(d_model=_D_MODEL, d_prosody=_D_PROSODY)
+        pred.train()
+        phoneme_feats = torch.randn(B, L, _D_MODEL, requires_grad=True)
+        target_prosody = torch.randn(B, pred.d_prosody)
+
+        loss = pred.flow_matching_loss(phoneme_feats, target_prosody)
+        assert loss.item() > 0, "Flow-matching loss should be non-zero"
+        loss.backward()
+        assert any(p.grad is not None and p.grad.abs().sum() > 0
+                   for p in pred.parameters()), \
+            "Gradients should flow through flow_matching_loss"
 
     def test_with_dialogue_context(self):
         """Should accept optional dialogue_context."""
@@ -409,41 +423,6 @@ class TestPredictProsody:
 
 
 # ---------------------------------------------------------------------------
-# DisentangledUCLM.forward_tts() legacy wrapper test
-# ---------------------------------------------------------------------------
-
-
-class TestForwardTtsWrapper:
-    def test_forward_tts_delegates_to_pointer(self):
-        """forward_tts() should delegate to forward_tts_pointer()."""
-        B, L, T = 2, 10, 30
-        model = _make_model()
-
-        phoneme_ids = torch.randint(1, 64, (B, L))
-        language_ids = torch.zeros((B,), dtype=torch.long)
-        explicit_state = torch.randn(B, T, 8)
-        ssl_state = torch.randn(B, T, 32)
-        speaker_embed = torch.randn(B, _D_SPEAKER)
-        target_b = torch.randint(0, 32, (B, 4, T))
-
-        out = model.forward_tts(
-            phoneme_ids=phoneme_ids,
-            language_ids=language_ids,
-            pointer_state=None,
-            speaker_embed=speaker_embed,
-            explicit_state=explicit_state,
-            ssl_state=ssl_state,
-            target_b=target_b,
-            target_length=T,
-        )
-
-        # Should produce same keys as forward_tts_pointer
-        assert "logits_a" in out
-        assert "logits_b" in out
-        assert "pointer_logits" in out
-
-
-# ---------------------------------------------------------------------------
 # forward_tts_pointer v3 output fields
 # ---------------------------------------------------------------------------
 
@@ -461,6 +440,7 @@ class TestForwardTtsPointerV3Fields:
             speaker_embed=torch.randn(B, _D_SPEAKER),
             explicit_state=torch.randn(B, T, 8),
             ssl_state=torch.randn(B, T, 32),
+            target_a=torch.randint(0, 128, (B, 8, T)),
             target_b=torch.randint(0, 32, (B, 4, T)),
             target_length=T,
         )
@@ -481,6 +461,7 @@ class TestForwardTtsPointerV3Fields:
             speaker_embed=torch.randn(B, _D_SPEAKER),
             explicit_state=torch.randn(B, T, 8),
             ssl_state=torch.randn(B, T, 32),
+            target_a=torch.randint(0, 128, (B, 8, T)),
             target_b=torch.randint(0, 32, (B, 4, T)),
             target_length=T,
         )
@@ -500,6 +481,7 @@ class TestForwardTtsPointerV3Fields:
             speaker_embed=torch.randn(B, _D_SPEAKER),
             explicit_state=torch.randn(B, T, 8),
             ssl_state=torch.randn(B, T, 32),
+            target_a=torch.randint(0, 128, (B, 8, T)),
             target_b=torch.randint(0, 32, (B, 4, T)),
             target_length=T,
         )

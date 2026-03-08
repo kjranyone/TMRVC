@@ -58,11 +58,15 @@ shared_state:
 
 | 構成要素 | 目標 |
 |---|---|
-| Codec Encoder | `~5 ms` |
-| UCLM Core | `~8-10 ms` |
-| Codec Decoder | `~5 ms` |
+| Codec Encoder | `VC path only; pinned separately` |
+| UCLM Core + pointer update | `real-time path で <= 8 ms p95 を目安` |
+| Codec Decoder | `real-time path で <= 2 ms p95 を目安` |
+| Steady-state frame compute | `<= 10 ms p95` |
 | Algorithmic latency | `10 ms` |
 | End-to-end nominal | `~35-50 ms` |
+
+one-shot の prompt extraction や model load は steady-state frame compute には含めない。
+ただし streaming server の end-to-end 指標には TTFA として別管理で含める。
 
 ## 5. 外部制御
 

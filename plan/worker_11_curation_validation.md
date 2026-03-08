@@ -21,6 +21,7 @@ This worker is the brake pedal. It prevents the project from claiming success be
 - promoted subset quality report
 - downstream uplift report
 - human-audit process report
+- `voice_state` pseudo-label validation report
 
 ## Validation Layers
 
@@ -32,6 +33,7 @@ Measure:
 - diarization purity (via Gradio Auditor)
 - separation artifact rate
 - transcript refinement uplift
+- `voice_state` pseudo-label calibration and coverage
 
 ### Layer 2: Promotion Policy Quality
 
@@ -51,6 +53,7 @@ Measure:
 - pointer-training stability uplift
 - VC prior stability uplift
 - expressive metrics uplift where available
+- physical-control response uplift attributable to curated `voice_state` labels
 
 ### Layer 4: Human Process Integrity
 
@@ -81,6 +84,9 @@ Measure:
    - every critical promotion/export action has actor, timestamp, and rationale
    - required role separation is enforced
    - blinded rating protocol is actually followed in stored records
+8. Validate `voice_state` pseudo-label utility:
+   - coverage and calibration are reported for promoted subsets
+   - masked training with these labels improves or preserves held-out controllability metrics
 
 ## Acceptance Criteria
 
@@ -93,6 +99,7 @@ The curation system is acceptable only if:
 5. provenance is sufficient to explain failures
 6. legality and split gates are enforced with zero critical violations
 7. human audit and rating records are sufficient to reconstruct who approved what and why
+8. `voice_state` pseudo-labels are calibrated enough to justify use in mainline training
 
 ## Guardrails
 
@@ -101,6 +108,7 @@ The curation system is acceptable only if:
 - do not ignore false promotions
 - do not accept opaque score formulas
 - do not accept a HITL claim if approvals or ratings are not reconstructible from stored audit data
+- do not sign off on physical-control claims if curated `voice_state` labels were never utility-tested
 
 ## Deliverables
 
@@ -109,3 +117,4 @@ The curation system is acceptable only if:
 - provider comparison matrix
 - downstream uplift report template
 - human workflow integrity checklist
+- `voice_state` pseudo-label utility checklist

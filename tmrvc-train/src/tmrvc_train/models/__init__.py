@@ -2,7 +2,8 @@
 
 from tmrvc_train.models.uclm import VectorQuantizer, VCEncoder
 from tmrvc_train.models.uclm_transformer import CodecTransformer
-from tmrvc_train.models.uclm_model import DisentangledUCLM, DialogueContextProjector, PointerHead, PointerState, SpeakerPromptEncoder, ProsodyPredictor
+from tmrvc_core.types import PointerState
+from tmrvc_train.models.uclm_model import DisentangledUCLM, DialogueContextProjector, PointerHead, SpeakerPromptEncoder, ProsodyPredictor
 from tmrvc_train.models.uclm_loss import uclm_loss
 from tmrvc_train.models.duration_predictor import DurationPredictor, duration_loss
 from tmrvc_train.models.speaker_encoder import SpeakerEncoderWithLoRA

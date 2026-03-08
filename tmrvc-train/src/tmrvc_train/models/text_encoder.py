@@ -56,7 +56,11 @@ class TextEncoder(nn.Module):
 
     def forward(self, phoneme_ids, language_ids, phoneme_lengths=None):
         B, L = phoneme_ids.shape
-        x = self.phoneme_embed(phoneme_ids) + self.lang_embed(language_ids).unsqueeze(1)
+        lang = self.lang_embed(language_ids)
+        if lang.dim() == 2:
+            # language_ids was (B,) scalar per sample — broadcast over sequence
+            lang = lang.unsqueeze(1)
+        x = self.phoneme_embed(phoneme_ids) + lang
         x = self.embed_dropout(self.pos_enc(x))
         
         mask = None

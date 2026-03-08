@@ -60,6 +60,7 @@ def test_forward_tts_pointer_accepts_padded_target_b_context():
         speaker_embed=torch.randn(B, 192),
         explicit_state=torch.randn(B, T, 8),
         ssl_state=torch.randn(B, T, 128),
+        target_a=torch.zeros(B, 8, T, dtype=torch.long),
         target_b=target_b,
         target_length=T,
     )

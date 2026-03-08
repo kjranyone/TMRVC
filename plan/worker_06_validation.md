@@ -32,6 +32,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - **Explicit proof protocol for few-shot adaptation against a fixed external baseline artifact**
 - explicit validation protocol for pseudo-annotated corpora
 - baseline artifact/version/settings and statistical test procedure are frozen before sign-off
+- explicit validation of `voice_state` pseudo-label usefulness, calibration, and masking semantics
 
 
 ## Concrete Tasks
@@ -81,6 +82,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
    - speaker clustering purity spot-check
    - pseudo-label confidence calibration
    - quality-score threshold selection
+   - `voice_state` pseudo-label calibration and coverage audit
 10. Add separation-aided annotation validation:
    - compare raw vs separated ASR quality
    - compare diarization purity before/after separation
@@ -92,10 +94,18 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 12. Add explicit regression checks for known open issues:
    - batch vs frame-by-frame CausalConv1d numerical drift
    - `tmrvc-train-codec` `collate_fn` contract verification
+   - frame-index parity of `bootstrap_alignment.json` against `tmrvc-core`
 13. Freeze external baseline policy:
    - at least one strong public baseline is mandatory
    - baseline name, exact artifact or checkpoint, prompt length, tokenizer or text-normalization settings, and inference settings must be fixed in the evaluation spec
    - baseline changes require an explicit version bump to the evaluation protocol; "or newer successor" is forbidden in sign-off criteria
+   - recommended public candidates to evaluate before freezing the registry (must match `docs/design/external-baseline-registry.md`):
+     - **CosyVoice 2/3** (arXiv:2412.10117, arXiv:2505.17589): streaming, LLM + CFM, strong zero-shot, multilingual
+     - **F5-TTS** (arXiv:2410.06885): flow-matching, non-AR, strong naturalness
+     - **MaskGCT**: fully non-AR, no alignment needed, strong long-prompt performance
+     - **Qwen3-TTS** (arXiv:2601.15621): 2-stage AR + flow matching, block-wise streaming, multilingual, open-source weights available
+     - any additional candidate recorded and justified in `plan/arxiv_survey_2026_03.md`
+   - the chosen baseline must be reproducible with public artifacts; proprietary-only systems are not acceptable as primary baselines
 14. Freeze human-evaluation statistics policy:
    - pre-register sample count, rater count, duplicate-rate QC, and hypothesis test
    - report confidence intervals in addition to `p` values
@@ -120,6 +130,7 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
 - **Automated Acting Alignment:**
   - correlation between F0/Energy contours and predicted scene/intent labels.
 - pseudo-annotated training subset passes manual audit thresholds before full training
+- pseudo-labeled `voice_state` supervision improves or at minimum does not degrade control-response metrics on the held-out control set
 - separation-aided subset shows measurable annotation uplift before adoption
 - Python / Rust / ONNX parity gates pass within predefined tolerance
 
@@ -143,6 +154,11 @@ Define and implement the test and evaluation matrix that decides whether v3 is a
     - boundary hold frequency
 - parity:
   - PyTorch vs ONNX and Python vs Rust paths must remain within the predefined tolerance on pointer outputs and state transitions
+- frame-alignment parity:
+  - all exported `start_frame` / `end_frame` artifacts must match `sample_rate=24000`, `hop_length=240`, `T = ceil(N / 240)` exactly
+- `voice_state` supervision:
+  - reported coverage, observed ratio, and confidence summaries must exist for every promoted training subset
+  - masked training with partial `voice_state` supervision must outperform or equal the no-physical-target ablation on registered controllability metrics
 - force-advance parity:
   - Python and Rust must agree on forced-advance trigger timing and post-trigger state updates within the predefined tolerance
 - few-shot speaker adaptation:
@@ -191,6 +207,10 @@ Worker 06 must freeze explicit formulas or scripts for the following before fina
 - `prosody_transfer_leakage_score`
   - measure prompt-prosody leakage by correlating reference-prompt pitch/duration contours with generated contours when target text/context differ.
   - target: low leakage under cross-context prompting while retaining speaker similarity.
+- `voice_state_label_utility_score`
+  - measure the controllability uplift attributable to curated `voice_state` supervision versus the ablation without those targets.
+- `voice_state_calibration_error`
+  - compare pseudo-label confidence against downstream residual error or audit buckets.
 - `external_baseline_delta`
   - initial recommendation:
     - report the directional gap between TMRVC and the fixed public baseline on the same protocol
@@ -208,6 +228,7 @@ The exact metric implementation may mature, but sign-off cannot rely on undefine
 - do not sign off if Python, Rust, or ONNX paths disagree on the runtime contract
 - do not sign off if expressive claims are based only on anecdotal samples
 - do not sign off on pseudo-annotations without manual spot-audit
+- do not sign off if `voice_state` controls exist only in the UI/runtime but lack validated training supervision quality
 - do not adopt a separator because demos sound impressive; require measured uplift
 - do not sign off on SOTA-style claims using only internal baselines
 - do not use undefined human-evaluation wording in the final acceptance report; threshold and test procedure must be named

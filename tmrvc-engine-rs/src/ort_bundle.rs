@@ -55,6 +55,7 @@ pub struct OrtBundle {
     text_encoder: Option<Session>,
     duration_predictor: Option<Session>,
     f0_predictor: Option<Session>,
+    pointer_head: Option<Session>,
 }
 
 impl OrtBundle {
@@ -75,6 +76,7 @@ impl OrtBundle {
         let text_encoder = load_optional(model_dir, "text_encoder.onnx");
         let duration_predictor = load_optional(model_dir, "duration_predictor.onnx");
         let f0_predictor = load_optional(model_dir, "f0_predictor.onnx");
+        let pointer_head = load_optional(model_dir, "pointer_head.onnx");
 
         Ok(Self {
             codec_encoder,
@@ -85,6 +87,7 @@ impl OrtBundle {
             text_encoder,
             duration_predictor,
             f0_predictor,
+            pointer_head,
         })
     }
 
@@ -410,6 +413,43 @@ impl OrtBundle {
         self.text_encoder.is_some()
             && self.duration_predictor.is_some()
             && self.f0_predictor.is_some()
+            && self.pointer_head.is_some()
+    }
+
+    /// Run pointer head: hidden_states → advance_logit + progress_delta
+    ///
+    /// Inputs:
+    /// - hidden_states: `[1, seq_len, d_model]` flattened hidden states from UCLM core
+    /// - seq_len: sequence length
+    ///
+    /// Outputs (RT-safe, written to pre-allocated buffers):
+    /// - advance_logit_out: `[1, seq_len, 1]` advance vs hold logit
+    /// - progress_delta_out: `[1, seq_len, 1]` pointer progress update (sigmoid, 0-1)
+    pub fn run_pointer_head(
+        &mut self,
+        hidden_states: &[f32],
+        seq_len: usize,
+        advance_logit_out: &mut [f32],
+        progress_delta_out: &mut [f32],
+    ) -> Result<()> {
+        let session = self
+            .pointer_head
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pointer_head not loaded"))?;
+
+        let outputs = session.run(ort::inputs![
+            "hidden_states" => TensorRef::from_array_view(([1usize, seq_len, D_MODEL], hidden_states))?,
+        ])?;
+
+        let advance_logit = outputs["advance_logit"].try_extract_tensor::<f32>()?;
+        let al_len = advance_logit.1.len().min(advance_logit_out.len());
+        advance_logit_out[..al_len].copy_from_slice(&advance_logit.1[..al_len]);
+
+        let progress_delta = outputs["progress_delta"].try_extract_tensor::<f32>()?;
+        let pd_len = progress_delta.1.len().min(progress_delta_out.len());
+        progress_delta_out[..pd_len].copy_from_slice(&progress_delta.1[..pd_len]);
+
+        Ok(())
     }
 
     pub fn run_duration_predictor(

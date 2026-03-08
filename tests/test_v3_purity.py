@@ -30,9 +30,11 @@ class TestV3ArchitecturePurity:
         assert hasattr(model, "forward_tts_pointer")
         assert hasattr(model, "forward_vc")
         assert hasattr(model, "forward_streaming")
-        # Legacy method must be gone
+        # forward_tts is retained as a compatibility wrapper that delegates
+        # to forward_tts_pointer (per Worker 01 guardrails)
+        assert hasattr(model, "forward_tts")
+        # Legacy-only method must be gone
         assert not hasattr(model, "forward_tts_legacy")
-        assert not hasattr(model, "forward_tts")
 
 
 class TestEnginePurity:

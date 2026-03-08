@@ -9,12 +9,18 @@ positions at each decoder step, deciding *which* phoneme to read and *when* to
 advance. This removes the need for externally supplied duration labels and
 enables more natural, expressive synthesis.
 
+This guide is an overview only. Canonical v3 contracts live in:
+
+- `docs/design/architecture.md`
+- `docs/design/unified-codec-lm.md`
+- `docs/design/onnx-contract.md`
+
 Key wins:
 
 - No dependency on forced-alignment durations at training time.
 - Runtime control over pacing, pauses, and breathing.
-- Optional expressive conditioning via dialogue context, acting intent, and
-  prosody latents.
+- Optional expressive conditioning via dialogue context, acting intent,
+  `local_prosody_latent`, and explicit physical control.
 
 ---
 
@@ -40,9 +46,12 @@ Key wins:
 ```python
 forward_tts_pointer(
     ...,
-    dialogue_context=None,   # (B, D_ctx) dialogue/scene embedding
+    dialogue_context=None,   # (B, C_ctx, d_model) or (B, d_model)
     acting_intent=None,      # (B, num_intents) soft intent vector
-    prosody_latent=None,     # (B, T, D_prosody) per-frame prosody target
+    local_prosody_latent=None,  # (B, d_prosody) or (B, T, D_prosody)
+    explicit_voice_state=None,  # (B, T, 8) or (B, 8)
+    delta_voice_state=None,     # (B, T, 8) or (B, 8)
+    ssl_voice_state=None,       # optional SSL-derived state evidence
 )
 ```
 
@@ -75,9 +84,11 @@ pass `--tts-mode legacy_duration`.
 
 The dataloader may now yield additional fields:
 
-- `dialogue_context` -- pre-extracted dialogue embedding tensor.
+- `dialogue_context` -- bounded multi-turn text-context tensor.
 - `acting_intent` -- intent label or soft vector.
-- `prosody_targets` -- per-frame prosody features for auxiliary prosody loss.
+- `local_prosody_latent` -- optional prosody control latent.
+- `voice_state_targets` / `voice_state_observed_mask` /
+  `voice_state_confidence` -- optional physical-control supervision bundle.
 
 These fields are optional; batches without them simply skip the corresponding
 loss terms.

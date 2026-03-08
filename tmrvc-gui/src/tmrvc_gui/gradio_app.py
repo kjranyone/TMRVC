@@ -1,0 +1,1515 @@
+"""TMRVC Gradio Control Plane — UCLM v3 HITL Interface.
+
+Browser-based control plane for drama-grade TTS evaluation, curation
+auditing, dataset management, blind A/B evaluation, and system admin.
+
+Implements Worker 12 (Gradio Control Plane) from the UCLM v3 plan.
+
+Launch:
+    python -m tmrvc_gui.gradio_app [--server-url http://localhost:8000]
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import logging
+import random
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import gradio as gr
+import numpy as np
+
+from tmrvc_gui.gradio_state import (
+    ROLES,
+    AuditTrail,
+    CastingGallery,
+    EvalPair,
+    EvalSession,
+    check_permission,
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# API helpers — talk to tmrvc-serve
+# ---------------------------------------------------------------------------
+
+_SERVER_URL = "http://localhost:8000"
+
+
+def _api_url(path: str) -> str:
+    return f"{_SERVER_URL}{path}"
+
+
+def _api_get(path: str) -> dict | list | None:
+    import httpx
+
+    try:
+        r = httpx.get(_api_url(path), timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("API GET %s failed: %s", path, e)
+        return None
+
+
+def _api_post(path: str, body: dict) -> dict | None:
+    import httpx
+
+    try:
+        r = httpx.post(_api_url(path), json=body, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("API POST %s failed: %s", path, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Shared instances
+# ---------------------------------------------------------------------------
+
+_audit = AuditTrail()
+_gallery = CastingGallery()
+_eval_session = EvalSession()
+
+SAMPLE_RATE = 24000
+
+
+# ===================================================================
+# Tab 1: Drama Workshop
+# ===================================================================
+
+
+def _build_drama_workshop() -> gr.Blocks:
+    """Interactive drama workshop with voice cloning, pacing, and physical controls."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Drama Workshop")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                # --- Voice Cloning ---
+                gr.Markdown("### Voice Cloning / Casting")
+                ref_audio = gr.Audio(
+                    label="Reference Audio (3-10s)",
+                    type="filepath",
+                    sources=["upload", "microphone"],
+                )
+                character_id = gr.Textbox(
+                    label="Character ID", value="default", max_lines=1
+                )
+                with gr.Row():
+                    btn_extract = gr.Button("Extract Profile")
+                    btn_gallery_refresh = gr.Button("Refresh Gallery")
+
+                gallery_list = gr.Dropdown(
+                    label="Casting Gallery",
+                    choices=_gallery.list_names(),
+                    interactive=True,
+                )
+
+                # --- Pacing Controls ---
+                gr.Markdown("### Pacing")
+                pace = gr.Slider(0.5, 3.0, value=1.0, step=0.05, label="Pace")
+                hold_bias = gr.Slider(
+                    -1.0, 1.0, value=0.0, step=0.05, label="Hold Bias"
+                )
+                boundary_bias = gr.Slider(
+                    -1.0, 1.0, value=0.0, step=0.05, label="Boundary Bias"
+                )
+                cfg_scale = gr.Slider(
+                    0.5, 5.0, value=1.5, step=0.1, label="CFG Scale"
+                )
+
+            with gr.Column(scale=1):
+                # --- Physical Controls (8-D voice_state) ---
+                gr.Markdown("### Physical Controls (Voice State)")
+                vs_energy = gr.Slider(0, 1, value=0.5, step=0.05, label="Energy")
+                vs_pitch_mean = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label="Pitch Mean"
+                )
+                vs_pitch_range = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label="Pitch Range"
+                )
+                vs_speed = gr.Slider(0, 1, value=0.5, step=0.05, label="Speed")
+                vs_breathiness = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label="Breathiness"
+                )
+                vs_tension = gr.Slider(0, 1, value=0.5, step=0.05, label="Tension")
+                vs_warmth = gr.Slider(0, 1, value=0.5, step=0.05, label="Warmth")
+                vs_brightness = gr.Slider(
+                    0, 1, value=0.5, step=0.05, label="Brightness"
+                )
+
+                # --- Dialogue Context ---
+                gr.Markdown("### Dialogue Context")
+                dialogue_ctx = gr.Textbox(
+                    label="Context",
+                    placeholder="Enter preceding dialogue context...",
+                    lines=3,
+                )
+                acting_intent = gr.Textbox(
+                    label="Acting Intent",
+                    placeholder="e.g. sarcastic, pleading, cheerful",
+                    max_lines=1,
+                )
+
+        # --- Input & Generation ---
+        gr.Markdown("### Generation")
+        input_text = gr.Textbox(
+            label="Input Text",
+            placeholder="Enter text to synthesize...",
+            lines=3,
+        )
+        with gr.Row():
+            btn_generate = gr.Button("Generate", variant="primary")
+            btn_compare = gr.Button("Compare A/B")
+
+        output_audio = gr.Audio(label="Output", type="numpy")
+        generation_info = gr.JSON(label="Generation Info", visible=True)
+
+        # --- Take Management ---
+        gr.Markdown("### Take Management")
+        with gr.Row():
+            take_seed = gr.Number(label="Seed", value=-1, precision=0)
+            btn_multi_take = gr.Button("Generate 3 Takes")
+
+        take_outputs = gr.Dataframe(
+            headers=["take_id", "seed", "cfg_scale", "pace", "notes"],
+            label="Takes",
+            interactive=False,
+        )
+
+        # --- Session Persistence ---
+        with gr.Row():
+            btn_save_project = gr.Button("Save Project")
+            btn_load_project = gr.Button("Load Project")
+            project_file = gr.File(label="Project File", file_types=[".json"])
+
+        # --- Preset Management ---
+        gr.Markdown("### Voice State Presets")
+        with gr.Row():
+            preset_name = gr.Textbox(label="Preset Name", max_lines=1)
+            btn_save_preset = gr.Button("Save Preset")
+            btn_load_preset = gr.Button("Load Preset")
+        preset_list = gr.Dropdown(label="Presets", choices=[], interactive=True)
+
+        status = gr.Textbox(label="Status", interactive=False, value="Ready")
+
+        # --- Callbacks ---
+
+        def save_preset(name, energy, pitch_mean, pitch_range, speed, breathiness, tension, warmth, brightness):
+            if not name.strip():
+                return [], "Enter preset name."
+            preset = {
+                "energy": energy, "pitch_mean": pitch_mean, "pitch_range": pitch_range,
+                "speed": speed, "breathiness": breathiness, "tension": tension,
+                "warmth": warmth, "brightness": brightness,
+            }
+            p = Path("data/presets")
+            p.mkdir(parents=True, exist_ok=True)
+            (p / f"{name}.json").write_text(json.dumps(preset, indent=2), encoding="utf-8")
+            names = [f.stem for f in p.glob("*.json")]
+            return names, f"Saved preset: {name}"
+
+        btn_save_preset.click(
+            save_preset,
+            inputs=[preset_name, vs_energy, vs_pitch_mean, vs_pitch_range, vs_speed,
+                    vs_breathiness, vs_tension, vs_warmth, vs_brightness],
+            outputs=[preset_list, status],
+        )
+
+        def load_preset(name):
+            if not name:
+                return [0.5]*8 + ["Select a preset."]
+            p = Path("data/presets") / f"{name}.json"
+            if not p.exists():
+                return [0.5]*8 + [f"Preset not found: {name}"]
+            d = json.loads(p.read_text(encoding="utf-8"))
+            return [d.get(k, 0.5) for k in [
+                "energy", "pitch_mean", "pitch_range", "speed",
+                "breathiness", "tension", "warmth", "brightness"
+            ]] + [f"Loaded preset: {name}"]
+
+        btn_load_preset.click(
+            load_preset,
+            inputs=[preset_list],
+            outputs=[vs_energy, vs_pitch_mean, vs_pitch_range, vs_speed,
+                     vs_breathiness, vs_tension, vs_warmth, vs_brightness, status],
+        )
+
+        def generate(
+            text,
+            char_id,
+            pace_v,
+            hold_v,
+            boundary_v,
+            cfg_v,
+            energy,
+            pitch_mean,
+            pitch_range,
+            speed,
+            breathiness,
+            tension,
+            warmth,
+            brightness,
+            ctx,
+            intent,
+        ):
+            if not text.strip():
+                return None, {}, "Enter text to generate."
+            voice_state = [
+                energy,
+                pitch_mean,
+                pitch_range,
+                speed,
+                breathiness,
+                tension,
+                warmth,
+                brightness,
+            ]
+            body = {
+                "text": text,
+                "character_id": char_id or "default",
+                "pace": pace_v,
+                "hold_bias": hold_v,
+                "boundary_bias": boundary_v,
+                "cfg_scale": cfg_v,
+                "explicit_voice_state": voice_state,
+            }
+            resp = _api_post("/tts", body)
+            if resp is None:
+                return None, {}, "API call failed. Is tmrvc-serve running?"
+            audio_b64 = resp.get("audio_base64", "")
+            if not audio_b64:
+                return None, resp, "No audio in response."
+            audio_bytes = base64.b64decode(audio_b64)
+            sr = resp.get("sample_rate", SAMPLE_RATE)
+            audio_np = np.frombuffer(audio_bytes[44:], dtype=np.int16).astype(
+                np.float32
+            ) / 32768.0
+            return (sr, audio_np), resp.get("style_used", {}), "Generated."
+
+        btn_generate.click(
+            generate,
+            inputs=[
+                input_text,
+                character_id,
+                pace,
+                hold_bias,
+                boundary_bias,
+                cfg_scale,
+                vs_energy,
+                vs_pitch_mean,
+                vs_pitch_range,
+                vs_speed,
+                vs_breathiness,
+                vs_tension,
+                vs_warmth,
+                vs_brightness,
+                dialogue_ctx,
+                acting_intent,
+            ],
+            outputs=[output_audio, generation_info, status],
+        )
+
+        def extract_profile(audio_path):
+            if not audio_path:
+                return _gallery.list_names(), "No audio loaded."
+            name = Path(audio_path).stem
+            _gallery.add(name, source_audio=str(audio_path))
+            _audit.log("director", "gradio", "extract_speaker_profile", after_state=name)
+            return _gallery.list_names(), f"Profile extracted: {name}"
+
+        btn_extract.click(
+            extract_profile,
+            inputs=[ref_audio],
+            outputs=[gallery_list, status],
+        )
+
+        btn_gallery_refresh.click(
+            lambda: _gallery.list_names(),
+            outputs=[gallery_list],
+        )
+
+        def save_project(
+            text,
+            char_id,
+            pace_v,
+            hold_v,
+            boundary_v,
+            cfg_v,
+            ctx,
+            intent,
+            energy,
+            pitch_mean,
+            pitch_range,
+            speed,
+            breathiness,
+            tension,
+            warmth,
+            brightness,
+        ):
+            project = {
+                "text": text,
+                "character_id": char_id,
+                "pacing": {"pace": pace_v, "hold_bias": hold_v, "boundary_bias": boundary_v},
+                "cfg_scale": cfg_v,
+                "dialogue_context": ctx,
+                "acting_intent": intent,
+                "voice_state": {
+                    "energy": energy,
+                    "pitch_mean": pitch_mean,
+                    "pitch_range": pitch_range,
+                    "speed": speed,
+                    "breathiness": breathiness,
+                    "tension": tension,
+                    "warmth": warmth,
+                    "brightness": brightness,
+                },
+            }
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, prefix="drama_project_"
+            )
+            json.dump(project, tmp, indent=2, ensure_ascii=False)
+            tmp.close()
+            return tmp.name, "Project saved."
+
+        btn_save_project.click(
+            save_project,
+            inputs=[
+                input_text,
+                character_id,
+                pace,
+                hold_bias,
+                boundary_bias,
+                cfg_scale,
+                dialogue_ctx,
+                acting_intent,
+                vs_energy,
+                vs_pitch_mean,
+                vs_pitch_range,
+                vs_speed,
+                vs_breathiness,
+                vs_tension,
+                vs_warmth,
+                vs_brightness,
+            ],
+            outputs=[project_file, status],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 2: Curation Auditor
+# ===================================================================
+
+
+def _build_curation_auditor() -> gr.Blocks:
+    """Manifest browser for review, promotion, and rejection."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Curation Auditor")
+
+        with gr.Row():
+            manifest_path = gr.Textbox(
+                label="Manifest Path",
+                value="data/curation/manifest.jsonl",
+                max_lines=1,
+            )
+            btn_load_manifest = gr.Button("Load Manifest")
+
+        with gr.Row():
+            filter_status = gr.Dropdown(
+                choices=["all", "promoted", "review", "rejected", "scored"],
+                value="review",
+                label="Filter Status",
+            )
+            filter_bucket = gr.Dropdown(
+                choices=[
+                    "all",
+                    "tts_mainline",
+                    "vc_prior",
+                    "expressive_prior",
+                    "holdout_eval",
+                ],
+                value="all",
+                label="Filter Bucket",
+            )
+
+        manifest_table = gr.Dataframe(
+            headers=[
+                "record_id",
+                "transcript",
+                "language",
+                "quality_score",
+                "status",
+                "speaker_cluster",
+                "source_legality",
+            ],
+            label="Manifest Records",
+            interactive=False,
+        )
+
+        gr.Markdown("### Quick Review")
+        with gr.Row():
+            selected_record_id = gr.Textbox(
+                label="Selected Record ID", max_lines=1
+            )
+
+        with gr.Row():
+            record_audio = gr.Audio(label="Waveform", interactive=False)
+            record_info = gr.JSON(label="Record Details")
+
+        with gr.Row():
+            transcript_edit = gr.Textbox(label="Edit Transcript", lines=2)
+
+        with gr.Row():
+            role_select = gr.Dropdown(choices=ROLES, value="auditor", label="Your Role")
+            actor_id = gr.Textbox(
+                label="Your ID", value="reviewer_1", max_lines=1
+            )
+            rationale = gr.Textbox(
+                label="Rationale", placeholder="Reason for decision...", max_lines=1
+            )
+
+        with gr.Row():
+            btn_promote = gr.Button("Promote", variant="primary")
+            btn_reject = gr.Button("Reject", variant="stop")
+            btn_save_transcript = gr.Button("Save Transcript Edit")
+
+        audit_status = gr.Textbox(label="Status", interactive=False)
+
+        # --- Callbacks ---
+
+        def load_manifest(path, status_filter, bucket_filter):
+            p = Path(path)
+            if not p.exists():
+                return [], f"File not found: {path}"
+            rows = []
+            for line in p.read_text(encoding="utf-8").strip().splitlines():
+                rec = json.loads(line)
+                if status_filter != "all" and rec.get("status") != status_filter:
+                    continue
+                if (
+                    bucket_filter != "all"
+                    and rec.get("promotion_bucket") != bucket_filter
+                ):
+                    continue
+                rows.append([
+                    rec.get("record_id", ""),
+                    rec.get("transcript", "")[:80],
+                    rec.get("language", ""),
+                    rec.get("quality_score", 0),
+                    rec.get("status", ""),
+                    rec.get("speaker_cluster", ""),
+                    rec.get("source_legality", ""),
+                ])
+            return rows, f"Loaded {len(rows)} records."
+
+        btn_load_manifest.click(
+            load_manifest,
+            inputs=[manifest_path, filter_status, filter_bucket],
+            outputs=[manifest_table, audit_status],
+        )
+
+        def do_promote(record_id, role, aid, reason):
+            if not check_permission(role, "promote"):
+                return f"Role '{role}' cannot promote."
+            if not record_id.strip():
+                return "Select a record first."
+            _audit.log(role, aid, "promote", before_state="review", after_state="promoted", rationale=reason)
+            return f"Promoted {record_id}."
+
+        btn_promote.click(
+            do_promote,
+            inputs=[selected_record_id, role_select, actor_id, rationale],
+            outputs=[audit_status],
+        )
+
+        def do_reject(record_id, role, aid, reason):
+            if not check_permission(role, "reject"):
+                return f"Role '{role}' cannot reject."
+            if not record_id.strip():
+                return "Select a record first."
+            _audit.log(role, aid, "reject", before_state="review", after_state="rejected", rationale=reason)
+            return f"Rejected {record_id}."
+
+        btn_reject.click(
+            do_reject,
+            inputs=[selected_record_id, role_select, actor_id, rationale],
+            outputs=[audit_status],
+        )
+
+        def do_save_transcript(record_id, new_text, role, aid):
+            if not check_permission(role, "edit_transcript"):
+                return f"Role '{role}' cannot edit transcripts."
+            if not record_id.strip():
+                return "Select a record first."
+            _audit.log(role, aid, "edit_transcript", after_state=new_text[:100])
+            return f"Transcript saved for {record_id}."
+
+        btn_save_transcript.click(
+            do_save_transcript,
+            inputs=[selected_record_id, transcript_edit, role_select, actor_id],
+            outputs=[audit_status],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 3: Dataset Manager
+# ===================================================================
+
+
+def _build_dataset_manager() -> gr.Blocks:
+    """Asset ingest, health dashboard, pipeline controls, and export."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Dataset Manager")
+
+        # --- Asset Ingest ---
+        gr.Markdown("### Asset Ingest")
+        with gr.Row():
+            upload_files = gr.File(
+                label="Upload Audio Files",
+                file_count="multiple",
+                file_types=["audio"],
+            )
+            register_dir = gr.Textbox(
+                label="Or Register Server Directory",
+                placeholder="/path/to/audio/corpus",
+                max_lines=1,
+            )
+
+        with gr.Row():
+            legality = gr.Dropdown(
+                choices=["owned", "licensed", "research-restricted", "unknown"],
+                value="owned",
+                label="Legality",
+            )
+            btn_ingest = gr.Button("Ingest", variant="primary")
+
+        ingest_status = gr.Textbox(label="Ingest Status", interactive=False)
+
+        # --- Health Dashboard ---
+        gr.Markdown("### Health Dashboard")
+        with gr.Row():
+            health_dir = gr.Textbox(
+                label="Cache Directory", value="data/cache", max_lines=1
+            )
+            btn_refresh_health = gr.Button("Refresh")
+
+        with gr.Row():
+            lbl_phoneme_cov = gr.Textbox(label="Phoneme Coverage", interactive=False)
+            lbl_speaker_count = gr.Textbox(label="Speaker Count", interactive=False)
+            lbl_unk_phone = gr.Textbox(label="Unknown Phone Ratio", interactive=False)
+            lbl_duration = gr.Textbox(label="Duration Stats", interactive=False)
+
+        # --- Pipeline Controls ---
+        gr.Markdown("### Pipeline Controls")
+        with gr.Row():
+            btn_start_pipeline = gr.Button("Start")
+            btn_resume_pipeline = gr.Button("Resume")
+            btn_stop_pipeline = gr.Button("Stop")
+
+        pipeline_progress = gr.Textbox(
+            label="Pipeline Status", value="Idle", interactive=False
+        )
+
+        # --- Export ---
+        gr.Markdown("### Export")
+        with gr.Row():
+            export_bucket = gr.Dropdown(
+                choices=[
+                    "tts_mainline",
+                    "vc_prior",
+                    "expressive_prior",
+                    "holdout_eval",
+                ],
+                value="tts_mainline",
+                label="Bucket",
+            )
+            btn_export = gr.Button("Export Promoted Subset")
+
+        export_status = gr.Textbox(label="Export Status", interactive=False)
+
+        # --- Split Manager ---
+        gr.Markdown("### Split Manager")
+        with gr.Row():
+            cb_lock_split = gr.Checkbox(label="Lock Holdout/Train Split", value=False)
+            lbl_split = gr.Textbox(
+                label="Split Counts", value="train: -- | holdout: --", interactive=False
+            )
+
+        # --- Callbacks ---
+
+        def refresh_health(cache_dir):
+            p = Path(cache_dir) / "health_metrics.json"
+            if not p.exists():
+                return "--", "--", "--", "--"
+            m = json.loads(p.read_text(encoding="utf-8"))
+            return (
+                str(m.get("phoneme_coverage", "--")),
+                str(m.get("speaker_count", "--")),
+                str(m.get("unknown_phone_ratio", "--")),
+                str(m.get("duration_stats", "--")),
+            )
+
+        btn_refresh_health.click(
+            refresh_health,
+            inputs=[health_dir],
+            outputs=[lbl_phoneme_cov, lbl_speaker_count, lbl_unk_phone, lbl_duration],
+        )
+
+        def do_ingest(files, dir_path, legal):
+            sources = []
+            if files:
+                sources.extend(f.name for f in files)
+            if dir_path and dir_path.strip():
+                sources.append(dir_path.strip())
+            if not sources:
+                return "No sources provided."
+            _audit.log("admin", "gradio", "ingest", after_state=f"legality={legal}, sources={len(sources)}")
+            return f"Ingested {len(sources)} source(s) with legality={legal}."
+
+        btn_ingest.click(
+            do_ingest,
+            inputs=[upload_files, register_dir, legality],
+            outputs=[ingest_status],
+        )
+
+        def do_export(bucket):
+            _audit.log("admin", "gradio", "export", after_state=f"bucket={bucket}")
+            return f"Exported '{bucket}' subset."
+
+        btn_export.click(do_export, inputs=[export_bucket], outputs=[export_status])
+
+    return tab
+
+
+# ===================================================================
+# Tab 4: Evaluation Arena
+# ===================================================================
+
+
+def _build_evaluation_arena() -> gr.Blocks:
+    """Blind A/B testing and MOS collection."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Evaluation Arena")
+        gr.Markdown(
+            "Blind A/B preference test. Samples are randomized. "
+            "Rate each pair without knowing which system produced which sample."
+        )
+
+        with gr.Row():
+            eval_role = gr.Dropdown(
+                choices=["rater", "director"], value="rater", label="Your Role"
+            )
+            eval_id = gr.Textbox(label="Your ID", value="rater_1", max_lines=1)
+
+        gr.Markdown("### Current Pair")
+        eval_text = gr.Textbox(label="Text", interactive=False)
+        pair_id_state = gr.State("")
+
+        with gr.Row():
+            audio_a = gr.Audio(label="Sample A", interactive=False)
+            audio_b = gr.Audio(label="Sample B", interactive=False)
+
+        with gr.Row():
+            mos_a = gr.Slider(1, 5, value=3, step=0.5, label="MOS A (1-5)")
+            mos_b = gr.Slider(1, 5, value=3, step=0.5, label="MOS B (1-5)")
+
+        with gr.Row():
+            btn_prefer_a = gr.Button("Prefer A")
+            btn_tie = gr.Button("Tie")
+            btn_prefer_b = gr.Button("Prefer B")
+
+        eval_notes = gr.Textbox(
+            label="Notes (Director only)",
+            placeholder="Qualitative notes...",
+            lines=2,
+        )
+
+        btn_next_pair = gr.Button("Next Pair", variant="primary")
+        eval_status = gr.Textbox(label="Status", interactive=False)
+
+        # --- Summary ---
+        gr.Markdown("### Results Summary")
+        btn_summary = gr.Button("Show Summary")
+        summary_output = gr.JSON(label="Summary")
+
+        # --- Callbacks ---
+
+        def record_preference(pref, pair_id, ma, mb, role, rid, notes):
+            if not pair_id:
+                return "No active pair."
+            if not check_permission(role, "rate"):
+                return f"Role '{role}' cannot rate."
+            pair = EvalPair(
+                pair_id=pair_id,
+                sample_a_label="hidden_a",
+                sample_b_label="hidden_b",
+                text="",
+                preference=pref,
+                mos_a=ma,
+                mos_b=mb,
+                rater_id=rid,
+                rater_role=role,
+                notes=notes if role == "director" else "",
+            )
+            _eval_session.record(pair)
+            _audit.log(role, rid, "rate", after_state=f"pair={pair_id} pref={pref}")
+            return f"Recorded: {pref} for pair {pair_id}."
+
+        btn_prefer_a.click(
+            lambda *a: record_preference("A", *a),
+            inputs=[pair_id_state, mos_a, mos_b, eval_role, eval_id, eval_notes],
+            outputs=[eval_status],
+        )
+        btn_tie.click(
+            lambda *a: record_preference("tie", *a),
+            inputs=[pair_id_state, mos_a, mos_b, eval_role, eval_id, eval_notes],
+            outputs=[eval_status],
+        )
+        btn_prefer_b.click(
+            lambda *a: record_preference("B", *a),
+            inputs=[pair_id_state, mos_a, mos_b, eval_role, eval_id, eval_notes],
+            outputs=[eval_status],
+        )
+
+        btn_summary.click(lambda: _eval_session.summary(), outputs=[summary_output])
+
+    return tab
+
+
+# ===================================================================
+# Tab 5: System Admin
+# ===================================================================
+
+
+def _build_system_admin() -> gr.Blocks:
+    """Model management, telemetry, and audit trail viewer."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## System Admin")
+
+        # --- Model Management ---
+        gr.Markdown("### Model Management")
+        with gr.Row():
+            uclm_ckpt = gr.Textbox(
+                label="UCLM Checkpoint",
+                placeholder="checkpoints/uclm_final.pt",
+                max_lines=1,
+            )
+            codec_ckpt = gr.Textbox(
+                label="Codec Checkpoint",
+                placeholder="checkpoints/codec.pt",
+                max_lines=1,
+            )
+            btn_load_model = gr.Button("Load Model")
+
+        model_status = gr.Textbox(label="Model Status", interactive=False)
+
+        # --- Health & Telemetry ---
+        gr.Markdown("### Health & Telemetry")
+        btn_refresh_health = gr.Button("Refresh")
+        health_info = gr.JSON(label="System Health")
+        telemetry_info = gr.JSON(label="Telemetry")
+
+        # --- Runtime Contract ---
+        gr.Markdown("### Runtime Contract")
+        btn_contract = gr.Button("Show Contract")
+        contract_info = gr.JSON(label="Active Runtime Contract")
+
+        # --- Available Models ---
+        gr.Markdown("### Available Checkpoints")
+        btn_list_models = gr.Button("List Models")
+        models_table = gr.Dataframe(
+            headers=["name", "path", "loaded"],
+            label="Checkpoints",
+            interactive=False,
+        )
+
+        # --- Audit Trail ---
+        gr.Markdown("### Audit Trail (Recent)")
+        btn_audit = gr.Button("Show Recent Audit")
+        audit_table = gr.Dataframe(
+            headers=[
+                "timestamp",
+                "actor_role",
+                "actor_id",
+                "action",
+                "after_state",
+                "rationale",
+            ],
+            label="Audit Entries",
+            interactive=False,
+        )
+
+        # --- Callbacks ---
+
+        def load_model(uclm, codec):
+            resp = _api_post("/admin/load_model", {
+                "uclm_checkpoint": uclm,
+                "codec_checkpoint": codec,
+            })
+            if resp is None:
+                return "Failed to load model."
+            _audit.log("admin", "gradio", "load_model", after_state=f"uclm={uclm}")
+            return resp.get("message", "OK")
+
+        btn_load_model.click(
+            load_model,
+            inputs=[uclm_ckpt, codec_ckpt],
+            outputs=[model_status],
+        )
+
+        def refresh_health():
+            h = _api_get("/admin/health") or {}
+            t = _api_get("/admin/telemetry") or {}
+            return h, t
+
+        btn_refresh_health.click(
+            refresh_health, outputs=[health_info, telemetry_info]
+        )
+
+        btn_contract.click(
+            lambda: _api_get("/admin/runtime_contract") or {},
+            outputs=[contract_info],
+        )
+
+        def list_models():
+            models = _api_get("/admin/models")
+            if not models:
+                return []
+            return [[m["name"], m["path"], m.get("loaded", False)] for m in models]
+
+        btn_list_models.click(list_models, outputs=[models_table])
+
+        def show_audit():
+            entries = _audit.read_recent(50)
+            rows = []
+            for e in entries:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e.get("timestamp", 0)))
+                rows.append([
+                    ts,
+                    e.get("actor_role", ""),
+                    e.get("actor_id", ""),
+                    e.get("action", ""),
+                    e.get("after_state", "")[:60],
+                    e.get("rationale", "")[:60],
+                ])
+            return rows
+
+        btn_audit.click(show_audit, outputs=[audit_table])
+
+    return tab
+
+
+# ===================================================================
+# Tab 6: Realtime Voice Conversion
+# ===================================================================
+
+
+def _build_realtime_vc() -> gr.Blocks:
+    """Real-time voice conversion via tmrvc-serve WebSocket streaming."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Realtime Voice Conversion")
+        gr.Markdown(
+            "Stream microphone input through the VC engine in real-time. "
+            "Requires tmrvc-serve to be running with VC streaming enabled."
+        )
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### Source")
+                vc_input = gr.Audio(
+                    label="Source Audio (or record from mic)",
+                    type="filepath",
+                    sources=["upload", "microphone"],
+                )
+                vc_character = gr.Textbox(
+                    label="Target Character ID", value="default", max_lines=1
+                )
+
+                gr.Markdown("### Voice Controls")
+                vc_energy = gr.Slider(0, 1, value=0.5, step=0.05, label="Energy")
+                vc_pitch_shift = gr.Slider(-12, 12, value=0, step=1, label="Pitch Shift (semitones)")
+                vc_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="Speed")
+
+            with gr.Column(scale=1):
+                gr.Markdown("### Output")
+                vc_output = gr.Audio(label="Converted Audio", type="numpy")
+                vc_latency = gr.Textbox(label="Latency", interactive=False, value="--")
+
+        with gr.Row():
+            btn_convert = gr.Button("Convert", variant="primary")
+            btn_stream_start = gr.Button("Start Streaming")
+            btn_stream_stop = gr.Button("Stop Streaming")
+
+        vc_status = gr.Textbox(label="Status", interactive=False, value="Ready")
+
+        def do_convert(audio_path, char_id, energy, pitch_shift, speed):
+            if not audio_path:
+                return None, "--", "No audio loaded."
+            import httpx
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+            audio_b64 = base64.b64encode(audio_bytes).decode()
+            body = {
+                "audio_base64": audio_b64,
+                "character_id": char_id or "default",
+                "explicit_voice_state": [energy, 0.5, 0.5, speed, 0.5, 0.5, 0.5, 0.5],
+                "pitch_shift": pitch_shift,
+            }
+            t0 = time.time()
+            resp = _api_post("/vc", body)
+            latency = f"{(time.time() - t0)*1000:.0f}ms"
+            if resp is None:
+                return None, latency, "VC API call failed."
+            out_b64 = resp.get("audio_base64", "")
+            if not out_b64:
+                return None, latency, "No audio in response."
+            out_bytes = base64.b64decode(out_b64)
+            sr = resp.get("sample_rate", SAMPLE_RATE)
+            audio_np = np.frombuffer(out_bytes[44:], dtype=np.int16).astype(np.float32) / 32768.0
+            return (sr, audio_np), latency, "Conversion complete."
+
+        btn_convert.click(
+            do_convert,
+            inputs=[vc_input, vc_character, vc_energy, vc_pitch_shift, vc_speed],
+            outputs=[vc_output, vc_latency, vc_status],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 7: ONNX Export
+# ===================================================================
+
+
+def _build_onnx_export() -> gr.Blocks:
+    """ONNX model export controls."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## ONNX Export")
+        gr.Markdown("Export UCLM and codec models to ONNX format for deployment.")
+
+        gr.Markdown("### Model Selection")
+        with gr.Row():
+            cb_uclm = gr.Checkbox(label="UCLM Transformer", value=True)
+            cb_codec = gr.Checkbox(label="Codec Decoder", value=True)
+            cb_speaker_enc = gr.Checkbox(label="Speaker Encoder", value=False)
+            cb_prosody = gr.Checkbox(label="Prosody Predictor", value=False)
+
+        with gr.Row():
+            export_format = gr.Radio(
+                choices=["FP32", "FP16", "INT8"],
+                value="FP32",
+                label="Precision",
+            )
+            onnx_output_dir = gr.Textbox(
+                label="Output Directory",
+                value="exports/onnx",
+                max_lines=1,
+            )
+
+        gr.Markdown("### Source Checkpoints")
+        with gr.Row():
+            src_uclm = gr.Textbox(label="UCLM Checkpoint", value="checkpoints/uclm_final.pt", max_lines=1)
+            src_codec = gr.Textbox(label="Codec Checkpoint", value="checkpoints/codec.pt", max_lines=1)
+
+        btn_export = gr.Button("Export", variant="primary")
+        export_log = gr.Textbox(label="Export Log", interactive=False, lines=8)
+
+        def do_export(uclm, codec, spk, prosody, fmt, out_dir, uclm_ckpt, codec_ckpt):
+            components = []
+            if uclm:
+                components.append("uclm")
+            if codec:
+                components.append("codec")
+            if spk:
+                components.append("speaker_encoder")
+            if prosody:
+                components.append("prosody_predictor")
+            if not components:
+                return "No components selected."
+            body = {
+                "components": components,
+                "precision": fmt.lower(),
+                "output_dir": out_dir,
+                "uclm_checkpoint": uclm_ckpt,
+                "codec_checkpoint": codec_ckpt,
+            }
+            resp = _api_post("/admin/export_onnx", body)
+            if resp is None:
+                return "Export API call failed. Is tmrvc-serve running?"
+            _audit.log("admin", "gradio", "onnx_export",
+                       after_state=f"components={components}, precision={fmt}")
+            return resp.get("message", json.dumps(resp, indent=2))
+
+        btn_export.click(
+            do_export,
+            inputs=[cb_uclm, cb_codec, cb_speaker_enc, cb_prosody,
+                    export_format, onnx_output_dir, src_uclm, src_codec],
+            outputs=[export_log],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 8: Training Monitor
+# ===================================================================
+
+
+def _build_training_monitor() -> gr.Blocks:
+    """Training progress monitoring for codec and UCLM training."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Training Monitor")
+
+        with gr.Row():
+            train_log_dir = gr.Textbox(
+                label="Log Directory", value="runs/", max_lines=1
+            )
+            btn_refresh_train = gr.Button("Refresh")
+
+        with gr.Tabs():
+            with gr.Tab("UCLM Training"):
+                gr.Markdown("### UCLM Losses")
+                uclm_metrics = gr.Dataframe(
+                    headers=["step", "loss", "codec_loss", "pointer_loss",
+                             "progress_loss", "adv_loss", "mode"],
+                    label="Recent Steps",
+                    interactive=False,
+                )
+                uclm_curriculum = gr.Textbox(label="Curriculum Stage", interactive=False)
+
+            with gr.Tab("Codec Training"):
+                gr.Markdown("### Codec Losses")
+                codec_metrics = gr.Dataframe(
+                    headers=["step", "recon_loss", "commit_loss", "vq_loss", "total_loss"],
+                    label="Recent Steps",
+                    interactive=False,
+                )
+
+        train_status = gr.Textbox(label="Status", interactive=False)
+
+        def refresh_training(log_dir):
+            p = Path(log_dir)
+            # UCLM metrics
+            uclm_log = p / "uclm_train.jsonl"
+            uclm_rows = []
+            curriculum_stage = "--"
+            if uclm_log.exists():
+                lines = uclm_log.read_text(encoding="utf-8").strip().splitlines()
+                for line in lines[-50:]:
+                    d = json.loads(line)
+                    uclm_rows.append([
+                        d.get("step", 0), d.get("loss", 0), d.get("codec_loss", 0),
+                        d.get("pointer_loss", 0), d.get("progress_loss", 0),
+                        d.get("adv_loss", 0), "TTS" if d.get("mode", 0) else "VC",
+                    ])
+                    curriculum_stage = d.get("curriculum_stage", curriculum_stage)
+
+            # Codec metrics
+            codec_log = p / "codec_train.jsonl"
+            codec_rows = []
+            if codec_log.exists():
+                lines = codec_log.read_text(encoding="utf-8").strip().splitlines()
+                for line in lines[-50:]:
+                    d = json.loads(line)
+                    codec_rows.append([
+                        d.get("step", 0), d.get("recon_loss", 0),
+                        d.get("commit_loss", 0), d.get("vq_loss", 0),
+                        d.get("total_loss", 0),
+                    ])
+
+            return uclm_rows, str(curriculum_stage), codec_rows, "Refreshed."
+
+        btn_refresh_train.click(
+            refresh_training,
+            inputs=[train_log_dir],
+            outputs=[uclm_metrics, uclm_curriculum, codec_metrics, train_status],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 9: Speaker Enrollment
+# ===================================================================
+
+
+def _build_speaker_enrollment() -> gr.Blocks:
+    """Speaker enrollment and profile management."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Speaker Enrollment")
+        gr.Markdown(
+            "Upload reference audio to create speaker profiles for voice cloning. "
+            "Profiles are saved to the Casting Gallery."
+        )
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### Upload Reference")
+                enroll_audio = gr.Audio(
+                    label="Reference Audio (3-30s, clear speech)",
+                    type="filepath",
+                    sources=["upload", "microphone"],
+                )
+                enroll_name = gr.Textbox(label="Speaker Name", max_lines=1)
+                enroll_notes = gr.Textbox(label="Notes", placeholder="Voice characteristics...", lines=2)
+
+                btn_enroll = gr.Button("Enroll Speaker", variant="primary")
+
+            with gr.Column(scale=1):
+                gr.Markdown("### Enrolled Speakers")
+                btn_refresh_speakers = gr.Button("Refresh")
+                speaker_table = gr.Dataframe(
+                    headers=["profile_id", "name", "source_audio", "created_at"],
+                    label="Speaker Profiles",
+                    interactive=False,
+                )
+                selected_profile = gr.Textbox(label="Selected Profile ID", max_lines=1)
+                with gr.Row():
+                    btn_remove = gr.Button("Remove Selected")
+                    btn_test_voice = gr.Button("Test Voice")
+
+        test_text = gr.Textbox(label="Test Text", value="Hello, this is a test of my voice.", max_lines=1)
+        test_output = gr.Audio(label="Test Output", type="numpy")
+        enroll_status = gr.Textbox(label="Status", interactive=False)
+
+        def do_enroll(audio_path, name, notes):
+            if not audio_path:
+                return [], "Upload reference audio first."
+            if not name.strip():
+                return [], "Enter a speaker name."
+            profile = _gallery.add(name.strip(), source_audio=str(audio_path))
+            _audit.log("admin", "gradio", "enroll_speaker",
+                       after_state=f"name={name}, id={profile.profile_id}")
+            rows = [[pid, p.name, p.source_audio, time.strftime("%Y-%m-%d %H:%M", time.localtime(p.created_at))]
+                    for pid, p in _gallery.profiles.items()]
+            return rows, f"Enrolled: {name} ({profile.profile_id})"
+
+        btn_enroll.click(
+            do_enroll,
+            inputs=[enroll_audio, enroll_name, enroll_notes],
+            outputs=[speaker_table, enroll_status],
+        )
+
+        def refresh_speakers():
+            rows = [[pid, p.name, p.source_audio, time.strftime("%Y-%m-%d %H:%M", time.localtime(p.created_at))]
+                    for pid, p in _gallery.profiles.items()]
+            return rows
+
+        btn_refresh_speakers.click(refresh_speakers, outputs=[speaker_table])
+
+        def remove_speaker(pid):
+            if not pid.strip():
+                return [], "Select a profile first."
+            _gallery.remove(pid.strip())
+            _audit.log("admin", "gradio", "remove_speaker", after_state=f"id={pid}")
+            rows = [[pid2, p.name, p.source_audio, time.strftime("%Y-%m-%d %H:%M", time.localtime(p.created_at))]
+                    for pid2, p in _gallery.profiles.items()]
+            return rows, f"Removed profile {pid}."
+
+        btn_remove.click(
+            remove_speaker,
+            inputs=[selected_profile],
+            outputs=[speaker_table, enroll_status],
+        )
+
+        def test_voice(pid, text):
+            if not pid.strip():
+                return None, "Select a profile."
+            body = {"text": text, "speaker_profile_id": pid.strip()}
+            resp = _api_post("/tts", body)
+            if resp is None:
+                return None, "TTS API call failed."
+            audio_b64 = resp.get("audio_base64", "")
+            if not audio_b64:
+                return None, "No audio in response."
+            audio_bytes = base64.b64decode(audio_b64)
+            sr = resp.get("sample_rate", SAMPLE_RATE)
+            audio_np = np.frombuffer(audio_bytes[44:], dtype=np.int16).astype(np.float32) / 32768.0
+            return (sr, audio_np), "Test generated."
+
+        btn_test_voice.click(
+            test_voice,
+            inputs=[selected_profile, test_text],
+            outputs=[test_output, enroll_status],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 10: Server Control
+# ===================================================================
+
+
+def _build_server_control() -> gr.Blocks:
+    """Server management and API testing."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Server Control")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### Server Connection")
+                server_url_input = gr.Textbox(
+                    label="Server URL",
+                    value=_SERVER_URL,
+                    max_lines=1,
+                )
+                btn_ping = gr.Button("Ping Server")
+                server_health = gr.JSON(label="Server Health")
+
+                gr.Markdown("### VRAM & Resources")
+                btn_resources = gr.Button("Check Resources")
+                resource_info = gr.JSON(label="Resource Info")
+
+            with gr.Column(scale=1):
+                gr.Markdown("### API Test")
+                test_endpoint = gr.Dropdown(
+                    choices=["/health", "/characters", "/admin/health",
+                             "/admin/telemetry", "/admin/runtime_contract",
+                             "/admin/models"],
+                    value="/health",
+                    label="Endpoint",
+                )
+                test_method = gr.Radio(choices=["GET", "POST"], value="GET", label="Method")
+                test_body = gr.Textbox(label="Request Body (JSON)", lines=3, placeholder='{"key": "value"}')
+                btn_test_api = gr.Button("Send Request")
+                test_response = gr.JSON(label="Response")
+
+        server_status = gr.Textbox(label="Status", interactive=False)
+
+        def ping_server(url):
+            global _SERVER_URL
+            _SERVER_URL = url.rstrip("/")
+            h = _api_get("/health")
+            if h is None:
+                return {}, f"Cannot reach {url}"
+            return h, f"Connected to {url}"
+
+        btn_ping.click(
+            ping_server,
+            inputs=[server_url_input],
+            outputs=[server_health, server_status],
+        )
+
+        def check_resources():
+            return _api_get("/admin/telemetry") or {"error": "unavailable"}
+
+        btn_resources.click(check_resources, outputs=[resource_info])
+
+        def test_api(endpoint, method, body_str):
+            if method == "GET":
+                return _api_get(endpoint) or {"error": "request failed"}
+            else:
+                try:
+                    body = json.loads(body_str) if body_str.strip() else {}
+                except json.JSONDecodeError:
+                    return {"error": "Invalid JSON body"}
+                return _api_post(endpoint, body) or {"error": "request failed"}
+
+        btn_test_api.click(
+            test_api,
+            inputs=[test_endpoint, test_method, test_body],
+            outputs=[test_response],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Tab 11: Batch Script
+# ===================================================================
+
+
+def _build_batch_script() -> gr.Blocks:
+    """Batch script generation from YAML or line-by-line text."""
+
+    with gr.Blocks() as tab:
+        gr.Markdown("## Batch Script Generation")
+        gr.Markdown(
+            "Generate multiple TTS outputs from a script. "
+            "Each line produces one audio file."
+        )
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                script_input = gr.Textbox(
+                    label="Script (one line per utterance)",
+                    lines=10,
+                    placeholder="Line 1: Hello world\nLine 2: How are you?",
+                )
+                script_file = gr.File(
+                    label="Or Upload Script (YAML/TXT)",
+                    file_types=[".yaml", ".yml", ".txt"],
+                )
+                script_character = gr.Textbox(label="Character ID", value="default", max_lines=1)
+
+            with gr.Column(scale=1):
+                gr.Markdown("### Output Settings")
+                script_output_dir = gr.Textbox(
+                    label="Output Directory", value="exports/script_output", max_lines=1
+                )
+                script_format = gr.Radio(
+                    choices=["wav", "flac", "mp3"],
+                    value="wav",
+                    label="Format",
+                )
+                script_pace = gr.Slider(0.5, 3.0, value=1.0, step=0.05, label="Pace")
+                script_cfg = gr.Slider(0.5, 5.0, value=1.5, step=0.1, label="CFG Scale")
+
+        btn_run_script = gr.Button("Run Batch", variant="primary")
+        script_progress = gr.Textbox(label="Progress", interactive=False, lines=5)
+        script_results = gr.Dataframe(
+            headers=["line", "text", "output_file", "status"],
+            label="Results",
+            interactive=False,
+        )
+
+        def run_batch(text, file, char_id, out_dir, fmt, pace_v, cfg_v):
+            lines = []
+            if text and text.strip():
+                lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+            elif file:
+                content = Path(file.name).read_text(encoding="utf-8")
+                if file.name.endswith((".yaml", ".yml")):
+                    import yaml
+                    data = yaml.safe_load(content)
+                    if isinstance(data, list):
+                        lines = [str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in data]
+                    elif isinstance(data, dict) and "lines" in data:
+                        lines = [str(l) for l in data["lines"]]
+                else:
+                    lines = [l.strip() for l in content.splitlines() if l.strip()]
+
+            if not lines:
+                return "No lines to process.", []
+
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            results = []
+            for i, line in enumerate(lines):
+                body = {
+                    "text": line,
+                    "character_id": char_id or "default",
+                    "pace": pace_v,
+                    "cfg_scale": cfg_v,
+                }
+                resp = _api_post("/tts", body)
+                if resp and resp.get("audio_base64"):
+                    out_file = str(Path(out_dir) / f"{i+1:04d}.{fmt}")
+                    audio_bytes = base64.b64decode(resp["audio_base64"])
+                    Path(out_file).write_bytes(audio_bytes)
+                    results.append([i+1, line[:50], out_file, "OK"])
+                else:
+                    results.append([i+1, line[:50], "", "FAILED"])
+
+            _audit.log("admin", "gradio", "batch_script",
+                       after_state=f"lines={len(lines)}, ok={sum(1 for r in results if r[3]=='OK')}")
+            return f"Processed {len(lines)} lines.", results
+
+        btn_run_script.click(
+            run_batch,
+            inputs=[script_input, script_file, script_character,
+                    script_output_dir, script_format, script_pace, script_cfg],
+            outputs=[script_progress, script_results],
+        )
+
+    return tab
+
+
+# ===================================================================
+# Main App Assembly
+# ===================================================================
+
+
+def create_app() -> gr.Blocks:
+    """Build the complete Gradio control plane."""
+
+    with gr.Blocks(
+        title="TMRVC Control Plane",
+        theme=gr.themes.Soft(),
+    ) as app:
+        gr.Markdown(
+            "# TMRVC Control Plane — UCLM v3\n"
+            "Browser-based HITL interface for drama-grade TTS evaluation, "
+            "curation auditing, dataset management, and system administration."
+        )
+
+        with gr.Tabs():
+            with gr.Tab("Drama Workshop"):
+                _build_drama_workshop()
+            with gr.Tab("Realtime VC"):
+                _build_realtime_vc()
+            with gr.Tab("Curation Auditor"):
+                _build_curation_auditor()
+            with gr.Tab("Dataset Manager"):
+                _build_dataset_manager()
+            with gr.Tab("Evaluation Arena"):
+                _build_evaluation_arena()
+            with gr.Tab("Speaker Enrollment"):
+                _build_speaker_enrollment()
+            with gr.Tab("Training Monitor"):
+                _build_training_monitor()
+            with gr.Tab("Batch Script"):
+                _build_batch_script()
+            with gr.Tab("ONNX Export"):
+                _build_onnx_export()
+            with gr.Tab("Server Control"):
+                _build_server_control()
+            with gr.Tab("System Admin"):
+                _build_system_admin()
+
+    return app
+
+
+# ===================================================================
+# CLI Entry Point
+# ===================================================================
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TMRVC Gradio Control Plane")
+    parser.add_argument(
+        "--server-url",
+        default="http://localhost:8000",
+        help="tmrvc-serve API base URL (default: http://localhost:8000)",
+    )
+    parser.add_argument("--port", type=int, default=7860, help="Gradio port")
+    parser.add_argument("--host", default="0.0.0.0", help="Gradio host")
+    parser.add_argument("--share", action="store_true", help="Create public link")
+    args = parser.parse_args()
+
+    global _SERVER_URL
+    _SERVER_URL = args.server_url.rstrip("/")
+
+    logging.basicConfig(level=logging.INFO)
+    app = create_app()
+    app.queue()
+    app.launch(server_name=args.host, server_port=args.port, share=args.share)
+
+
+if __name__ == "__main__":
+    main()

@@ -36,6 +36,16 @@ These are mandatory.
 
 Pointer alone is insufficient. A purely pointer-based model without context/prosody planning and high-fidelity cloning capacity is non-compliant.
 
+### Prosody granularity escalation policy
+
+Initial v3 uses utterance-global prosody `[B, d_prosody]`. This is sufficient for utterance-level style (e.g., "say this angrily") but insufficient for fine-grained dramatic delivery (mid-sentence emotion shifts, selective emphasis, trailing-off). SOTA systems (DiFlow-TTS, Flamed-TTS, Vevo) operate at token-level or segment-level granularity.
+
+If drama acting quality gates (§ 6.1 context-sensitivity score, § 6.2 same-line different-context appropriateness) are not met with the utterance-global form at Stage B completion, the upgrade to time-local `[B, T_plan, d_prosody]` must be scheduled for Stage C. This is not optional if the drama-grade claim is to be maintained.
+
+### Waveform quality escalation policy
+
+If end-to-end TTS quality comparisons against the external baseline show deficits attributable to fine-grained acoustic detail (rather than prosody or alignment), the 2-stage acoustic refinement path (flow matching / DiT over coarse AR tokens) defined in Worker 01 § Acoustic Refinement Roadmap must be activated. Waveform decoder quality is a drama requirement, not only a fidelity requirement.
+
 ## 3. Data requirements
 
 These are mandatory to make the claim believable.

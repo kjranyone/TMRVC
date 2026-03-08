@@ -21,6 +21,7 @@ The curation system must not depend on one model family. It needs a provider lay
 - fallback order per stage
 - artifact translation into the manifest contract
 - explicit transcript-refinement engine contract
+- explicit `voice_state` pseudo-label estimator contract
 
 ## Recommended Provider Stack
 
@@ -87,6 +88,8 @@ Use local extractors and classifiers for:
 - speech rate
 - pitch / energy statistics
 - style embeddings
+- 8-D `voice_state` estimation
+- per-dimension confidence calibration
 
 ## Concrete Tasks
 
@@ -118,6 +121,16 @@ Use local extractors and classifiers for:
    - provider missing
    - provider low-confidence
    - provider disagreement
+9. Define `voice_state` estimator contract:
+   - canonical output tensor shape: `[T_frames, 8]`
+   - observed mask shape: `[T_frames, 8]`
+   - confidence shape: `[T_frames, 8]` or `[T_frames, 1]`
+   - estimator/version provenance
+   - calibration semantics and missing-dimension behavior
+10. Define provider comparison metrics for `voice_state` labels:
+   - agreement across estimators where available
+   - calibration quality
+   - downstream controllability uplift correlation
 
 ## Guardrails
 
@@ -126,9 +139,11 @@ Use local extractors and classifiers for:
 - do not ignore disagreement between providers
 - do not leave transcript refinement as an implied step without a concrete engine contract
 - do not confuse file-local diarization labels with persistent dataset-global speaker ids
+- do not emit dense zero `voice_state` labels when the estimator is uncertain; use masks and confidences
 
 ## Handoff Contract
 
 - worker 07 receives normalized stage outputs
 - worker 09 receives confidence-calibrated fields
 - worker 11 can compare providers on a common basis
+- worker 10 receives canonical `voice_state` artifacts without provider-specific reinterpretation

@@ -27,9 +27,10 @@ P(A_t, B_t, G_t | C_t, S, V_t, H_t)
 - normalized text
 - text units (`phoneme_ids` または grapheme ids)
 - pointer state
-  - `unit_index`
-  - `in_unit_progress`
-  - `finished`
+  - `text_index`
+  - `progress_value`
+  - optional `boundary_confidence`
+  - optional `stall_frames`
 
 ### 2.2 VC 条件
 
@@ -41,9 +42,12 @@ P(A_t, B_t, G_t | C_t, S, V_t, H_t)
 ### 2.3 共通条件
 
 - `speaker_embed`
-- `explicit_state`
-- `ssl_state`
-- `prosody_latent`
+- `explicit_voice_state`
+- `delta_voice_state`
+- `ssl_voice_state`
+- `local_prosody_latent`
+- `prompt_codec_tokens` or `prompt_kv_cache`
+- `dialogue_context`
 - external controls: `pace`, `hold_bias`, `boundary_bias`
 
 ## 3. 出力
@@ -108,6 +112,8 @@ TTS サンプルで必要なのは:
 - text
 - text units
 - audio-side frame artifacts
+- optional `voice_state` supervision artifacts
+- optional `bootstrap_alignment.json`
 
 必要ではないもの:
 
@@ -131,6 +137,22 @@ TTS サンプルで必要なのは:
 
 legacy は mainline 仕様に干渉してはならない。
 
+## 7.3 Release-Critical Contract
+
+mainline 正本として固定するもの:
+
+- pointer-based causal progression
+- `advance_logit` を主キーとする pointer 出力
+- `voice_state_targets` / mask / confidence / provenance
+- `SpeakerProfile` による few-shot prompt contract
+- `sample_rate = 24000`, `hop_length = 240`, `T = ceil(num_samples / 240)` の frame 規約
+
+research-track として切り離すもの:
+
+- backbone modernization bundles
+- advanced CFG acceleration
+- second-stage acoustic refinement
+
 ## v3 Pointer Contract
 
 本セクションは `forward_tts_pointer()` の正式な入出力仕様と、関連モジュールの動作を定義する。
@@ -143,16 +165,18 @@ def forward_tts_pointer(
     phoneme_ids: torch.Tensor,        # [B, L] phoneme token ids
     language_ids: torch.Tensor,        # [B, L] language token ids
     pointer_state: PointerState | None,# streaming 推論用 pointer state
+    acoustic_history: torch.Tensor,    # [B, n_codebooks, T_hist] or embedded equivalent
     speaker_embed: torch.Tensor,       # [B, d_speaker]
-    explicit_state: torch.Tensor,      # [B, T, d_explicit]
-    ssl_state: torch.Tensor,           # [B, T, d_ssl]
-    target_b: torch.Tensor,            # [B, n_codebooks, T] ground-truth codec tokens
-    target_length: int,                # 生成する acoustic frame 数
-    f0_condition: torch.Tensor | None = None,      # [B, T, 2]
+    explicit_voice_state: torch.Tensor | None = None,   # [B, T, 8] or [B, 8]
+    delta_voice_state: torch.Tensor | None = None,      # [B, T, 8] or [B, 8]
+    ssl_voice_state: torch.Tensor | None = None,        # [B, T, d_ssl]
+    target_b: torch.Tensor | None = None,               # teacher forcing only
+    target_length: int | None = None,                   # training/eval only
     cfg_scale: float = 1.0,
-    dialogue_context: torch.Tensor | None = None,  # [B, D_ctx]
+    dialogue_context: torch.Tensor | None = None,  # [B, C_ctx, d_model] or [B, d_model]
     acting_intent: torch.Tensor | None = None,     # [B, D_act]
-    prosody_latent: torch.Tensor | None = None,    # [B, T, D_pro]
+    local_prosody_latent: torch.Tensor | None = None,   # [B, d_prosody] or [B, T, d_prosody]
+    prompt_kv_cache: torch.Tensor | None = None,
 ) -> dict
 ```
 
@@ -162,27 +186,28 @@ def forward_tts_pointer(
 |---|---|---|
 | `logits_a` | `[B, n_codebooks, T, vocab_a]` | acoustic token logits |
 | `logits_b` | `[B, n_slots, T, vocab_b]` | control token logits |
-| `pointer_logits` | `[B, T, 1]` | advance/hold logit |
+| `advance_logit` | `[B, T, 1]` | advance/hold logit (canonical key) |
 | `progress_delta` | `[B, T, 1]` | phoneme 内進行度 (sigmoid, 0-1) |
-| `adv_logits` | varies or `None` | adversarial logits from VoiceStateEncoder |
+| `boundary_confidence` | `[B, T, 1]` | boundary trust score |
 | `hidden_states` | `[B, T, d_model]` | transformer hidden states |
 
 ### DialogueContextProjector
 
-`DialogueContextProjector` は dialogue_context, acting_intent, prosody_latent を受け取り、それぞれを `d_model` 次元に線形射影して content features に加算する。
+`DialogueContextProjector` は `dialogue_context`, `acting_intent`, `local_prosody_latent` を受け取り、それぞれを `d_model` 次元に線形射影して content features に加算する。
 
 - `dialogue_context` (`[B, D_ctx]`): `dialogue_proj` で `[B, d_model]` に射影し、`unsqueeze(1)` で `[B, 1, d_model]` として T 方向にブロードキャスト加算。
 - `acting_intent` (`[B, D_act]`): `acting_proj` で同様に `[B, 1, d_model]` にブロードキャスト加算。
-- `prosody_latent` (`[B, T, D_pro]`): `prosody_proj` で `[B, T, d_model]` に射影して加算。T が content features と異なる場合は `F.interpolate(mode="nearest")` でリサイズ。
+- `local_prosody_latent` (`[B, T, D_pro]`): `prosody_proj` で `[B, T, d_model]` に射影して加算。T が content features と異なる場合は `F.interpolate(mode="nearest")` でリサイズ。
 
 入力が `None` の場合は寄与ゼロ (加算をスキップ)。
 
 ### PointerHead
 
-`PointerHead` は transformer hidden states (`[B, T, d_model]`) を受け取り、dual projection で 2 つの出力を生成する。
+`PointerHead` は transformer hidden states (`[B, T, d_model]`) を受け取り、dual projection で 2 つの主出力と optional diagnostics を生成する。
 
-- **`advance_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1)` — advance/hold の生ロジットを出力 (`[B, T, 1]`)。
-- **`progress_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1) -> Sigmoid` — 現在 phoneme 内の進行度を `[0, 1]` で出力 (`[B, T, 1]`)。
+- **`advance_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1)` — advance/hold の生ロジット (`advance_logit`) を出力。
+- **`progress_proj`**: `Linear(d_model, d_model//4) -> GELU -> Linear(d_model//4, 1) -> Sigmoid` — 現在 phoneme 内の進行度を `[0, 1]` で出力。
+- optional `boundary_proj`: 境界信頼度を出力。
 
 ## Few-Shot Speaker Adaptation Contract
 
@@ -204,15 +229,15 @@ def encode_speaker_prompt(
 
 ### prompt_kv_cache Reuse
 
-`prompt_kv_cache` は会話ターンをまたいで再利用できる。同一話者による連続発話では、リファレンス音声の再エンコードを省略し、キャッシュされた KV を `forward_tts_pointer()` に直接渡す。これにより multi-turn 対話の推論コストを大幅に削減する。
+`prompt_kv_cache` は会話ターンをまたいで再利用できる。同一話者による連続発話では、リファレンス音声の再エンコードを省略し、キャッシュされた KV を `forward_tts_pointer()` に直接渡す。これにより multi-turn 対話の推論コストを大幅に削減する。cache の有効性は `SpeakerProfile` の encoder/tokenizer fingerprint に従って判定する。
 
 ### Timbre-Prosody Disentanglement
 
 speaker prompt は timbre のみを提供する。韻律は以下から独立に制御される:
 
-- `ProsodyPredictor`: テキストとコンテキストから VAE-style で予測
+- `ProsodyPredictor`: テキストとコンテキストから予測
 - `dialogue_context` / `acting_intent`: DialogueContextProjector 経由で conditioning
-- `explicit_state`: 8 次元の物理パラメータによる直接制御
+- `explicit_voice_state`: 8 次元の物理パラメータによる直接制御
 
 この分離により、同一話者で異なる感情・演技スタイルの音声を生成できる。
 
@@ -231,18 +256,18 @@ def forward_tts_pointer(
     language_ids: torch.Tensor,        # [B, L] language token ids
     pointer_state: PointerState | None,# streaming 推論用 pointer state
     speaker_embed: torch.Tensor,       # [B, d_speaker]
-    explicit_state: torch.Tensor,      # [B, T, d_explicit]
-    ssl_state: torch.Tensor,           # [B, T, d_ssl]
-    target_b: torch.Tensor,            # [B, n_codebooks, T] ground-truth codec tokens
-    target_length: int,                # 生成する acoustic frame 数
-    f0_condition: torch.Tensor | None = None,      # [B, T, 2]
+    acoustic_history: torch.Tensor,    # [B, n_codebooks, T_hist]
+    explicit_voice_state: torch.Tensor | None = None,
+    delta_voice_state: torch.Tensor | None = None,
+    ssl_voice_state: torch.Tensor | None = None,
+    target_b: torch.Tensor | None = None,
+    target_length: int | None = None,
     cfg_scale: float = 1.0,
-    dialogue_context: torch.Tensor | None = None,  # [B, D_ctx]
+    dialogue_context: torch.Tensor | None = None,  # [B, C_ctx, d_model] or [B, d_model]
     acting_intent: torch.Tensor | None = None,     # [B, D_act]
-    prosody_latent: torch.Tensor | None = None,    # [B, T, D_pro]
+    local_prosody_latent: torch.Tensor | None = None,   # [B, d_prosody] or [B, T, d_prosody]
     # --- v3 additions ---
     prompt_kv_cache: torch.Tensor | None = None,   # [B, n_layers, 2, n_heads, T_prompt, d_head]
-    acoustic_history: torch.Tensor | None = None,  # [B, n_codebooks, T_hist]
     token_language_ids: torch.Tensor | None = None, # [B, L] per-token language ids
 ) -> dict
 ```
@@ -253,10 +278,29 @@ def forward_tts_pointer(
 |---|---|---|
 | `logits_a` | `[B, n_codebooks, T, vocab_a]` | acoustic token logits |
 | `logits_b` | `[B, n_slots, T, vocab_b]` | control token logits |
-| `pointer_logits` | `[B, T, 1]` | advance/hold logit |
+| `advance_logit` | `[B, T, 1]` | advance/hold logit |
 | `progress_delta` | `[B, T, 1]` | phoneme 内進行度 (sigmoid, 0-1) |
-| `adv_logits` | varies or `None` | adversarial logits from VoiceStateEncoder |
-| `hidden_states` | `[B, T, d_model]` | transformer hidden states |
-| `advance_logit` | `[B, T, 1]` | advance/hold の raw logit (pointer_logits と同義、明示的命名) |
 | `boundary_confidence` | `[B, T, 1]` | phoneme 境界の信頼度スコア |
+| `hidden_states` | `[B, T, d_model]` | transformer hidden states |
 | `next_pointer_state` | `PointerState` | 更新後の pointer state |
+
+## CFG Unconditional Contract
+
+unconditional pass では以下を drop / zero する:
+
+- `explicit_voice_state`
+- `delta_voice_state`
+- `ssl_voice_state`
+- `speaker_embed`
+- `prompt_codec_tokens` / `prompt_kv_cache`
+- `dialogue_context`
+- `acting_intent`
+- `local_prosody_latent`
+
+以下は保持する:
+
+- text / language inputs
+- pointer state
+- causal `acoustic_history`
+
+この契約は training, PyTorch inference, ONNX, Rust で一致しなければならない。

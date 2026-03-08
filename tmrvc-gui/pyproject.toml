@@ -5,10 +5,8 @@ description = "TMRVC Research Studio — GUI application for voice conversion re
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "PySide6>=6.6",
-    "pyqtgraph>=0.13",
-    "sounddevice>=0.4",
-    "onnxruntime>=1.17",
+    "gradio>=4.0",
+    "httpx>=0.25",
     "numpy>=1.26",
     "tmrvc-core",
     "tmrvc-data",
@@ -17,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-tmrvc-gui = "tmrvc_gui.__main__:main"
+tmrvc-gui = "tmrvc_gui.gradio_app:main"
 
 [build-system]
 requires = ["hatchling"]

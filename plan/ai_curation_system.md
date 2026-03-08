@@ -281,6 +281,9 @@ Recover:
 - speech rate
 - pitch / energy statistics
 - style embedding
+- 8-D `voice_state` pseudo-labels
+- per-dimension observed mask
+- per-dimension confidence / calibration metadata
 
 ### Stage 7: Quality Scoring
 
@@ -294,6 +297,7 @@ Produce per-sample scores from:
 - language consistency
 - duration sanity
 - style / event extraction success
+- `voice_state` supervision density and confidence
 
 ### Stage 8: Promotion / Review / Rejection
 
@@ -315,6 +319,7 @@ Promoted samples become cache-ready assets:
 - text
 - language
 - text units
+- `voice_state` targets, masks, confidences, and provenance
 - speaker metadata
 - style/event metadata
 - provenance metadata
@@ -374,6 +379,7 @@ Every record must track:
 - curation pass index
 - promotion/rejection reasons
 - source legality / provenance status
+- `voice_state` target source and calibration version
 
 ## Minimum Manifest Fields
 
@@ -403,6 +409,9 @@ At minimum, every record must store:
 - `providers`
 - `pass_index`
 - `source_legality`
+- `voice_state_target_source`
+- `voice_state_observed_ratio`
+- `voice_state_confidence_summary`
 
 ## Quality Policy
 
@@ -433,6 +442,7 @@ Promote only when:
 - transcript is stable
 - speaker structure is trustworthy enough
 - prosody metadata exists or gracefully degrades
+- physical-state supervision exists or gracefully degrades with explicit absence markers
 - quality score exceeds threshold
 - source legality permits the target export bucket
 
@@ -447,6 +457,7 @@ Requires:
 - usable text units
 - acceptable speaker trust
 - context graph preserved when the sample is dialogue-derived
+- explicit `voice_state` supervision status is recorded, even if the sample is admitted with missing targets
 
 ### `vc_prior`
 
@@ -460,6 +471,7 @@ Requires:
 Requires:
 
 - useful prosody / event signal
+- usable `voice_state` pseudo-label density for at least one accepted training recipe
 - may tolerate weaker transcript quality if not used as primary text supervision
 
 ### `holdout_eval`
@@ -482,6 +494,7 @@ These values are initial defaults and must be refined by worker 11, but downstre
 - overlap ratio: `< 0.10`
 - quality score: `>= 0.85`
 - legality: `owned` or `licensed`
+- `voice_state` supervision status: reported and policy-gated
 
 ### `vc_prior`
 
@@ -517,6 +530,7 @@ Minimum export fields:
 - transcript
 - language
 - text units
+- `voice_state` targets or explicit absence metadata
 - speaker metadata
 - conversation metadata
 - quality score

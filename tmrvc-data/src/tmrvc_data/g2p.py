@@ -63,6 +63,9 @@ _JA_CONSONANTS = [
 ]
 _JA_SPECIAL = ["N", "cl", "pau"]  # moraic nasal, geminate, pause
 
+# Special pitch/accent symbols for Japanese (UCLM v3)
+_JA_ACCENT = ["^", "=", "_"]  # Upstep, Hold, Downstep
+
 # English phonemes (ARPAbet-style via espeak / CMU)
 _EN_VOWELS = [
     "iː",
@@ -197,6 +200,7 @@ _ALL_PHONES = _SPECIAL + sorted(
         _JA_VOWELS
         + _JA_CONSONANTS
         + _JA_SPECIAL
+        + _JA_ACCENT
         + _EN_VOWELS
         + _EN_CONSONANTS
         + _ZH_VOWELS
@@ -242,7 +246,7 @@ class G2PResult:
 
 
 def _g2p_japanese(text: str) -> list[str]:
-    """Convert Japanese text to phoneme list.
+    """Convert Japanese text to phoneme list with Pitch Accent.
 
     Preference order:
     1) pyopenjtalk fullcontext
@@ -259,20 +263,46 @@ def _g2p_japanese(text: str) -> list[str]:
         try:
             labels = pyopenjtalk.extract_fullcontext(text)
             phonemes: list[str] = []
-            for label in labels:
-                # Extract phoneme from fullcontext label
+            
+            # Robust accent extraction logic
+            for i, label in enumerate(labels):
                 # Format: p1^p2-p3+p4=p5/.../...
                 match = re.match(r"[^-]*-([^+]+)\+", label)
                 if match:
                     phone = match.group(1)
                     if phone == "xx":
                         continue
+                    
+                    # Normalize pause/silence
                     if phone == "pau":
                         phonemes.append("pau")
+                        continue
                     elif phone == "cl":
                         phonemes.append("cl")
-                    else:
-                        phonemes.append(phone)
+                        continue
+                    
+                    # Determine pitch state (simplification of fullcontext logic)
+                    # /F: (mora-level) pitch/accent status
+                    if "/F:" in label:
+                        f_block = label.split("/F:")[1].split("/")[0]
+                        if f_block != "xx":
+                            # In pyopenjtalk, F: block contains accent info
+                            # [pos_in_accent_phrase]_[is_accent_top]_[length_of_phrase]
+                            parts = f_block.split("_")
+                            is_top = parts[1] == "1"
+                            
+                            # Insert accent marker before the phoneme
+                            if is_top:
+                                phonemes.append("^")  # Upstep (accent nucleus)
+                            elif parts[0] == "1":
+                                # Start of a phrase, often low
+                                phonemes.append("_")  # Downstep/Low
+                            else:
+                                # Normal continuation
+                                phonemes.append("=")  # Hold
+                    
+                    phonemes.append(phone)
+                    
             if phonemes:
                 return phonemes
             logger.warning(

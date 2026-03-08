@@ -24,6 +24,7 @@ Curation is not finished when labels exist. It is finished when the promoted sub
 - bootstrap alignment export is already projected into canonical phoneme space
 - dialogue-context export remains model-agnostic by default
 - export and packaging flows required by humans are triggerable from the WebUI without shell access
+- `voice_state` supervision artifacts survive export with masks, confidences, and provenance
 
 ## Export Targets
 
@@ -54,6 +55,7 @@ For reproducible held-out tests.
 - quality score
 - provider provenance
 - promotion bucket
+- `voice_state` supervision status
 
 Optional:
 
@@ -61,6 +63,7 @@ Optional:
 - breath events
 - style embedding
 - same-text cluster
+- `voice_state` targets when not required by the destination bucket
 
 ## Concrete Tasks
 
@@ -93,7 +96,19 @@ Optional:
    - preserve token-level or word-level timestamps from Stage 4/5 for provenance
    - export `bootstrap_alignment.json` already projected onto canonical `phoneme_ids` with `text_unit_index`, `start_frame`, `end_frame`, `confidence`, and projection provenance, utilizing **Acoustic-Aware Heuristics** for precise boundary estimation.
    - ensure these labels are available to Worker 02 as a supervised `pointer_target_source`
-10. Define artifact package contract:
+   - freeze frame convention:
+     - `sample_rate = 24000`
+     - `hop_length = 240`
+     - `start_frame` inclusive
+     - `end_frame` exclusive
+     - `T = ceil(num_samples / 240)`
+10. Export physical-control supervision:
+   - `voice_state.npy`
+   - `voice_state_observed_mask.npy`
+   - `voice_state_confidence.npy`
+   - `voice_state_meta.json`
+   - preserve estimator identity, calibration version, and target-source provenance
+11. Define artifact package contract:
    - every exported package must include:
      - `artifact_id`
      - `artifact_type`
@@ -107,17 +122,17 @@ Optional:
      - cache-ready training bundle
      - holdout evaluation bundle
      - pinned workshop take bundle
-11. Define artifact lifecycle and cleanup policy:
+12. Define artifact lifecycle and cleanup policy:
    - `ephemeral`
    - `durable`
    - `release_candidate`
    - who may delete each class
    - whether download URLs are time-limited
-12. Define export failure / retry semantics:
+13. Define export failure / retry semantics:
    - partial package cleanup rules
    - idempotent retry behavior keyed by manifest snapshot and export intent
    - WebUI-visible failure payload with actionable remediation
-12. Define browser-safe artifact handoff:
+14. Define browser-safe artifact handoff:
    - download for human operators
    - server-side registration for training/eval jobs
    - checksum display and verification status in WebUI
@@ -130,6 +145,7 @@ Optional:
 - do not drop conversation graph fields needed for dialogue-conditioned training
 - do not make model-dependent context embeddings the canonical export contract
 - do not export bootstrap alignment that still requires downstream phoneme projection guesswork
+- do not export `voice_state` supervision without masks and provenance
 - do not make shell access a prerequisite for exporting, packaging, or downloading curated outputs
 - do not produce opaque artifact directories that the WebUI cannot describe or audit
 

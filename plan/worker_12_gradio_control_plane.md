@@ -10,10 +10,8 @@ The WebUI is the "cockpit" where humans make the final calls on acting quality a
 
 ## Primary Files
 
-- `tmrvc-gui/src/tmrvc_gui/gradio_app.py`
-- `tmrvc-gui/src/tmrvc_gui/gradio_components/`
+- `tmrvc-gui/src/tmrvc_gui/gradio_app.py` (all tabs: Drama Workshop, Realtime VC, Curation Auditor, Dataset Manager, Evaluation Arena, Speaker Enrollment, Training Monitor, Batch Script, ONNX Export, Server Control, System Admin)
 - `tmrvc-gui/src/tmrvc_gui/gradio_state.py`
-- existing desktop `tmrvc-gui` pages only where reuse is practical
 - `tmrvc-serve/src/tmrvc_serve/routes/admin.py` (UI-specific management APIs)
 - `docs/design/gui-design.md`
 - `docs/design/auth-spec.md` (Infrastructure Foundation)
@@ -55,6 +53,7 @@ The UI must not assume one super-user does every step.
 
 ### 1. Interactive Drama Workshop (Inference UI)
 - **Voice Cloning / Actor Casting:** Add a file upload component for `reference_audio` and a **"Casting Gallery"** to save/load/export **`SpeakerProfile`** objects.
+- `SpeakerProfile` is a backend-owned persistent object. The UI must consume the Worker 01 / Worker 04 schema and must not invent a divergent frontend-only shape.
 - **Session Persistence:** Implement "Save Project" to store all parameters, context history, and assigned actors for the workshop, subject to RBAC and audit.
 - Implement sliders for new v3 pacing controls.
 - Implement explicit 8-D `voice_state` controls and preset recall.
@@ -69,7 +68,7 @@ The UI must not assume one super-user does every step.
 ### 2. Curation Auditor (Data UI)
 - Build a manifest browser that displays waveform, transcript, and AI confidence scores.
 - **Optimistic Locking:** Implement version checks when submitting transcript fixes or promotion decisions to prevent lost updates.
-- **Data Access:** Read the `manifest.jsonl` via the local data service which enforces auth and concurrency rules.
+- **Data Access:** Use the authoritative typed `/ui/*` API exposed by `tmrvc-serve`. Any local data service must sit behind the same typed contract and auth/concurrency rules. Direct filesystem reads are dev-only and are forbidden for the mainline multi-user path.
 - Implement "Quick Review" mode for rapid manual promotion/rejection.
 - Implement a simple text editor to fix ASR errors, feeding back into the refinement stage.
 - Visualize speaker clusters and diarization timelines.
@@ -135,7 +134,7 @@ Each step must record:
 - blind A/B evaluation and queue-based review are naturally multi-user web workflows
 - audit trails and approval queues are easier to centralize in a web control plane
 - dataset upload and ingest must be operable by humans without shell access
-- the existing Qt app may remain as an operator or research console, but it is not the canonical HITL surface for v3 sign-off
+- PySide6/Qt has been fully deprecated and removed; the Gradio WebUI is the sole UI surface
 
 
 ## Guardrails
@@ -146,8 +145,7 @@ Each step must record:
 - **Do not** invent audio-context injection if Worker 01 freezes text-side `dialogue_context` for the initial mainline.
 - **Do not** let the UI become the first implementation of a control path that is not already stable in Worker 04.
 - **Do not** treat human approvals as ephemeral UI state; all critical actions must be auditable.
-- **Do not** let the legacy desktop GUI become the only place where a required human workflow exists.
-- existing Qt widgets may be reused where sensible, but the browser WebUI is the required delivery surface.
+- **Do not** require humans to use CLI or desktop apps; all workflows are browser-based.
 - **Do not** require humans to switch to CLI for dataset upload, curation execution, export, or evaluation setup.
 
 ## Handoff Contract
