@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from tmrvc_core.types import PointerState
 
 from .text_encoder import TextEncoder
-from .uclm import VCEncoder, VoiceStateEncoder
+from .uclm import VCEncoder, VoiceStateEncoder, VectorQuantizer
 from .uclm_transformer import CodecTransformer
 
 
@@ -75,19 +75,23 @@ class SpeakerPromptEncoder(nn.Module):
             nn.Tanh(),
             nn.Linear(d_speaker, d_model),
         )
+        # Vector Quantizer for fine-grained timbre (Worker 01 Task 6)
+        self.vq = VectorQuantizer(n_bins=256, d_model=d_model)
 
     def forward(
         self,
         prompt_codec_tokens: torch.Tensor,
         speaker_embed: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode prompt tokens into speaker embedding and prompt KV features.
 
         Args:
             prompt_codec_tokens: [B, T_prompt, n_codebooks] codec tokens from reference audio.
             speaker_embed: [B, d_speaker] optional external speaker embedding.
         Returns:
-            (refined_speaker_embed [B, d_model], prompt_features [B, T_prompt, d_model])
+            refined_speaker_embed: [B, d_model]
+            prompt_features: [B, T_prompt, d_model] quantized timbre features
+            vq_loss: scalar commitment loss
         """
         # Average across codebooks -> [B, T_prompt]
         avg_tokens = prompt_codec_tokens[:, :, 0].long()  # use first codebook
@@ -95,14 +99,17 @@ class SpeakerPromptEncoder(nn.Module):
         x = self.prompt_encoder(x)
         x = self.output_norm(x)
 
+        # Apply VQ bottleneck to the sequence features (prosody stripping)
+        x_q, vq_loss, _ = self.vq(x)
+
         # Extract timbre through bottleneck (blocks prosody leakage)
-        timbre = self.timbre_bottleneck(x.mean(dim=1))  # [B, d_model]
+        timbre = self.timbre_bottleneck(x_q.mean(dim=1))  # [B, d_model]
 
         if speaker_embed is not None:
             # Fuse external speaker embedding with prompt-derived timbre
             timbre = timbre + self.speaker_proj(speaker_embed)
 
-        return timbre, x
+        return timbre, x_q, vq_loss
 
 
 class ProsodyPredictor(nn.Module):
@@ -425,21 +432,23 @@ class DisentangledUCLM(nn.Module):
         self,
         prompt_codec_tokens: torch.Tensor,
         speaker_embed: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode short reference audio for few-shot speaker adaptation.
 
         Args:
             prompt_codec_tokens: [B, T_prompt, n_codebooks] from reference audio.
             speaker_embed: [B, d_speaker] optional external speaker embedding.
         Returns:
-            (refined_speaker_embed [B, d_model], prompt_summary_tokens [B, n_summary, d_model])
+            refined_speaker_embed: [B, d_model]
+            prompt_summary_tokens: [B, n_summary, d_model]
+            vq_loss: scalar commitment loss
         """
-        refined_embed, prompt_feats = self.speaker_prompt_encoder(prompt_codec_tokens, speaker_embed)
+        refined_embed, prompt_feats, vq_loss = self.speaker_prompt_encoder(prompt_codec_tokens, speaker_embed)
         
         # Condense full prompt features into summary tokens for 10ms efficiency
         summary_tokens = self.uclm_core.prompt_resampler(prompt_feats)
         
-        return refined_embed, summary_tokens
+        return refined_embed, summary_tokens, vq_loss
 
     def predict_prosody(
         self,
@@ -539,6 +548,7 @@ class DisentangledUCLM(nn.Module):
         acoustic_history: tuple[torch.Tensor, torch.Tensor] | None = None,
         bootstrap_alignment: dict | None = None,
         text_suprasegmentals: torch.Tensor | None = None,
+        phoneme_indices: torch.Tensor | None = None,
     ) -> dict:
         """Pointer-based TTS forward pass (UCLM v3).
 
@@ -565,6 +575,8 @@ class DisentangledUCLM(nn.Module):
             acoustic_history: optional tuple of (a_ctx, b_ctx) for causal decoding context.
             bootstrap_alignment: optional dict with 'phoneme_indices' for hard bootstrap.
             text_suprasegmentals: optional [B, L, d_suprasegmental] companion per-unit features.
+            phoneme_indices: optional [B, T] phoneme indices per frame for training.
+                Overrides internal pointer-state or uniform fallback when provided.
 
         Returns:
             dict with keys ``logits_a``, ``logits_b``, ``advance_logit``,
@@ -598,8 +610,8 @@ class DisentangledUCLM(nn.Module):
             if bootstrap_alignment is None:
                 raise ValueError("bootstrap_alignment required when is_hard_bootstrapped=True")
             # bootstrap_alignment is expected to be [B, T] mapping frame -> phoneme index
-            phoneme_indices = bootstrap_alignment["phoneme_indices"]
-            content_features = phoneme_features[torch.arange(B).unsqueeze(1), phoneme_indices, :]
+            idx = bootstrap_alignment["phoneme_indices"]
+            content_features = phoneme_features[torch.arange(B).unsqueeze(1), idx, :]
         elif pointer_state is not None:
             # Inference or Latent phase: Use pointer_state.text_index
             # In streaming, text_index is usually [B], so we unsqueeze
@@ -607,11 +619,15 @@ class DisentangledUCLM(nn.Module):
             if idx.ndim == 1:
                 idx = idx.unsqueeze(1).expand(-1, target_length)
             content_features = phoneme_features[torch.arange(B).unsqueeze(1), idx, :]
+        elif phoneme_indices is not None:
+            # Explicit teacher-forced indices (from MAS or bootstrap)
+            content_features = phoneme_features[torch.arange(B).unsqueeze(1), phoneme_indices, :]
         else:
-            # Teacher-forced training / Legacy fallback
+            # Legacy fallback: Uniform distribution (Warn in v3)
+            # Worker 01 constraint: Avoid this in release recipes.
             frame_indices = torch.arange(target_length, device=phoneme_features.device)
-            phoneme_indices = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
-            content_features = phoneme_features[:, phoneme_indices, :]
+            idx = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
+            content_features = phoneme_features[:, idx, :]
 
         # 3. Apply F0 conditioning
         if f0_condition is not None:

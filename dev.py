@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from tmrvc_core.constants import SERVE_PORT
+
 CONFIGS_DIR = Path("configs")
 DATASETS_YAML = CONFIGS_DIR / "datasets.yaml"
 CHARACTERS_JSON = CONFIGS_DIR / "characters.json"
@@ -61,9 +63,7 @@ def validate_v3_config(cfg: dict) -> list[str]:
         if key not in cfg:
             errors.append(f"missing required v3 field: {key}")
         elif not isinstance(cfg[key], expected_type):
-            errors.append(
-                f"{key}: expected {expected_type}, got {type(cfg[key])}"
-            )
+            errors.append(f"{key}: expected {expected_type}, got {type(cfg[key])}")
     if cfg.get("tts_mode") not in ("pointer", "legacy_duration"):
         errors.append(
             f"tts_mode must be 'pointer' or 'legacy_duration', got {cfg.get('tts_mode')!r}"
@@ -128,7 +128,9 @@ def print_dependency_map() -> None:
     print("  出力: uclm_final.pt")
     print()
     print("推奨フロー (v3): 6 -> 4 -> 13 -> 14 -> 16 -> 1 -> 8 -> 7 -> 11")
-    print("  (設定 -> データ追加 -> ingest -> curation -> export -> 学習 -> codec -> 確定 -> serve)")
+    print(
+        "  (設定 -> データ追加 -> ingest -> curation -> export -> 学習 -> codec -> 確定 -> serve)"
+    )
     print()
     print("--- キュレーション (Curation) ---")
     print()
@@ -182,35 +184,47 @@ def cmd_run_serve() -> None:
     print("\n--- 推論サーバー起動 ---")
     uclm_ckpt = CHECKPOINTS_DIR / "uclm" / "uclm_latest.pt"
     codec_ckpt = CHECKPOINTS_DIR / "codec" / "codec_latest.pt"
-    
+
     if not uclm_ckpt.exists():
         print(f"WARNING: {uclm_ckpt} が見つかりません。")
     if not codec_ckpt.exists():
         print(f"WARNING: {codec_ckpt} が見つかりません。")
-        
+
     device = select_device()
     host = input_default("ホスト", "127.0.0.1")
     port = input_default("ポート番号", "8000")
-    api_key = input_default("Anthropic API Key (context予測用, 空欄可)", os.environ.get("ANTHROPIC_API_KEY", ""))
-    use_reload = input_default("オートリロードを有効にしますか? (y/n)", "n").lower() == "y"
+    api_key = input_default(
+        "Anthropic API Key (context予測用, 空欄可)",
+        os.environ.get("ANTHROPIC_API_KEY", ""),
+    )
+    use_reload = (
+        input_default("オートリロードを有効にしますか? (y/n)", "n").lower() == "y"
+    )
     use_verbose = input_default("詳細ログを出力しますか? (y/n)", "n").lower() == "y"
-    
+
     cmd = [
-        "uv", "run", "tmrvc-serve",
-        "--uclm-checkpoint", str(uclm_ckpt),
-        "--codec-checkpoint", str(codec_ckpt),
-        "--device", device,
-        "--host", host,
-        "--port", port
+        "uv",
+        "run",
+        "tmrvc-serve",
+        "--uclm-checkpoint",
+        str(uclm_ckpt),
+        "--codec-checkpoint",
+        str(codec_ckpt),
+        "--device",
+        device,
+        "--host",
+        host,
+        "--port",
+        port,
     ]
-    
+
     if api_key:
         cmd.extend(["--api-key", api_key])
     if use_reload:
         cmd.append("--reload")
     if use_verbose:
         cmd.append("--verbose")
-    
+
     print(f"\nサーバーを起動します: http://{host}:{port}")
     print("Ctrl+C で停止します。\n")
     try:
@@ -220,22 +234,22 @@ def cmd_run_serve() -> None:
 
 
 def cmd_system_check() -> None:
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("  システム整合性チェック (UCLM v3)")
-    print("="*60)
-    
+    print("=" * 60)
+
     print("\n[1/2] 静的解析 (Ruff)...")
     ruff_ok = run_checked(["uv", "run", "ruff", "check", "."])
-    
+
     print("\n[2/2] 統合テスト (Pytest)...")
     pytest_ok = run_checked(["uv", "run", "pytest", "tests/serve", "tests/core"])
-    
+
     print("-" * 60)
     if ruff_ok and pytest_ok:
         print("✅ すべてのチェックを通過しました。")
     else:
         print("❌ エラーが検出されました。ログを確認してください。")
-    
+
     input("\nEnterで戻る...")
 
 
@@ -253,6 +267,7 @@ def select_device() -> str:
 def get_gpu_info() -> tuple[float, float, int] | None:
     try:
         import torch
+
         if not torch.cuda.is_available():
             return None
         idx = torch.cuda.current_device()
@@ -269,20 +284,24 @@ def get_gpu_info() -> tuple[float, float, int] | None:
 
 
 def select_workers(device: str) -> int:
-    if device != "cuda": return 1
+    if device != "cuda":
+        return 1
     info = get_gpu_info()
-    if info is None: return 1
+    if info is None:
+        return 1
     _, _, recommended = info
     workers = input_default("並列度 (workers)", str(recommended))
     return int(workers)
 
 
 def load_character_profiles() -> dict:
-    if not CHARACTERS_JSON.exists(): return {}
+    if not CHARACTERS_JSON.exists():
+        return {}
     try:
         with open(CHARACTERS_JSON, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception: return {}
+    except Exception:
+        return {}
 
 
 def save_character_profiles(profiles: dict) -> None:
@@ -302,18 +321,24 @@ def cmd_manage_characters() -> None:
             print(f"\n{'ID':<15} {'Name':<20} {'Adaptation':<10} {'Path'}")
             print("-" * 70)
             for cid, p in profiles.items():
-                print(f"{cid:<15} {p.get('name', ''):<20} {p.get('adaptation_level', ''):<10} {p.get('speaker_file', '')}")
+                print(
+                    f"{cid:<15} {p.get('name', ''):<20} {p.get('adaptation_level', ''):<10} {p.get('speaker_file', '')}"
+                )
         print("\n1) 新規キャラクター作成 (Enrollment)\n2) キャラクター削除\nb) 戻る")
         choice = input("\n選択: ").strip().lower()
-        if choice == "b": break
-        elif choice == "1": _enroll_character()
-        elif choice == "2": _delete_character()
+        if choice == "b":
+            break
+        elif choice == "1":
+            _enroll_character()
+        elif choice == "2":
+            _delete_character()
 
 
 def _enroll_character() -> None:
     print("\n--- 新規キャラクター作成 ---")
     char_id = input("キャラクターID: ").strip()
-    if not char_id: return
+    if not char_id:
+        return
     profiles = load_character_profiles()
     if char_id in profiles:
         print(f"ERROR: ID '{char_id}' は既に存在します。")
@@ -329,12 +354,29 @@ def _enroll_character() -> None:
     CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
     output_file = CHARACTERS_DIR / f"{char_id}.tmrvc_speaker"
     codec_ckpt = _find_codec_checkpoint()
-    cmd = ["uv", "run", "tmrvc-enroll", "--name", name, "--level", level, "--output", str(output_file)]
-    if Path(audio_path).is_dir(): cmd.extend(["--audio-dir", audio_path])
-    else: cmd.extend(["--audio", audio_path])
-    if level != "light" and codec_ckpt: cmd.extend(["--codec-checkpoint", str(codec_ckpt)])
+    cmd = [
+        "uv",
+        "run",
+        "tmrvc-enroll",
+        "--name",
+        name,
+        "--level",
+        level,
+        "--output",
+        str(output_file),
+    ]
+    if Path(audio_path).is_dir():
+        cmd.extend(["--audio-dir", audio_path])
+    else:
+        cmd.extend(["--audio", audio_path])
+    if level != "light" and codec_ckpt:
+        cmd.extend(["--codec-checkpoint", str(codec_ckpt)])
     if run_checked(cmd):
-        profiles[char_id] = {"name": name, "speaker_file": str(output_file), "adaptation_level": level}
+        profiles[char_id] = {
+            "name": name,
+            "speaker_file": str(output_file),
+            "adaptation_level": level,
+        }
         save_character_profiles(profiles)
         print(f"\nキャラクター '{char_id}' を作成しました。")
     input("\nEnterで戻る...")
@@ -342,14 +384,20 @@ def _enroll_character() -> None:
 
 def _delete_character() -> None:
     char_id = input("\n削除するキャラクターID: ").strip()
-    if not char_id: return
+    if not char_id:
+        return
     profiles = load_character_profiles()
-    if char_id not in profiles: return
+    if char_id not in profiles:
+        return
     if input(f"本当に '{char_id}' を削除しますか? (y/n): ").lower() == "y":
         p = profiles.pop(char_id)
         save_character_profiles(profiles)
         sp_file = Path(p.get("speaker_file", ""))
-        if sp_file.exists() and input(f"ファイル '{sp_file.name}' も削除しますか? (y/n): ").lower() == "y":
+        if (
+            sp_file.exists()
+            and input(f"ファイル '{sp_file.name}' も削除しますか? (y/n): ").lower()
+            == "y"
+        ):
             sp_file.unlink()
     input("Enterで戻る...")
 
@@ -358,30 +406,41 @@ def load_datasets() -> dict:
     if not DATASETS_YAML.exists():
         print(f"ERROR: {DATASETS_YAML} not found. Run option 6 first.")
         sys.exit(1)
-    with open(DATASETS_YAML) as f: return yaml.safe_load(f) or {}
+    with open(DATASETS_YAML) as f:
+        return yaml.safe_load(f) or {}
 
 
 def get_enabled_datasets() -> list[str]:
     cfg = load_datasets()
-    return [name for name, ds in cfg.get("datasets", {}).items() if ds.get("enabled", False)]
+    return [
+        name for name, ds in cfg.get("datasets", {}).items() if ds.get("enabled", False)
+    ]
 
 
 def show_enabled_datasets() -> None:
     enabled = get_enabled_datasets()
-    if not enabled: print("有効なデータセットがありません。")
+    if not enabled:
+        print("有効なデータセットがありません。")
     else:
         print("使用するデータセット:")
-        for name in enabled: print(f"  - {name}")
+        for name in enabled:
+            print(f"  - {name}")
 
 
 def list_experiment_cache_dirs() -> list[Path]:
-    if not EXPERIMENTS_DIR.exists(): return []
-    return sorted([p for p in EXPERIMENTS_DIR.glob("*/cache") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+    if not EXPERIMENTS_DIR.exists():
+        return []
+    return sorted(
+        [p for p in EXPERIMENTS_DIR.glob("*/cache") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
 
 
 def clear_training_caches_for_enabled_datasets(enabled: list[str]) -> int:
     """Remove training caches for enabled datasets. Returns count of removed dirs."""
     import shutil
+
     removed = 0
     if not enabled:
         return removed
@@ -405,7 +464,8 @@ def clear_training_caches_for_enabled_datasets(enabled: list[str]) -> int:
 
 
 def find_latest_cache_for_enabled_datasets(enabled: list[str]) -> Path | None:
-    if not EXPERIMENTS_DIR.exists() or not enabled: return None
+    if not EXPERIMENTS_DIR.exists() or not enabled:
+        return None
     prefix = "_".join(sorted(enabled))
     candidates = []
     for exp in EXPERIMENTS_DIR.glob(f"{prefix}_*"):
@@ -428,20 +488,32 @@ def run_checked(cmd: list[str]) -> bool:
 
 
 def _read_yaml(path: Path) -> dict:
-    if not path.exists(): return {}
+    if not path.exists():
+        return {}
     try:
-        with open(path, encoding="utf-8") as f: return yaml.safe_load(f) or {}
-    except Exception: return {}
+        with open(path, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
 
 
-def find_latest_uclm_checkpoint_for_enabled_datasets(enabled: list[str]) -> tuple[Path | None, Path | None]:
-    if not enabled or not EXPERIMENTS_DIR.exists(): return None, None
+def find_latest_uclm_checkpoint_for_enabled_datasets(
+    enabled: list[str],
+) -> tuple[Path | None, Path | None]:
+    if not enabled or not EXPERIMENTS_DIR.exists():
+        return None, None
     prefix = "_".join(sorted(enabled))
     candidates = [
-        ((exp / "checkpoints" / "uclm_final.pt").stat().st_mtime, exp, exp / "checkpoints" / "uclm_final.pt")
-        for exp in EXPERIMENTS_DIR.glob(f"{prefix}_*") if (exp / "checkpoints" / "uclm_final.pt").exists()
+        (
+            (exp / "checkpoints" / "uclm_final.pt").stat().st_mtime,
+            exp,
+            exp / "checkpoints" / "uclm_final.pt",
+        )
+        for exp in EXPERIMENTS_DIR.glob(f"{prefix}_*")
+        if (exp / "checkpoints" / "uclm_final.pt").exists()
     ]
-    if not candidates: return None, None
+    if not candidates:
+        return None, None
     _, exp_dir, ckpt = max(candidates, key=lambda x: x[0])
     return exp_dir, ckpt
 
@@ -587,10 +659,17 @@ def cmd_prepare_tts_alignment_from_latest_cache(  # [v2-legacy]
     for ds_name, ds_cfg in enabled_cfg.items():
         lang = ds_cfg.get("language", "ja")
         cmd = [
-            "uv", "run", "python", "-m", "scripts.annotate.run_forced_alignment",
-            "--cache-dir", str(cache_dir),
-            "--dataset", ds_name,
-            "--language", lang,
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "scripts.annotate.run_forced_alignment",
+            "--cache-dir",
+            str(cache_dir),
+            "--dataset",
+            ds_name,
+            "--language",
+            lang,
         ]
         if textgrid_overrides and ds_name in textgrid_overrides:
             cmd.extend(["--textgrid-dir", str(textgrid_overrides[ds_name])])
@@ -641,18 +720,18 @@ def cmd_mfa_align_and_inject_from_cache(  # [v2-legacy]
         _build_mfa_corpus_from_cache_dataset(cache_dir, ds_name, corpus_dir, lang)
 
         align_cmd = mfa_cmd + [
-            "align", str(corpus_dir),
+            "align",
+            str(corpus_dir),
             normalize_mfa_model_name(dictionary),
             normalize_mfa_model_name(acoustic),
             str(Path(output_root) / ds_name),
-            "-j", str(jobs),
+            "-j",
+            str(jobs),
         ]
         run_checked(align_cmd)
 
     # Prepare TTS alignment from results
-    textgrid_overrides = {
-        ds: Path(output_root) / ds for ds in enabled_cfg
-    }
+    textgrid_overrides = {ds: Path(output_root) / ds for ds in enabled_cfg}
     return cmd_prepare_tts_alignment_from_latest_cache(
         cache_dir=cache_dir,
         enabled_cfg=enabled_cfg,
@@ -665,7 +744,8 @@ def cmd_mfa_align_and_inject_from_cache(  # [v2-legacy]
 
 def cmd_finalize_training_outputs(preferred_device: str | None = None) -> None:
     enabled = get_enabled_datasets()
-    if not enabled: return
+    if not enabled:
+        return
     print("\n=== 学習成果物の確定 (Finalization) ===")
     exp_dir, uclm_ckpt = find_latest_uclm_checkpoint_for_enabled_datasets(enabled)
     if exp_dir is None or uclm_ckpt is None:
@@ -690,19 +770,34 @@ def cmd_finalize_training_outputs(preferred_device: str | None = None) -> None:
 
 
 def _run_serve_health_smoke(uclm_ckpt: Path, codec_ckpt: Path, device: str) -> bool:
-    script = f"from tmrvc_serve.app import init_app, app; from fastapi.testclient import TestClient; " \
-             f"init_app(uclm_checkpoint={str(uclm_ckpt)!r}, codec_checkpoint={str(codec_ckpt)!r}, device={device!r}); " \
-             f"client = TestClient(app); resp = client.get('/health'); assert resp.status_code == 200"
+    script = (
+        f"from tmrvc_serve.app import init_app, app; from fastapi.testclient import TestClient; "
+        f"init_app(uclm_checkpoint={str(uclm_ckpt)!r}, codec_checkpoint={str(codec_ckpt)!r}, device={device!r}); "
+        f"client = TestClient(app); resp = client.get('/health'); assert resp.status_code == 200"
+    )
     return run_checked(["uv", "run", "python", "-c", script])
 
 
 def cmd_train_codec_from_latest_cache(preferred_device: str | None = None) -> bool:
     enabled = get_enabled_datasets()
-    exp_dir = find_latest_cache_for_enabled_datasets(enabled).parent if enabled else None
-    if not exp_dir: return False
+    exp_dir = (
+        find_latest_cache_for_enabled_datasets(enabled).parent if enabled else None
+    )
+    if not exp_dir:
+        return False
     cache_dir = exp_dir / "cache"
     device = preferred_device or select_device()
-    cmd = ["uv", "run", "tmrvc-train-codec", "--cache-dir", str(cache_dir), "--output-dir", str(CHECKPOINTS_DIR / "codec"), "--device", device]
+    cmd = [
+        "uv",
+        "run",
+        "tmrvc-train-codec",
+        "--cache-dir",
+        str(cache_dir),
+        "--output-dir",
+        str(CHECKPOINTS_DIR / "codec"),
+        "--device",
+        device,
+    ]
     if run_checked(cmd):
         src = CHECKPOINTS_DIR / "codec" / "codec_final.pt"
         dst = CHECKPOINTS_DIR / "codec" / "codec_latest.pt"
@@ -720,11 +815,24 @@ def _find_codec_checkpoint() -> Path | None:
 def cmd_full_training_legacy() -> None:
     # [v2-legacy] This path is retained for ablation. v3 mainline uses pointer mode.
     enabled = get_enabled_datasets()
-    if not enabled: return
+    if not enabled:
+        return
     device = select_device()
     workers = select_workers(device)
     print(f"\n=== [v2-legacy] MFA学習 開始 ===")
-    cmd = ["uv", "run", "tmrvc-train-pipeline", "--output-dir", "experiments", "--workers", str(workers), "--train-device", device, "--tts-mode", "legacy_duration"]
+    cmd = [
+        "uv",
+        "run",
+        "tmrvc-train-pipeline",
+        "--output-dir",
+        "experiments",
+        "--workers",
+        str(workers),
+        "--train-device",
+        device,
+        "--tts-mode",
+        "legacy_duration",
+    ]
     if run_checked(cmd):
         if input_default("Codec学習も実行しますか? (y/n)", "y").lower() == "y":
             cmd_train_codec_from_latest_cache(preferred_device=device)
@@ -733,11 +841,24 @@ def cmd_full_training_legacy() -> None:
 
 def cmd_full_training() -> None:
     enabled = get_enabled_datasets()
-    if not enabled: return
+    if not enabled:
+        return
     device = select_device()
     workers = select_workers(device)
     print(f"\n=== フル学習 (UCLM v3) 開始 ===")
-    cmd = ["uv", "run", "tmrvc-train-pipeline", "--output-dir", "experiments", "--workers", str(workers), "--train-device", device, "--tts-mode", "pointer"]
+    cmd = [
+        "uv",
+        "run",
+        "tmrvc-train-pipeline",
+        "--output-dir",
+        "experiments",
+        "--workers",
+        str(workers),
+        "--train-device",
+        device,
+        "--tts-mode",
+        "pointer",
+    ]
     if run_checked(cmd):
         if input_default("Codec学習も実行しますか? (y/n)", "y").lower() == "y":
             cmd_train_codec_from_latest_cache(preferred_device=device)
@@ -747,10 +868,24 @@ def cmd_full_training() -> None:
 def cmd_skip_preprocess() -> None:
     enabled = get_enabled_datasets()
     cache_dir = find_latest_cache_for_enabled_datasets(enabled)
-    if not cache_dir: return
+    if not cache_dir:
+        return
     device = select_device()
     print(f"\n=== 既存キャッシュで学習 (UCLM v3) 開始 ===")
-    cmd = ["uv", "run", "tmrvc-train-pipeline", "--output-dir", "experiments", "--cache-dir", str(cache_dir), "--skip-preprocess", "--train-device", device, "--tts-mode", "pointer"]
+    cmd = [
+        "uv",
+        "run",
+        "tmrvc-train-pipeline",
+        "--output-dir",
+        "experiments",
+        "--cache-dir",
+        str(cache_dir),
+        "--skip-preprocess",
+        "--train-device",
+        device,
+        "--tts-mode",
+        "pointer",
+    ]
     if run_checked(cmd):
         cmd_finalize_training_outputs(preferred_device=device)
 
@@ -761,7 +896,9 @@ def cmd_list_datasets() -> None:
     print(f"{'Name':<25} {'Status':<10} {'Lang':<6} {'Path'}")
     print("-" * 80)
     for name, ds in datasets.items():
-        print(f"{name:<25} {'enabled' if ds.get('enabled') else 'disabled':<10} {ds.get('language','?'):<6} {ds.get('raw_dir','')}")
+        print(
+            f"{name:<25} {'enabled' if ds.get('enabled') else 'disabled':<10} {ds.get('language', '?'):<6} {ds.get('raw_dir', '')}"
+        )
 
 
 def cmd_add_dataset() -> None:
@@ -771,7 +908,18 @@ def cmd_add_dataset() -> None:
 def cmd_cluster_speakers() -> None:
     input_dir = input_default("入力ディレクトリ")
     device = input_default("デバイス", "cuda")
-    run_checked(["uv", "run", "python", "scripts/eval/cluster_speakers.py", "--input", input_dir, "--device", device])
+    run_checked(
+        [
+            "uv",
+            "run",
+            "python",
+            "scripts/eval/cluster_speakers.py",
+            "--input",
+            input_dir,
+            "--device",
+            device,
+        ]
+    )
 
 
 def cmd_init_configs() -> None:
@@ -824,8 +972,11 @@ def cmd_curate_validate() -> None:
 def cmd_curate_status() -> None:
     """Show curation summary / status (calls backend API)."""
     import requests
+
     try:
-        resp = requests.get("http://localhost:8000/ui/curation/summary", timeout=5)
+        resp = requests.get(
+            f"http://localhost:{SERVE_PORT}/ui/curation/summary", timeout=5
+        )
         if resp.status_code == 200:
             print("\n=== キュレーションサマリー ===")
             print(json.dumps(resp.json(), indent=2))
@@ -839,8 +990,9 @@ def cmd_curate_status() -> None:
 def _api_post(path: str, data: dict) -> bool:
     """Helper to call tmrvc-serve API."""
     import requests
+
     try:
-        url = f"http://localhost:8000{path}"
+        url = f"http://localhost:{SERVE_PORT}{path}"
         resp = requests.post(url, json=data, timeout=10)
         if resp.status_code < 300:
             return True
@@ -854,7 +1006,8 @@ def main() -> None:
     while True:
         print_menu()
         choice = input("選択 [1-18, h=ヘルプ, q=終了]: ").strip()
-        if choice == "q": break
+        if choice == "q":
+            break
         if choice == "h":
             print_dependency_map()
             input("\nEnterで続行...")
@@ -884,8 +1037,11 @@ def main() -> None:
             "17": cmd_curate_validate,
             "18": cmd_curate_status,
         }
-        if choice in handlers: handlers[choice]()
-        else: input(f"無効な選択: {choice}. Enterで続行...")
+        if choice in handlers:
+            handlers[choice]()
+        else:
+            input(f"無効な選択: {choice}. Enterで続行...")
+
 
 if __name__ == "__main__":
     main()

@@ -1,26 +1,28 @@
-#!/usr/bin/env python3
-"""Generate Python, C++, and Rust constant files from configs/constants.yaml.
+"""Auto-generate constants from YAML.
 
-Usage:
-    python scripts/codegen/generate_constants.py          # generate all
-    python scripts/codegen/generate_constants.py --check   # verify files are up-to-date
+This module is called by constants.py on import when the generated file
+is missing or stale.
 """
 
 from __future__ import annotations
 
-import argparse
-import sys
 from pathlib import Path
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-YAML_PATH = REPO_ROOT / "configs" / "constants.yaml"
-PY_OUT = REPO_ROOT / "tmrvc-core" / "src" / "tmrvc_core" / "_generated_constants.py"
-CPP_OUT = REPO_ROOT / "tmrvc-engine" / "include" / "tmrvc" / "constants.h"
-RUST_OUT = REPO_ROOT / "tmrvc-engine-rs" / "src" / "constants.rs"
+_YAML_PATH = Path(__file__).resolve().parents[3] / "configs" / "constants.yaml"
+_PY_OUT = Path(__file__).parent / "_generated_constants.py"
+_RUST_OUT = (
+    Path(__file__).resolve().parents[3] / "tmrvc-engine-rs" / "src" / "constants.rs"
+)
+_CPP_OUT = (
+    Path(__file__).resolve().parents[3]
+    / "tmrvc-engine"
+    / "include"
+    / "tmrvc"
+    / "constants.h"
+)
 
-# Keys relevant to the Rust/C++ runtime engine (exclude training-only keys).
 _RUNTIME_KEYS = {
     "sample_rate",
     "n_fft",
@@ -51,7 +53,6 @@ _RUNTIME_KEYS = {
     "converter_hq_state_frames",
     "hq_threshold_q",
     "crossfade_frames",
-    # TTS extension
     "d_style",
     "n_style_params",
     "d_text_encoder",
@@ -64,7 +65,6 @@ _RUNTIME_KEYS = {
     "d_f0_predictor",
     "d_content_synthesizer",
     "n_languages",
-    # UCLM Token Spec
     "n_codebooks",
     "rvq_vocab_size",
     "control_vocab_size",
@@ -88,39 +88,31 @@ _RUNTIME_KEYS = {
     "dec_state_frames",
     "d_event_trace",
     "kv_cache_size",
-    # F0 Conditioning
     "d_f0",
     "f0_smoothing_frames",
-    # Suprasegmental text features (v3)
     "d_suprasegmental",
     "cfg_scale_default",
     "cfg_scale_max",
-    # Prompt budget limits (v3)
     "max_prompt_seconds_active",
     "max_prompt_frames",
     "max_prompt_kv_tokens",
     "max_prompt_cache_bytes",
     "max_frames_per_unit",
     "skip_protection_threshold",
-    # Runtime budget limits (v3)
     "max_text_units_active",
     "max_dialogue_context_units",
     "max_acoustic_history_frames",
     "max_cross_attn_kv_bytes",
     "streaming_latency_budget_ms",
     "streaming_hardware_class_primary",
+    "serve_port",
+    "gui_port",
 }
 
-# Rust name overrides (YAML key → Rust const name) for backward compat.
 _RUST_NAME_MAP: dict[str, str] = {
     "content_encoder_state_frames": "CONTENT_ENC_STATE_FRAMES",
     "ir_estimator_state_frames": "IR_EST_STATE_FRAMES",
 }
-
-
-# ---------------------------------------------------------------------------
-# Python
-# ---------------------------------------------------------------------------
 
 
 def _py_value(v: object) -> str:
@@ -136,11 +128,11 @@ def _py_value(v: object) -> str:
     return str(v)
 
 
-def generate_python(cfg: dict) -> str:
+def _generate_python(cfg: dict) -> str:
     lines = [
-        '"""Auto-generated constants — DO NOT EDIT MANUALLY.',
+        '"""Auto-generated constants — DO NOT EDIT.',
         "",
-        "Run: python scripts/codegen/generate_constants.py",
+        "Regenerated automatically on import when constants.yaml changes.",
         '"""',
         "",
     ]
@@ -148,69 +140,6 @@ def generate_python(cfg: dict) -> str:
         name = key.upper()
         lines.append(f"{name} = {_py_value(val)}")
     return "\n".join(lines) + "\n"
-
-
-# ---------------------------------------------------------------------------
-# C++
-# ---------------------------------------------------------------------------
-
-
-def _cpp_type(v: object) -> str:
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, int):
-        return "int"
-    if isinstance(v, float):
-        return "float"
-    if isinstance(v, str):
-        return "const char*"
-    return "auto"
-
-
-def _cpp_value(v: object) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, float):
-        return f"{v}f"
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, list):
-        inner = ", ".join(_cpp_value(x) for x in v)
-        return f"{{{inner}}}"
-    return str(v)
-
-
-def generate_cpp(cfg: dict) -> str:
-    lines = [
-        "// Auto-generated constants — DO NOT EDIT MANUALLY.",
-        "// Run: python scripts/generate_constants.py",
-        "",
-        "#pragma once",
-        "",
-        "#include <array>",
-        "",
-        "namespace tmrvc {",
-        "",
-    ]
-    for key, val in cfg.items():
-        name = key.upper()
-        ctype = _cpp_type(val)
-        cval = _cpp_value(val)
-        if isinstance(val, list):
-            lines.append(f"constexpr std::array<int, {len(val)}> {name} = {cval};")
-        else:
-            lines.append(f"constexpr {ctype} {name} = {cval};")
-    lines += [
-        "",
-        "}  // namespace tmrvc",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Rust
-# ---------------------------------------------------------------------------
 
 
 def _rust_type(v: object) -> str:
@@ -238,16 +167,7 @@ def _rust_value(v: object) -> str:
     return str(v)
 
 
-def generate_rust(cfg: dict) -> str:
-    lines = [
-        "// Auto-generated from configs/constants.yaml — DO NOT EDIT MANUALLY.",
-        "// Run: python scripts/generate_constants.py",
-        "",
-        "#![allow(dead_code)]",
-        "",
-        "// --- Audio parameters ---",
-    ]
-
+def _generate_rust(cfg: dict) -> str:
     sections = {
         "audio": [
             "sample_rate",
@@ -330,6 +250,10 @@ def generate_rust(cfg: dict) -> str:
         "suprasegmental": [
             "d_suprasegmental",
         ],
+        "cfg": [
+            "cfg_scale_default",
+            "cfg_scale_max",
+        ],
         "prompt_budget": [
             "max_prompt_seconds_active",
             "max_prompt_frames",
@@ -344,6 +268,10 @@ def generate_rust(cfg: dict) -> str:
             "streaming_latency_budget_ms",
             "streaming_hardware_class_primary",
         ],
+        "server": [
+            "serve_port",
+            "gui_port",
+        ],
     }
 
     section_headers = {
@@ -357,12 +285,18 @@ def generate_rust(cfg: dict) -> str:
         "uclm": "\n// --- UCLM (Unified Codec Language Model) ---",
         "f0": "\n// --- F0 Conditioning ---",
         "suprasegmental": "\n// --- Suprasegmental text features (v3) ---",
+        "cfg": "\n// --- CFG (Classifier-Free Guidance) ---",
         "prompt_budget": "\n// --- Prompt budget limits (v3) ---",
         "runtime_budget": "\n// --- Runtime budget limits (v3) ---",
+        "server": "\n// --- Server ports ---",
     }
 
-    # Remove the initial audio header since we add it per section
-    lines.pop()
+    lines = [
+        "// Auto-generated from configs/constants.yaml — DO NOT EDIT.",
+        "",
+        "#![allow(dead_code)]",
+        "",
+    ]
 
     for section, keys in sections.items():
         lines.append(section_headers[section])
@@ -387,7 +321,6 @@ def generate_rust(cfg: dict) -> str:
             "pub const MAX_LOOKAHEAD_HOPS: usize = MAX_LOOKAHEAD_HOPS_V2_LEGACY;"
         )
 
-    # Derived constants
     lines.append("")
     lines.append("// --- Derived constants ---")
     lines.append("pub const RING_BUFFER_CAPACITY: usize = 4096;")
@@ -425,13 +358,7 @@ def generate_rust(cfg: dict) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def _write_if_changed(path: Path, content: str) -> bool:
-    """Write content to path. Return True if file was changed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text(encoding="utf-8") == content:
         return False
@@ -439,48 +366,23 @@ def _write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Verify generated files are up-to-date (exit 1 if stale).",
-    )
-    args = parser.parse_args()
+def ensure_generated() -> None:
+    """Regenerate constants if YAML is newer than generated files."""
+    if not _YAML_PATH.exists():
+        return
 
-    with open(YAML_PATH, encoding="utf-8") as f:
+    yaml_mtime = _YAML_PATH.stat().st_mtime
+    py_mtime = _PY_OUT.stat().st_mtime if _PY_OUT.exists() else 0
+    rust_mtime = _RUST_OUT.stat().st_mtime if _RUST_OUT.exists() else 0
+
+    if yaml_mtime <= py_mtime and yaml_mtime <= rust_mtime:
+        return
+
+    with open(_YAML_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    targets: list[tuple[Path, str]] = [
-        (PY_OUT, generate_python(cfg)),
-        (RUST_OUT, generate_rust(cfg)),
-    ]
+    changed_py = _write_if_changed(_PY_OUT, _generate_python(cfg))
+    changed_rust = _write_if_changed(_RUST_OUT, _generate_rust(cfg))
 
-    # C++ only if directory exists
-    if CPP_OUT.parent.exists():
-        targets.append((CPP_OUT, generate_cpp(cfg)))
-
-    if args.check:
-        stale = []
-        for path, expected in targets:
-            if not path.exists():
-                stale.append(f"  MISSING: {path}")
-            elif path.read_text(encoding="utf-8") != expected:
-                stale.append(f"  STALE:   {path}")
-        if stale:
-            print("Constants are out of date:")
-            print("\n".join(stale))
-            print("\nRun: python scripts/generate_constants.py")
-            sys.exit(1)
-        else:
-            print("All generated constants are up-to-date.")
-            sys.exit(0)
-
-    for path, content in targets:
-        changed = _write_if_changed(path, content)
-        status = "Updated" if changed else "Up-to-date"
-        print(f"{status}: {path}")
-
-
-if __name__ == "__main__":
-    main()
+    if changed_py or changed_rust:
+        print(f"Regenerated constants from {_YAML_PATH}")

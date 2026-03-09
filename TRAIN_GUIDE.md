@@ -3,8 +3,7 @@
 この文書は、現行 mainline である `UCLM v3` の学習フローをまとめたものです。前提は次のとおりです。
 
 - TTS / VC は単一の UCLM backbone で学習する
-- TTS の主経路は `pointer-based internal alignment`
-- `MFA` や `durations.npy` は mainline では必須にしない
+- TTS の主経路は `pointer-based internal alignment` (MFA 不要)
 - dual-stream token contract (`A_t / B_t`) は維持する
 
 ## 1. 学習成果物
@@ -57,14 +56,7 @@ mainline の TTS 監督は次を使います。
 
 互換 alias:
 
-- `explicit_state.npy` (`voice_state.npy` の legacy / compatibility alias)
-
-互換用 legacy artifact:
-
-- `durations.npy`
-- `TextGrid`
-
-これらは比較実験や旧経路の検証では読めますが、mainline 学習の必須条件ではありません。
+- `explicit_state.npy` (`voice_state.npy` の alias)
 
 ## 4. dev.py ベースの標準フロー
 
@@ -79,39 +71,55 @@ uv run python dev.py
 ### 4.2 推奨順序
 
 1. `6` 設定初期化
-2. `4` データセット追加
-3. `1` フル学習 (前処理 + 学習) [v3 pointer]
+2. `4` データセット追加 (raw_dir, language 設定)
+3. `1` フル学習 (前処理 + 学習)
 4. `8` Codec 学習
 5. `7` 学習成果物を確定
 6. `11` 推論サーバー起動
 
-`1` が v3 mainline の推奨フローです。MFA を必要とせず、前処理→学習を一括実行します。
+`1` が推奨フローです。前処理→学習を一括実行します。
 
 ### 4.3 再学習
 
 前処理済み cache を再利用する場合:
 
-1. `2` 既存キャッシュで学習のみ [v3 pointer]
+1. `2` 既存キャッシュで学習のみ
 2. `7` 成果物を確定
 3. `11` 推論サーバー起動
 
-### 4.4 v2 Legacy フロー
+### 4.4 キュレーション経由のデータ準備
 
-MFA ベースの duration 学習が必要な場合は `12` (v2 legacy MFA学習) を使用してください。
+raw音声から学習データを準備する場合:
+
+1. `13` キュレーション: 音声ファイル取込 (ingest)
+2. `14` キュレーション: スコアリング & 昇格判定 (run)
+3. `16` キュレーション: エクスポート (promoted → cache)
+4. `1` フル学習
 
 ## 5. CLI ベースの実行
 
-### 5.1 v3 ポインタモード統合パイプライン (推奨)
+### 5.1 前処理のみ
+
+```bash
+uv run tmrvc-preprocess \
+  --raw-dir /path/to/raw \
+  --cache-dir experiments/cache \
+  --dataset mydata \
+  --language ja \
+  --workers 2
+```
+
+### 5.2 統合パイプライン (推奨)
 
 ```bash
 uv run tmrvc-train-pipeline \
   --output-dir experiments \
   --workers 2 \
-  --seed 42 \
-  --tts-mode pointer
+  --train-device cuda \
+  --seed 42
 ```
 
-### 5.2 既存 cache で v3 ポインタ学習のみ
+### 5.3 既存 cache で学習のみ
 
 ```bash
 uv run tmrvc-train-pipeline \
@@ -119,18 +127,7 @@ uv run tmrvc-train-pipeline \
   --cache-dir experiments/<exp_id>/cache \
   --skip-preprocess \
   --train-device cuda \
-  --seed 42 \
-  --tts-mode pointer
-```
-
-### 5.3 v2 Legacy (MFA duration モード)
-
-```bash
-uv run tmrvc-train-pipeline \
-  --output-dir experiments \
-  --workers 2 \
-  --seed 42 \
-  --tts-mode legacy_duration
+  --seed 42
 ```
 
 ### 5.4 codec 学習
@@ -142,7 +139,33 @@ uv run tmrvc-train-codec \
   --device cuda
 ```
 
-## 6. Quality Gate
+### 5.5 UCLM 単体学習 (cache 既存)
+
+```bash
+uv run tmrvc-train-uclm \
+  --cache-dir experiments/<exp_id>/cache \
+  --output-dir checkpoints/uclm \
+  --batch-size 16 \
+  --max-steps 10000 \
+  --device cuda
+```
+
+## 6. 利用可能な CLI コマンド一覧
+
+| コマンド | パッケージ | 説明 |
+|---|---|---|
+| `tmrvc-preprocess` | tmrvc-data | 音声の前処理・特徴量抽出 |
+| `tmrvc-extract-features` | tmrvc-data | 特徴量抽出のみ |
+| `tmrvc-verify-cache` | tmrvc-data | cache 整合性検証 |
+| `tmrvc-prepare-uclm` | tmrvc-data | UCLM 用データ準備 |
+| `tmrvc-curate` / `tmrvc-curation` | tmrvc-data | キュレーション CLI |
+| `tmrvc-train-pipeline` | tmrvc-train | 統合学習パイプライン (推奨) |
+| `tmrvc-train-uclm` | tmrvc-train | UCLM 単体学習 |
+| `tmrvc-train-codec` | tmrvc-train | Codec 学習 |
+| `tmrvc-finetune-encodec` | tmrvc-train | EnCodec fine-tuning |
+| `tmrvc-serve` | tmrvc-serve | 推論サーバー起動 |
+
+## 7. Quality Gate
 
 学習前に cache 品質を検査します。主な検査対象は次のとおりです。
 
@@ -154,32 +177,22 @@ uv run tmrvc-train-codec \
 
 legacy alignment coverage は mainline fail 条件ではなく、別指標として扱います。
 
-## 7. G2P と言語依存
+## 8. G2P と言語依存
 
-### 7.1 日本語
+### 8.1 日本語
 
 - backend: `pyopenjtalk`
 - dataset `language: ja`
 
-### 7.2 英語
+### 8.2 英語
 
 - backend: `phonemizer`
 - system dependency: `espeak-ng`
 - dataset `language: en`
 
-### 7.3 多言語運用
+### 8.3 多言語運用
 
 多言語コーパスであっても、`datasets.yaml` の 1 entry は単一言語に分割してください。language ごとに backend と text normalization が異なるため、混在運用は mainline 品質を崩します。
-
-## 8. legacy 経路
-
-`dev.py` の `12` と `13` は legacy alignment utilities です。
-
-- 比較実験
-- 旧 checkpoint 再現
-- デバッグ
-
-には使えますが、mainline 仕様ではありません。新規学習での標準フローとしては扱いません。
 
 ## 9. 次に参照すべき文書
 

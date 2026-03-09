@@ -13,6 +13,8 @@ import logging
 import os
 from pathlib import Path
 
+from tmrvc_core.constants import SERVE_PORT
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -27,8 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="Bind port (default: 8000).",
+        default=SERVE_PORT,
+        help=f"Bind port (default: {SERVE_PORT}).",
     )
     parser.add_argument(
         "--uclm-checkpoint",
@@ -58,7 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable auto-reload (development).",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Verbose logging.",
     )

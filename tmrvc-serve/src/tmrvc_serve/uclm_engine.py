@@ -374,11 +374,11 @@ class UCLMEngine:
         reference_audio: torch.Tensor | None = None,
         reference_codec_tokens: torch.Tensor | None = None,
         speaker_embed: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
         """Encode reference audio for few-shot speaker adaptation.
 
         Returns:
-            (refined_speaker_embed, prompt_summary_tokens, encoding_time_ms)
+            (refined_speaker_embed, prompt_summary_tokens, vq_loss, encoding_time_ms)
         """
         self._require_loaded()
         t0 = time.perf_counter()
@@ -387,14 +387,16 @@ class UCLMEngine:
             reference_codec_tokens = self.codec_enc(reference_audio)
 
         if reference_codec_tokens is not None:
-            # UCLM v3: Returns (refined_speaker_embed, prompt_summary_tokens)
-            refined_embed, summary_tokens = self.uclm_core_model.encode_speaker_prompt(
+            # UCLM v3: Returns (refined_speaker_embed, prompt_summary_tokens, vq_loss)
+            refined_embed, summary_tokens, vq_loss = self.uclm_core_model.encode_speaker_prompt(
                 reference_codec_tokens.to(self.device),
                 speaker_embed.to(self.device) if speaker_embed is not None else None,
             )
+            vq_loss_val = vq_loss.item() if isinstance(vq_loss, torch.Tensor) else float(vq_loss)
         elif speaker_embed is not None:
             refined_embed = speaker_embed.to(self.device)
             summary_tokens = None
+            vq_loss_val = 0.0
         else:
             raise ValueError("No speaker identity evidence provided")
 
@@ -417,7 +419,7 @@ class UCLMEngine:
                 )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        return refined_embed, summary_tokens, elapsed_ms
+        return refined_embed, summary_tokens, vq_loss_val, elapsed_ms
 
     # ------------------------------------------------------------------
     # SpeakerProfile runtime behaviour (Worker 04, task 25)
@@ -693,7 +695,7 @@ class UCLMEngine:
                 
                 # Re-encode to get summary tokens (using the model's resampler internally)
                 # Note: encode_speaker_prompt should return summary_tokens in v3
-                _, prompt_summary_tokens, _ = self.encode_speaker_prompt(
+                _, prompt_summary_tokens, _, _ = self.encode_speaker_prompt(
                     reference_codec_tokens=prompt_tokens,
                     speaker_embed=speaker_embed
                 )

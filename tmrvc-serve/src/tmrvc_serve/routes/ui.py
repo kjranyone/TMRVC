@@ -16,13 +16,17 @@ import json
 import logging
 import time
 import uuid
+import base64
+import io
 from typing import AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
+import torch
+import scipy.io.wavfile as wavfile
 
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 from tmrvc_data.curation.models import RecordStatus, PromotionBucket
 from tmrvc_data.curation.data_service import CurationDataService
 from tmrvc_serve.events import SSEEvent, SSEEventType
@@ -142,6 +146,9 @@ class WorkshopGenerateResponse(BaseModel):
     job_id: str
     takes: List[str] = Field(default_factory=list)  # take IDs
     status: str = "pending"
+    audio_base64: Optional[str] = None
+    sample_rate: Optional[int] = None
+    duration_sec: Optional[float] = None
 
 
 class WorkshopSessionRequest(BaseModel):
@@ -221,305 +228,7 @@ class TakeExportResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# SSE event stream (Worker 04, task 22)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Worker 04 Task 14: WebUI-facing orchestration and evaluation routes
-# ---------------------------------------------------------------------------
-
-@router.post("/datasets/upload", response_model=DatasetUploadResponse)
-async def upload_dataset(file: UploadFile = File(...)):
-    """Stub for uploading dataset zip/tar via browser."""
-    return DatasetUploadResponse(job_id=f"job_upload_{uuid.uuid4().hex[:8]}")
-
-@router.post("/datasets/register", response_model=DatasetRegisterResponse)
-async def register_dataset(req: DatasetRegisterRequest):
-    """Stub for registering an existing server-side directory."""
-    return DatasetRegisterResponse(
-        dataset_id=f"ds_{uuid.uuid4().hex[:8]}", 
-        name=req.name
-    )
-
-@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job(job_id: str):
-    """Get status of any long-running job (stub)."""
-    # TODO: Wire to actual job tracking once orchestrator is integrated
-    return JobStatusResponse(
-        job_id=job_id,
-        status="pending",
-        progress=0.0,
-    )
-
-@router.post("/curation/runs", response_model=CurationRunResponse)
-async def create_curation_run(req: CurationRunRequest):
-    """Stub for starting a full curation pipeline run."""
-    run_id = f"run_{uuid.uuid4().hex[:8]}"
-    return CurationRunResponse(run_id=run_id, dataset_id=req.dataset_id)
-
-@router.post("/curation/runs/{run_id}/resume")
-async def resume_curation_run(run_id: str):
-    """Stub for resuming a stopped/failed curation run."""
-    return {"status": "resumed", "run_id": run_id}
-
-@router.post("/curation/runs/{run_id}/stop")
-async def stop_curation_run(run_id: str):
-    """Stub for stopping an active curation run."""
-    return {"status": "stopped", "run_id": run_id}
-
-@router.post("/workshop/generate")
-async def workshop_generate():
-    """Stub for generating multi-take variations."""
-    return {"take_ids": [f"take_{uuid.uuid4().hex[:8]}" for _ in range(3)]}
-
-@router.post("/workshop/takes/{take_id}/pin")
-async def workshop_pin_take(take_id: str):
-    """Stub for pinning a selected take."""
-    return {"status": "pinned", "take_id": take_id}
-
-@router.post("/workshop/takes/{take_id}/export")
-async def workshop_export_take(take_id: str):
-    """Stub for exporting a take."""
-    return {"status": "exported", "take_id": take_id}
-
-@router.post("/workshop/sessions")
-async def create_workshop_session():
-    """Stub for creating a persisted workshop session."""
-    return {"session_id": f"ws_{uuid.uuid4().hex[:8]}"}
-
-@router.post("/eval/sessions")
-async def create_eval_session(req: Dict):
-    """Stub for creating a blind A/B evaluation session."""
-    session_id = f"eval_{uuid.uuid4().hex[:8]}"
-    n_assignments = req.get("n_assignments", 10)
-    assignments = [f"asn_{uuid.uuid4().hex[:8]}" for _ in range(n_assignments)]
-    return {"session_id": session_id, "assignments": assignments}
-
-@router.get("/eval/assignments/{assignment_id}")
-async def get_eval_assignment(assignment_id: str):
-    """Stub for getting a specific A/B pair to rate."""
-    return {
-        "assignment_id": assignment_id,
-        "text": "This is a sample evaluation text.",
-        "sample_a_url": f"/media/{assignment_id}_a.wav",
-        "sample_b_url": f"/media/{assignment_id}_b.wav",
-    }
-
-@router.post("/eval/assignments/{assignment_id}/submit")
-async def submit_eval_assignment(assignment_id: str, req: Dict):
-    """Stub for submitting an evaluation rating."""
-    return {"status": "submitted", "assignment_id": assignment_id}
-
-# ---------------------------------------------------------------------------
-# Existing Event Stream and Curation Routes
-# ---------------------------------------------------------------------------
-
-@router.get("/events")
-async def event_stream(
-    request: Request,
-    last_event_id: Optional[str] = None,
-):
-    """SSE Event Stream for job progress and telemetry (Worker 04 requirement).
-
-    Supports resumable streaming via Last-Event-ID header or query parameter.
-    """
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        while True:
-            # Check for client disconnect
-            if await request.is_disconnected():
-                break
-
-            # Emit periodic telemetry heartbeat
-            evt = SSEEvent(
-                event_type=SSEEventType.TELEMETRY_UPDATE,
-                data={"active_jobs": 0},
-            )
-            yield evt.to_sse()
-            await asyncio.sleep(2.0)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-# ---------------------------------------------------------------------------
-# Dataset routes
-# ---------------------------------------------------------------------------
-
-
-@router.post("/datasets/upload")
-async def upload_dataset(
-    file: UploadFile = File(None),
-    idempotency_key: Optional[str] = Header(None),
-):
-    """Upload a dataset archive for processing."""
-    job_id = uuid.uuid4().hex[:16]
-    return DatasetUploadResponse(job_id=job_id, status="accepted")
-
-
-@router.post("/datasets/register", response_model=DatasetRegisterResponse)
-async def register_dataset(
-    req: DatasetRegisterRequest,
-    idempotency_key: Optional[str] = Header(None),
-):
-    """Register an existing dataset path."""
-    dataset_id = f"ds-{uuid.uuid4().hex[:8]}"
-    return DatasetRegisterResponse(
-        dataset_id=dataset_id,
-        name=req.name,
-        status="registered",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Job routes
-# ---------------------------------------------------------------------------
-
-
-@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str):
-    """Get the status of a long-running job."""
-    # Stub: in production, this looks up from a job store
-    return JobStatusResponse(
-        job_id=job_id,
-        job_type="unknown",
-        status="pending",
-        progress=0.0,
-    )
-
-
-@router.get("/jobs/{job_id}/events")
-async def job_event_stream(
-    request: Request,
-    job_id: str,
-    last_event_id: Optional[str] = None,
-):
-    """SSE stream of events for a specific job.
-
-    Resumable via Last-Event-ID or query parameter.
-    """
-
-    async def _stream() -> AsyncGenerator[str, None]:
-        while True:
-            if await request.is_disconnected():
-                break
-
-            evt = SSEEvent(
-                event_type=SSEEventType.JOB_PROGRESS,
-                job_id=job_id,
-                data={"progress": 0.0, "status": "pending"},
-            )
-            yield evt.to_sse()
-            await asyncio.sleep(2.0)
-
-    return StreamingResponse(_stream(), media_type="text/event-stream")
-
-
-# ---------------------------------------------------------------------------
-# Curation routes
-# ---------------------------------------------------------------------------
-
-
-@router.post("/curation/runs", response_model=CurationRunResponse)
-async def create_curation_run(
-    req: CurationRunRequest,
-    idempotency_key: Optional[str] = Header(None),
-):
-    """Start a new curation run on a dataset."""
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
-    return CurationRunResponse(
-        run_id=run_id,
-        dataset_id=req.dataset_id,
-        status="pending",
-    )
-
-
-@router.post("/curation/runs/{run_id}/resume")
-async def resume_curation_run(run_id: str):
-    """Resume a paused curation run."""
-    return {"run_id": run_id, "status": "resumed"}
-
-
-@router.post("/curation/runs/{run_id}/stop")
-async def stop_curation_run(run_id: str):
-    """Stop a running curation run."""
-    return {"run_id": run_id, "status": "stopped"}
-
-
-@router.get("/curation/records")
-async def list_records(
-    status: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    ds: CurationDataService = Depends(get_data_service),
-):
-    """Authoritative API for manifest browsing (Worker 07/12)."""
-    records = ds.query_records(status=status, limit=limit, offset=offset)
-    return [r.to_dict() for r in records]
-
-
-@router.get("/curation/records/{record_id}")
-async def get_record(
-    record_id: str,
-    ds: CurationDataService = Depends(get_data_service),
-):
-    """Get a single curation record by ID."""
-    record = ds.get_record(record_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Record not found")
-    return record.to_dict()
-
-
-@router.post("/curation/records/{record_id}/action")
-async def update_record_status(
-    record_id: str,
-    req: CurationActionRequest,
-    idempotency_key: Optional[str] = Header(None),
-    ds: CurationDataService = Depends(get_data_service),
-):
-    """Update record status with optimistic locking and idempotency (Worker 04/07)."""
-    # 1. Fetch record
-    record = ds.get_record(record_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Record not found")
-
-    # 2. Check metadata version (Optimistic Locking)
-    if record.metadata_version != req.metadata_version:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "stale_version",
-                "current_version": record.metadata_version,
-                "message": "The record has been modified by another user.",
-            },
-        )
-
-    # 3. Apply action
-    if req.action == "promote":
-        record.status = RecordStatus.PROMOTED
-        if req.bucket:
-            record.promotion_bucket = PromotionBucket(req.bucket)
-    elif req.action == "reject":
-        record.status = RecordStatus.REJECTED
-    elif req.action == "review":
-        record.status = RecordStatus.REVIEW
-
-    # 4. Save with audit log
-    success = ds.update_record(
-        record,
-        actor_id=req.actor_id,
-        action_type=f"ui_{req.action}",
-        rationale=req.rationale,
-    )
-
-    if not success:
-        raise HTTPException(status_code=409, detail="conflict_retry")
-
-    return {"status": "ok", "new_version": record.metadata_version}
-
-
-# ---------------------------------------------------------------------------
-# Workshop routes
+# Workshop routes (Worker 04 Tier 1 implementation)
 # ---------------------------------------------------------------------------
 
 
@@ -529,15 +238,57 @@ async def workshop_generate(
     idempotency_key: Optional[str] = Header(None),
 ):
     """Generate one or more takes for the drama workshop."""
-    job_id = f"wk-{uuid.uuid4().hex[:8]}"
-    take_ids = [f"take-{uuid.uuid4().hex[:8]}" for _ in range(req.n_takes)]
+    from tmrvc_serve.app import get_engine
+    from tmrvc_data.g2p import text_to_phonemes
 
-    # In production, this enqueues generation jobs and returns immediately.
-    return WorkshopGenerateResponse(
-        job_id=job_id,
-        takes=take_ids,
-        status="pending",
-    )
+    engine = get_engine()
+    job_id = f"wk-{uuid.uuid4().hex[:8]}"
+
+    try:
+        g2p_result = text_to_phonemes(req.text)
+        phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+        supra_t = g2p_result.text_suprasegmentals
+
+        speaker_profile = None
+        if req.speaker_profile_id:
+            speaker_profile = engine.load_speaker_profile(req.speaker_profile_id)
+
+        evs = None
+        if req.explicit_voice_state:
+            evs = torch.tensor(req.explicit_voice_state).float().view(1, 1, 8)
+
+        audio_t, stats = engine.tts(
+            phonemes=phonemes_t,
+            speaker_profile=speaker_profile,
+            text_suprasegmentals=supra_t,
+            explicit_voice_state=evs,
+            pace=req.pace,
+            hold_bias=req.hold_bias,
+            boundary_bias=req.boundary_bias,
+            cfg_scale=req.cfg_scale,
+            cfg_mode=req.cfg_mode,
+            language_id=g2p_result.language_id,
+        )
+
+        audio_np = audio_t.detach().cpu().numpy()
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        
+        buf = io.BytesIO()
+        wavfile.write(buf, engine.FRAME_SAMPLE_RATE, audio_int16)
+        audio_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        return WorkshopGenerateResponse(
+            job_id=job_id,
+            takes=[f"take-{uuid.uuid4().hex[:8]}"],
+            status="completed",
+            audio_base64=audio_b64,
+            sample_rate=engine.FRAME_SAMPLE_RATE,
+            duration_sec=float(len(audio_int16) / engine.FRAME_SAMPLE_RATE),
+        )
+
+    except Exception as e:
+        logger.exception("Workshop generation failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/workshop/takes/{take_id}/pin", response_model=TakePinResponse)
@@ -573,50 +324,96 @@ async def create_workshop_session(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation routes
+# Curation routes
 # ---------------------------------------------------------------------------
 
 
-@router.post("/eval/sessions", response_model=EvalSessionResponse)
-async def create_eval_session(
-    req: EvalSessionRequest,
-    idempotency_key: Optional[str] = Header(None),
+@router.get("/curation/records")
+async def list_records(
+    status: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    ds: CurationDataService = Depends(get_data_service),
 ):
-    """Create a new evaluation session with assignments."""
-    session_id = f"ev-{uuid.uuid4().hex[:8]}"
-    assignment_ids = [
-        f"asgn-{uuid.uuid4().hex[:8]}" for _ in range(req.n_assignments)
-    ]
-    return EvalSessionResponse(
-        session_id=session_id,
-        assignments=assignment_ids,
-        status="created",
-    )
+    """Authoritative API for manifest browsing (Worker 07/12)."""
+    records = ds.query_records(status=status, limit=limit, offset=offset)
+    return [r.to_dict() for r in records]
 
 
-@router.get(
-    "/eval/assignments/{assignment_id}",
-    response_model=EvalAssignmentResponse,
-)
-async def get_eval_assignment(assignment_id: str):
-    """Get a single evaluation assignment."""
-    return EvalAssignmentResponse(
-        assignment_id=assignment_id,
-        status="pending",
-    )
-
-
-@router.post(
-    "/eval/assignments/{assignment_id}/submit",
-    response_model=EvalSubmitResponse,
-)
-async def submit_eval_assignment(
-    assignment_id: str,
-    req: EvalSubmitRequest,
-    idempotency_key: Optional[str] = Header(None),
+@router.get("/curation/records/{record_id}")
+async def get_record(
+    record_id: str,
+    ds: CurationDataService = Depends(get_data_service),
 ):
-    """Submit an evaluation rating for an assignment."""
-    return EvalSubmitResponse(
-        assignment_id=assignment_id,
-        status="submitted",
+    """Get a single curation record by ID."""
+    record = ds.get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return record.to_dict()
+
+
+@router.post("/curation/records/{record_id}/action")
+async def update_record_status(
+    record_id: str,
+    req: CurationActionRequest,
+    idempotency_key: Optional[str] = Header(None),
+    ds: CurationDataService = Depends(get_data_service),
+):
+    """Update record status with optimistic locking and idempotency (Worker 04/07)."""
+    record = ds.get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    if record.metadata_version != req.metadata_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "stale_version",
+                "current_version": record.metadata_version,
+                "message": "The record has been modified by another user.",
+            },
+        )
+
+    if req.action == "promote":
+        record.status = RecordStatus.PROMOTED
+        if req.bucket:
+            record.promotion_bucket = PromotionBucket(req.bucket)
+    elif req.action == "reject":
+        record.status = RecordStatus.REJECTED
+    elif req.action == "review":
+        record.status = RecordStatus.REVIEW
+
+    success = ds.update_record(
+        record,
+        actor_id=req.actor_id,
+        action_type=f"ui_{req.action}",
+        rationale=req.rationale,
     )
+
+    if not success:
+        raise HTTPException(status_code=409, detail="conflict_retry")
+
+    return {"status": "ok", "new_version": record.metadata_version}
+
+
+# ---------------------------------------------------------------------------
+# Job routes
+# ---------------------------------------------------------------------------
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get the status of a long-running job."""
+    return JobStatusResponse(job_id=job_id, status="pending", progress=0.0)
+
+
+@router.get("/events")
+async def event_stream(request: Request):
+    """SSE Event Stream for job progress and telemetry (Worker 04 requirement)."""
+    async def event_generator() -> AsyncGenerator[str, None]:
+        while True:
+            if await request.is_disconnected(): break
+            evt = SSEEvent(event_type=SSEEventType.TELEMETRY_UPDATE, data={"active_jobs": 0})
+            yield evt.to_sse()
+            await asyncio.sleep(2.0)
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

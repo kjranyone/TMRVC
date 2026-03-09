@@ -1,77 +1,157 @@
-sample_rate: 24000
-n_fft: 1024
-hop_length: 240
-window_length: 960
-n_mels: 80
-n_freq_bins: 513
-mel_fmin: 0.0
-mel_fmax: 12000.0
-log_floor: 1.0e-10
-loudness_target_lufs: -23.0
-segment_min_sec: 0.5
-segment_max_sec: 30.0
-d_model: 512
-d_speaker: 192
-d_f0: 2
-n_codebooks: 8
-rvq_vocab_size: 1024
-control_slots: 4
-control_vocab_size: 64
-d_voice_state: 8
-d_voice_state_explicit: 8
-d_voice_state_ssl: 128
-codebook_dim: 128
-latent_dim: 512
-enc_state_dim: 512
-enc_state_frames: 32
-dec_state_dim: 256
-dec_state_frames: 32
-d_event_trace: 64
-uclm_vq_bins: 128
-# Active canonical symbol count is managed by tmrvc_data.g2p PHONE2ID.
-# This capacity value must always exceed the active count by at least 20
-# symbols to allow append-only multilingual expansion without retraining
-# embeddings. If active_phone_inventory count exceeds
-# (phoneme_vocab_size - 20), Worker 03 must file a capacity-expansion
-# request before new languages are added.
-phoneme_vocab_size: 200
-n_languages: 4
-lora_rank: 4
-lora_alpha: 8
-lora_delta_size: 32768
-d_scene_state: 64
-uclm_n_heads: 8
-uclm_n_layers: 12
-uclm_dropout: 0.1
-uclm_max_seq_len: 2048
-uclm_context_frames: 200
-uclm_block_size: 4
-# v2 legacy VC only; v3 mainline VC must not consume this constant.
-max_lookahead_hops_v2_legacy: 6
-hq_threshold_q: 0.3
-f0_smoothing_frames: 5
-d_style: 128
-d_prosody: 128
-n_kv_heads: 2
-d_text_encoder: 256
-n_text_encoder_layers: 6
-n_text_encoder_heads: 4
-text_encoder_ff_dim: 1024
-n_voice_source_params: 8
-n_acoustic_params: 32
-d_suprasegmental: 4
-cfg_scale_default: 1.5
-cfg_scale_max: 3.0
-n_prompt_summary_tokens: 32
-max_prompt_seconds_active: 10.0
-max_prompt_frames: 1000
-max_prompt_kv_tokens: 512
-max_prompt_cache_bytes: 52428800
-max_frames_per_unit: 50
-skip_protection_threshold: 0.3
-max_text_units_active: 512
-max_dialogue_context_units: 1024
-max_acoustic_history_frames: 2000
-max_cross_attn_kv_bytes: 104857600
-streaming_latency_budget_ms: 10.0
+# TMRVC Constants Configuration Example
+# このファイルを constants.yaml にコピーして環境に合わせて編集する。
+# 全ての数値定数の単一正本（Single Source of Truth）。
+
+# =============================================================================
+# Audio Frontend (音声フロントエンド)
+# =============================================================================
+
+sample_rate: 24000        # サンプリングレート [Hz]。全モデルで固定。
+n_fft: 1024               # STFT フレームサイズ [samples]
+hop_length: 240           # ホップ長 [samples] = 10ms @ 24kHz。因果クロックの基準。
+window_length: 960        # 窓長 [samples] = 40ms @ 24kHz
+n_mels: 80                # メルスペクトログラムの周波数ビン数
+n_freq_bins: 513          # 線形スペクトログラムの周波数ビン数 (= n_fft // 2 + 1)
+mel_fmin: 0.0             # メルフィルタバンクの最低周波数 [Hz]
+mel_fmax: 12000.0         # メルフィルタバンクの最高周波数 [Hz]
+log_floor: 1.0e-10        # 対数スペクトログラムの下限値（ゼロ除算防止）
+loudness_target_lufs: -23.0  # ラウドネス正規化ターゲット [LUFS]
+segment_min_sec: 0.5      # 前処理で許容する最小セグメント長 [秒]
+segment_max_sec: 30.0     # 前処理で許容する最大セグメント長 [秒]
+
+# =============================================================================
+# Model Architecture (モデルアーキテクチャ)
+# =============================================================================
+
+d_model: 512              # Transformer 隠れ層次元数
+d_speaker: 192            # 話者埋め込み次元数
+d_f0: 2                   # F0 表現次元数 (log-f0, voicing)
+n_codebooks: 8            # RVQ コードブック数（音響トークン）
+rvq_vocab_size: 1024      # RVQ 語彙サイズ
+control_slots: 4          # 制御トークンスロット数
+control_vocab_size: 64    # 制御トークン語彙サイズ
+d_voice_state: 8          # Voice State 次元数（物理パラメータ）
+d_voice_state_explicit: 8    # 明示的 Voice State 次元数
+d_voice_state_ssl: 128    # SSLベース Voice State 潜在次元数
+codebook_dim: 128         # コードブック埋め込み次元数
+latent_dim: 512           # 潜在空間次元数
+enc_state_dim: 512        # Codec エンコーダ状態次元数
+enc_state_frames: 32      # エンコーダ状態フレーム数
+dec_state_dim: 256        # Codec デコーダ状態次元数
+dec_state_frames: 32      # デコーダ状態フレーム数
+d_event_trace: 64         # イベントトレース次元数
+uclm_vq_bins: 128         # UCLM VQ ビン数
+
+# =============================================================================
+# Text & Language (テキスト・言語)
+# =============================================================================
+
+phoneme_vocab_size: 200   # 音素語彙容量。実効シンボル数 + 20 以上を維持。
+                         # 新言語追加時は Worker 03 で容量拡張リクエストが必要。
+n_languages: 4            # サポート言語数
+
+# =============================================================================
+# LoRA Adapters (LoRA アダプタ)
+# =============================================================================
+
+lora_rank: 4              # LoRA ランク
+lora_alpha: 8             # LoRA スケーリング係数
+lora_delta_size: 32768    # LoRA delta パラメータ数
+
+# =============================================================================
+# UCLM Core (UCLM コア)
+# =============================================================================
+
+d_scene_state: 64         # シーン状態次元数
+uclm_n_heads: 8           # UCLM アテンションヘッド数
+uclm_n_layers: 12         # UCLM Transformer 層数
+uclm_dropout: 0.1         # UCLM ドロップアウト率
+uclm_max_seq_len: 2048    # UCLM 最大シーケンス長
+uclm_context_frames: 200  # UCLM コンテキストフレーム数
+uclm_block_size: 4        # UCLM ブロックサイズ
+
+# =============================================================================
+# Legacy (v2 レガシー)
+# =============================================================================
+
+max_lookahead_hops_v2_legacy: 6  # v2 VC 専用の先読みホップ数。v3 mainline では使用禁止。
+
+# =============================================================================
+# Quality & Smoothing (品質・スムージング)
+# =============================================================================
+
+hq_threshold_q: 0.3       # 高品質判定閾値（キュレーションスコアリング用）
+f0_smoothing_frames: 5    # F0 スムージングフレーム数
+
+# =============================================================================
+# Prosody & Style (韻律・スタイル)
+# =============================================================================
+
+d_style: 128              # スタイル埋め込み次元数
+d_prosody: 128            # 韻律潜在次元数
+d_suprasegmental: 4       # 超分節特徴次元数（文アクセント・境界など）
+
+# =============================================================================
+# Text Encoder (テキストエンコーダ)
+# =============================================================================
+
+d_text_encoder: 256       # テキストエンコーダ出力次元数
+n_text_encoder_layers: 6  # テキストエンコーダ層数
+n_text_encoder_heads: 4   # テキストエンコーダヘッド数
+text_encoder_ff_dim: 1024  # テキストエンコーダ FFN 次元数
+
+# =============================================================================
+# Acoustic Parameters (音響パラメータ)
+# =============================================================================
+
+n_voice_source_params: 8   # 音源パラメータ数
+n_acoustic_params: 32      # 音響パラメータ数
+
+# =============================================================================
+# Attention (アテンション)
+# =============================================================================
+
+n_kv_heads: 2             # GQA (Grouped Query Attention) KV ヘッド数
+
+# =============================================================================
+# CFG (Classifier-Free Guidance)
+# =============================================================================
+
+cfg_scale_default: 1.5    # CFG スケール デフォルト値
+cfg_scale_max: 3.0        # CFG スケール 最大値（安全性制限）
+
+# =============================================================================
+# Speaker Prompt (話者プロンプト)
+# =============================================================================
+
+n_prompt_summary_tokens: 32   # プロンプト要約トークン数
+max_prompt_seconds_active: 10.0  # アクティブプロンプト最大長 [秒]
+max_prompt_frames: 1000       # プロンプト最大フレーム数
+max_prompt_kv_tokens: 512     # プロンプト KV キャッシュ最大トークン数
+max_prompt_cache_bytes: 52428800  # プロンプトキャッシュ最大サイズ [bytes] = 50MB
+
+# =============================================================================
+# Streaming & Memory (ストリーミング・メモリ)
+# =============================================================================
+
+max_frames_per_unit: 50   # 1テキストユニットあたり最大フレーム数（ポインタ停滞保護）
+skip_protection_threshold: 0.3  # スキップ保護閾値
+max_text_units_active: 512    # アクティブテキストユニット最大数
+max_dialogue_context_units: 1024  # 対話コンテキスト最大ユニット数
+max_acoustic_history_frames: 2000  # 音響履歴最大フレーム数
+max_cross_attn_kv_bytes: 104857600  # Cross-Attention KV 最大サイズ [bytes] = 100MB
+streaming_latency_budget_ms: 10.0   # ストリーミングレイテンシ予算 [ms]
+
+# =============================================================================
+# Hardware Class (ハードウェアクラス)
+# =============================================================================
+
 streaming_hardware_class_primary: "single_nvidia_rtx_2080ti_22gb_cuda12_sdpa"
+                          # プライマリ検証ハードウェアクラス識別子
+
+# =============================================================================
+# Server Ports (サーバーポート)
+# =============================================================================
+
+serve_port: 8000          # tmrvc-serve FastAPI ポート
+gui_port: 7860            # tmrvc-gui Gradio ポート

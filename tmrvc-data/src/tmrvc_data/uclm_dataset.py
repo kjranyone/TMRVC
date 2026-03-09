@@ -83,6 +83,8 @@ class UCLMBatch:
     voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
     voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool
     voice_state_confidence: Optional[torch.Tensor] = None     # [B, T, 8]
+    # Few-shot prompt tokens (Worker 02 Task 14)
+    prompt_codec_tokens: Optional[torch.Tensor] = None  # [B, T_prompt, n_codebooks]
 
 
 class UCLMDataset(Dataset):
@@ -146,6 +148,7 @@ class UCLMDataset(Dataset):
         self.provenance_filter = provenance_filter
 
         self.utterances: list[dict[str, Any]] = []
+        self.speaker_to_indices: dict[str, list[int]] = {}
         self._scan_utterances()
 
         logger.info(
@@ -179,7 +182,8 @@ class UCLMDataset(Dataset):
                 continue
 
             for speaker_dir in train_dir.iterdir():
-                if not speaker_dir.is_dir() or speaker_dir.name in self.exclude_speakers:
+                speaker_id = speaker_dir.name
+                if not speaker_dir.is_dir() or speaker_id in self.exclude_speakers:
                     continue
 
                 for utt_dir in speaker_dir.iterdir():
@@ -187,8 +191,6 @@ class UCLMDataset(Dataset):
                         continue
 
                     # Check for required core files.
-                    # durations.npy is NOT required -- v3 pointer mode
-                    # does not use external duration labels.
                     codec_path = utt_dir / "codec_tokens.npy"
                     voice_path = utt_dir / "voice_state.npy"
                     meta_path = utt_dir / "meta.json"
@@ -216,10 +218,11 @@ class UCLMDataset(Dataset):
                         if meta.get("provenance_class", "") != self.provenance_filter:
                             continue
 
+                    idx = len(self.utterances)
                     self.utterances.append(
                         {
                             "utterance_id": meta.get("utterance_id", utt_dir.name),
-                            "speaker_id": meta.get("speaker_id", speaker_dir.name),
+                            "speaker_id": speaker_id,
                             "dataset": dataset_dir.name,
                             "path": utt_dir,
                             "n_frames": n_frames,
@@ -227,9 +230,30 @@ class UCLMDataset(Dataset):
                             "meta": meta,
                         }
                     )
+                    if speaker_id not in self.speaker_to_indices:
+                        self.speaker_to_indices[speaker_id] = []
+                    self.speaker_to_indices[speaker_id].append(idx)
 
     def __len__(self) -> int:
         return len(self.utterances)
+
+    def get_random_prompt(self, speaker_id: str, exclude_idx: int | None = None) -> dict[str, Any] | None:
+        """Sample a random 3-10s prompt from the same speaker (Worker 02 Task 14)."""
+        indices = self.speaker_to_indices.get(speaker_id, [])
+        if exclude_idx is not None:
+            indices = [i for i in indices if i != exclude_idx]
+        
+        if not indices:
+            return None
+            
+        # Try to find a prompt with 3-10s duration (roughly 300-1000 frames)
+        # Fallback to any clip if none in range.
+        candidates = [i for i in indices if 300 <= self.utterances[i]["n_frames"] <= 1000]
+        if not candidates:
+            candidates = indices
+            
+        prompt_idx = np.random.choice(candidates)
+        return self.__getitem__(int(prompt_idx), return_prompt=False)
 
     def supervision_report(self) -> dict:
         """Return dataset-level supervision statistics (Worker 03 requirement).
@@ -379,7 +403,7 @@ class UCLMDataset(Dataset):
             "expressive_readiness_score": sum(counts.values()) / (len(fields) * total) if total > 0 else 0
         }
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
+    def __getitem__(self, idx: int, return_prompt: bool = True) -> dict[str, Any]:
         utt = self.utterances[idx]
         utt_path = utt["path"]
         meta = utt.get("meta", {})
@@ -477,7 +501,7 @@ class UCLMDataset(Dataset):
         prompt_eligible = meta.get("prompt_eligible")
         prompt_pair_id = meta.get("prompt_pair_id")
 
-        return {
+        res = {
             "codec_tokens": codec_tokens,
             "voice_state": voice_state,
             "phoneme_ids": phoneme_ids,
@@ -485,6 +509,7 @@ class UCLMDataset(Dataset):
             "spk_embed": spk_embed,
             "text": utt["text"],
             "utterance_id": utt["utterance_id"],
+            "speaker_id": utt["speaker_id"],
             "n_frames": utt["n_frames"],
             "dialogue_context": dialogue_context,
             "acting_intent": acting_intent,
@@ -503,6 +528,13 @@ class UCLMDataset(Dataset):
             "prompt_eligible": prompt_eligible,
             "prompt_pair_id": prompt_pair_id,
         }
+
+        if return_prompt:
+            prompt = self.get_random_prompt(utt["speaker_id"], exclude_idx=idx)
+            if prompt is not None:
+                res["prompt_codec_tokens"] = prompt["codec_tokens"]
+
+        return res
 
 
 def collate_uclm_batch(
@@ -565,6 +597,12 @@ def collate_uclm_batch(
         voice_state_observed_mask = torch.zeros(B, max_codec_frames, d_vs, dtype=torch.bool)
         voice_state_confidence = torch.zeros(B, max_codec_frames, d_vs)
 
+    # Prompt codec tokens
+    prompt_codec_tokens = None
+    if any("prompt_codec_tokens" in s for s in batch):
+        max_prompt_frames = max(s["prompt_codec_tokens"].shape[1] for s in batch if "prompt_codec_tokens" in s)
+        prompt_codec_tokens = torch.zeros(B, n_codebooks, max_prompt_frames, dtype=torch.long)
+
     text = []
     utterance_ids = []
 
@@ -618,6 +656,11 @@ def collate_uclm_batch(
             if vsc is not None:
                 voice_state_confidence[i, :limit] = vsc[:limit]
 
+        if prompt_codec_tokens is not None and "prompt_codec_tokens" in sample:
+            pct = sample["prompt_codec_tokens"]
+            limit_p = pct.shape[1]
+            prompt_codec_tokens[i, :, :limit_p] = pct
+
         text.append(sample["text"])
         utterance_ids.append(sample["utterance_id"])
 
@@ -639,4 +682,5 @@ def collate_uclm_batch(
         voice_state_targets=voice_state_targets,
         voice_state_observed_mask=voice_state_observed_mask,
         voice_state_confidence=voice_state_confidence,
+        prompt_codec_tokens=prompt_codec_tokens,
     )

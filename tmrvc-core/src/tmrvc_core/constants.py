@@ -3,7 +3,7 @@
 This module re-exports constants from _generated_constants.py (auto-generated from YAML).
 
 Single source of truth: configs/constants.yaml
-Run: python scripts/codegen/generate_constants.py
+Generated automatically on import when YAML changes.
 """
 
 from pathlib import Path as _Path
@@ -18,14 +18,8 @@ if not _YAML_PATH.exists():
         f"Expected: {_YAML_PATH}"
     )
 
-if not _GEN_PATH.exists():
-    raise FileNotFoundError(
-        f"_generated_constants.py が見つかりません。\n"
-        f"実行してください: python scripts/codegen/generate_constants.py"
-    )
+from tmrvc_core._codegen import ensure_generated
 
-# Auto-generated from YAML - the canonical runtime budget and tensor-layout
-# values must be defined there, not re-declared here.
-# Worker 04 Task 16: all runtime-budget constants are owned by
-# configs/constants.yaml and must NOT be re-declared in this file.
+ensure_generated()
+
 from tmrvc_core._generated_constants import *  # noqa: F401, F403
