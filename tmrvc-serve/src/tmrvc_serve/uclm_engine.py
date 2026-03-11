@@ -629,21 +629,28 @@ class UCLMEngine:
             cfg_scale = 1.0
 
         style = style or StyleParams.neutral()
-        v_state = (
+        v_state_raw = (
             torch.tensor(
                 legacy_style_to_canonical_voice_state(style), device=self.device
             )
             .float()
             .view(1, 1, -1)
         )
+        
+        # Encode voice state to d_model (512-D) via voice_state_enc
+        ssl_state = torch.zeros(1, 1, 128, device=self.device)
+        v_out = self.voice_state_enc(v_state_raw, ssl_state)
+        v_state = v_out[0] if isinstance(v_out, tuple) else v_out
 
-        # Override voice state with explicit 8-D vector if provided
+        # Override voice state with explicit 8-D vector if provided, then re-encode
         if explicit_voice_state is not None:
             if explicit_voice_state.dim() == 1:
                 explicit_voice_state = explicit_voice_state.unsqueeze(0).unsqueeze(0)
             elif explicit_voice_state.dim() == 2:
                 explicit_voice_state = explicit_voice_state.unsqueeze(0)
-            v_state = explicit_voice_state.to(self.device)
+            v_state_raw = explicit_voice_state.to(self.device)
+            v_out = self.voice_state_enc(v_state_raw, ssl_state)
+            v_state = v_out[0] if isinstance(v_out, tuple) else v_out
 
         # Apply delta voice state if provided
         if delta_voice_state is not None:
@@ -651,7 +658,9 @@ class UCLMEngine:
                 delta_voice_state = delta_voice_state.unsqueeze(0).unsqueeze(0)
             elif delta_voice_state.dim() == 2:
                 delta_voice_state = delta_voice_state.unsqueeze(0)
-            v_state = v_state + delta_voice_state.to(self.device)
+            v_state_raw = v_state_raw + delta_voice_state.to(self.device)
+            v_out = self.voice_state_enc(v_state_raw, ssl_state)
+            v_state = v_out[0] if isinstance(v_out, tuple) else v_out
 
         num_phonemes = phonemes.shape[1]
         phoneme_ids = phonemes.to(self.device)
@@ -958,7 +967,7 @@ class UCLMEngine:
 
         a_t, b_t = torch.cat(a_tokens, dim=-1), torch.cat(b_tokens, dim=-1)
         t_frames = a_t.shape[-1]
-        audio_out, _ = self.codec_dec(a_t, b_t, v_state.expand(-1, t_frames, -1), [])
+        audio_out, _ = self.codec_dec(a_t, b_t, v_state_raw.expand(-1, t_frames, -1), [])
 
         gen_time = time.perf_counter() - t0
         rtf = gen_time / (audio_out.shape[-1] / SAMPLE_RATE)

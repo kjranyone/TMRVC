@@ -427,6 +427,10 @@ def preprocess_single_utterance(
         f"This indicates a bug in codec implementation."
     )
 
+    from tmrvc_data.g2p import text_to_phonemes
+    g2p_result = text_to_phonemes(text, language=language)
+    phoneme_ids = g2p_result.phoneme_ids.detach().cpu()
+
     # Save to cache
     features = UCLMFeatureSet(
         codec_tokens_a=a_tokens.detach().cpu().squeeze(0),
@@ -434,7 +438,7 @@ def preprocess_single_utterance(
         voice_state_explicit=explicit_state,
         voice_state_ssl=ssl_state,
         spk_embed=spk_embed.detach().cpu().squeeze(0),
-        phoneme_ids=None,
+        phoneme_ids=phoneme_ids,
         durations=None,
         text=text,
         utterance_id=utt.utterance_id,

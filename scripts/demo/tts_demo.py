@@ -66,11 +66,12 @@ def main() -> None:
 
     # 2. Prepare Inputs
     # Phonemes
-    phoneme_ids = text_to_phonemes(args.text, language=args.language)
-    phonemes_t = torch.tensor(phoneme_ids).long().unsqueeze(0)
+    g2p_result = text_to_phonemes(args.text, language=args.language)
+    phonemes_t = g2p_result.phoneme_ids.unsqueeze(0).to(args.device)
+    supra_t = g2p_result.text_suprasegmentals.unsqueeze(0).to(args.device) if g2p_result.text_suprasegmentals is not None else None
     
     # Dummy speaker embedding
-    spk_embed = torch.randn(1, D_SPEAKER)
+    spk_embed = torch.randn(1, D_SPEAKER).to(args.device)
     
     # Style
     style = StyleParams(emotion=args.emotion)
@@ -81,7 +82,9 @@ def main() -> None:
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
         speaker_embed=spk_embed,
-        style=style
+        style=style,
+        language_id=g2p_result.language_id,
+        text_suprasegmentals=supra_t
     )
     total_ms = (time.perf_counter() - t0) * 1000
     
