@@ -260,29 +260,24 @@ class UCLMEngine:
         ssl_state = torch.zeros(1, 1, 128, device=self.device)
 
         # 1. Pitch-shift implementation via F0 conditioning
-        # In a real setup, we'd extract F0 from audio_frame. 
-        # Here we use a placeholder or derived F0 for v3 logic.
         f0_condition = None
         if pitch_shift != 0.0:
-            # Shift pitch in semitones (log2 domain)
-            # Placeholder: [B, 1, 2] -> [val, voiced_flag]
-            # Actual implementation would use a tracker.
             f0_val = 0.0 + (pitch_shift / 12.0) 
             f0_condition = torch.tensor([[[f0_val, 1.0]]], device=self.device)
 
-        v_out = self.voice_state_enc(v_state, ssl_state)
-        state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
-
-        logits_a, logits_b, new_kv, _ = self.uclm_core(
-            content_features, 
-            state.ctx_a,
-            state.ctx_b, 
-            speaker_embed, 
-            state_cond, 
-            cfg_scale, 
-            state.kv_caches,
+        out = self.uclm_core_model.forward_streaming(
+            queries=content_features,
+            memory=content_features,
+            a_ctx=state.ctx_a,
+            b_ctx=state.ctx_b,
+            speaker_embed=speaker_embed,
+            explicit_state=v_state,
+            ssl_state=ssl_state,
+            cfg_scale=cfg_scale,
+            kv_caches=state.kv_caches,
             f0_condition=f0_condition,
         )
+        logits_a, logits_b, new_kv = out["logits_a"], out["logits_b"], out["kv_cache_out"]
 
         if temperature > 0:
             probs_a = F.softmax(logits_a[:, :, -1, :] / temperature, dim=-1)
@@ -629,28 +624,21 @@ class UCLMEngine:
             cfg_scale = 1.0
 
         style = style or StyleParams.neutral()
-        v_state_raw = (
+        v_state = (
             torch.tensor(
                 legacy_style_to_canonical_voice_state(style), device=self.device
             )
             .float()
             .view(1, 1, -1)
         )
-        
-        # Encode voice state to d_model (512-D) via voice_state_enc
-        ssl_state = torch.zeros(1, 1, 128, device=self.device)
-        v_out = self.voice_state_enc(v_state_raw, ssl_state)
-        v_state = v_out[0] if isinstance(v_out, tuple) else v_out
 
-        # Override voice state with explicit 8-D vector if provided, then re-encode
+        # Override voice state with explicit 8-D vector if provided
         if explicit_voice_state is not None:
             if explicit_voice_state.dim() == 1:
                 explicit_voice_state = explicit_voice_state.unsqueeze(0).unsqueeze(0)
             elif explicit_voice_state.dim() == 2:
                 explicit_voice_state = explicit_voice_state.unsqueeze(0)
-            v_state_raw = explicit_voice_state.to(self.device)
-            v_out = self.voice_state_enc(v_state_raw, ssl_state)
-            v_state = v_out[0] if isinstance(v_out, tuple) else v_out
+            v_state = explicit_voice_state.to(self.device)
 
         # Apply delta voice state if provided
         if delta_voice_state is not None:
@@ -658,9 +646,7 @@ class UCLMEngine:
                 delta_voice_state = delta_voice_state.unsqueeze(0).unsqueeze(0)
             elif delta_voice_state.dim() == 2:
                 delta_voice_state = delta_voice_state.unsqueeze(0)
-            v_state_raw = v_state_raw + delta_voice_state.to(self.device)
-            v_out = self.voice_state_enc(v_state_raw, ssl_state)
-            v_state = v_out[0] if isinstance(v_out, tuple) else v_out
+            v_state = v_state + delta_voice_state.to(self.device)
 
         num_phonemes = phonemes.shape[1]
         phoneme_ids = phonemes.to(self.device)
@@ -765,7 +751,7 @@ class UCLMEngine:
                 a_ctx=ctx_a,
                 b_ctx=ctx_b,
                 speaker_embed=speaker_embed,
-                state_cond=v_state,
+                explicit_state=v_state,
                 cfg_scale=1.0,  # Conditional pass always uses scale=1
                 kv_caches=kv_caches,
                 dialogue_context=_dlg_ctx,
@@ -794,7 +780,7 @@ class UCLMEngine:
                         a_ctx=ctx_a,
                         b_ctx=ctx_b,
                         speaker_embed=speaker_embed,
-                        state_cond=v_state,
+                        explicit_state=v_state,
                         cfg_scale=cfg_scale,
                         kv_caches=None,
                         dialogue_context=_dlg_ctx,
@@ -837,7 +823,7 @@ class UCLMEngine:
                             a_ctx=ctx_a,
                             b_ctx=ctx_b,
                             speaker_embed=masked["speaker_embed"],
-                            state_cond=masked["explicit_state"],
+                            explicit_state=masked["explicit_state"],
                             cfg_scale=1.0,
                             kv_caches=None,  # Don't share cache with unconditional
                             dialogue_context=masked["dialogue_context"],

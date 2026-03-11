@@ -774,7 +774,9 @@ class DisentangledUCLM(nn.Module):
         a_ctx: torch.Tensor | None = None,
         b_ctx: torch.Tensor | None = None,
         speaker_embed: torch.Tensor | None = None,
-        state_cond: torch.Tensor | None = None,
+        explicit_state: torch.Tensor | None = None,
+        ssl_state: torch.Tensor | None = None,
+        delta_voice_state: torch.Tensor | None = None,
         cfg_scale: float = 1.0,
         kv_caches: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None,
         dialogue_context: torch.Tensor | None = None,
@@ -784,26 +786,7 @@ class DisentangledUCLM(nn.Module):
         prompt_summary_tokens: torch.Tensor | None = None,
         content_features: torch.Tensor | None = None,
     ) -> dict:
-        """Forward pass for streaming inference with KV cache list.
-
-        Args:
-            queries: [B, T_q, D] current frame base features.
-                Also accepts ``content_features`` as a backward-compatible alias.
-            memory: [B, L_mem, D] full phoneme sequence for global cross-attention.
-                When None, queries are used as both query and memory.
-            a_ctx: [B, n_codebooks, T_q] previous acoustic tokens.
-            b_ctx: [B, n_slots, T_q] previous control tokens.
-            speaker_embed: [B, d_speaker] speaker embedding.
-            state_cond: [B, T_q, D] voice state conditioning.
-            cfg_scale: classifier-free guidance scale.
-            kv_caches: optional KV caches from previous step.
-            dialogue_context: optional [B, D_ctx] or [B, C_ctx, D_ctx] scene/dialogue embedding.
-            acting_intent: optional [B, D_act] acting intent vector.
-            prosody_latent: optional [B, D_pro] or [B, T_q, D_pro] local prosody planning.
-            f0_condition: optional [B, T_q, 2] F0 conditioning.
-            prompt_summary_tokens: [B, n_summary, D] pre-condensed prompt features.
-            content_features: backward-compatible alias for queries.
-        """
+        """Forward pass for streaming inference with internal voice state encoding."""
         # Backward-compatible alias: content_features -> queries
         if queries is None and content_features is not None:
             queries = content_features
@@ -814,7 +797,23 @@ class DisentangledUCLM(nn.Module):
         if memory is None:
             memory = queries
 
-        # Apply dialogue/acting/prosody conditioning
+        # 1. Encode Voice State (Matching training path)
+        if explicit_state is not None:
+            _ssl = ssl_state if ssl_state is not None else torch.zeros(
+                explicit_state.shape[0], explicit_state.shape[1], self.voice_state_enc.ssl_proj.in_features,
+                device=explicit_state.device
+            )
+            v_out = self.voice_state_enc(explicit_state, _ssl)
+            state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
+
+            # Apply delta voice state if provided
+            if delta_voice_state is not None:
+                state_cond = state_cond + self.delta_voice_state_proj(delta_voice_state)
+        else:
+            # Fallback if no state provided
+            state_cond = torch.zeros(queries.shape[0], queries.shape[1], self.d_model, device=queries.device)
+
+        # 2. Apply dialogue/acting/prosody conditioning
         queries = self.context_projector(
             queries,
             dialogue_context=dialogue_context,
