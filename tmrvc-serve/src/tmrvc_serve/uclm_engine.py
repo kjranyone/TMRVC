@@ -953,7 +953,7 @@ class UCLMEngine:
 
         a_t, b_t = torch.cat(a_tokens, dim=-1), torch.cat(b_tokens, dim=-1)
         t_frames = a_t.shape[-1]
-        audio_out, _ = self.codec_dec(a_t, b_t, v_state_raw.expand(-1, t_frames, -1), [])
+        audio_out, _ = self.codec_dec(a_t, b_t, v_state.expand(-1, t_frames, -1), [])
 
         gen_time = time.perf_counter() - t0
         rtf = gen_time / (audio_out.shape[-1] / SAMPLE_RATE)
