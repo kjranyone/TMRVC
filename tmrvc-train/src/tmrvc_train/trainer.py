@@ -238,7 +238,7 @@ class UCLMTrainer:
     def _generate_pointer_targets(
         self, durations: torch.Tensor, target_length: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate advance and progress targets from phoneme durations.
+        """Generate advance and progress targets using Velocity (Rate) semantics.
 
         Args:
             durations: [B, L] durations per phoneme.
@@ -246,7 +246,7 @@ class UCLMTrainer:
 
         Returns:
             advance_targets: [B, T] binary (1 at phoneme boundaries).
-            progress_targets: [B, T] fractional progress (0-1).
+            progress_targets: [B, T] velocity field (1/dur per frame).
         """
         B, L = durations.shape
         device = durations.device
@@ -257,15 +257,14 @@ class UCLMTrainer:
             curr_durations = durations[b]
             cum_dur = torch.cumsum(curr_durations, dim=0).long()
 
-            # Boundary indices (where phoneme changes)
+            # Boundary indices: the last frame of each phoneme should signal 'advance'
             boundaries = cum_dur - 1
-            # Filter valid boundaries within target_length
             valid_boundaries = boundaries[boundaries < target_length]
             advance_targets[b, valid_boundaries] = 1.0
 
-            # Calculate progress within each phoneme
+            # Progress as Velocity: 1.0 / duration
             start_idx = 0
-            for i, dur in enumerate(curr_durations):
+            for dur in curr_durations:
                 if dur <= 0:
                     continue
                 dur_int = int(dur.item())
@@ -273,9 +272,12 @@ class UCLMTrainer:
                 actual_dur = end_idx - start_idx
                 if actual_dur <= 0:
                     continue
-                # progress goes from 1/dur to 1.0
-                p = torch.linspace(1.0 / dur_int, 1.0, steps=actual_dur, device=device)
-                progress_targets[b, start_idx:end_idx] = p
+                
+                # SOTA Theory: The model predicts the 'velocity' of progress
+                # 1.0 / phoneme_duration is the ideal constant velocity.
+                velocity = 1.0 / max(1.0, dur.item())
+                progress_targets[b, start_idx:end_idx] = velocity
+                
                 start_idx = end_idx
                 if start_idx >= target_length:
                     break
@@ -658,11 +660,11 @@ class UCLMTrainer:
             # MAS targets
             with torch.no_grad():
                 phoneme_lens = (phonemes != 0).sum(dim=1)
-                x_text = self.model.text_encoder(
+                x_text = F.normalize(self.model.text_encoder(
                     phonemes, language_ids, phoneme_lens,
                     text_suprasegmentals=text_suprasegmentals,
-                ).transpose(1, 2)
-                x_acoustic = out["hidden_states"]
+                ).transpose(1, 2), dim=-1)
+                x_acoustic = F.normalize(out["hidden_states"], dim=-1)
                 dist = torch.cdist(x_text, x_acoustic)
                 log_probs = -0.5 * (dist ** 2)
                 path = monotonic_alignment_search(log_probs)
@@ -687,11 +689,11 @@ class UCLMTrainer:
             # Phase 3: Pure Latent-Only (MAS from internal attention)
             with torch.no_grad():
                 phoneme_lens = (phonemes != 0).sum(dim=1)
-                x_text = self.model.text_encoder(
+                x_text = F.normalize(self.model.text_encoder(
                     phonemes, language_ids, phoneme_lens,
                     text_suprasegmentals=text_suprasegmentals,
-                ).transpose(1, 2)
-                x_acoustic = out["hidden_states"]
+                ).transpose(1, 2), dim=-1)
+                x_acoustic = F.normalize(out["hidden_states"], dim=-1)
                 dist = torch.cdist(x_text, x_acoustic)
                 log_probs = -0.5 * (dist ** 2)
                 path = monotonic_alignment_search(log_probs)

@@ -99,10 +99,12 @@ def apply_rotary_emb(
     """
     B, n_h, T, hd = x.shape
     if position_indices is not None:
-        # Use provided indices [B, T] to slice RoPE table
-        # We need to expand cos/sin to [B, T, hd] using indices
-        # and then unsqueeze for head dimension alignment.
-        indices = position_indices.long()
+        # SOTA fix: Combine phoneme-based position with temporal progression (offset).
+        # Even during a pointer stall, the RoPE index must increment frame-by-frame
+        # to allow the Transformer to distinguish between temporal steps.
+        t_seq = torch.arange(T, device=x.device).unsqueeze(0) + offset
+        indices = (position_indices.long() + t_seq.long()).clamp(max=cos.shape[0] - 1)
+        
         cos_b = cos[indices].unsqueeze(1)  # [B, 1, T, hd]
         sin_b = sin[indices].unsqueeze(1)  # [B, 1, T, hd]
         return x * cos_b + _rotate_half(x) * sin_b
@@ -420,10 +422,23 @@ class ModernTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
+        
+        # SOTA: Speaker FiLM
+        self.speaker_film = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model * 2),
+        )
 
-    def forward(self, x, memory=None, k_cache=None, v_cache=None):
+    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None, speaker_embed_mapped=None):
+        # Apply speaker FiLM if provided
+        if speaker_embed_mapped is not None:
+            film_params = self.speaker_film(speaker_embed_mapped)
+            gamma, beta = film_params.chunk(2, dim=-1)
+            x = x * (1 + gamma) + beta
+
         # Self-attention with pre-norm
-        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache)
+        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices)
         x = x + self.dropout(h)
 
         # Cross-attention against phoneme memory
@@ -462,8 +477,29 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
+        
+        # SOTA: Speaker FiLM
+        self.speaker_film = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model * 2),
+        )
 
-    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None):
+    def forward(
+        self,
+        x,
+        memory=None,
+        k_cache=None,
+        v_cache=None,
+        position_indices=None,
+        speaker_embed_mapped=None,
+    ):
+        # Apply speaker FiLM if provided (per-layer speaker conditioning)
+        if speaker_embed_mapped is not None:
+            film_params = self.speaker_film(speaker_embed_mapped)
+            gamma, beta = film_params.chunk(2, dim=-1)
+            x = x * (1 + gamma) + beta
+
         # Self-attention
         h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices)
         x = x + self.dropout(h)
@@ -605,8 +641,11 @@ class CodecTransformer(nn.Module):
         )  # [B, T, d_model]
         x = x + b_ctx_fused
 
-        # Add speaker embedding (global)
-        x = x + self.speaker_proj(speaker_embed).unsqueeze(1)
+        # SOTA: Map speaker embedding once for FiLM conditioning across all layers
+        spk_mapped = self.speaker_proj(speaker_embed).unsqueeze(1)  # [B, 1, d_model]
+        
+        # Add speaker embedding as a base bias (optional, but kept for stability)
+        x = x + spk_mapped
 
         # Add voice state condition (temporal)
         if state_cond.dim() == 2:
@@ -644,12 +683,14 @@ class CodecTransformer(nn.Module):
             k_in = kv_list[i][0] if kv_list else None
             v_in = kv_list[i][1] if kv_list else None
             # layer now takes 'memory' (full phonemes) for cross-attention
+            # and speaker_embed_mapped for FiLM
             x, nk, nv = layer(
                 x, 
                 memory=memory, 
                 k_cache=k_in, 
                 v_cache=v_in,
-                position_indices=position_indices
+                position_indices=position_indices,
+                speaker_embed_mapped=spk_mapped,
             )
 
             if nk.shape[2] > max_seq_len:

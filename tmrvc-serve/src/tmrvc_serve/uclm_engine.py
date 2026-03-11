@@ -86,7 +86,9 @@ class PointerInferenceState:
 
     @property
     def finished(self) -> bool:
-        return self.text_index >= self.total_phonemes
+        # SOTA EOS logic: Finish when pointer has passed all phonemes
+        # and has generated a minimum tail buffer.
+        return self.text_index >= self.total_phonemes and self.frames_on_current_unit >= 5
 
     def to_dict(self) -> dict:
         return {
@@ -893,8 +895,9 @@ class UCLMEngine:
 
             # --- Pointer state-transition with failure handling ---
             ptr.frames_on_current_unit += 1
-            progress_delta = p_delta.item() / max(0.1, 1.0 / (pace + 1e-6))
-            ptr.progress += progress_delta
+            # SOTA Theory: p_delta is predicted velocity (1/dur).
+            # We integrate it, scaled by pace, to recover absolute position.
+            ptr.progress += p_delta.item() * pace
             adv_prob_val = p_adv_prob.item()
 
             # Compute boundary_confidence as sigmoid of the raw advance logit
