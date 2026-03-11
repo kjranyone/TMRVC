@@ -81,6 +81,7 @@ def print_menu() -> None:
     print()
     print("--- v3 学習 (Training — pointer mainline) ---")
     print("1) フル学習 (前処理 + 学習) [v3 pointer]")
+    print("1a) 演技特化フル学習 (jvs, tsukuyomi, moe) [v3 pointer]")
     print("2) 既存キャッシュで学習のみ [v3 pointer]")
     print("8) Codec学習 (最新cacheから)")
     print()
@@ -839,13 +840,22 @@ def cmd_full_training_legacy() -> None:
         cmd_finalize_training_outputs(preferred_device=device)
 
 
-def cmd_full_training() -> None:
-    enabled = get_enabled_datasets()
+def cmd_full_training(force_datasets: list[str] | None = None) -> None:
+    if force_datasets:
+        enabled = force_datasets
+    else:
+        enabled = get_enabled_datasets()
+        
     if not enabled:
+        print("有効なデータセットがありません。")
         return
+        
     device = select_device()
     workers = select_workers(device)
+    
     print(f"\n=== フル学習 (UCLM v3) 開始 ===")
+    print(f"データセット: {', '.join(enabled)}")
+    
     cmd = [
         "uv",
         "run",
@@ -858,11 +868,32 @@ def cmd_full_training() -> None:
         device,
         "--tts-mode",
         "pointer",
+        "--require-tts-supervision",  # SOTA: Ensure phoneme_ids are present
     ]
+    
+    # Add each dataset explicitly to ensure no omissions
+    for ds in enabled:
+        cmd.extend(["--dataset", ds])
+        
     if run_checked(cmd):
         if input_default("Codec学習も実行しますか? (y/n)", "y").lower() == "y":
             cmd_train_codec_from_latest_cache(preferred_device=device)
         cmd_finalize_training_outputs(preferred_device=device)
+
+
+def cmd_acting_training() -> None:
+    """Acting-focused preset: only high-quality Japanese expressive datasets."""
+    acting_datasets = ["jvs", "tsukuyomi", "moe_multispeaker_voices"]
+    # Check if they exist in datasets.yaml
+    cfg = load_datasets()
+    available = cfg.get("datasets", {}).keys()
+    to_use = [ds for ds in acting_datasets if ds in available]
+    
+    if not to_use:
+        print(f"ERROR: 演技データセット {acting_datasets} が configs/datasets.yaml に見当たりません。")
+        return
+        
+    cmd_full_training(force_datasets=to_use)
 
 
 def cmd_skip_preprocess() -> None:
@@ -1015,6 +1046,7 @@ def main() -> None:
         handlers = {
             # v3 mainline training
             "1": cmd_full_training,
+            "1a": cmd_acting_training,
             "2": cmd_skip_preprocess,
             # data prep
             "3": cmd_list_datasets,
