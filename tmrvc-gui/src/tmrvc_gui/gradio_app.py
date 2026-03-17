@@ -260,31 +260,47 @@ def _build_drama_workshop() -> gr.Blocks:
                     lines=3,
                 )
                 acting_intent = gr.Textbox(
-                    label="Acting Intent",
-                    placeholder="e.g. sarcastic, pleading, cheerful",
+                    label="Acting Prompt",
+                    placeholder="e.g. 悲しげに, sarcastic, whisper...",
                     max_lines=1,
+                    info="Natural language acting instructions."
                 )
+                with gr.Row():
+                    btn_compile = gr.Button("Compile Intent", variant="secondary")
+                
+                compile_status = gr.Markdown("*Ready to compile.*")
+                compile_id_state = gr.State("")
 
         # --- Input & Generation ---
         gr.Markdown("### Generation")
-        input_text = gr.Textbox(
-            label="Input Text",
-            placeholder="Enter text to synthesize...",
-            lines=3,
-            info=get_tooltip("tts_text"),
-        )
         with gr.Row():
-            btn_generate = gr.Button("Generate", variant="primary")
+            with gr.Column(scale=2):
+                input_text = gr.Textbox(
+                    label="Input Text",
+                    placeholder="Enter text to synthesize...",
+                    lines=3,
+                    info=get_tooltip("tts_text"),
+                )
+            with gr.Column(scale=1):
+                gr.Markdown("#### Compiled Score")
+                compile_info = gr.JSON(label="Intent Compiler Output", visible=True)
+        
+        with gr.Row():
+            btn_generate = gr.Button("Generate (Render)", variant="primary")
             btn_multi_take = gr.Button("Generate Multi-Take (3)")
 
         output_audio = gr.Audio(label="Output", type="numpy")
         generation_info = gr.JSON(label="Generation Info", visible=True)
 
         take_outputs = gr.Dataframe(
-            headers=["take_id", "seed", "cfg_scale", "pace", "notes"],
-            label="Takes",
+            headers=["trajectory_id", "status", "cfg_scale", "pace", "created_at"],
+            label="Historical Trajectories (Takes)",
             interactive=False,
         )
+        
+        with gr.Row():
+            selected_trajectory = gr.Textbox(label="Selected Trajectory ID", max_lines=1)
+            btn_replay = gr.Button("Replay Selected (Deterministic)", variant="secondary")
 
         # --- Session Persistence ---
         with gr.Row():
@@ -315,6 +331,86 @@ def _build_drama_workshop() -> gr.Blocks:
         ]
 
         # --- Callbacks ---
+
+        def on_take_select(evt: gr.SelectData, df):
+            # Select trajectory_id from dataframe
+            traj_id = df.iloc[evt.index[0]]["trajectory_id"]
+            return traj_id
+
+        take_outputs.select(
+            on_take_select,
+            inputs=[take_outputs],
+            outputs=[selected_trajectory]
+        )
+
+        def do_replay(traj_id, spk_profile, cfg_v):
+            if not traj_id.strip():
+                return None, {}, "Select a trajectory first."
+            
+            body = {
+                "speaker_profile_id": spk_profile,
+                "cfg_scale": cfg_v
+            }
+            resp = _api_post(f"/ui/workshop/trajectories/{traj_id}/replay", body)
+            if resp is None:
+                return None, {}, "Replay failed."
+            
+            audio_b64 = resp.get("audio_base64", "")
+            if not audio_b64:
+                return None, resp, "No audio returned from replay."
+                
+            audio_bytes = base64.b64decode(audio_b64)
+            sr = resp.get("sample_rate", SAMPLE_RATE)
+            audio_np = (
+                np.frombuffer(audio_bytes[44:], dtype=np.int16).astype(np.float32)
+                / 32768.0
+            )
+            
+            _audit.log(
+                "director",
+                "gradio",
+                "trajectory_replay",
+                after_state=f"trajectory={traj_id}, speaker={spk_profile}",
+            )
+            return (sr, audio_np), resp, f"Replayed trajectory: {traj_id}"
+
+        btn_replay.click(
+            do_replay,
+            inputs=[selected_trajectory, speaker_profile_id, cfg_scale],
+            outputs=[output_audio, generation_info, status]
+        )
+
+        def do_compile(prompt, ctx):
+            if not prompt.strip():
+                return "", "Enter a prompt first.", {}, 1.0, 0.0, 0.0, *([0.5]*8)
+            
+            resp = _api_post("/ui/workshop/compile", {"prompt": prompt, "context": {"dialogue": ctx}})
+            if resp is None:
+                return "", "Compilation failed.", {}, 1.0, 0.0, 0.0, *([0.5]*8)
+            
+            cid = resp["compile_id"]
+            pacing = resp["pacing"]
+            evs = resp.get("explicit_voice_state") or ([0.5]*8)
+            
+            status_msg = f"Compiled successfully: {cid}"
+            if resp.get("warnings"):
+                status_msg += f" ({len(resp['warnings'])} warnings)"
+            
+            return (
+                cid, 
+                status_msg, 
+                resp, 
+                pacing.get("pace", 1.0),
+                pacing.get("hold_bias", 0.0),
+                pacing.get("boundary_bias", 0.0),
+                *evs
+            )
+
+        btn_compile.click(
+            do_compile,
+            inputs=[acting_intent, dialogue_ctx],
+            outputs=[compile_id_state, compile_status, compile_info, pace, hold_bias, boundary_bias] + _vs_sliders
+        )
 
         btn_refresh_profiles.click(
             lambda: gr.update(choices=_fetch_speaker_profiles()),
@@ -362,52 +458,61 @@ def _build_drama_workshop() -> gr.Blocks:
             hold_v,
             boundary_v,
             cfg_v,
+            cid, # compile_id_state
+            current_df, # current take_outputs
             *vs_and_ctx,
         ):
-            # Last two args are dialogue_ctx and acting_intent
+            # vs_and_ctx is [8 vs sliders, dialogue_ctx, acting_intent]
             vs_vals = list(vs_and_ctx[:8])
-            ctx = vs_and_ctx[8] if len(vs_and_ctx) > 8 else ""
-            intent = vs_and_ctx[9] if len(vs_and_ctx) > 9 else ""
-
+            
             if not text.strip():
-                return None, {}, "Enter text to generate."
+                return None, {}, "Enter text to generate.", current_df
 
             body = {
                 "text": text,
                 "character_id": char_id or "default",
-                "pace": pace_v,
-                "hold_bias": hold_v,
-                "boundary_bias": boundary_v,
+                "compile_id": cid or None,
+                "speaker_profile_id": spk_profile,
                 "cfg_scale": cfg_v,
-                "explicit_voice_state": vs_vals,
+                "cfg_mode": "full",
             }
-            if spk_profile:
-                body["speaker_profile_id"] = spk_profile
 
-            # Use the workshop generate endpoint
             resp = _api_post("/ui/workshop/generate", body)
             if resp is None:
-                # Fallback to /tts for backward compatibility
-                resp = _api_post("/tts", body)
-            if resp is None:
-                return None, {}, "API call failed. Is tmrvc-serve running?"
+                return None, {}, "API call failed. Is tmrvc-serve running?", current_df
+            
             audio_b64 = resp.get("audio_base64", "")
             if not audio_b64:
-                # Workshop endpoint returns job_id; show that as info
-                return None, resp, f"Job submitted: {resp.get('job_id', 'unknown')}"
+                return None, resp, f"Job submitted: {resp.get('job_id', 'unknown')}", current_df
+            
             audio_bytes = base64.b64decode(audio_b64)
             sr = resp.get("sample_rate", SAMPLE_RATE)
             audio_np = (
                 np.frombuffer(audio_bytes[44:], dtype=np.int16).astype(np.float32)
                 / 32768.0
             )
+            
+            traj_id = resp.get("trajectory_id", "direct")
+            
+            # Update dataframe
+            import pandas as pd
+            new_row = {
+                "trajectory_id": traj_id,
+                "status": "completed",
+                "cfg_scale": cfg_v,
+                "pace": pace_v,
+                "created_at": time.strftime("%H:%M:%S", time.gmtime())
+            }
+            new_df = pd.concat([pd.DataFrame([new_row]), current_df], ignore_index=True)
+            
+            msg = f"Generated. Trajectory: {traj_id}"
             _audit.log(
                 "director",
                 "gradio",
                 "workshop_generate",
-                after_state=f"text={text[:30]}",
+                after_state=f"text={text[:30]}, trajectory={traj_id}",
             )
-            return (sr, audio_np), resp.get("style_used", {}), "Generated."
+            return (sr, audio_np), resp, msg, new_df
 
         btn_generate.click(
             generate,
@@ -419,10 +524,12 @@ def _build_drama_workshop() -> gr.Blocks:
                 hold_bias,
                 boundary_bias,
                 cfg_scale,
+                compile_id_state,
+                take_outputs,
             ]
             + _vs_sliders
             + [dialogue_ctx, acting_intent],
-            outputs=[output_audio, generation_info, status],
+            outputs=[output_audio, generation_info, status, take_outputs],
         )
 
         def generate_multi_take(
@@ -1909,48 +2016,50 @@ def _build_speaker_enrollment() -> gr.Blocks:
 
         def do_enroll(audio_path, name, notes):
             if not audio_path:
-                return (
-                    [],
-                    "Upload reference audio first.",
-                    "Encoding Speaker Profile...",
-                )
+                return [], "Upload reference audio first.", ""
             if not name.strip():
                 return [], "Enter a speaker name.", ""
 
-            # Attempt to encode via API first (sends reference audio for encoding)
-            import httpx
-
             try:
+                # 1. Authoritative Encoding via Backend (Worker 04)
                 with open(audio_path, "rb") as f:
                     audio_bytes = f.read()
                 audio_b64 = base64.b64encode(audio_bytes).decode()
+                
                 body = {
-                    "text": "test",
-                    "character_id": "default",
-                    "reference_audio_base64": audio_b64,
-                    "wait_for_prompt": True,
+                    "name": name.strip(),
+                    "audio_base64": audio_b64,
+                    "notes": notes
                 }
-                # Try to get the server to encode the speaker prompt
-                _api_post("/tts", body)
-            except Exception:
-                pass
-
-            # Save profile locally
-            import torch
-
-            dummy_embed = torch.randn(192)
-            profile = _gallery.add(name.strip(), speaker_embed=dummy_embed)
-            _audit.log(
-                "admin",
-                "gradio",
-                "enroll_speaker",
-                after_state=f"name={name}, id={profile.speaker_profile_id}",
-            )
-            rows = [
-                [pid, p.display_name, "uploaded", p.created_at]
-                for pid, p in _gallery.profiles.items()
-            ]
-            return rows, f"Enrolled: {name} ({profile.speaker_profile_id})", ""
+                
+                resp = _api_post("/ui/speaker/enroll", body)
+                if resp is None or "profile_id" not in resp:
+                    return [], "Enrollment failed on server.", ""
+                
+                profile_id = resp["profile_id"]
+                
+                # 2. Register in local gallery for UI visibility
+                # Note: The embedding stays on the server; the UI only tracks the ID.
+                import torch
+                dummy_placeholder = torch.zeros(192) # UI doesn't need the real embed anymore
+                profile = _gallery.add(name.strip(), profile_id=profile_id, speaker_embed=dummy_placeholder)
+                
+                _audit.log(
+                    "admin",
+                    "gradio",
+                    "enroll_speaker",
+                    after_state=f"name={name}, id={profile_id}",
+                )
+                
+                rows = [
+                    [pid, p.display_name, "authoritative", p.created_at]
+                    for pid, p in _gallery.profiles.items()
+                ]
+                return rows, f"Enrolled: {name} ({profile_id})", "Encoding complete."
+                
+            except Exception as e:
+                logger.exception("Enrollment UI failed: %s", e)
+                return [], f"Error: {str(e)}", ""
 
         btn_enroll.click(
             do_enroll,

@@ -33,6 +33,7 @@ class TestPointerInferenceState:
             progress=1.0,
             total_phonemes=10,
             frames_generated=80,
+            frames_on_current_unit=5, # New SOTA requirement
         )
         assert state.finished is True
 
@@ -42,6 +43,7 @@ class TestPointerInferenceState:
             progress=0.5,
             total_phonemes=10,
             frames_generated=40,
+            frames_on_current_unit=0,
         )
         assert state.finished is False
 
@@ -51,6 +53,7 @@ class TestPointerInferenceState:
             progress=1.0,
             total_phonemes=10,
             frames_generated=120,
+            frames_on_current_unit=5, # New SOTA requirement
         )
         assert state.finished is True
 
@@ -198,18 +201,18 @@ class TestTTSRequestExpressiveFields:
 
 class TestPointerStateFinishedProperty:
     def test_pointer_state_finished_property_zero_phonemes(self):
-        """A state with zero total phonemes should be finished immediately."""
-        state = PointerInferenceState(text_index=0, total_phonemes=0)
+        """A state with zero total phonemes should be finished after tail buffer."""
+        state = PointerInferenceState(text_index=0, total_phonemes=0, frames_on_current_unit=5)
         assert state.finished is True
 
     def test_pointer_state_finished_property_one_remaining(self):
         """A state one step from completion should not be finished."""
-        state = PointerInferenceState(text_index=9, total_phonemes=10)
+        state = PointerInferenceState(text_index=9, total_phonemes=10, frames_on_current_unit=0)
         assert state.finished is False
 
     def test_pointer_state_finished_property_exact(self):
-        """Finished when text_index == total_phonemes."""
-        state = PointerInferenceState(text_index=10, total_phonemes=10)
+        """Finished when text_index == total_phonemes and tail buffer complete."""
+        state = PointerInferenceState(text_index=10, total_phonemes=10, frames_on_current_unit=5)
         assert state.finished is True
 
 

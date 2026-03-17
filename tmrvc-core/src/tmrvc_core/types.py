@@ -114,64 +114,6 @@ class PointerState:
             last_advance_score=self.last_advance_score,
         )
 
-    def step_pointer(
-        self,
-        advance_prob: float,
-        progress_delta: float,
-        boundary_confidence: float = 0.0,
-    ) -> bool:
-        """Canonical pointer state-transition logic.
-
-        Implements forced advance on stall, skip-protection against premature
-        advance, and normal advance/hold behaviour.
-
-        Returns:
-            ``True`` if the pointer advanced to the next text unit.
-        """
-        self.last_advance_score = float(advance_prob)
-        self.boundary_confidence = float(boundary_confidence)
-
-        # 1. Track time on the current unit
-        self.frames_on_current_unit += 1
-
-        # 2. Accumulate progress
-        self.progress += progress_delta
-
-        # 3. Forced advance when stuck too long on one unit
-        if self.frames_on_current_unit >= self.max_frames_per_unit:
-            self.text_index += 1
-            self.progress = self.progress * 0 + 0.0  # keep tensor type if applicable
-            self.frames_on_current_unit = 0
-            self.stall_frames = 0
-            self.forced_advance_count += 1
-            return True
-
-        # 4. High-confidence advance with skip-protection
-        if advance_prob > 0.5 and self.progress >= 1.0:
-            if boundary_confidence >= self.skip_protection_threshold:
-                # Normal boundary advance
-                self.text_index += 1
-                self.progress = self.progress * 0 + 0.0
-                self.frames_on_current_unit = 0
-                self.stall_frames = 0
-                return True
-            else:
-                # Skip-protection blocks the advance
-                self.skip_protection_count += 1
-                return False
-
-        # 5. Advance on either signal alone
-        if advance_prob > 0.5 or self.progress >= 1.0:
-            self.text_index += 1
-            self.progress = self.progress * 0 + 0.0
-            self.frames_on_current_unit = 0
-            self.stall_frames = 0
-            return True
-
-        # 6. Hold — no advance
-        self.stall_frames += 1
-        return False
-
 
 # ---------------------------------------------------------------------------
 # CFG Unconditional Mask Contract (Frozen)
@@ -320,3 +262,81 @@ class UCLM_Batch:
             else:
                 res[k] = v
         return UCLM_Batch(**res)
+
+
+# ---------------------------------------------------------------------------
+# Programmable Expressive Speech Contracts (Worker 01)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PacingControls:
+    """Compiled pacing biases for pointer progression."""
+    pace: float = 1.0            # Overall speed multiplier
+    hold_bias: float = 0.0       # Negative = advance sooner, Positive = hold longer
+    boundary_bias: float = 0.0   # Positive = encourage transitions
+    phrase_pressure: float = 0.0 # Urgency within phrases
+    breath_tendency: float = 0.0 # Likeliness to pause at boundaries
+
+
+@dataclass
+class IntentCompilerOutput:
+    """Authoritative compiled intent for expressive synthesis.
+
+    Produced by the Intent Compiler from prompts/tags. This is the 'Score'
+    that the UCLM model performs.
+    """
+    compile_id: str
+    source_prompt: str
+    inline_tags: List[dict] = field(default_factory=list)
+    
+    # Static global targets
+    explicit_voice_state: torch.Tensor | None = None  # [1, 8]
+    acting_intent: torch.Tensor | None = None         # [1, d_acting]
+    
+    # Time-varying/Pointer-synchronous targets
+    # Key: phoneme index, Value: state overrides
+    local_prosody_plan: dict[int, torch.Tensor] = field(default_factory=dict)
+    
+    pacing: PacingControls = field(default_factory=PacingControls)
+    
+    schema_version: str = "v0"
+    warnings: List[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class TrajectoryRecord:
+    """Deterministic record of a speech performance.
+
+    Can be replayed, edited (patched), or transferred to other speakers.
+    This is the authoritative artifact for 'Programmable Expressive Speech'.
+    """
+    trajectory_id: str
+    source_compile_id: str
+    
+    # 1. Input Context (Ensures replay parity regardless of G2P changes)
+    phoneme_ids: torch.Tensor | None = None           # [1, L]
+    text_suprasegmentals: torch.Tensor | None = None  # [1, L, D_supra]
+    
+    # 2. Realized Sequence
+    # [text_index, frames_spent]
+    pointer_trace: List[Tuple[int, int]] = field(default_factory=list)
+    
+    # Realized voice state per frame [T, 8]
+    voice_state_trajectory: torch.Tensor | None = None
+    
+    # Realized tokens (for bit-exact replay)
+    acoustic_trace: torch.Tensor | None = None # Stream A [8, T]
+    control_trace: torch.Tensor | None = None  # Stream B [4, T]
+    
+    # Compiled pacing used for this rendering
+    applied_pacing: PacingControls = field(default_factory=PacingControls)
+    
+    # Performance provenance
+    speaker_profile_id: str = ""
+    uclm_version: str = ""
+    
+    version: int = 1  # For optimistic concurrency in patching
+    schema_version: str = "v1" # Bumped due to major schema change
+    created_at: str = ""  # ISO 8601
+    metadata: dict = field(default_factory=dict)

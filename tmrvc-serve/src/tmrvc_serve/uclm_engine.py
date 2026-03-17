@@ -91,18 +91,54 @@ class PointerInferenceState:
         return self.text_index >= self.total_phonemes and self.frames_on_current_unit >= 5
 
     def to_dict(self) -> dict:
+        """Serialize state for telemetry."""
         return {
             "text_index": self.text_index,
             "progress": self.progress,
             "total_phonemes": self.total_phonemes,
             "frames_generated": self.frames_generated,
-            "stall_frames": self.stall_frames,
-            "max_frames_per_unit": self.max_frames_per_unit,
-            "skip_protection_threshold": self.skip_protection_threshold,
-            "frames_on_current_unit": self.frames_on_current_unit,
             "forced_advance_count": self.forced_advance_count,
             "skip_protection_count": self.skip_protection_count,
-            "cfg_cache_age": self.cfg_cache_age,
+        }
+
+    def replay(self, record: TrajectoryRecord) -> Tuple[torch.Tensor, dict]:
+        """SOTA: Perform deterministic replay from a TrajectoryRecord.
+        
+        Bypasses the transformer model and directly decodes realized tokens.
+        Ensures bit-exact reproduction of a specific performance.
+        """
+        if record.acoustic_trace is None or record.control_trace is None:
+            raise ValueError("TrajectoryRecord must contain acoustic and control traces for replay")
+
+        t0 = time.perf_counter()
+        
+        # Stream A and B tokens
+        a_t = record.acoustic_trace
+        b_t = record.control_trace
+        
+        # Ensure they are on the correct device
+        a_t = a_t.to(self.device)
+        b_t = b_t.to(self.device)
+        
+        # Realized voice state trajectory
+        vs_full = record.voice_state_trajectory
+        if vs_full is not None:
+            vs_full = vs_full.to(self.device).unsqueeze(0) # [1, T, 8]
+        else:
+            # Fallback to neutral if somehow missing
+            t_frames = a_t.shape[-1]
+            vs_full = torch.zeros((1, t_frames, 8), device=self.device)
+
+        # Decode using the bit-exact realized tokens
+        with torch.no_grad():
+            audio_out, _ = self.codec_dec(a_t, b_t, vs_full, [])
+
+        gen_time = time.perf_counter() - t0
+        return audio_out.squeeze(), {
+            "rtf": gen_time / (audio_out.shape[-1] / SAMPLE_RATE),
+            "gen_time_ms": gen_time * 1000.0,
+            "mode": "deterministic_replay",
+            "trajectory_id": record.trajectory_id
         }
 
 
@@ -159,6 +195,18 @@ class UCLMEngine:
             raise RuntimeError("UCLMEngine models are not loaded.")
         if self.uclm_core is None or self.vc_enc is None or self.voice_state_enc is None:
             raise RuntimeError("UCLMEngine models are not loaded.")
+
+    def init_random_models(self, num_speakers: int = 1000) -> None:
+        """Initialize models with random weights for testing."""
+        from tmrvc_train.models import DisentangledUCLM
+        
+        self.uclm_core_model = DisentangledUCLM(num_speakers=num_speakers).to(self.device).eval()
+        self.uclm_core = self.uclm_core_model.uclm_core
+        self.vc_enc = self.uclm_core_model.vc_encoder
+        self.voice_state_enc = self.uclm_core_model.voice_state_enc
+        self._has_distilled_cfg = hasattr(self.uclm_core_model, "cfg_scale_embed")
+        self._loaded = True
+        logger.info("Initialized UCLMEngine with RANDOM weights on %s", self.device)
 
     def load_models(
         self,
@@ -558,6 +606,7 @@ class UCLMEngine:
         text_suprasegmentals: torch.Tensor | None = None,
         explicit_voice_state: torch.Tensor | None = None,
         delta_voice_state: torch.Tensor | None = None,
+        local_prosody_plan: dict[int, torch.Tensor] | None = None, # New SOTA field
         disable_circuit_breaker: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """Full causal pointer-based TTS generation (v3).
@@ -732,14 +781,31 @@ class UCLMEngine:
         # If frame latency exceeds 8ms, we downgrade CFG to OFF for the rest of the utterance.
         cfg_circuit_broken = False
 
+        # Trajectory collection (Worker 04)
+        pointer_trace: List[Tuple[int, int]] = [] # [text_index, frames_spent]
+        vs_trajectory: List[torch.Tensor] = []    # [1, 8] per frame
+        a_trace_list: List[torch.Tensor] = []     # [8, 1] per frame
+        
+        # Local Prosody Plan (Worker 01/04)
+        local_plan = local_prosody_plan or {}
+
         for t in range(max_frames):
             if ptr.finished:
                 break
 
             frame_start_t = time.perf_counter()
+            
+            # --- Dynamic Voice State Overrides (Local Prosody Plan) ---
+            v_state_active = v_state
+            if ptr.text_index in local_plan:
+                v_state_active = local_plan[ptr.text_index].to(self.device).view(1, 1, 8)
+
+            # Record active state for trajectory (Worker 04)
+            vs_trajectory.append(v_state_active.squeeze(1))
 
             # Index into cached text features by pointer position
-            content_features = all_phoneme_features[:, ptr.text_index : ptr.text_index + 1, :]
+            safe_idx = min(ptr.text_index, ptr.total_phonemes - 1)
+            content_features = all_phoneme_features[:, safe_idx : safe_idx + 1, :]
 
             # Automatic CFG downgrade if budget is tight
             active_cfg_mode = cfg_mode
@@ -753,12 +819,13 @@ class UCLMEngine:
                 a_ctx=ctx_a,
                 b_ctx=ctx_b,
                 speaker_embed=speaker_embed,
-                explicit_state=v_state,
+                explicit_state=v_state_active,
                 cfg_scale=1.0,  # Conditional pass always uses scale=1
                 kv_caches=kv_caches,
                 dialogue_context=_dlg_ctx,
                 acting_intent=_act_int,
                 prompt_summary_tokens=prompt_summary_tokens,
+                frame_index=t,
             )
 
             logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
@@ -787,6 +854,7 @@ class UCLMEngine:
                         kv_caches=None,
                         dialogue_context=_dlg_ctx,
                         acting_intent=_act_int,
+                        frame_index=t,
                     )
                     logits_a = out_dist["logits_a"]
                     logits_b = out_dist["logits_b"]
@@ -830,6 +898,7 @@ class UCLMEngine:
                             kv_caches=None,  # Don't share cache with unconditional
                             dialogue_context=masked["dialogue_context"],
                             acting_intent=masked["acting_intent"],
+                            frame_index=t,
                         )
                         uncond_a = out_uncond["logits_a"]
                         uncond_b = out_uncond["logits_b"]
@@ -888,6 +957,7 @@ class UCLMEngine:
                 at = logits_a[:, :, 0, :].argmax(dim=-1)
                 bt = logits_b[:, :, 0, :].argmax(dim=-1)
                 
+            a_trace_list.append(at.unsqueeze(-1))
             a_tokens.append(at.unsqueeze(-1))
             b_tokens.append(bt.unsqueeze(-1))
             ctx_a = at.unsqueeze(-1)
@@ -897,43 +967,53 @@ class UCLMEngine:
             ptr.frames_on_current_unit += 1
             # SOTA Theory: p_delta is predicted velocity (1/dur).
             # We integrate it, scaled by pace, to recover absolute position.
-            ptr.progress += p_delta.item() * pace
+            # SOTA: hold_bias acts as a drag on velocity to prevent premature jumps.
+            velocity = p_delta.item() * pace
+            drag = max(0.0, hold_bias * 0.02) # Scale drag factor
+            ptr.progress += (velocity - drag)
+            ptr.progress = max(0.0, ptr.progress)
+            
             adv_prob_val = p_adv_prob.item()
 
             # Compute boundary_confidence as sigmoid of the raw advance logit
             boundary_confidence = torch.sigmoid(p_adv_logit).item()
 
             advanced = False
+            advance_reason = ""
+
+            # SOTA: Define the "Integration Threshold"
+            # If the integrated progress exceeds 1.0, we have physically passed the boundary.
+            passed_threshold = ptr.progress >= 1.0
 
             # Forced advance: stuck too long on one text unit
             if ptr.frames_on_current_unit >= ptr.max_frames_per_unit:
-                logger.warning(
-                    "Forced advance at text_index=%d after %d frames on unit",
-                    ptr.text_index, ptr.frames_on_current_unit,
-                )
-                ptr.text_index += 1
-                ptr.progress = 0.0
-                ptr.frames_on_current_unit = 0
-                ptr.stall_frames = 0
-                ptr.forced_advance_count += 1
+                advance_reason = "FORCED"
                 advanced = True
             # Skip-protection: both signals fire but boundary_confidence is low
-            elif adv_prob_val > 0.5 and ptr.progress >= 1.0:
+            elif adv_prob_val > 0.5 and passed_threshold:
                 if boundary_confidence >= ptr.skip_protection_threshold:
-                    ptr.text_index += 1
-                    ptr.progress = 0.0
-                    ptr.frames_on_current_unit = 0
-                    ptr.stall_frames = 0
+                    advance_reason = "SKIP_PROTECTED_OK"
                     advanced = True
                 else:
                     ptr.skip_protection_count += 1
-            # Normal advance on either signal
-            elif adv_prob_val > 0.5 or ptr.progress >= 1.0:
+            # Normal advance: either signal or both depending on hold_bias
+            elif (adv_prob_val > 0.5 and passed_threshold) if hold_bias > 2.0 else (adv_prob_val > 0.5 or passed_threshold):
+                advance_reason = "NORMAL"
+                advanced = True
+
+            if advanced:
+                # Record trace: unit X lasted Y frames (Worker 04)
+                pointer_trace.append((ptr.text_index, ptr.frames_on_current_unit))
+
+                logger.debug(
+                    "t=%d: Advanced [%s] to text_index=%d (adv_prob=%.3f, p_delta=%.3f, progress=%.3f, bc=%.3f)",
+                    t, advance_reason, ptr.text_index + 1, adv_prob_val, p_delta.item(), ptr.progress, boundary_confidence
+                )
                 ptr.text_index += 1
-                ptr.progress = 0.0
+                # SOTA: Continuous integration - carry over the remainder velocity
+                ptr.progress = max(0.0, ptr.progress - 1.0) if advance_reason != "FORCED" else 0.0
                 ptr.frames_on_current_unit = 0
                 ptr.stall_frames = 0
-                advanced = True
 
             if not advanced:
                 ptr.stall_frames += 1
@@ -954,21 +1034,167 @@ class UCLMEngine:
         if not a_tokens:
             return torch.zeros(0), {}
 
+        # Finalize trace for the last (partial) unit (Worker 04)
+        if ptr.frames_on_current_unit > 0:
+            pointer_trace.append((ptr.text_index, ptr.frames_on_current_unit))
+
         a_t, b_t = torch.cat(a_tokens, dim=-1), torch.cat(b_tokens, dim=-1)
         t_frames = a_t.shape[-1]
-        audio_out, _ = self.codec_dec(a_t, b_t, v_state.expand(-1, t_frames, -1), [])
+        
+        # Use realized trajectory for final render to ensure consistency
+        vs_full = torch.cat(vs_trajectory, dim=0).unsqueeze(0) if vs_trajectory else v_state.expand(-1, t_frames, -1)
+        audio_out, _ = self.codec_dec(a_t, b_t, vs_full, [])
 
         gen_time = time.perf_counter() - t0
         rtf = gen_time / (audio_out.shape[-1] / SAMPLE_RATE)
+        
         return audio_out.squeeze(), {
             "rtf": float(rtf),
             "gen_time_ms": float(gen_time * 1000.0),
+            "pointer_trace": pointer_trace,
+            "phoneme_ids": phoneme_ids, # Store original IDs
+            "voice_state_trajectory": vs_full.squeeze(0),
+            "acoustic_trace": torch.cat(a_trace_list, dim=-1) if a_trace_list else None,
+            "control_trace": b_t,
             "pointer_state": ptr.to_dict(),
-            "prompt_encoding_time_ms": 0.0,
-            "stall_events": 0,
             "forced_advance_count": ptr.forced_advance_count,
             "skip_protection_count": ptr.skip_protection_count,
             "cfg_mode": cfg_mode.value,
+        }
+
+    def replay_trajectory(
+        self,
+        phonemes: torch.Tensor,
+        trajectory: TrajectoryRecord,
+        speaker_profile: SpeakerProfile | None = None,
+        speaker_embed: torch.Tensor | None = None,
+        text_suprasegmentals: torch.Tensor | None = None,
+        local_prosody_plan: dict[int, torch.Tensor] | None = None,
+        cfg_scale: float = 1.5,
+        temperature: float = 0.8,
+        language_id: int = 0,
+        use_exact_tokens: bool = True,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Replay a specific performance trajectory deterministically."""
+        self._require_loaded()
+        t0 = time.perf_counter()
+        
+        device = self.device
+        num_phonemes = phonemes.shape[1]
+        phoneme_ids = phonemes.to(device)
+        
+        # 1. Prepare Speaker (with fallback encoding if summary is missing)
+        prompt_summary_tokens = None
+        if speaker_profile is not None:
+            speaker_embed = speaker_profile.speaker_embed.to(device).unsqueeze(0)
+            
+            if speaker_profile.prompt_summary_tokens is not None:
+                prompt_summary_tokens = speaker_profile.prompt_summary_tokens.to(device).unsqueeze(0)
+            elif speaker_profile.prompt_codec_tokens is not None:
+                # Same as tts(): encode summary tokens on the fly
+                prompt_tokens = speaker_profile.prompt_codec_tokens.to(device).unsqueeze(0)
+                if prompt_tokens.shape[2] > MAX_PROMPT_FRAMES:
+                    prompt_tokens = prompt_tokens[:, :, -MAX_PROMPT_FRAMES:]
+                _, prompt_summary_tokens, _, _ = self.encode_speaker_prompt(
+                    reference_codec_tokens=prompt_tokens,
+                    speaker_embed=speaker_embed
+                )
+        elif speaker_embed is not None:
+            speaker_embed = speaker_embed.to(device)
+            if speaker_embed.dim() == 1:
+                speaker_embed = speaker_embed.unsqueeze(0)
+        else:
+            raise ValueError("Either speaker_profile or speaker_embed must be provided")
+        
+        # 2. Process Phonemes (SOTA: Prioritize Phoneme IDs from the trajectory itself to prevent drift)
+        active_phoneme_ids = trajectory.phoneme_ids.to(device) if trajectory.phoneme_ids is not None else phoneme_ids
+        active_supra = trajectory.text_suprasegmentals.to(device) if trajectory.text_suprasegmentals is not None else (text_suprasegmentals.to(device) if text_suprasegmentals is not None else None)
+
+        all_phoneme_features = self.uclm_core_model.text_encoder(
+            active_phoneme_ids, 
+            torch.full((1, active_phoneme_ids.shape[1]), language_id, device=device),
+            torch.tensor([active_phoneme_ids.shape[1]], device=device),
+            text_suprasegmentals=active_supra
+        ).transpose(1, 2)
+
+        # 3. Unpack trajectory trace
+        forced_indices = []
+        for text_idx, duration in trajectory.pointer_trace:
+            forced_indices.extend([text_idx] * duration)
+        
+        max_frames = len(forced_indices)
+        a_tokens, b_tokens = [], []
+        a_trace_list = [] # Worker 04
+        ctx_a = torch.zeros(1, 8, 1, dtype=torch.long, device=device)
+        ctx_b = torch.zeros(1, 4, 1, dtype=torch.long, device=device)
+        kv_caches = None
+        
+        vs_trajectory = trajectory.voice_state_trajectory.to(device) if trajectory.voice_state_trajectory is not None else None
+        # Bit-exact acoustic tokens if requested (Worker 01/04)
+        a_trace = trajectory.acoustic_trace.to(device) if (use_exact_tokens and trajectory.acoustic_trace is not None) else None
+        
+        # Local Prosody Plan overrides (Worker 04)
+        local_plan = local_prosody_plan or {}
+
+        # 4. Forced Generation Loop
+        for t in range(max_frames):
+            text_idx = forced_indices[t]
+            # SOTA: Same safe-indexing as tts() to handle tail buffer indices
+            safe_idx = min(text_idx, all_phoneme_features.shape[1] - 1)
+            content_features = all_phoneme_features[:, safe_idx : safe_idx + 1, :]
+            
+            # SOTA: Allow local overrides even during deterministic replay
+            v_state_curr = vs_trajectory[t].view(1, 1, 8) if vs_trajectory is not None else torch.zeros(1, 1, 8, device=device)
+            if text_idx in local_plan:
+                v_state_curr = local_plan[text_idx].to(device).view(1, 1, 8)
+
+            out = self.uclm_core_model.forward_streaming(
+                queries=content_features,
+                memory=all_phoneme_features,
+                a_ctx=ctx_a,
+                b_ctx=ctx_b,
+                speaker_embed=speaker_embed,
+                explicit_state=v_state_curr,
+                cfg_scale=1.0,
+                kv_caches=kv_caches,
+                prompt_summary_tokens=prompt_summary_tokens,
+            )
+            
+            logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
+            
+            if a_trace is not None and use_exact_tokens:
+                # a_trace is [B, 8, T]
+                at = a_trace[:, :, t] # [B, 8]
+            elif temperature > 0:
+                at = torch.stack([torch.multinomial(F.softmax(logits_a[:, i, 0, :] / temperature, dim=-1), 1) for i in range(8)], dim=1).squeeze(-1)
+            else:
+                at = logits_a[:, :, 0, :].argmax(dim=-1)
+            
+            bt = logits_b[:, :, 0, :].argmax(dim=-1)
+                
+            a_trace_list.append(at.unsqueeze(-1))
+            a_tokens.append(at.unsqueeze(-1))
+            b_tokens.append(bt.unsqueeze(-1))
+            ctx_a = at.unsqueeze(-1)
+            ctx_b = bt.unsqueeze(-1)
+
+        # 5. Decode audio
+        a_t, b_t = torch.cat(a_tokens, dim=-1), torch.cat(b_tokens, dim=-1)
+        t_frames = a_t.shape[-1]
+        vs_full = vs_trajectory.unsqueeze(0) if vs_trajectory is not None else torch.zeros(1, t_frames, 8, device=device)
+        # Ensure vs_full matches actual generated frame count
+        if vs_full.shape[1] > t_frames: vs_full = vs_full[:, :t_frames, :]
+        elif vs_full.shape[1] < t_frames:
+            padding = vs_full[:, -1:, :].expand(-1, t_frames - vs_full.shape[1], -1)
+            vs_full = torch.cat([vs_full, padding], dim=1)
+
+        audio_out, _ = self.codec_dec(a_t, b_t, vs_full, [])
+
+        return audio_out.squeeze(), {
+            "rtf": (time.perf_counter() - t0) / (audio_out.shape[-1] / SAMPLE_RATE),
+            "pointer_trace": trajectory.pointer_trace, # Identity mapping
+            "acoustic_trace": torch.cat(a_trace_list, dim=-1) if a_trace_list else None,
+            "control_trace": b_t,
         }
 
     def _tts_legacy_duration(
@@ -981,6 +1207,7 @@ class UCLMEngine:
         language_id: int = 0,
         pace: float = 1.0,
         max_frames: int = 1500,
+        **kwargs,
     ) -> Tuple[torch.Tensor, dict]:
         """Legacy duration-based TTS fallback.
 
@@ -992,6 +1219,39 @@ class UCLMEngine:
             "Legacy duration-based TTS is not available. "
             "DurationPredictor has not been integrated into the serving engine. "
             "Use tts_mode='pointer' (the default) for v3 pointer-based synthesis."
+        )
+
+    def create_trajectory_record(
+        self,
+        trajectory_id: str,
+        compile_id: str,
+        stats: dict,
+        phoneme_ids: torch.Tensor,
+        text_suprasegmentals: torch.Tensor | None = None,
+        speaker_profile_id: str = "default",
+        metadata: dict | None = None,
+    ) -> TrajectoryRecord:
+        """Helper to create a TrajectoryRecord from generation stats."""
+        from tmrvc_core.types import TrajectoryRecord, PacingControls
+        import time
+        
+        return TrajectoryRecord(
+            trajectory_id=trajectory_id,
+            source_compile_id=compile_id,
+            phoneme_ids=phoneme_ids.cpu(),
+            text_suprasegmentals=text_suprasegmentals.cpu() if text_suprasegmentals is not None else None,
+            pointer_trace=stats["pointer_trace"],
+            voice_state_trajectory=stats["voice_state_trajectory"].cpu(),
+            acoustic_trace=stats["acoustic_trace"].cpu() if "acoustic_trace" in stats else None,
+            control_trace=stats["control_trace"].cpu() if "control_trace" in stats else None,
+            applied_pacing=PacingControls(
+                pace=stats.get("applied_pace", 1.0),
+                hold_bias=stats.get("applied_hold_bias", 0.0),
+                boundary_bias=stats.get("applied_boundary_bias", 0.0)
+            ),
+            speaker_profile_id=speaker_profile_id,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            metadata=metadata or {}
         )
 
     def synthesize_sentences(self, text: str, language: str, spk_embed: np.ndarray, style: StyleParams | None, speed: float = 1.0, cancel=None, sentence_pause_ms: int = 120, auto_style: bool = True):
