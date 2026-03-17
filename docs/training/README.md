@@ -6,7 +6,7 @@
 - `../design/unified-codec-lm.md`
 - `../design/dataset-preparation-flow.md`
 - `../../TRAIN_GUIDE.md`
-- `../../plan/worker_02_training.md`
+- `../../plan/README.md`
 
 ## このディレクトリに置くもの
 

@@ -29,13 +29,14 @@ class IntentCompiler:
         
         # Simple heuristic parsing for v0
         warnings = []
-        if "[fast]" in prompt:
+        p_str = prompt.lower()
+        if "[fast]" in p_str or "速く" in p_str:
             pacing.pace = 1.3
-        if "[slow]" in prompt:
-            pacing.pace = 0.7
-        if "[stable]" in prompt:
+        if "[slow]" in p_str or "ゆっくり" in p_str or "悲し" in p_str:
+            pacing.pace = 0.8
+        if "[stable]" in p_str or "落ち着いて" in p_str:
             pacing.hold_bias = 3.0
-        if "[energetic]" in prompt:
+        if "[energetic]" in p_str or "元気に" in p_str:
             explicit_vs[0, 2] = 0.8 # energy_level
             
         logger.info("Compiled prompt [%s] -> ID: %s", prompt, compile_id)

@@ -1,7 +1,7 @@
 # データセット作成フロー設計
 
-この文書は、TMRVC mainline における dataset 登録、前処理、cache 保存の標準仕様を定義する。
-正本は `plan/worker_03_dataset_alignment.md` であり、この文書はそれを実装契約へ落としたものとする。
+この文書は、TMRVC mainline における dataset 登録、前処理、cache 保存の標準仕様の正本である。
+active backlog が必要な場合のみ `plan/README.md` と `plan/repo_remaining_inventory_2026_03.md` を参照する。
 目的は、`TTS/VC 共通で再利用できる 10 ms 同期 cache` を構築し、text supervision を
 `MFA 非依存` で扱うことである。
 

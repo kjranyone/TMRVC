@@ -81,38 +81,27 @@ v3 は以下の 3 層に分けて管理する。
 ## 2. システム構成
 
 ```text
+Orchestration (Worker 04):
+  Natural Language Prompt / Tags
+    -> Intent Compiler
+       -> IntentCompilerOutput (Pacing, VoiceState, ProsodyPlan)
+    -> UCLM Engine (TTS/VC Mode)
+       -> TrajectoryRecord (Pointer Trace, Audio/Control Trace)
+    -> Trajectory Store (Persistence & Patching)
+
 TTS path:
-  text
-    -> normalizer / g2p / grapheme backend
-    -> text units
-    -> TextEncoder
-    -> UCLM Core
-       -> A_t head
-       -> B_t head
-       -> pointer head
-    -> Codec Decoder
-    -> waveform
-
-VC path:
-  source waveform
-    -> Codec Encoder
-    -> causal semantic encoder
-    -> UCLM Core
-       -> A_t head
-       -> B_t head
-    -> Codec Decoder
-    -> waveform
-
-Shared conditions:
-  speaker embedding
-  explicit voice state
-  ssl voice-state / local prosody latent
-  pacing controls
+...
 ```
 
 ## 3. 主要コンポーネント
 
+### 3.0 Intent Compiler & Trajectory Store (Worker 04)
+
+- **Intent Compiler**: 自然言語による演技指示（例: `[fast]`, `[stable]`）を、物理的な制御パラメータ（`pace`, `hold_bias` 等）に決定論的に変換する。
+- **Trajectory Store**: 生成された音声の「演技の軌道」を `TrajectoryRecord` として保存する。これにより、ビット精度のリプレイ（Deterministic Replay）と、特定区間の部分的な書き換え（Edit Locality）を可能にする。
+
 ### 3.1 Text Frontend
+...
 
 - monolingual dataset を default とする
 - multilingual / code-switch dataset も許可するが、`language_id` と `language_spans` を明示する

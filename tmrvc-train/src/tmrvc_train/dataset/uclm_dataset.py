@@ -38,6 +38,7 @@ class DisentangledUCLMDataset(Dataset):
         tts_mode: str = "auto",
         min_quality_score: float = 0.0,
         provenance_filter: str | None = None,
+        require_tts_supervision: bool = False,
     ):
         if tts_mode not in _VALID_TTS_MODES:
             raise ValueError(
@@ -48,6 +49,7 @@ class DisentangledUCLMDataset(Dataset):
         self.tts_mode = tts_mode
         self.min_quality_score = min_quality_score
         self.provenance_filter = provenance_filter
+        self.require_tts_supervision = require_tts_supervision
         self.include_datasets = (
             set(include_datasets) if include_datasets is not None else None
         )
@@ -87,6 +89,11 @@ class DisentangledUCLMDataset(Dataset):
                 # v3 pointer mode does not use external duration labels.
 
                 if all((utt_dir / req).exists() for req in required_files):
+                    # SOTA: Strictly enforce TTS supervision if requested (GEMINI.md Mandate)
+                    if self.require_tts_supervision:
+                        if not (utt_dir / "phoneme_ids.npy").exists():
+                            continue
+
                     # Quality filtering (Worker 03 contract)
                     if self.min_quality_score > 0.0:
                         qs = meta.get("quality_score", 1.0)

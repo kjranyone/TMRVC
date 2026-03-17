@@ -168,6 +168,80 @@ impl Default for TimingStats {
 // Internal Types
 // ============================================================================
 
+#[derive(Debug, Clone)]
+pub struct PointerState {
+    pub text_index: usize,
+    pub progress: f32,
+    pub frames_on_current_unit: usize,
+    pub frames_generated: u64,
+    pub stall_frames: usize,
+    pub max_frames_per_unit: usize,
+    pub skip_protection_threshold: f32,
+    pub forced_advance_count: u64,
+    pub skip_protection_count: u64,
+}
+
+impl Default for PointerState {
+    fn default() -> Self {
+        Self {
+            text_index: 0,
+            progress: 0.0,
+            frames_on_current_unit: 0,
+            frames_generated: 0,
+            stall_frames: 0,
+            max_frames_per_unit: 400, // Matching Python default
+            skip_protection_threshold: 0.5,
+            forced_advance_count: 0,
+            skip_protection_count: 0,
+        }
+    }
+}
+
+impl PointerState {
+    /// SOTA: Update pointer with continuous integration (GEMINI.md Mandate).
+    pub fn step(&mut self, advance_prob: f32, progress_delta: f32, boundary_confidence: f32, hold_bias: f32) -> bool {
+        self.frames_on_current_unit += 1;
+        self.frames_generated += 1;
+
+        // Integration with drag
+        let drag = (hold_bias * 0.02).max(0.0);
+        self.progress += (progress_delta - drag).max(0.0);
+
+        let mut advanced = false;
+        let mut forced = false;
+
+        if self.frames_on_current_unit >= self.max_frames_per_unit {
+            advanced = true;
+            forced = true;
+            self.forced_advance_count += 1;
+        } else if advance_prob > 0.5 && self.progress >= 1.0 {
+            if boundary_confidence >= self.skip_protection_threshold {
+                advanced = true;
+            } else {
+                self.skip_protection_count += 1;
+            }
+        } else if hold_bias > 2.0 {
+            if advance_prob > 0.5 && self.progress >= 1.0 {
+                advanced = true;
+            }
+        } else if advance_prob > 0.5 || self.progress >= 1.0 {
+            advanced = true;
+        }
+
+        if advanced {
+            self.text_index += 1;
+            // SOTA: Carry over surplus progress
+            self.progress = if forced { 0.0 } else { (self.progress - 1.0).max(0.0) };
+            self.frames_on_current_unit = 0;
+            self.stall_frames = 0;
+        } else {
+            self.stall_frames += 1;
+        }
+
+        advanced
+    }
+}
+
 struct TokenBuffer {
     tokens: Vec<i64>,
     write_pos: usize,
@@ -242,7 +316,7 @@ impl ModelStates {
 // StreamingEngine
 // ============================================================================
 
-/// Main streaming engine for real-time voice conversion.
+/// Main streaming engine for real-time voice conversion and TTS.
 pub struct StreamingEngine {
     models: Option<OrtBundle>,
     states: Option<ModelStates>,
@@ -257,6 +331,7 @@ pub struct StreamingEngine {
     top_k: usize,
     status: Option<Arc<SharedStatus>>,
     models_loaded: bool,
+    ptr: PointerState,
 }
 
 impl StreamingEngine {
@@ -276,6 +351,7 @@ impl StreamingEngine {
             top_k: 50,
             status,
             models_loaded: false,
+            ptr: PointerState::default(),
         }
     }
 
@@ -409,7 +485,7 @@ impl StreamingEngine {
         };
 
         // Run the Codec-Latent pipeline
-        let result = self.process_frame_internal(input);
+        let result = self.process_frame_internal(input, &params);
 
         // Mix output
         match result {
@@ -477,7 +553,7 @@ impl StreamingEngine {
         }
     }
 
-    fn process_frame_internal(&mut self, audio_in: &[f32]) -> Result<Vec<f32>> {
+    fn process_frame_internal(&mut self, audio_in: &[f32], params: &FrameParams) -> Result<Vec<f32>> {
         let temperature = self.temperature;
         let top_k = self.top_k;
 
@@ -490,57 +566,83 @@ impl StreamingEngine {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("States not initialized"))?;
 
-        // Codec encoder: audio → A_t tokens
-        let (state_in, state_out) = states.codec_encoder.get_both();
-        let tokens_in = models.run_codec_encoder(audio_in, state_in, state_out)?;
+        // 1. Determine Input Mode (VC vs TTS)
+        // If audio_in is silent and we have characters/text, we could enter TTS mode.
+        // For now, we follow params to decide.
+        let is_tts = audio_in.iter().all(|&x| x.abs() < 1e-6);
 
-        self.token_buffer.push(&tokens_in);
-
-        // Token model: A_t context → predicted A_t'
-        let tokens_out = if self.token_buffer.is_full() {
-            let f0_cond = self.f0_tracker.process_frame(audio_in);
-            let tokens_ctx = self.token_buffer.get_context();
-
-            let spk_embed: &[f32] = self
-                .speaker
-                .as_ref()
-                .map(|s| s.spk_embed.as_slice())
-                .unwrap_or(&[0.0f32; D_SPEAKER]);
-
-            let f0_condition = vec![f0_cond[0].max(0.0); CONTEXT_LENGTH * 2];
-            let voice_state_ctx = vec![0.0f32; D_MODEL];
-            let mut logits_out = vec![0.0f32; N_CODEBOOKS * CODEBOOK_SIZE];
-
+        let tokens_out = if is_tts {
+            // --- TTS Mode: Pointer-driven generation ---
             let (kv_in, kv_out) = states.token_model.get_both();
+            
+            // Get current phoneme feature from character memory
+            // (Simplification for v0: assume character memory is pre-loaded)
+            let text_ctx = vec![0.0f32; D_MODEL]; // Placeholder for TextEncoder output
+            
+            let mut logits_out = vec![0.0f32; N_CODEBOOKS * CODEBOOK_SIZE];
+            let mut hidden_states = vec![0.0f32; D_MODEL];
+
+            // Run core transformer
             models.run_token_model(
-                &tokens_ctx,
-                spk_embed,
-                &f0_condition,
-                &voice_state_ctx,
+                &[], // source tokens empty in TTS
+                &params.speaker_embed,
+                &params.f0_condition,
+                &text_ctx, // Pass text features as memory
                 kv_in,
                 &mut logits_out,
                 kv_out,
+                Some(&mut hidden_states),
             )?;
+
+            // Run pointer head to get transition signals
+            let mut p_signals = [0.0f32; 3]; // adv_logit, progress_delta, boundary_conf
+            models.run_pointer_head(&hidden_states, &mut p_signals)?;
+
+            // SOTA: Update pointer with continuous integration
+            self.ptr.step(
+                p_signals[0], // advance_logit (converted to prob in step if needed, or use sigmoid)
+                p_signals[1], // progress_delta
+                p_signals[2], // boundary_confidence
+                params.hold_bias
+            );
 
             sample_tokens(&logits_out, top_k, temperature)
         } else {
-            tokens_in
+            // --- VC Mode: Source-driven generation ---
+            let (state_in, state_out) = states.codec_encoder.get_both();
+            let tokens_in = models.run_codec_encoder(audio_in, state_in, state_out)?;
+            self.token_buffer.push(&tokens_in);
+
+            if self.token_buffer.is_full() {
+                let tokens_ctx = self.token_buffer.get_context();
+                let mut logits_out = vec![0.0f32; N_CODEBOOKS * CODEBOOK_SIZE];
+                let (kv_in, kv_out) = states.token_model.get_both();
+                
+                models.run_token_model(
+                    &tokens_ctx,
+                    &params.speaker_embed,
+                    &params.f0_condition,
+                    &vec![0.0f32; D_MODEL],
+                    kv_in,
+                    &mut logits_out,
+                    kv_out,
+                    None,
+                )?;
+                sample_tokens(&logits_out, top_k, temperature)
+            } else {
+                tokens_in
+            }
         };
 
-        // Codec decoder: A_t' → audio
-        let control_tokens = [0i64; CONTROL_SLOTS];
-        let voice_state = [0.5f32; D_VOICE_STATE];
-        let event_trace_in = vec![0.0f32; D_EVENT_TRACE];
-        let mut event_trace_out = vec![0.0f32; D_EVENT_TRACE];
-
+        // 3. Codec decoder: tokens → audio
         let (dec_in, dec_out) = states.codec_decoder.get_both();
         let audio = models.run_codec_decoder(
             &tokens_out,
-            &control_tokens,
-            &voice_state,
-            &event_trace_in,
+            &params.control_tokens,
+            &params.voice_state,
+            &vec![0.0f32; D_EVENT_TRACE],
             dec_in,
-            &mut event_trace_out,
+            &mut vec![0.0f32; D_EVENT_TRACE],
             dec_out,
         )?;
 

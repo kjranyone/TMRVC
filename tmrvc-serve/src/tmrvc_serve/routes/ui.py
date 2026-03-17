@@ -26,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from tmrvc_core.constants import SAMPLE_RATE
-from tmrvc_core.dialogue_types import PromotionBucket
+from tmrvc_data.curation.models import PromotionBucket
 from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 from tmrvc_core.types import (
     IntentCompilerOutput, 
@@ -86,6 +86,7 @@ class WorkshopGenerateRequest(BaseModel):
     cfg_scale: float = Field(1.5, ge=0.5, le=5.0)
     cfg_mode: str = "full"
     n_takes: int = Field(1, ge=1, le=10)
+    style_preset: str = "default"
 
 class TrajectoryReplayRequest(BaseModel):
     speaker_profile_id: Optional[str] = None

@@ -44,7 +44,7 @@ class BucketThresholds:
     allowed_legality: Tuple[str, ...] = ("owned", "licensed")
 
 
-# Default thresholds from plan/ai_curation_system.md
+# Default thresholds from docs/design/curation-contract.md
 DEFAULT_THRESHOLDS: Dict[str, BucketThresholds] = {
     "tts_mainline": BucketThresholds(
         transcript_confidence=0.90,

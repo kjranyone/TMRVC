@@ -147,8 +147,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--dataset",
-        default=None,
-        help="Dataset name (e.g., vctk, jvs). If not specified, uses all enabled datasets.",
+        action="append",
+        help="Dataset name (e.g., vctk, jvs). Can be specified multiple times. If not specified, uses all enabled datasets.",
     )
     parser.add_argument(
         "--raw-dir",
@@ -230,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Experiment name (default: auto-generated timestamp)",
     )
     parser.add_argument(
+        "--base-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to base checkpoint to load before training.",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -268,7 +274,7 @@ def main(argv: list[str] | None = None) -> None:
             registry = yaml.safe_load(f) or {}
 
     if args.dataset:
-        datasets_to_use = [args.dataset]
+        datasets_to_use = args.dataset
     else:
         all_datasets = registry.get("datasets") or {}
         datasets_to_use = [
@@ -281,6 +287,8 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
 
     experiment_name = args.experiment_name or "_".join(sorted(datasets_to_use))
+    if len(experiment_name) > 60:
+        experiment_name = experiment_name[:50] + "_etc"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"{experiment_name}_{timestamp}"
 
@@ -406,6 +414,7 @@ def main(argv: list[str] | None = None) -> None:
             skip_preprocess=args.skip_preprocess,
             run_training=not args.preprocess_only,
             train_datasets=[plan.name],
+            base_checkpoint=args.base_checkpoint,
         )
         success = pipeline.run()
     else:
@@ -445,6 +454,7 @@ def main(argv: list[str] | None = None) -> None:
                 skip_preprocess=True,
                 run_training=True,
                 train_datasets=[p.name for p in dataset_plans],
+                base_checkpoint=args.base_checkpoint,
             )
             success = training_pipeline.run()
 

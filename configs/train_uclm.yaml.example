@@ -1,5 +1,5 @@
 # TMRVC UCLM v3 Training Config Example
-# See plan/worker_02_training.md for full documentation.
+# See docs/design/unified-codec-lm.md and TRAIN_GUIDE.md for full documentation.
 
 language: ja
 

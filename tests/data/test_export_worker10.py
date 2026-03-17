@@ -82,6 +82,11 @@ def _make_record(
     )
     defaults.update(overrides)
     attrs = defaults.pop("attributes", {})
+    
+    # SOTA: Enforce phoneme_ids_list for tts_mainline to pass GEMINI.md validation gate
+    if bucket == PromotionBucket.TTS_MAINLINE and "phoneme_ids_list" not in attrs:
+        attrs["phoneme_ids_list"] = [1, 2, 3, 4, 5]
+        
     r = CurationRecord(**defaults)
     r.attributes = attrs
     return r

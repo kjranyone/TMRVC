@@ -78,6 +78,26 @@ A placeholder entry is permitted only during pre-freeze drafting and must block 
 | `date_frozen` | `2026-03-08` |
 | `notes` | `Chosen as secondary ceiling baseline because it is an official open-weight model with strong multilingual and short-reference voice-cloning claims, but its 1.7B scale is materially larger than TMRVC's target regime.` |
 
+### `competitive_fishaudio_s2_pro_hf_1de9996`
+
+| Field | Value |
+|------|-------|
+| `baseline_id` | `competitive_fishaudio_s2_pro_hf_1de9996` |
+| `model_name` | `Fish Audio S2 Pro` |
+| `artifact_id` | `hf:fishaudio/s2-pro@1de9996` |
+| `tokenizer_version` | `bundled tokenizer in artifact @1de9996` |
+| `language_set` | `Japanese, English, Chinese, Korean, Spanish, Portuguese, Arabic, Russian, French, German` |
+| `prompt_rule` | `Use the official prompt/instruction-following path with matched verbatim reference transcript when few-shot prompting is required. Keep inline control tags and natural-language instructions frozen per evaluation subset; no manual prompt embellishment outside the frozen protocol.` |
+| `reference_lengths_sec` | `3, 5, 10` |
+| `inference_settings` | `Use the released S2 Pro artifact with the official streaming/offline inference path as documented in the model card and technical report. No hidden decoder retuning, prompt rewriting, or unofficial latency shortcuts.` |
+| `hardware_class` | `single_nvidia_rtx_2080ti_22gb_cuda12_sdpa` |
+| `task_scope` | `Mandatory competitor reference for any public claim that TMRVC beats Fish Audio S2. This entry is not the primary broad-quality sign-off blocker because the model scale and product scope differ, but it is the required head-to-head reference for programmable expressive-speech, prompt-control UX comparison, and competitor-facing claim language.` |
+| `evaluation_set_version` | `tmrvc_eval_public_v1_2026_03_08` |
+| `evaluation_protocol_version` | `v1_2026_03_08` |
+| `source_refs` | `https://huggingface.co/fishaudio/s2-pro/tree/main ; https://arxiv.org/abs/2603.08823 ; https://fish.audio/` |
+| `date_frozen` | `2026-03-16` |
+| `notes` | `Frozen from the official public S2 Pro artifact and technical report. Use this entry only for direct Fish-competitor language, not as a substitute for the primary scale-aligned sign-off baseline.` |
+
 ---
 
 ## Other Candidate Baselines

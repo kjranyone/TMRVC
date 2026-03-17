@@ -4,7 +4,7 @@ Extracts 8-D voice state features per frame with observed masks and
 per-dimension confidence.  Uses OSS tools: parselmouth for HNR/jitter/
 shimmer/CPP, librosa for RMS, FCPE/CREPE for F0.
 
-The 8 canonical dimensions (per plan/worker_08_curation_providers.md):
+The 8 canonical dimensions (per docs/design/architecture.md and docs/design/curation-contract.md):
   0: pitch_level      - normalised F0 relative to speaker mean
   1: pitch_range      - local F0 range / variability
   2: energy_level     - RMS energy (normalised)

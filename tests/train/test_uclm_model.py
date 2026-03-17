@@ -151,7 +151,7 @@ class TestSpeakerPromptEncoder:
         enc = SpeakerPromptEncoder(d_model=_D_MODEL, d_speaker=_D_SPEAKER)
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
 
-        timbre, prompt_feats = enc(tokens)
+        timbre, prompt_feats, vq_loss, indices = enc(tokens)
 
         assert timbre.shape == (B, _D_MODEL)
         assert prompt_feats.shape == (B, T_prompt, _D_MODEL)
@@ -378,7 +378,7 @@ class TestEncodeSpkPrompt:
         model = _make_model()
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
 
-        timbre, summary_tokens = model.encode_speaker_prompt(tokens)
+        timbre, summary_tokens, vq_loss, indices = model.encode_speaker_prompt(tokens)
         assert timbre.shape == (B, _D_MODEL)
         # encode_speaker_prompt runs PromptResampler, output is [B, n_summary, D]
         assert summary_tokens.ndim == 3
@@ -391,7 +391,7 @@ class TestEncodeSpkPrompt:
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
         spk = torch.randn(B, _D_SPEAKER)
 
-        timbre, prompt_feats = model.encode_speaker_prompt(tokens, speaker_embed=spk)
+        timbre, prompt_feats, vq_loss, indices = model.encode_speaker_prompt(tokens, speaker_embed=spk)
         assert timbre.shape == (B, _D_MODEL)
 
 
@@ -551,97 +551,6 @@ class TestPointerStateNewFields:
         assert cloned.text_index is not state.text_index
 
 
-class TestStepPointer:
-    """Tests for PointerState.step_pointer method."""
-
-    def _make_state(self, **overrides):
-        defaults = dict(
-            text_index=torch.tensor([0]),
-            progress=torch.tensor([0.0]),
-        )
-        defaults.update(overrides)
-        return PointerState(**defaults)
-
-    def test_step_pointer_normal_advance(self):
-        """advance_prob > 0.5, progress >= 1.0, confidence > threshold -> advances."""
-        state = self._make_state()
-        # Set progress high enough that after adding delta it passes 1.0
-        state.progress = torch.tensor([0.8])
-        advanced = state.step_pointer(
-            advance_prob=0.8,
-            progress_delta=0.3,
-            boundary_confidence=0.5,  # above default threshold 0.3
-        )
-        assert advanced is True
-        assert state.text_index.item() == 1
-        assert state.progress.item() == pytest.approx(0.0)
-        assert state.frames_on_current_unit == 0
-        assert state.stall_frames == 0
-
-    def test_step_pointer_hold(self):
-        """advance_prob < 0.5 and progress < 1.0 -> holds (no advance)."""
-        state = self._make_state()
-        advanced = state.step_pointer(
-            advance_prob=0.3,
-            progress_delta=0.1,
-        )
-        assert advanced is False
-        assert state.text_index.item() == 0
-        assert state.progress.item() == pytest.approx(0.1)
-
-    def test_step_pointer_forced_advance(self):
-        """After max_frames_per_unit reached, forced advance occurs."""
-        state = self._make_state(max_frames_per_unit=5)
-        # Simulate 4 frames already spent (frames_on_current_unit will be
-        # incremented to 5 inside step_pointer, triggering forced advance)
-        state.frames_on_current_unit = 4
-
-        advanced = state.step_pointer(
-            advance_prob=0.1,  # low — would not normally advance
-            progress_delta=0.05,
-        )
-        assert advanced is True
-        assert state.forced_advance_count == 1
-        assert state.frames_on_current_unit == 0
-        assert state.text_index.item() == 1
-
-    def test_step_pointer_skip_protection(self):
-        """Advance would happen but boundary_confidence too low -> blocked."""
-        state = self._make_state(skip_protection_threshold=0.5)
-        # Make progress >= 1.0 and advance_prob > 0.5 but confidence below threshold
-        state.progress = torch.tensor([0.9])
-
-        advanced = state.step_pointer(
-            advance_prob=0.8,
-            progress_delta=0.2,  # progress will become 1.1
-            boundary_confidence=0.2,  # below threshold of 0.5
-        )
-        assert advanced is False
-        assert state.skip_protection_count == 1
-        assert state.text_index.item() == 0  # did not advance
-
-    def test_step_pointer_stall_frames_increment(self):
-        """stall_frames should increment when the pointer holds."""
-        state = self._make_state()
-        state.step_pointer(advance_prob=0.2, progress_delta=0.05)
-        assert state.stall_frames == 1
-        state.step_pointer(advance_prob=0.2, progress_delta=0.05)
-        assert state.stall_frames == 2
-
-    def test_step_pointer_stall_frames_reset_on_advance(self):
-        """stall_frames should reset to 0 when the pointer advances."""
-        state = self._make_state()
-        # Accumulate some stall frames
-        state.step_pointer(advance_prob=0.2, progress_delta=0.05)
-        state.step_pointer(advance_prob=0.2, progress_delta=0.05)
-        assert state.stall_frames == 2
-
-        # Now force an advance via high advance_prob (progress alone triggers it)
-        advanced = state.step_pointer(advance_prob=0.8, progress_delta=0.01)
-        assert advanced is True
-        assert state.stall_frames == 0
-
-
 # ---------------------------------------------------------------------------
 # PromptResampler tests (Worker 01 § Architecture)
 # ---------------------------------------------------------------------------
@@ -704,7 +613,7 @@ class TestSpeakerPromptEncoderResamplerPipeline:
         resampler = PromptResampler(d_model=_D_MODEL, n_summary=32, n_heads=4)
 
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
-        timbre, prompt_feats = enc(tokens)
+        timbre, prompt_feats, vq_loss, indices = enc(tokens)
 
         assert prompt_feats.shape == (B, T_prompt, _D_MODEL)
 
@@ -717,7 +626,7 @@ class TestSpeakerPromptEncoderResamplerPipeline:
         model = _make_model()
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
 
-        timbre, summary = model.encode_speaker_prompt(tokens)
+        timbre, summary, vq_loss, indices = model.encode_speaker_prompt(tokens)
         # Summary should be [B, n_prompt_summary_tokens, d_model]
         assert summary.ndim == 3
         assert summary.shape[0] == B

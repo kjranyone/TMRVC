@@ -90,28 +90,46 @@ def apply_rotary_emb(
     sin: torch.Tensor,
     offset: int = 0,
     position_indices: torch.Tensor | None = None,
+    frame_offsets: torch.Tensor | None = None, # New SOTA field
 ) -> torch.Tensor:
     """Apply rotary embeddings to *x* ``[B, n_heads, T, head_dim]``.
 
-    If *position_indices* [B, T] is provided, it uses those as indices into
-    the RoPE table instead of a simple linear offset. This prevents attention
-    collapse during pointer stalls (Progress-aware RoPE).
+    SOTA: Support 2D Orthogonal RoPE if both position_indices and frame_offsets are provided.
+    Half of head_dim is rotated by semantic index, half by temporal offset.
     """
     B, n_h, T, hd = x.shape
-    if position_indices is not None:
-        # SOTA: Use the provided absolute indices (frame counters).
-        # The caller (DisentangledUCLM) ensures that these increment frame-by-frame
-        # regardless of pointer stalls.
-        indices = position_indices.long().clamp(max=cos.shape[0] - 1)
+    
+    if position_indices is not None and frame_offsets is not None:
+        # Hierarchical RoPE: Split head_dim into two 50/50 subspaces
+        half_hd = hd // 2
         
-        cos_b = cos[indices].unsqueeze(1)  # [B, 1, T, hd]
-        sin_b = sin[indices].unsqueeze(1)  # [B, 1, T, hd]
+        # 1. Semantic rotation (Phoneme index) on first half
+        idx_sem = position_indices.long().clamp(max=cos.shape[0] - 1)
+        cos_sem = cos[idx_sem, :half_hd].unsqueeze(1) # [B, 1, T, hd/2]
+        sin_sem = sin[idx_sem, :half_hd].unsqueeze(1)
+        
+        # 2. Temporal rotation (Frame offset) on second half
+        idx_temp = frame_offsets.long().clamp(max=cos.shape[0] - 1)
+        cos_temp = cos[idx_temp, half_hd:].unsqueeze(1)
+        sin_temp = sin[idx_temp, half_hd:].unsqueeze(1)
+        
+        # Combine
+        cos_2d = torch.cat([cos_sem, cos_temp], dim=-1)
+        sin_2d = torch.cat([sin_sem, sin_temp], dim=-1)
+        
+        return x * cos_2d + _rotate_half(x) * sin_2d
+
+    elif position_indices is not None:
+        # Legacy 1D mode
+        indices = position_indices.long().clamp(max=cos.shape[0] - 1)
+        cos_b = cos[indices].unsqueeze(1)
+        sin_b = sin[indices].unsqueeze(1)
         return x * cos_b + _rotate_half(x) * sin_b
     else:
-        # Legacy linear offset mode
-        cos = cos[offset : offset + T].unsqueeze(0).unsqueeze(0)  # [1, 1, T, hd]
-        sin = sin[offset : offset + T].unsqueeze(0).unsqueeze(0)
-        return x * cos + _rotate_half(x) * sin
+        # Base linear offset mode
+        cos_b = cos[offset : offset + T].unsqueeze(0).unsqueeze(0)
+        sin_b = sin[offset : offset + T].unsqueeze(0).unsqueeze(0)
+        return x * cos_b + _rotate_half(x) * sin_b
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +259,7 @@ class CausalGQAttention(nn.Module):
         k_cache: Optional[torch.Tensor] = None,
         v_cache: Optional[torch.Tensor] = None,
         position_indices: Optional[torch.Tensor] = None,
+        frame_offsets: Optional[torch.Tensor] = None, # New SOTA field
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, C = x.shape
 
@@ -260,8 +279,8 @@ class CausalGQAttention(nn.Module):
         
         cos, sin = self.rope(max_idx)
 
-        q = apply_rotary_emb(q, cos, sin, offset=rope_offset, position_indices=position_indices)
-        k = apply_rotary_emb(k, cos, sin, offset=rope_offset, position_indices=position_indices)
+        q = apply_rotary_emb(q, cos, sin, offset=rope_offset, position_indices=position_indices, frame_offsets=frame_offsets)
+        k = apply_rotary_emb(k, cos, sin, offset=rope_offset, position_indices=position_indices, frame_offsets=frame_offsets)
 
         # Concatenate KV cache
         if k_cache is not None:
@@ -359,11 +378,12 @@ class CrossAttention(nn.Module):
         self.dropout_p = dropout
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, memory: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: [B, T, d_model] query sequence.
             memory: [B, S, d_model] key/value sequence.
+            attn_mask: [B, n_heads, T, S] optional focus mask.
         """
         B, T, C = x.shape
         _, S, _ = memory.shape
@@ -375,10 +395,10 @@ class CrossAttention(nn.Module):
         k_exp = CausalGQAttention._expand_kv(k, self.n_rep)
         v_exp = CausalGQAttention._expand_kv(v, self.n_rep)
 
-        # Cross-attention uses SDPA without causal mask
+        # SOTA: Use provided attention mask to focus on current pointer region
         out = F.scaled_dot_product_attention(
             q, k_exp, v_exp,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=False,
         )
@@ -425,18 +445,18 @@ class ModernTransformerBlock(nn.Module):
         self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None, film_gamma=None, film_beta=None):
+    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None, film_gamma=None, film_beta=None, cross_attn_mask=None, frame_offsets=None):
         # SOTA: Apply speaker FiLM modulation (Feature-wise Linear Modulation)
         if film_gamma is not None and film_beta is not None:
             x = x * (1 + film_gamma) + film_beta
 
-        # Self-attention with pre-norm
-        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices)
+        # Self-attention with pre-norm (SOTA: Hierarchical RoPE)
+        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices, frame_offsets=frame_offsets)
         x = x + self.dropout(h)
 
-        # Cross-attention against phoneme memory
+        # Cross-attention against phoneme memory (SOTA: with dynamic masking)
         if memory is not None:
-            h_cross = self.cross_attn(self.norm_cross(x), memory)
+            h_cross = self.cross_attn(self.norm_cross(x), memory, attn_mask=cross_attn_mask)
             x = x + self.dropout(h_cross)
 
         # SwiGLU FFN with pre-norm
@@ -534,6 +554,9 @@ class CodecTransformer(nn.Module):
         max_seq_len=200,
         f0_condition=None,
         position_indices=None,
+        precomputed_film_params=None, # SOTA: Optional pre-baked FiLM
+        cross_attn_mask=None,         # SOTA: Dynamic focus mask
+        frame_offsets=None,           # SOTA: temporal offsets for Hierarchical RoPE
     ):
         # x starts as the queries (temporal frame base)
         x = queries
@@ -579,11 +602,15 @@ class CodecTransformer(nn.Module):
         )  # [B, T, d_model]
         x = x + b_ctx_fused
 
-        # SOTA: Map speaker embedding once for FiLM parameters across ALL layers (GEMINI.md Mandate)
-        spk_flat = self.speaker_proj(speaker_embed)  # [B, d_model]
-        film_params = self.speaker_film_gen(spk_flat) # [B, 2 * d_model * n_layers]
-        # Reshape to [B, n_layers, 2, d_model] to simplify slicing in the loop
-        film_params = film_params.view(B, self.n_layers, 2, self.d_model)
+        # SOTA: Map speaker embedding once for FiLM parameters across ALL layers
+        if precomputed_film_params is not None:
+            film_params = precomputed_film_params
+            spk_flat = self.speaker_proj(speaker_embed) # Still needed for bias
+        else:
+            spk_flat = self.speaker_proj(speaker_embed)  # [B, d_model]
+            film_params = self.speaker_film_gen(spk_flat) # [B, 2 * d_model * n_layers]
+            # Reshape to [B, n_layers, 2, d_model] to simplify slicing in the loop
+            film_params = film_params.view(B, self.n_layers, 2, self.d_model)
 
         # Base speaker bias (optional, for embedding-space stability)
         x = x + spk_flat.unsqueeze(1)
@@ -638,6 +665,8 @@ class CodecTransformer(nn.Module):
                 position_indices=position_indices,
                 film_gamma=f_gamma,
                 film_beta=f_beta,
+                cross_attn_mask=cross_attn_mask,
+                frame_offsets=frame_offsets,
             )
 
             if nk.shape[2] > max_seq_len:

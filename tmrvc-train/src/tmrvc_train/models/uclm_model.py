@@ -11,8 +11,119 @@ import torch.nn.functional as F
 from tmrvc_core.types import PointerState
 
 from .text_encoder import TextEncoder
-from .uclm import VCEncoder, VoiceStateEncoder, VectorQuantizer
+from .voice_state_encoder import VoiceStateEncoder
 from .uclm_transformer import CodecTransformer
+
+
+class VectorQuantizer(nn.Module):
+    """Information Bottleneck (VQ) for VC Encoder.
+    Strips speaker and style info by mapping continuous embeddings to discrete codes.
+    """
+
+    def __init__(self, n_bins: int, d_model: int, beta: float = 0.25):
+        super().__init__()
+        self.n_bins = n_bins
+        self.d_model = d_model
+        self.beta = beta
+
+        self.embedding = nn.Embedding(n_bins, d_model)
+        self.embedding.weight.data.uniform_(-1.0 / n_bins, 1.0 / n_bins)
+
+    def forward(
+        self, z: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z: [B, T, d_model]
+            mask: [B, T] valid-frame mask (True=valid), optional
+        Returns:
+            z_q: [B, T, d_model] quantized vectors
+            loss: VQ commitment loss
+            indices: [B, T] quantization indices
+        """
+        # Flatten
+        z_flattened = z.reshape(-1, self.d_model)
+
+        # Distances from z to embeddings
+        d = (
+            torch.sum(z_flattened**2, dim=1, keepdim=True)
+            + torch.sum(self.embedding.weight**2, dim=1)
+            - 2 * torch.matmul(z_flattened, self.embedding.weight.t())
+        )
+
+        # Find closest embeddings
+        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
+        min_encodings = torch.zeros(
+            min_encoding_indices.shape[0], self.n_bins, device=z.device
+        )
+        min_encodings.scatter_(1, min_encoding_indices, 1)
+
+        # Get quantized latent vectors
+        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
+
+        # Loss: commitment loss (pulling encoder output to embeddings) + codebook loss
+        if mask is None:
+            loss = torch.mean((z_q.detach() - z) ** 2) + self.beta * torch.mean(
+                (z_q - z.detach()) ** 2
+            )
+        else:
+            mask_f = mask.to(z.dtype).unsqueeze(-1)  # [B, T, 1]
+            denom = (mask_f.sum() * self.d_model).clamp_min(1.0)
+            loss_commit = (((z_q.detach() - z) ** 2) * mask_f).sum() / denom
+            loss_codebook = (((z_q - z.detach()) ** 2) * mask_f).sum() / denom
+            loss = loss_commit + self.beta * loss_codebook
+
+        return z_q, loss, min_encoding_indices.view(z.shape[:-1])
+
+
+class VCEncoder(nn.Module):
+    """Encodes source A_t tokens and applies VQ bottleneck to remove style/speaker info."""
+
+    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=512, vq_bins=128):
+        super().__init__()
+        # Each codebook gets d_model // n_codebooks dimensions to concat into d_model
+        self.codebook_embeds = nn.ModuleList(
+            [
+                nn.Embedding(vocab_size, d_model // n_codebooks)
+                for _ in range(n_codebooks)
+            ]
+        )
+
+        # Causal convolution instead of full transformer to keep it light and causal
+        self.source_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=2)
+
+        self.vq_bottleneck = VectorQuantizer(vq_bins, d_model)
+
+    def forward(
+        self, source_a_t: torch.Tensor, source_mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            source_a_t: [B, 8, T] from EnCodec
+            source_mask: [B, T] valid-frame mask (True=valid), optional
+        Returns:
+            content_features: [B, T, d_model]
+            vq_loss: scalar tensor
+        """
+        B, n_cb, T = source_a_t.shape
+
+        # Embed and concatenate along feature dim
+        embeds = []
+        for i, emb_layer in enumerate(self.codebook_embeds):
+            embeds.append(emb_layer(source_a_t[:, i, :]))  # [B, T, d_model//8]
+
+        x = torch.cat(embeds, dim=-1)  # [B, T, d_model]
+
+        # Causal conv [B, d_model, T] -> [B, T, d_model]
+        x = x.transpose(1, 2)
+        x = F.relu(self.source_conv(x))
+        x = x[:, :, :-2]  # Remove padding to keep causal
+        x = x.transpose(1, 2)
+
+        # Apply Information Bottleneck
+        content_features, vq_loss, _ = self.vq_bottleneck(x, mask=source_mask)
+
+        return content_features, vq_loss
 
 
 class PointerHead(nn.Module):
@@ -82,7 +193,7 @@ class SpeakerPromptEncoder(nn.Module):
         self,
         prompt_codec_tokens: torch.Tensor,
         speaker_embed: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode prompt tokens into speaker embedding and prompt KV features.
 
         Args:
@@ -92,6 +203,7 @@ class SpeakerPromptEncoder(nn.Module):
             refined_speaker_embed: [B, d_model]
             prompt_features: [B, T_prompt, d_model] quantized timbre features
             vq_loss: scalar commitment loss
+            indices: [B, T_prompt] VQ indices
         """
         # Average across codebooks -> [B, T_prompt]
         avg_tokens = prompt_codec_tokens[:, :, 0].long()  # use first codebook
@@ -100,7 +212,7 @@ class SpeakerPromptEncoder(nn.Module):
         x = self.output_norm(x)
 
         # Apply VQ bottleneck to the sequence features (prosody stripping)
-        x_q, vq_loss, _ = self.vq(x)
+        x_q, vq_loss, indices = self.vq(x)
 
         # Extract timbre through bottleneck (blocks prosody leakage)
         timbre = self.timbre_bottleneck(x_q.mean(dim=1))  # [B, d_model]
@@ -109,7 +221,7 @@ class SpeakerPromptEncoder(nn.Module):
             # Fuse external speaker embedding with prompt-derived timbre
             timbre = timbre + self.speaker_proj(speaker_embed)
 
-        return timbre, x_q, vq_loss
+        return timbre, x_q, vq_loss, indices
 
 
 class ProsodyPredictor(nn.Module):
@@ -432,7 +544,7 @@ class DisentangledUCLM(nn.Module):
         self,
         prompt_codec_tokens: torch.Tensor,
         speaker_embed: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode short reference audio for few-shot speaker adaptation.
 
         Args:
@@ -442,13 +554,14 @@ class DisentangledUCLM(nn.Module):
             refined_speaker_embed: [B, d_model]
             prompt_summary_tokens: [B, n_summary, d_model]
             vq_loss: scalar commitment loss
+            indices: [B, T_prompt] VQ indices
         """
-        refined_embed, prompt_feats, vq_loss = self.speaker_prompt_encoder(prompt_codec_tokens, speaker_embed)
+        refined_embed, prompt_feats, vq_loss, indices = self.speaker_prompt_encoder(prompt_codec_tokens, speaker_embed)
         
         # Condense full prompt features into summary tokens for 10ms efficiency
         summary_tokens = self.uclm_core.prompt_resampler(prompt_feats)
         
-        return refined_embed, summary_tokens, vq_loss
+        return refined_embed, summary_tokens, vq_loss, indices
 
     def predict_prosody(
         self,
@@ -482,6 +595,7 @@ class DisentangledUCLM(nn.Module):
         source_mask: Optional[torch.Tensor] = None,
         f0_condition: Optional[torch.Tensor] = None,
         cfg_scale: float = 1.0,
+        cross_attn_mask: torch.Tensor | None = None, # New SOTA field
     ) -> dict:
         content_features, vq_loss = self.vc_encoder(source_a_t, source_mask=source_mask)
 
@@ -514,6 +628,8 @@ class DisentangledUCLM(nn.Module):
             speaker_embed=speaker_embed,
             cfg_scale=cfg_scale,
             position_indices=frame_indices,
+            frame_offsets=frame_indices, # 1:1 mapping for VC
+            cross_attn_mask=cross_attn_mask,
         )
 
         return {
@@ -531,6 +647,75 @@ class DisentangledUCLM(nn.Module):
         with code that calls forward_tts directly.
         """
         return self.forward_tts_pointer(**kwargs)
+
+    @torch.no_grad()
+    def forward_streaming(
+        self,
+        queries: torch.Tensor,
+        memory: torch.Tensor,
+        a_ctx: torch.Tensor,
+        b_ctx: torch.Tensor,
+        speaker_embed: torch.Tensor,
+        explicit_state: Optional[torch.Tensor] = None,
+        ssl_state: Optional[torch.Tensor] = None,
+        cfg_scale: float = 1.0,
+        kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        f0_condition: Optional[torch.Tensor] = None,
+        dialogue_context: Optional[torch.Tensor] = None,
+        acting_intent: Optional[torch.Tensor] = None,
+        prosody_latent: Optional[torch.Tensor] = None,
+        position_indices: Optional[torch.Tensor] = None,
+        precomputed_film_params: Optional[torch.Tensor] = None,
+        state_cond: Optional[torch.Tensor] = None, # Explicitly named for older tests
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        """Incremental forward pass for low-latency streaming (Worker 04)."""
+        
+        # SOTA: Prioritize explicit_state but fallback to state_cond if provided
+        eff_explicit = explicit_state if explicit_state is not None else state_cond
+        
+        if eff_explicit is None:
+            eff_explicit = torch.zeros((queries.shape[0], queries.shape[1], 8), device=queries.device)
+        if ssl_state is None:
+            d_ssl = self.voice_state_enc.ssl_proj[0].in_features
+            ssl_state = torch.zeros((queries.shape[0], queries.shape[1], d_ssl), device=queries.device)
+
+        # 1. Apply F0 conditioning to queries
+        if f0_condition is not None:
+            queries = queries + self.f0_proj(f0_condition)
+
+        # 2. Apply dialogue/acting/prosody
+        queries = self.context_projector(
+            queries,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_latent,
+        )
+
+        # 3. Voice state conditioning
+        v_out = self.voice_state_enc(explicit_state, ssl_state)
+        state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
+
+        # 4. Core transformer with KV cache
+        return self.uclm_core(
+            queries=queries,
+            memory=memory,
+            a_ctx=a_ctx,
+            b_ctx=b_ctx,
+            speaker_embed=speaker_embed,
+            state_cond=state_cond,
+            cfg_scale=cfg_scale,
+            kv_caches=kv_caches,
+            position_indices=position_indices,
+        )
+
+    @torch.no_grad()
+    def bake_film_params(self, speaker_embed: torch.Tensor) -> torch.Tensor:
+        """Pre-compute FiLM parameters from speaker embedding (SOTA efficiency)."""
+        spk_flat = self.uclm_core.speaker_proj(speaker_embed)
+        film_params = self.uclm_core.speaker_film_gen(spk_flat)
+        # [B, n_layers, 2, d_model]
+        return film_params.view(speaker_embed.shape[0], self.uclm_core.n_layers, 2, self.uclm_core.d_model)
 
     def forward_tts_pointer(
         self,
@@ -553,7 +738,9 @@ class DisentangledUCLM(nn.Module):
         acoustic_history: tuple[torch.Tensor, torch.Tensor] | None = None,
         bootstrap_alignment: dict | None = None,
         text_suprasegmentals: torch.Tensor | None = None,
-        phoneme_indices: torch.Tensor | None = None,
+        position_indices: torch.Tensor | None = None,
+        frame_offsets: torch.Tensor | None = None,
+        cross_attn_mask: torch.Tensor | None = None,
     ) -> dict:
         """Pointer-based TTS forward pass (UCLM v3).
 
@@ -678,11 +865,7 @@ class DisentangledUCLM(nn.Module):
             )
 
         # 6. Run through the codec transformer (now with Stream A history + Cross-Attention)
-        # SOTA: Explicitly calculate frame indices for Progress-aware RoPE.
-        # This ensures that even if multiple frames point to the same text token,
-        # the transformer recognizes temporal movement.
-        frame_indices = torch.arange(target_length, device=phoneme_features.device).unsqueeze(0).expand(B, -1)
-
+        # SOTA: Hierarchical RoPE - use semantic position + temporal offset
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
             queries=content_features,
             memory=phoneme_features,
@@ -693,7 +876,9 @@ class DisentangledUCLM(nn.Module):
             prompt_tokens=prompt_kv_cache, # Pass prompt features for condensation
             cfg_scale=cfg_scale,
             f0_condition=f0_condition,
-            position_indices=frame_indices,
+            position_indices=position_indices,
+            frame_offsets=frame_offsets,
+            cross_attn_mask=cross_attn_mask,
         )
 
         # 7. Pointer head
@@ -728,6 +913,9 @@ class DisentangledUCLM(nn.Module):
         prosody_latent: torch.Tensor | None = None,
         delta_voice_state: torch.Tensor | None = None,
         text_suprasegmentals: torch.Tensor | None = None,
+        position_indices: torch.Tensor | None = None,
+        frame_offsets: torch.Tensor | None = None,
+        cross_attn_mask: torch.Tensor | None = None, # New SOTA field
     ) -> dict:
         """Single-pass forward with cfg_scale injected for distillation training."""
         # Project cfg_scale to model dimension and add to global speaker/style conditioning
@@ -753,6 +941,9 @@ class DisentangledUCLM(nn.Module):
             acting_intent=acting_intent,
             prosody_latent=prosody_latent,
             delta_voice_state=delta_voice_state,
+            position_indices=position_indices,
+            frame_offsets=frame_offsets,
+            cross_attn_mask=cross_attn_mask,
         )
 
     @staticmethod
@@ -776,6 +967,13 @@ class DisentangledUCLM(nn.Module):
         loss_b = _kl(teacher_logits_b, student_logits_b)
         return (loss_a + loss_b) * 0.5
 
+    def bake_film_params(self, speaker_embed: torch.Tensor) -> torch.Tensor:
+        """SOTA: Pre-compute FiLM parameters from speaker embedding for efficient inference."""
+        with torch.no_grad():
+            spk_flat = self.uclm_core.speaker_proj(speaker_embed)
+            film_params = self.uclm_core.speaker_film_gen(spk_flat)
+            return film_params.view(speaker_embed.shape[0], self.uclm_core.n_layers, 2, self.d_model)
+
     def forward_streaming(
         self,
         queries: torch.Tensor | None = None,
@@ -795,6 +993,9 @@ class DisentangledUCLM(nn.Module):
         prompt_summary_tokens: torch.Tensor | None = None,
         content_features: torch.Tensor | None = None,
         frame_index: int = 0,
+        precomputed_film_params: torch.Tensor | None = None,
+        cross_attn_mask: torch.Tensor | None = None,
+        frame_offsets: int | torch.Tensor | None = None, # New SOTA field
     ) -> dict:
         """Forward pass for streaming inference with internal voice state encoding."""
         # Backward-compatible alias: content_features -> queries
@@ -810,7 +1011,7 @@ class DisentangledUCLM(nn.Module):
         # 1. Encode Voice State (Matching training path)
         if explicit_state is not None:
             _ssl = ssl_state if ssl_state is not None else torch.zeros(
-                explicit_state.shape[0], explicit_state.shape[1], self.voice_state_enc.ssl_proj.in_features,
+                explicit_state.shape[0], explicit_state.shape[1], self.voice_state_enc.ssl_proj[0].in_features,
                 device=explicit_state.device
             )
             v_out = self.voice_state_enc(explicit_state, _ssl)
@@ -833,9 +1034,15 @@ class DisentangledUCLM(nn.Module):
 
         cfg_tensor = torch.tensor([cfg_scale], device=queries.device)
         
-        # SOTA: Pass frame_index as position_indices for Progress-aware RoPE
+        # SOTA: Hierarchical RoPE - pass both semantic index and temporal offset
         pos_idx = torch.tensor([[frame_index]], device=queries.device, dtype=torch.long)
-        
+        f_offs = None
+        if frame_offsets is not None:
+            if isinstance(frame_offsets, int):
+                f_offs = torch.tensor([[frame_offsets]], device=queries.device, dtype=torch.long)
+            else:
+                f_offs = frame_offsets.to(queries.device)
+
         logits_a, logits_b, next_kv_caches, x_out = self.uclm_core(
             queries=queries,
             memory=memory,
@@ -848,6 +1055,9 @@ class DisentangledUCLM(nn.Module):
             kv_caches=kv_caches,
             f0_condition=f0_condition,
             position_indices=pos_idx,
+            precomputed_film_params=precomputed_film_params,
+            cross_attn_mask=cross_attn_mask,
+            frame_offsets=f_offs,
         )
 
         # Pointer head for streaming pointer-driven progression

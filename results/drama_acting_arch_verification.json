@@ -1,0 +1,26 @@
+{
+  "replay_fidelity": {
+    "passed": true,
+    "detail": {
+      "bit_exact_parity": {
+        "matches": 5,
+        "total": 5,
+        "passed": true
+      },
+      "timing_parity": {
+        "matches": 5,
+        "total": 5,
+        "passed": true
+      }
+    }
+  },
+  "edit_locality": {
+    "passed": true,
+    "detail": {
+      "prefix_bit_exact_matches": 4,
+      "total_texts": 5,
+      "threshold": 0.8
+    }
+  },
+  "overall_passed": true
+}

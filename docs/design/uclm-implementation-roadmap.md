@@ -5,7 +5,7 @@
 ## 1. 実装の正本
 
 - 全体計画: `../../plan/README.md`
-- ワーカー分割: `../../plan/worker_01_architecture.md` から `worker_12_gradio_control_plane.md`
+- active worker files: `../../plan/worker_01_architecture.md`, `worker_04_serving.md`, `worker_06_validation.md`, `worker_12_gradio_control_plane.md`
 
 このファイルに段階別ロードマップや旧前提の詳細は持たない。
 

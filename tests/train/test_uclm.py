@@ -1,5 +1,5 @@
 import torch
-from tmrvc_train.models.uclm import VoiceStateEncoder, VectorQuantizer, VCEncoder
+from tmrvc_train.models import VoiceStateEncoder, VectorQuantizer, VCEncoder
 from tmrvc_train.models.uclm_transformer import CodecTransformer
 
 

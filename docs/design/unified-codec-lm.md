@@ -148,6 +148,17 @@ legacy は mainline 仕様に干渉してはならない。
 
 ## 7.3 Release-Critical Contract
 
+以下の仕様は、TMRVC UCLM v3 の性能と決定論的再現性を保証するための「絶対的命令」である。
+
+1. **ポインタ連続積分 (Continuous Integration)**: 
+   - $P_{t} \ge 1.0$ での音素遷移時、進捗 $P$ を $0.0$ にリセットしてはならない。必ず $P_{next} = P_{t} - 1.0$ として余剰分を次音素へ引き継ぐこと。
+2. **Stall-aware RoPE**: 
+   - ポインタが停滞（Stall）している間も、Transformer が時間を正しく認識できるよう、RoPE インデックスに生成済みフレーム総数をオフセットとして加算すること。
+3. **停止条件 (EOS) と余韻**: 
+   - 最終音素の終了判定後、最低 5 フレーム以上の Tail Buffer を生成してから停止すること。
+4. **MAS 特徴量の正規化**: 
+   - 教師なしアライメント（MAS）の距離計算前には、特徴量を必ず L2 正規化し、コサイン空間での安定性を確保すること。
+
 `v3.0 core proof obligations` として固定するもの:
 
 - pointer-based causal progression

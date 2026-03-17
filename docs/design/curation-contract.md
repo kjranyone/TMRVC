@@ -1,6 +1,6 @@
 # TMRVC Curation Contract
 
-この文書は、`plan/ai_curation_system.md`、`plan/worker_07_curation_orchestration.md`、`plan/worker_09_curation_selection.md`、`plan/worker_10_curation_export.md` を正本として、mainline curation の manifest / promotion / export 契約を定義する。
+この文書は、mainline curation の manifest / promotion / export 契約の正本である。active backlog が必要な場合のみ `plan/README.md` と `plan/repo_remaining_inventory_2026_03.md` を参照する。
 
 ## 1. Scope
 

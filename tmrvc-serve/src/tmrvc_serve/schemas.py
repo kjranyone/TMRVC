@@ -469,24 +469,30 @@ WEBSOCKET_DOCS = {
 
 
 class ArtifactResponse(BaseModel):
-    """Artifact download envelope for WebUI-initiated exports.
+    """Artifact download envelope for WebUI-initiated exports."""
 
-    Artifacts must be retrievable without shell access.  The ``download_url``
-    is a server-relative path that the UI can fetch directly.
-    """
+    artifact_id: str
+    artifact_type: str
+    download_url: str
+    expires_at: Optional[str] = None
+    provenance_summary: dict = Field(default_factory=dict)
 
-    artifact_id: str = Field(..., description="Unique artifact identifier.")
-    artifact_type: str = Field(
-        ...,
-        description='One of "training_bundle", "eval_bundle", "take_bundle".',
-    )
-    download_url: str = Field(
-        ..., description="Relative URL to download the artifact."
-    )
-    expires_at: Optional[str] = Field(
-        None, description="ISO-8601 expiry timestamp, or null if permanent."
-    )
-    provenance_summary: dict = Field(
-        default_factory=dict,
-        description="Key provenance metadata (source, versions, hashes).",
-    )
+
+class JobStatusResponse(BaseModel):
+    """Status of an asynchronous backend job (e.g. curation, export)."""
+
+    job_id: str
+    status: Literal["pending", "running", "completed", "failed"]
+    progress: float = 0.0
+    message: str = ""
+    result: Optional[dict] = None
+    created_at: str = ""
+
+
+class CurationActionRequest(BaseModel):
+    """Request to perform an action on a curation record."""
+
+    action: Literal["promote", "reject", "review", "reset"]
+    expected_version: int
+    bucket: Optional[str] = None
+    rationale: str = ""

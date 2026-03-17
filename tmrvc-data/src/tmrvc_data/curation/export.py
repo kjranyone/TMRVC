@@ -189,8 +189,8 @@ class CurationExporter:
             if self.config.export_voice_state:
                 self._export_voice_state(record, record_dir, bucket)
 
-            # Export phoneme_ids.npy if available
-            self._export_phoneme_ids(record, record_dir)
+            # Export phoneme_ids.npy if available (Enforced for tts_mainline)
+            self._export_phoneme_ids(record, record_dir, bucket)
 
         # Write manifest
         manifest_path = out / "manifest.jsonl"
@@ -448,17 +448,32 @@ class CurationExporter:
             json.dump(meta, f, indent=2)
 
     # ------------------------------------------------------------------
-    # Phoneme IDs export
+    # Phoneme IDs export (Enforced by Worker 10 / GEMINI.md)
     # ------------------------------------------------------------------
 
-    def _export_phoneme_ids(self, record: CurationRecord, record_dir: Path) -> None:
-        """Export phoneme_ids.npy from record attributes if available."""
+    def _export_phoneme_ids(
+        self, record: CurationRecord, record_dir: Path, bucket: PromotionBucket
+    ) -> None:
+        """Export phoneme_ids.npy from record attributes.
+
+        SOTA Mandate: phoneme_ids.npy is REQUIRED for tts_mainline.
+        If missing, we fail fast to prevent G2P skipping during preprocessing.
+        """
         phoneme_ids = record.attributes.get("phoneme_ids_list")
+
+        if bucket == PromotionBucket.TTS_MAINLINE and phoneme_ids is None:
+            # Check if transcript exists to attempt emergency G2P or fail.
+            # Charter says G2P skipping is forbidden, so we stop here.
+            msg = f"FATAL: Missing phoneme_ids for tts_mainline record {record.record_id}. " \
+                  f"Preprocessing skip-G2P is forbidden by GEMINI.md."
+            logger.error(msg)
+            raise ValueError(msg)
+
         if phoneme_ids is not None:
             arr = np.asarray(phoneme_ids, dtype=np.int64)
             np.save(record_dir / "phoneme_ids.npy", arr)
 
-        # Export text_suprasegmentals if present
+        # Export text_suprasegmentals if present (Optional but recommended)
         supra = record.attributes.get("text_suprasegmentals")
         if supra is not None:
             supra_arr = np.asarray(supra, dtype=np.float32)

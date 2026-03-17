@@ -125,7 +125,8 @@ class TestModelExpressiveInputs:
         model = DisentangledUCLM(d_model=256, n_heads=4, n_layers=1, num_speakers=2)
         B = 1
         out = model.forward_streaming(
-            content_features=torch.randn(B, 1, 256),
+            queries=torch.randn(B, 1, 256),
+            memory=torch.randn(B, 1, 256),
             a_ctx=torch.zeros(B, 8, 1, dtype=torch.long),
             b_ctx=torch.zeros(B, 4, 1, dtype=torch.long),
             speaker_embed=torch.randn(B, 192),

@@ -7,7 +7,7 @@ Updated: 2026-03-08
 - `MFA` は mainline の設計前提にしない
 - TTS は `internal alignment + causal pointer` を使う
 - `A_t / B_t` の dual-stream token contract は維持する
-- 実装工程・依存関係・未完了タスクの正本は `plan/`
+- 未完了タスクの正本は `plan/`
 - `docs/design/` は `plan` から凍結された契約を記述する
 - `docs/training/` は監査・是正・補助資料を置く
 
@@ -35,25 +35,18 @@ Updated: 2026-03-08
 
 ## 実装計画
 
-現行の実装分解は `plan/` が正本です。
+現行の active backlog は `plan/` が正本です。
 
 | File | 役割 |
 |---|---|
 | `../plan/README.md` | 全体計画と依存関係 |
 | `../plan/worker_01_architecture.md` | モデル設計 |
-| `../plan/worker_02_training.md` | 学習系 |
-| `../plan/worker_03_dataset_alignment.md` | dataset / text supervision |
 | `../plan/worker_04_serving.md` | serving / runtime |
-| `../plan/worker_05_devops_docs.md` | dev tooling / docs |
 | `../plan/worker_06_validation.md` | validation / acceptance |
-| `../plan/worker_07_curation_orchestration.md` | curation orchestration / manifest |
-| `../plan/worker_08_curation_providers.md` | provider stack |
-| `../plan/worker_09_curation_selection.md` | promotion / rejection policy |
-| `../plan/worker_10_curation_export.md` | export / artifact package |
-| `../plan/worker_11_curation_validation.md` | curation acceptance |
 | `../plan/worker_12_gradio_control_plane.md` | Gradio/WebUI control plane |
 | `../plan/dramatic_acting_requirements.md` | drama-grade acting requirement |
-| `../plan/ai_curation_system.md` | curation 全体計画 |
+| `../plan/fish_audio_s2_competitive_strategy.md` | 競争戦略 |
+| `../plan/repo_remaining_inventory_2026_03.md` | repo 全体の pending-only inventory |
 
 ## 学習文書
 
