@@ -35,6 +35,7 @@ class TrainingPipeline:
         skip_preprocess: bool = False,
         run_training: bool = True,
         train_datasets: list[str] | None = None,
+        base_checkpoint: Path | None = None,
     ):
         self.experiment_dir = experiment_dir
         self.dataset = dataset
@@ -46,6 +47,7 @@ class TrainingPipeline:
         self.skip_preprocess = skip_preprocess
         self.run_training = run_training
         self.train_datasets = train_datasets
+        self.base_checkpoint = base_checkpoint
 
         self.experiment_manager = ExperimentManager(experiment_dir)
 
@@ -348,6 +350,9 @@ class TrainingPipeline:
             )
         if bool(self.config.get("train_require_tts_supervision", False)):
             train_args.append("--require-tts-supervision")
+        
+        if self.base_checkpoint:
+            train_args.extend(["--base-checkpoint", str(self.base_checkpoint)])
         tts_mode = self.config.get("tts_mode", "pointer")
         if tts_mode in ("pointer", "legacy_duration"):
             train_args.extend(["--tts-mode", tts_mode])

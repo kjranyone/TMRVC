@@ -501,6 +501,10 @@ class DisentangledUCLM(nn.Module):
         b_ctx[:, :, 1:] = target_b[:, :, :-1]
         b_ctx = b_ctx.clamp_min(0)
 
+        # SOTA: Explicitly calculate frame indices for Progress-aware RoPE
+        T = content_features.shape[1]
+        frame_indices = torch.arange(T, device=content_features.device).unsqueeze(0).expand(source_a_t.shape[0], -1)
+
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
             queries=content_features,
             memory=content_features, # VC cross-attends to its own latent sequence
@@ -509,6 +513,7 @@ class DisentangledUCLM(nn.Module):
             state_cond=state_cond,
             speaker_embed=speaker_embed,
             cfg_scale=cfg_scale,
+            position_indices=frame_indices,
         )
 
         return {
@@ -673,8 +678,11 @@ class DisentangledUCLM(nn.Module):
             )
 
         # 6. Run through the codec transformer (now with Stream A history + Cross-Attention)
-        # Note: we pass phoneme_features (L tokens) as memory for global cross-attention,
-        # while content_features (T frames) acts as the query/base.
+        # SOTA: Explicitly calculate frame indices for Progress-aware RoPE.
+        # This ensures that even if multiple frames point to the same text token,
+        # the transformer recognizes temporal movement.
+        frame_indices = torch.arange(target_length, device=phoneme_features.device).unsqueeze(0).expand(B, -1)
+
         logits_a, logits_b, x_out = self.uclm_core.forward_no_cache(
             queries=content_features,
             memory=phoneme_features,
@@ -685,6 +693,7 @@ class DisentangledUCLM(nn.Module):
             prompt_tokens=prompt_kv_cache, # Pass prompt features for condensation
             cfg_scale=cfg_scale,
             f0_condition=f0_condition,
+            position_indices=frame_indices,
         )
 
         # 7. Pointer head
@@ -785,6 +794,7 @@ class DisentangledUCLM(nn.Module):
         f0_condition: torch.Tensor | None = None,
         prompt_summary_tokens: torch.Tensor | None = None,
         content_features: torch.Tensor | None = None,
+        frame_index: int = 0,
     ) -> dict:
         """Forward pass for streaming inference with internal voice state encoding."""
         # Backward-compatible alias: content_features -> queries
@@ -822,6 +832,10 @@ class DisentangledUCLM(nn.Module):
         )
 
         cfg_tensor = torch.tensor([cfg_scale], device=queries.device)
+        
+        # SOTA: Pass frame_index as position_indices for Progress-aware RoPE
+        pos_idx = torch.tensor([[frame_index]], device=queries.device, dtype=torch.long)
+        
         logits_a, logits_b, next_kv_caches, x_out = self.uclm_core(
             queries=queries,
             memory=memory,
@@ -833,6 +847,7 @@ class DisentangledUCLM(nn.Module):
             cfg_scale=cfg_tensor,
             kv_caches=kv_caches,
             f0_condition=f0_condition,
+            position_indices=pos_idx,
         )
 
         # Pointer head for streaming pointer-driven progression

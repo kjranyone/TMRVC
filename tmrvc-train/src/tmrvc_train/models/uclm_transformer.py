@@ -99,11 +99,10 @@ def apply_rotary_emb(
     """
     B, n_h, T, hd = x.shape
     if position_indices is not None:
-        # SOTA fix: Combine phoneme-based position with temporal progression (offset).
-        # Even during a pointer stall, the RoPE index must increment frame-by-frame
-        # to allow the Transformer to distinguish between temporal steps.
-        t_seq = torch.arange(T, device=x.device).unsqueeze(0) + offset
-        indices = (position_indices.long() + t_seq.long()).clamp(max=cos.shape[0] - 1)
+        # SOTA: Use the provided absolute indices (frame counters).
+        # The caller (DisentangledUCLM) ensures that these increment frame-by-frame
+        # regardless of pointer stalls.
+        indices = position_indices.long().clamp(max=cos.shape[0] - 1)
         
         cos_b = cos[indices].unsqueeze(1)  # [B, 1, T, hd]
         sin_b = sin[indices].unsqueeze(1)  # [B, 1, T, hd]
@@ -249,9 +248,17 @@ class CausalGQAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Determine the RoPE offset from the KV cache length
+        # Determine the RoPE offset from the KV cache length.
+        # SOTA: If we are training (no cache), use position_indices to ensure
+        # the model learns temporal progress correctly even during stalls.
         rope_offset = k_cache.shape[2] if k_cache is not None else 0
-        cos, sin = self.rope(rope_offset + T)
+        
+        # We need enough cos/sin for the maximum sequence length we'll see
+        max_idx = T + rope_offset
+        if position_indices is not None:
+            max_idx = max(max_idx, int(position_indices.max().item()) + 1)
+        
+        cos, sin = self.rope(max_idx)
 
         q = apply_rotary_emb(q, cos, sin, offset=rope_offset, position_indices=position_indices)
         k = apply_rotary_emb(k, cos, sin, offset=rope_offset, position_indices=position_indices)
@@ -380,11 +387,6 @@ class CrossAttention(nn.Module):
         return self.out_proj(out)
 
 
-# Backward-compatible aliases
-CausalSelfAttention = CausalGQAttention
-GQAAttention = CausalGQAttention
-
-
 # ---------------------------------------------------------------------------
 # Modern Transformer Block (pre-norm with RMSNorm + SwiGLU + GQA + RoPE)
 # ---------------------------------------------------------------------------
@@ -410,7 +412,7 @@ class ModernTransformerBlock(nn.Module):
         # Pre-norm with RMSNorm (not LayerNorm)
         self.norm1 = RMSNorm(d_model)
         # GQA self-attention with RoPE (via CausalGQAttention)
-        self.attn = GQAAttention(
+        self.attn = CausalGQAttention(
             d_model, n_heads, n_kv_heads=n_kv_heads, dropout=dropout, max_seq_len=max_seq_len,
         )
         # Cross-attention layer
@@ -422,20 +424,11 @@ class ModernTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
-        
-        # SOTA: Speaker FiLM
-        self.speaker_film = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.SiLU(),
-            nn.Linear(d_model * 2, d_model * 2),
-        )
 
-    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None, speaker_embed_mapped=None):
-        # Apply speaker FiLM if provided
-        if speaker_embed_mapped is not None:
-            film_params = self.speaker_film(speaker_embed_mapped)
-            gamma, beta = film_params.chunk(2, dim=-1)
-            x = x * (1 + gamma) + beta
+    def forward(self, x, memory=None, k_cache=None, v_cache=None, position_indices=None, film_gamma=None, film_beta=None):
+        # SOTA: Apply speaker FiLM modulation (Feature-wise Linear Modulation)
+        if film_gamma is not None and film_beta is not None:
+            x = x * (1 + film_gamma) + film_beta
 
         # Self-attention with pre-norm
         h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices)
@@ -447,69 +440,6 @@ class ModernTransformerBlock(nn.Module):
             x = x + self.dropout(h_cross)
 
         # SwiGLU FFN with pre-norm
-        x = x + self.dropout(self.ff(self.norm2(x)))
-        return x, nk, nv
-
-
-# ---------------------------------------------------------------------------
-# Transformer Block (pre-norm with RMSNorm + SwiGLU + Cross-Attention)
-# ---------------------------------------------------------------------------
-
-class TransformerBlock(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        d_ff: int,
-        dropout: float = 0.0,
-        n_kv_heads: Optional[int] = None,
-        max_seq_len: int = 4096,
-    ):
-        super().__init__()
-        self.norm1 = RMSNorm(d_model)
-        self.attn = CausalSelfAttention(
-            d_model, n_heads, n_kv_heads=n_kv_heads, dropout=dropout, max_seq_len=max_seq_len,
-        )
-        self.norm_cross = RMSNorm(d_model)
-        self.cross_attn = CrossAttention(
-            d_model, n_heads, n_kv_heads=n_kv_heads, dropout=dropout
-        )
-        self.norm2 = RMSNorm(d_model)
-        self.ff = SwiGLUFFN(d_model, d_ff, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
-        
-        # SOTA: Speaker FiLM
-        self.speaker_film = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.SiLU(),
-            nn.Linear(d_model * 2, d_model * 2),
-        )
-
-    def forward(
-        self,
-        x,
-        memory=None,
-        k_cache=None,
-        v_cache=None,
-        position_indices=None,
-        speaker_embed_mapped=None,
-    ):
-        # Apply speaker FiLM if provided (per-layer speaker conditioning)
-        if speaker_embed_mapped is not None:
-            film_params = self.speaker_film(speaker_embed_mapped)
-            gamma, beta = film_params.chunk(2, dim=-1)
-            x = x * (1 + gamma) + beta
-
-        # Self-attention
-        h, nk, nv = self.attn(self.norm1(x), k_cache, v_cache, position_indices=position_indices)
-        x = x + self.dropout(h)
-
-        # Cross-attention (against full phoneme sequence/memory)
-        if memory is not None:
-            h_cross = self.cross_attn(self.norm_cross(x), memory)
-            x = x + self.dropout(h_cross)
-
-        # FFN
         x = x + self.dropout(self.ff(self.norm2(x)))
         return x, nk, nv
 
@@ -531,7 +461,7 @@ class CodecTransformer(nn.Module):
         n_kv_heads=None,
         max_seq_len=4096,
         n_prompt_summary_tokens=32,
-        use_modern_backbone: bool = False,
+        use_modern_backbone: bool = True, # CHARTER: Default to True
     ):
         super().__init__()
         self.d_model, self.n_layers = d_model, n_layers
@@ -543,6 +473,15 @@ class CodecTransformer(nn.Module):
 
         self.speaker_proj = nn.Linear(d_speaker, d_model)
         self.f0_proj = nn.Linear(2, d_model)  # F0 fusion layer (UCLM v3)
+
+        # SOTA: Single FiLM generator for all layers (Feature-wise Linear Modulation)
+        # This maps the speaker embedding into (gamma, beta) for each of the N layers.
+        # Total output: N_layers * d_model * 2
+        self.speaker_film_gen = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model * 2 * n_layers),
+        )
 
         # Prompt Resampler (condenses T_prompt into fixed N_summary tokens)
         self.prompt_resampler = PromptResampler(d_model, n_summary=n_prompt_summary_tokens, n_heads=n_heads)
@@ -559,11 +498,10 @@ class CodecTransformer(nn.Module):
         )
         self.b_ctx_fusion = nn.Linear(d_model, d_model)
 
-        # Select block class based on use_modern_backbone flag
-        BlockClass = ModernTransformerBlock if use_modern_backbone else TransformerBlock
+        # CHARTER: Modern backbone is now mandatory for SOTA Standards.
         self.layers = nn.ModuleList(
             [
-                BlockClass(
+                ModernTransformerBlock(
                     d_model,
                     n_heads,
                     d_model * 4,
@@ -641,11 +579,14 @@ class CodecTransformer(nn.Module):
         )  # [B, T, d_model]
         x = x + b_ctx_fused
 
-        # SOTA: Map speaker embedding once for FiLM conditioning across all layers
-        spk_mapped = self.speaker_proj(speaker_embed).unsqueeze(1)  # [B, 1, d_model]
-        
-        # Add speaker embedding as a base bias (optional, but kept for stability)
-        x = x + spk_mapped
+        # SOTA: Map speaker embedding once for FiLM parameters across ALL layers (GEMINI.md Mandate)
+        spk_flat = self.speaker_proj(speaker_embed)  # [B, d_model]
+        film_params = self.speaker_film_gen(spk_flat) # [B, 2 * d_model * n_layers]
+        # Reshape to [B, n_layers, 2, d_model] to simplify slicing in the loop
+        film_params = film_params.view(B, self.n_layers, 2, self.d_model)
+
+        # Base speaker bias (optional, for embedding-space stability)
+        x = x + spk_flat.unsqueeze(1)
 
         # Add voice state condition (temporal)
         if state_cond.dim() == 2:
@@ -682,15 +623,21 @@ class CodecTransformer(nn.Module):
         for i, layer in enumerate(self.layers):
             k_in = kv_list[i][0] if kv_list else None
             v_in = kv_list[i][1] if kv_list else None
+            
+            # SOTA: Extract per-layer FiLM params from the pre-computed tensor
+            f_gamma = film_params[:, i, 0, :].unsqueeze(1) # [B, 1, d_model]
+            f_beta = film_params[:, i, 1, :].unsqueeze(1)  # [B, 1, d_model]
+
             # layer now takes 'memory' (full phonemes) for cross-attention
-            # and speaker_embed_mapped for FiLM
+            # and explicit FiLM params for speaker modulation.
             x, nk, nv = layer(
                 x, 
                 memory=memory, 
                 k_cache=k_in, 
                 v_cache=v_in,
                 position_indices=position_indices,
-                speaker_embed_mapped=spk_mapped,
+                film_gamma=f_gamma,
+                film_beta=f_beta,
             )
 
             if nk.shape[2] > max_seq_len:
@@ -732,13 +679,20 @@ class CodecTransformer(nn.Module):
         f0_condition=None,
         prompt_tokens=None,
         prompt_summary_tokens=None,
+        position_indices=None,
     ):
         """Non-streaming forward for training. History must be shifted."""
         la, lb, _, x = self.forward(
-            queries, memory, a_ctx, b_ctx, speaker_embed, state_cond,
+            queries,
+            memory=memory,
+            a_ctx=a_ctx,
+            b_ctx=b_ctx,
+            speaker_embed=speaker_embed,
+            state_cond=state_cond,
             prompt_tokens=prompt_tokens,
             prompt_summary_tokens=prompt_summary_tokens,
             cfg_scale=cfg_scale,
             f0_condition=f0_condition,
+            position_indices=position_indices,
         )
         return la, lb, x

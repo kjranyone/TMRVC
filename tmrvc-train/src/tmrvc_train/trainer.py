@@ -558,6 +558,8 @@ class UCLMTrainer:
 
         # Optimization
         losses["loss"].backward()
+        # SOTA: Strict gradient clipping to prevent catastrophic loss spikes
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         res = {k: v.item() for k, v in losses.items() if isinstance(v, torch.Tensor)}
