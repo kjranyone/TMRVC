@@ -46,10 +46,11 @@ class MelSpectrogram(nn.Module):
     Mel spectrogram with exact frame alignment to codec tokens.
 
     Frame count formula: T = ceil(N / hop_length)
-    For 1s audio at 24kHz with hop_length=240: T = ceil(24000/240) = 100 frames
+    Example: 1s audio at 24kHz with hop_length=240 → T = ceil(24000/240) = 100 frames
 
     CRITICAL: This MUST match codec token frame count exactly.
     Any mismatch indicates a bug that must be fixed at the source.
+    Padding is computed dynamically as (n_fft - hop_length).
     """
 
     def __init__(
@@ -73,10 +74,9 @@ class MelSpectrogram(nn.Module):
         # Calculate exact padding for frame alignment
         # T = floor((N + pad - n_fft) / hop_length) + 1
         # For T = ceil(N / hop_length), we need:
-        # pad = hop_length - (N - n_fft) % hop_length + (window_length - hop_length)
-        # Simplified: pad = window_length - hop_length + (hop_length - (N - n_fft) % hop_length) % hop_length
-        # For N=24000, n_fft=1024, hop_length=240: pad = 784
-        self.pad_length = 784  # Exact padding for 100 frames at 24kHz
+        # pad = n_fft - hop_length (center the first window at sample 0)
+        # This ensures T = ceil(N / hop_length) frames for any hop_length.
+        self.pad_length = n_fft - hop_length
         self.register_buffer("window", torch.hann_window(window_length, periodic=True))
         self.register_buffer(
             "mel_basis", create_mel_filterbank(n_fft, n_mels, sample_rate, fmin, fmax)
@@ -116,7 +116,7 @@ def compute_stft(
 
     CRITICAL: Frame count MUST match MelSpectrogram and codec tokens.
     """
-    pad_length = 784  # Exact padding for frame alignment
+    pad_length = n_fft - hop_length
     x = F.pad(waveform, (pad_length, 0))
     # Explicitly create window on the SAME device as x
     window = torch.hann_window(window_length, periodic=True, device=x.device)

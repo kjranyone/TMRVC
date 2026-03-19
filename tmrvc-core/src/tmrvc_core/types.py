@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import torch
 
@@ -121,8 +121,8 @@ class PointerState:
 
 # Fields zeroed during CFG unconditional pass:
 CFG_ZEROED_FIELDS = frozenset({
-    "explicit_voice_state",   # [B, T, 8] or [B, 8]
-    "delta_voice_state",      # [B, T, 8] or [B, 8]
+    "explicit_voice_state",   # [B, T, 12] or [B, 12]
+    "delta_voice_state",      # [B, T, 12] or [B, 12]
     "ssl_voice_state",        # [B, T, d_ssl]
     "speaker_embed",          # [B, d_speaker]
     "prompt_codec_tokens",    # [B, T_prompt, n_codebooks]
@@ -142,25 +142,53 @@ CFG_PRESERVED_FIELDS = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Data Quality and Provenance
+# ---------------------------------------------------------------------------
+
+class SupervisionTier(str, Enum):
+    """Data quality tier classification.
+
+    Tier A: speaker / transcript / physical / semantic all high-confidence
+    Tier B: transcript and speaker high-confidence, physical or semantic partly pseudo
+    Tier C: transcript and basic speaker anchor present, physical supervision sparse
+    Tier D: reference-only or auxiliary-only
+    """
+    A = "tier_a"
+    B = "tier_b"
+    C = "tier_c"
+    D = "tier_d"
+
+
+class TrajectoryProvenance(str, Enum):
+    """Provenance label for trajectory artifacts."""
+    FRESH_COMPILE = "fresh_compile"
+    DETERMINISTIC_REPLAY = "deterministic_replay"
+    CROSS_SPEAKER_TRANSFER = "cross_speaker_transfer"
+    PATCHED_REPLAY = "patched_replay"
+
+
+# ---------------------------------------------------------------------------
 # Voice State Supervision Contract
 # ---------------------------------------------------------------------------
 
 @dataclass
 class VoiceStateSupervision:
-    """Canonical voice_state supervision artifact from curation/export.
+    """Canonical 12-D voice_state supervision artifact from curation/export.
 
     Tensor Contract:
-        targets: [B, T, 8] — 8-D physical voice state targets
-        observed_mask: [B, T, 8] — True where dimension has usable evidence
-        confidence: [B, T, 8] or [B, T, 1] — numeric confidence per dimension
+        targets: [B, T, 12] — 12-D physical voice state targets
+        observed_mask: [B, T, 12] — True where dimension has usable evidence
+        confidence: [B, T, 12] or [B, T, 1] — numeric confidence per dimension
+        supervision_tier: SupervisionTier classification
         provenance: str — estimator identity and calibration version
         target_source: canonical source label such as direct/pseudo/absent
 
     Missing dimensions must be masked in loss, never treated as zero-valued neutral.
     """
-    targets: torch.Tensor        # [B, T, 8]
-    observed_mask: torch.Tensor  # [B, T, 8] bool
-    confidence: torch.Tensor     # [B, T, 8] or [B, T, 1]
+    targets: torch.Tensor             # [B, T, 12]
+    observed_mask: torch.Tensor       # [B, T, 12] bool
+    confidence: torch.Tensor          # [B, T, 12] or [B, T, 1]
+    supervision_tier: SupervisionTier = SupervisionTier.C
     provenance: str = "unknown"
     target_source: str = "unknown"
 
@@ -170,8 +198,8 @@ class SpeakerProfile:
     """Canonical Speaker Profile contract for the Casting Gallery.
 
     Shared by Gradio UI, Python Serve, Rust Engine, and VST.
-    v3.0 mainline is prompt-based only. Legacy adaptor-related fields remain as
-    compatibility placeholders and are not part of the canonical v3.0 contract.
+    Prompt-based only. Legacy adaptor-related fields remain as
+    compatibility placeholders.
     """
     speaker_profile_id: str
     reference_audio_hash: str
@@ -182,7 +210,7 @@ class SpeakerProfile:
     prompt_kv_cache: Optional[torch.Tensor] = None
     # Compressed summary tokens from Prompt Resampler (Q-Former)
     prompt_summary_tokens: Optional[torch.Tensor] = None  # [n_prompt_summary_tokens, d_model]
-    # Deprecated compatibility placeholders: not canonical in v3.0.
+    # Deprecated compatibility placeholders.
     adaptor_id: Optional[str] = None
     adaptor_merged: bool = False
     prompt_text_tokens: Optional[torch.Tensor] = None  # [L_prompt]
@@ -197,11 +225,63 @@ class SpeakerProfile:
 
 
 @dataclass
+class TTSFeatureSet:
+    """Per-utterance feature set for TTS training."""
+    mel: torch.Tensor               # [n_mels, T]
+    content: torch.Tensor           # [D_content, T]
+    f0: torch.Tensor                # [1, T] or [T]
+    spk_embed: torch.Tensor         # [d_speaker]
+    phoneme_ids: torch.Tensor       # [L]
+    durations: torch.Tensor         # [L]
+    language_id: int = 0
+    utterance_id: str = ""
+    speaker_id: str = ""
+    n_frames: int = 0
+    n_phonemes: int = 0
+    content_dim: int = 0
+    text: str = ""
+    breath_onsets: Optional[torch.Tensor] = None      # [T]
+    breath_durations: Optional[torch.Tensor] = None    # [T]
+    breath_intensity: Optional[torch.Tensor] = None    # [T]
+    pause_durations: Optional[torch.Tensor] = None     # [T]
+
+
+@dataclass
+class TTSBatch:
+    """Collated batch for TTS training."""
+    phoneme_ids: torch.Tensor        # [B, L_max]
+    durations: torch.Tensor          # [B, L_max]
+    language_ids: torch.Tensor       # [B]
+    content: torch.Tensor            # [B, D_content, T_max]
+    f0: torch.Tensor                 # [B, 1, T_max] or [B, T_max]
+    spk_embed: torch.Tensor          # [B, d_speaker]
+    mel_target: torch.Tensor         # [B, n_mels, T_max]
+    frame_lengths: torch.Tensor      # [B]
+    phoneme_lengths: torch.Tensor    # [B]
+    utterance_ids: List[str] = field(default_factory=list)
+    speaker_ids: List[str] = field(default_factory=list)
+    content_dim: int = 0
+    breath_onsets: Optional[torch.Tensor] = None       # [B, T_max]
+    breath_durations: Optional[torch.Tensor] = None    # [B, T_max]
+    breath_intensity: Optional[torch.Tensor] = None    # [B, T_max]
+    pause_durations: Optional[torch.Tensor] = None     # [B, T_max]
+
+    def to(self, device: torch.device | str) -> TTSBatch:
+        res = {}
+        for k, v in vars(self).items():
+            if isinstance(v, torch.Tensor):
+                res[k] = v.to(device)
+            else:
+                res[k] = v
+        return TTSBatch(**res)
+
+
+@dataclass
 class FeatureSet:
     """Unified cached features for UCLM (dual-stream)."""
     codec_tokens_a: torch.Tensor  # [8, T]
     codec_tokens_b: torch.Tensor  # [4, T]
-    voice_state_explicit: torch.Tensor  # [8, T]
+    voice_state_explicit: torch.Tensor  # [12, T]
     voice_state_ssl: torch.Tensor       # [128, T]
     spk_embed: torch.Tensor  # [192]
     mel: Optional[torch.Tensor] = None
@@ -238,7 +318,7 @@ class UCLM_Batch:
     durations: Optional[torch.Tensor] = None
     language_id: Optional[torch.Tensor] = None
     utterance_ids: List[str] = field(default_factory=list)
-    # v3 expressive conditioning fields
+    # Expressive conditioning fields
     delta_voice_state: Optional[torch.Tensor] = None
     dialogue_context: Optional[torch.Tensor] = None
     acting_intent: Optional[torch.Tensor] = None
@@ -246,12 +326,12 @@ class UCLM_Batch:
     context_groups: Optional[torch.Tensor] = None
     prompt_codec_tokens: Optional[torch.Tensor] = None
     bootstrap_alignment: Optional[dict] = None
-    # Suprasegmental features (v3 accent/tone/boundary/stress)
+    # Suprasegmental features (accent/tone/boundary/stress)
     text_suprasegmentals: Optional[torch.Tensor] = None  # [B, L, D_SUPRASEGMENTAL]
     # Voice state supervision (Worker 01 § Physical-First Control)
-    voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
-    voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool
-    voice_state_confidence: Optional[torch.Tensor] = None     # [B, T, 8] or [B, T, 1]
+    voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 12]
+    voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 12] bool
+    voice_state_confidence: Optional[torch.Tensor] = None     # [B, T, 12] or [B, T, 1]
     voice_state_target_source: Optional[List[str] | torch.Tensor] = None
 
     def to(self, device: torch.device | str) -> UCLM_Batch:
@@ -279,28 +359,72 @@ class PacingControls:
 
 
 @dataclass
+class ActingTextureMacro:
+    """Macro controls for acting texture latent.
+
+    These are user-facing abstract controls, NOT raw latent axes.
+    Each maps to a learned projection into the latent space.
+    """
+    intensity: float = 0.5       # Overall acting intensity [0, 1]
+    instability: float = 0.2     # Emotional instability / variance [0, 1]
+    tenderness: float = 0.3      # Warmth / softness quality [0, 1]
+    tension: float = 0.3         # Internal tension / restraint [0, 1]
+    spontaneity: float = 0.5     # Naturalness vs controlled delivery [0, 1]
+    reference_mix: float = 0.0   # Blend with reference-derived latent [0, 1]
+
+
+@dataclass
+class ActingTextureLatent:
+    """Acting texture latent contract.
+
+    Represents the non-physical residual acting quality that cannot be
+    captured by explicit physical controls alone.
+
+    Rules:
+    - This is a SEPARATE tensor from physical controls
+    - Raw latent axes are NOT exposed to end users
+    - Users interact via ActingTextureMacro controls
+    - Must support same-speaker replay and cross-speaker reuse
+    """
+    latent: torch.Tensor             # [B, d_acting_latent] (default 24-D)
+    source: str = "prior"            # prior | reference | replay
+    macro_controls: ActingTextureMacro = field(default_factory=ActingTextureMacro)
+    confidence: float = 1.0
+    schema_version: str = "1.0"
+
+
+@dataclass
 class IntentCompilerOutput:
     """Authoritative compiled intent for expressive synthesis.
 
-    Produced by the Intent Compiler from prompts/tags. This is the 'Score'
-    that the UCLM model performs.
+    Produced by the Intent Compiler from prompts/tags/references.
+    Targets the 12-D physical + 24-D acting latent contract.
     """
     compile_id: str
     source_prompt: str
-    inline_tags: List[dict] = field(default_factory=list)
-    
-    # Static global targets
-    explicit_voice_state: torch.Tensor | None = None  # [1, 8]
-    acting_intent: torch.Tensor | None = None         # [1, d_acting]
-    
-    # Time-varying/Pointer-synchronous targets
-    # Key: phoneme index, Value: state overrides
+    inline_tags: List[str] = field(default_factory=list)
+
+    # Compiled physical targets (12-D)
+    physical_targets: torch.Tensor | None = None      # [1, 12]
+    physical_confidence: torch.Tensor | None = None    # [1, 12]
+
+    # Acting texture latent prior
+    acting_latent_prior: torch.Tensor | None = None    # [1, d_acting_latent]
+    acting_macro: ActingTextureMacro = field(default_factory=ActingTextureMacro)
+
+    # Time-varying / pointer-synchronous targets
     local_prosody_plan: dict[int, torch.Tensor] = field(default_factory=dict)
-    
+
+    # Pacing
     pacing: PacingControls = field(default_factory=PacingControls)
-    
-    schema_version: str = "v0"
+
+    # Optional dialogue state
+    dialogue_state: dict = field(default_factory=dict)
+
+    # Metadata
     warnings: List[str] = field(default_factory=list)
+    provenance: str = "intent_compiler"
+    schema_version: str = "1.0"
     metadata: dict = field(default_factory=dict)
 
 
@@ -308,35 +432,87 @@ class IntentCompilerOutput:
 class TrajectoryRecord:
     """Deterministic record of a speech performance.
 
-    Can be replayed, edited (patched), or transferred to other speakers.
-    This is the authoritative artifact for 'Programmable Expressive Speech'.
+    Supports 12-D physical controls and acting texture latent trajectories.
+    Supports replay, edit (patch), and cross-speaker transfer.
+
+    Rules:
+    - Wall-clock-only addressing is forbidden (use pointer-synchronous)
+    - Opaque unversioned latent blobs are forbidden
+    - Patching a local region must be a first-class use case
     """
     trajectory_id: str
     source_compile_id: str
-    
-    # 1. Input Context (Ensures replay parity regardless of G2P changes)
-    phoneme_ids: torch.Tensor | None = None           # [1, L]
-    text_suprasegmentals: torch.Tensor | None = None  # [1, L, D_supra]
-    
-    # 2. Realized Sequence
-    # [text_index, frames_spent]
-    pointer_trace: List[Tuple[int, int]] = field(default_factory=list)
-    
-    # Realized voice state per frame [T, 8]
-    voice_state_trajectory: torch.Tensor | None = None
-    
-    # Realized tokens (for bit-exact replay)
-    acoustic_trace: torch.Tensor | None = None # Stream A [8, T]
-    control_trace: torch.Tensor | None = None  # Stream B [4, T]
-    
-    # Compiled pacing used for this rendering
+
+    # 1. Input context
+    phoneme_ids: torch.Tensor | None = None            # [1, L]
+    text_suprasegmentals: torch.Tensor | None = None   # [1, L, D_supra]
+
+    # 2. Realized pointer trace
+    pointer_trace: list = field(default_factory=list)   # [(text_index, frames_spent), ...]
+
+    # 3. Realized physical trajectory (12-D)
+    physical_trajectory: torch.Tensor | None = None    # [T, 12]
+
+    # 4. Realized acting latent trajectory or resolved state
+    acting_latent_trajectory: torch.Tensor | None = None  # [T, d_acting_latent] or [1, d_acting_latent]
+    acting_latent_is_static: bool = False               # True if single static latent, False if time-varying
+
+    # 5. Realized tokens (for bit-exact replay)
+    acoustic_trace: torch.Tensor | None = None         # Stream A [8, T]
+    control_trace: torch.Tensor | None = None          # Stream B [4, T]
+
+    # 6. Compiled pacing
     applied_pacing: PacingControls = field(default_factory=PacingControls)
-    
-    # Performance provenance
+
+    # 7. Provenance
     speaker_profile_id: str = ""
+    provenance: TrajectoryProvenance = TrajectoryProvenance.FRESH_COMPILE
     uclm_version: str = ""
-    
-    version: int = 1  # For optimistic concurrency in patching
-    schema_version: str = "v1" # Bumped due to major schema change
-    created_at: str = ""  # ISO 8601
+
+    # 8. Versioning
+    version: int = 1                # Optimistic concurrency for patching
+    schema_version: str = "1.0"
+    created_at: str = ""            # ISO 8601
     metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class BootstrapCacheEntry:
+    """Train-ready cache contract for a single utterance.
+
+    This is the canonical output format of the raw-audio bootstrap pipeline.
+    """
+    utterance_id: str
+    corpus_id: str
+
+    # Audio tokens
+    acoustic_tokens: torch.Tensor | None = None     # [8, T]
+    control_tokens: torch.Tensor | None = None      # [4, T]
+
+    # Speaker
+    pseudo_speaker_id: str = ""
+    speaker_embed: torch.Tensor | None = None       # [d_speaker]
+    diarization_confidence: float = 0.0
+
+    # Text
+    text_transcript: str = ""
+    enriched_transcript: str = ""
+    phoneme_ids: torch.Tensor | None = None         # [L]
+    transcript_confidence: float = 0.0
+    language: str = ""
+
+    # Physical supervision (12-D)
+    physical_targets: torch.Tensor | None = None     # [T, 12]
+    physical_observed_mask: torch.Tensor | None = None  # [T, 12] bool
+    physical_confidence: torch.Tensor | None = None  # [T, 12]
+
+    # Semantic / acting annotations
+    acting_annotations: dict = field(default_factory=dict)  # scene_summary, dialogue_intent, emotion, acting_hint
+
+    # Quality metadata
+    supervision_tier: str = "tier_d"
+    quality_score: float = 0.0
+    n_frames: int = 0
+    duration_sec: float = 0.0
+
+    schema_version: str = "1.0"

@@ -49,7 +49,7 @@ _RUNTIME_KEYS = {
     "ir_estimator_state_frames",
     "converter_state_frames",
     "vocoder_state_frames",
-    "max_lookahead_hops_v2_legacy",
+    "max_lookahead_hops",
     "converter_hq_state_frames",
     "hq_threshold_q",
     "crossfade_frames",
@@ -200,7 +200,7 @@ def _generate_rust(cfg: dict) -> str:
             "vocoder_state_frames",
         ],
         "hq": [
-            "max_lookahead_hops_v2_legacy",
+            "max_lookahead_hops",
             "converter_hq_state_frames",
             "hq_threshold_q",
             "crossfade_frames",
@@ -313,13 +313,6 @@ def _generate_rust(cfg: dict) -> str:
                 )
             else:
                 lines.append(f"pub const {rust_name}: {rtype} = {rval};")
-
-    if "max_lookahead_hops_v2_legacy" in cfg:
-        lines.append("")
-        lines.append("// Backward-compat alias for legacy HQ latency consumers.")
-        lines.append(
-            "pub const MAX_LOOKAHEAD_HOPS: usize = MAX_LOOKAHEAD_HOPS_V2_LEGACY;"
-        )
 
     lines.append("")
     lines.append("// --- Derived constants ---")

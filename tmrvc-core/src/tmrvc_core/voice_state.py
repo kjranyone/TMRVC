@@ -1,8 +1,7 @@
-"""Canonical 8-D physical voice_state registry.
+"""Canonical 12-D physical voice_state registry.
 
 Defines the frozen semantic meaning, units, and ranges for the explicit physical
-control path in TMRVC UCLM v3. Also provides compatibility helpers for legacy
-style surfaces that still expose non-canonical controls.
+control path in TMRVC UCLM.
 """
 
 from dataclasses import dataclass
@@ -24,7 +23,7 @@ class VoiceStateDimension:
 
 
 # ---------------------------------------------------------------------------
-# Canonical 8-D Registry (Frozen)
+# Canonical 12-D Registry (Frozen)
 # ---------------------------------------------------------------------------
 # Reusing index k with different semantics across workers is forbidden.
 
@@ -125,17 +124,54 @@ VOICE_STATE_REGISTRY: Dict[int, VoiceStateDimension] = {
         is_frame_local=False,
         proxy_observable="f1_proxy",
     ),
-}
-
-LEGACY_VOICE_STATE_LABELS: Dict[str, str] = {
-    "pitch": "pitch_level",
-    "energy": "energy_level",
-    "speech_rate": "pressedness",
-    "breathiness": "breathiness",
-    "tension": "spectral_tilt",
-    "brightness": "voice_irregularity",
-    "pause_bias": "openness",
-    "emphasis": "pitch_range",
+    8: VoiceStateDimension(
+        index=8,
+        id="aperiodicity",
+        name="Aperiodicity",
+        physical_interpretation="Aperiodic energy ratio in voiced segments",
+        unit="normalized ratio",
+        min_val=0.0,
+        max_val=1.0,
+        default_val=0.2,
+        is_frame_local=True,
+        proxy_observable="aperiodicity_ratio",
+    ),
+    9: VoiceStateDimension(
+        index=9,
+        id="formant_shift",
+        name="Formant Shift",
+        physical_interpretation="Vocal-tract length proxy via formant frequency shift",
+        unit="normalized shift",
+        min_val=0.0,
+        max_val=1.0,
+        default_val=0.5,
+        is_frame_local=False,
+        proxy_observable="vtln_warp",
+    ),
+    10: VoiceStateDimension(
+        index=10,
+        id="vocal_effort",
+        name="Vocal Effort",
+        physical_interpretation="Overall phonatory effort independent of loudness",
+        unit="normalized effort",
+        min_val=0.0,
+        max_val=1.0,
+        default_val=0.4,
+        is_frame_local=True,
+        proxy_observable="effort_composite",
+    ),
+    11: VoiceStateDimension(
+        index=11,
+        id="creak",
+        name="Creak",
+        physical_interpretation="Subharmonic / vocal fry presence",
+        unit="normalized presence",
+        min_val=0.0,
+        max_val=1.0,
+        default_val=0.1,
+        is_frame_local=True,
+        proxy_observable="subharmonic_ratio",
+    ),
 }
 
 CANONICAL_VOICE_STATE_IDS: tuple[str, ...] = tuple(
@@ -146,6 +182,12 @@ CANONICAL_VOICE_STATE_LABELS: tuple[str, ...] = tuple(
 )
 CANONICAL_VOICE_STATE_DEFAULTS: tuple[float, ...] = tuple(
     VOICE_STATE_REGISTRY[i].default_val for i in range(len(VOICE_STATE_REGISTRY))
+)
+
+# Basic panel: most-used 6 controls for non-expert users
+BASIC_PANEL_IDS: tuple[str, ...] = (
+    "pitch_level", "energy_level", "breathiness",
+    "pressedness", "spectral_tilt", "vocal_effort",
 )
 
 
@@ -162,34 +204,6 @@ def canonical_voice_state_dict(values: Sequence[float]) -> Dict[str, float]:
         CANONICAL_VOICE_STATE_IDS[i]: float(values[i])
         for i in range(len(CANONICAL_VOICE_STATE_IDS))
     }
-
-
-def legacy_style_to_canonical_voice_state(style: object | None) -> List[float]:
-    """Approximate canonical 8-D voice_state from legacy compatibility style fields.
-
-    This is intentionally conservative: only dimensions that have a plausible
-    legacy analogue are transferred; the rest fall back to canonical defaults.
-    """
-    values = list(CANONICAL_VOICE_STATE_DEFAULTS)
-    if style is None:
-        return values
-
-    pitch_range = getattr(style, "pitch_range", values[1])
-    if pitch_range == 0.0:
-        pitch_range = getattr(style, "arousal", values[1])
-
-    speech_rate = getattr(style, "speech_rate", 1.0)
-    pressedness = (float(speech_rate) - 0.5) / 1.5
-
-    values[0] = _clamp01(getattr(style, "arousal", values[0]))
-    values[1] = _clamp01(pitch_range)
-    values[2] = _clamp01(getattr(style, "energy", values[2]))
-    values[3] = _clamp01(pressedness)
-    values[4] = _clamp01(getattr(style, "tension", values[4]))
-    values[5] = _clamp01(getattr(style, "breathiness", values[5]))
-    values[6] = _clamp01(getattr(style, "roughness", values[6]))
-    values[7] = CANONICAL_VOICE_STATE_DEFAULTS[7]
-    return values
 
 
 def get_voice_state_dimension_names() -> List[str]:
