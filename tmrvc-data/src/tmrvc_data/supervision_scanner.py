@@ -57,7 +57,6 @@ def scan_cache_dir(
     total = 0
     with_text = 0
     with_canonical_text_units = 0
-    with_legacy_duration = 0
     with_voice_state = 0
     with_dialogue_context = 0
     with_suprasegmentals = 0
@@ -116,10 +115,6 @@ def scan_cache_dir(
             except Exception:
                 pass
 
-        # Legacy durations
-        if (utt_dir / "durations.npy").exists():
-            with_legacy_duration += 1
-
         # Suprasegmentals
         if (utt_dir / "text_suprasegmentals.npy").exists():
             with_suprasegmentals += 1
@@ -160,7 +155,6 @@ def scan_cache_dir(
     report.num_utterances = total
     report.text_supervision_coverage = with_text / max(total, 1)
     report.canonical_text_unit_coverage = with_canonical_text_units / max(total, 1)
-    report.legacy_duration_coverage = with_legacy_duration / max(total, 1)
     report.unknown_phone_ratio = unk_phones / max(total_phones, 1)
     report.direct_hit_ratio = (total_phones - unk_phones) / max(total_phones, 1)
     report.active_phone_inventory = sorted(

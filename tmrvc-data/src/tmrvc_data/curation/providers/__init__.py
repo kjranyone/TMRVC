@@ -95,7 +95,7 @@ class TranscriptRefinementProvider(BaseProvider):
 
 
 class VoiceStateEstimationProvider(BaseProvider):
-    """Base class for 8-D voice state estimation."""
+    """Base class for 12-D voice state estimation."""
     stage = "voice_state_estimation"
 
 

@@ -1,7 +1,7 @@
 """TTSDataset and DataLoader construction for TTS training.
 
-Extends the VC dataset with phoneme-level alignment data (phoneme_ids, durations)
-for training TextEncoder, DurationPredictor, F0Predictor, and ContentSynthesizer.
+Extends the VC dataset with phoneme-level alignment data (phoneme_ids)
+for training TextEncoder, F0Predictor, and ContentSynthesizer.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
-from tmrvc_core.constants import DEFAULT_BATCH_SIZE, N_MELS
+from tmrvc_core.constants import N_MELS
 from tmrvc_core.types import TTSBatch, TTSFeatureSet
 from tmrvc_data.cache import FeatureCache
 from tmrvc_data.events import events_to_tensors, load_events

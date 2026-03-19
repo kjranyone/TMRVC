@@ -7,7 +7,6 @@ Throughput fallback: faster-whisper (already in ``..providers.FasterWhisperASR``
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 

@@ -7,7 +7,6 @@ dataset-global speaker cluster IDs using embedding similarity.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 

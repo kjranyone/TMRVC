@@ -5,7 +5,7 @@ rather than only producing impressive metadata.
 
 Classes:
 - ValidationConfig: thresholds for curation validation
-- CurationValidator: legacy validation checks (promotion, legality, holdout, provenance)
+- CurationValidator: validation checks (promotion, legality, holdout, provenance)
 - ProviderAcceptanceThresholds: per-provider acceptance criteria
 - StageBenchmark: evaluates each curation stage independently on known-good samples
 - SampleAuditor: human review workflow with dual-review and audit trail
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ValidationConfig (legacy, kept for backward compat)
+# ValidationConfig
 # ---------------------------------------------------------------------------
 
 
@@ -49,7 +49,7 @@ class ValidationConfig:
 
 
 # ---------------------------------------------------------------------------
-# CurationValidator (legacy checks, preserved)
+# CurationValidator
 # ---------------------------------------------------------------------------
 
 
@@ -688,7 +688,7 @@ class VoiceStateValidator:
         self,
         min_coverage_per_dim: float = 0.50,
         max_calibration_mae: float = 0.20,
-        n_dimensions: int = 8,
+        n_dimensions: int = 12,
     ) -> None:
         self.min_coverage_per_dim = min_coverage_per_dim
         self.max_calibration_mae = max_calibration_mae
@@ -739,8 +739,8 @@ class VoiceStateValidator:
         Computes per-dimension mean absolute error.
 
         Args:
-            predicted_states: list of predicted 8-D vectors
-            reference_states: list of reference 8-D vectors
+            predicted_states: list of predicted 12-D vectors
+            reference_states: list of reference 12-D vectors
         """
         n = min(len(predicted_states), len(reference_states))
         if n == 0:
@@ -1172,7 +1172,7 @@ class ComprehensiveValidator:
     """Run all Worker 11 validation layers and produce a unified report.
 
     Combines:
-    - Legacy CurationValidator checks
+    - CurationValidator checks
     - StageBenchmark results (when provided)
     - SampleAuditor report (when provided)
     - DownstreamComparison (when provided)
@@ -1185,7 +1185,7 @@ class ComprehensiveValidator:
         self,
         config: Optional[ValidationConfig] = None,
     ) -> None:
-        self.legacy = CurationValidator(config)
+        self.curation = CurationValidator(config)
         self.human_workflow = HumanWorkflowValidator()
         self.split_integrity = SplitIntegrityValidator()
         self.voice_state = VoiceStateValidator()
@@ -1199,18 +1199,18 @@ class ComprehensiveValidator:
         """Run all validation checks and return a unified report."""
         results: Dict[str, Any] = {}
 
-        # Layer 1 & 2: Legacy checks
+        # Layer 1 & 2: Core curation checks
         results["promotion_distribution"] = (
-            self.legacy.validate_promotion_distribution(records)
+            self.curation.validate_promotion_distribution(records)
         )
         results["legality_gating"] = (
-            self.legacy.validate_legality_gating(records)
+            self.curation.validate_legality_gating(records)
         )
         results["holdout_integrity"] = (
-            self.legacy.validate_holdout_integrity(records, holdout_ids)
+            self.curation.validate_holdout_integrity(records, holdout_ids)
         )
         results["provenance_completeness"] = (
-            self.legacy.validate_provenance_completeness(records)
+            self.curation.validate_provenance_completeness(records)
         )
 
         # Layer 4: Human workflow

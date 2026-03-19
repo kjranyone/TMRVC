@@ -17,16 +17,16 @@ Frame convention (frozen):
     start_frame inclusive, end_frame exclusive
     T = ceil(num_samples / 240)
 
-Voice state dimensions (8-D, canonical order):
+Voice state dimensions (12-D, canonical order):
     pitch_level, pitch_range, energy_level, pressedness,
-    spectral_tilt, breathiness, voice_irregularity, openness
+    spectral_tilt, breathiness, voice_irregularity, openness,
+    aperiodicity, formant_shift, vocal_effort, creak
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,6 +54,10 @@ VOICE_STATE_DIM_NAMES = (
     "breathiness",
     "voice_irregularity",
     "openness",
+    "aperiodicity",
+    "formant_shift",
+    "vocal_effort",
+    "creak",
 )
 VOICE_STATE_NDIM = len(VOICE_STATE_DIM_NAMES)
 

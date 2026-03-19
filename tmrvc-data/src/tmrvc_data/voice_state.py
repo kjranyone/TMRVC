@@ -1,6 +1,6 @@
 """Voice State Estimator for frame-level acoustic parameter extraction.
 
-Canonical UCLM v3 voice_state dimensions:
+Canonical UCLM voice_state dimensions (12-D):
 - pitch_level: Fundamental frequency (F0) level
 - pitch_range: Local melodic variation / F0 spread
 - energy_level: Overall loudness
@@ -9,12 +9,16 @@ Canonical UCLM v3 voice_state dimensions:
 - breathiness: Aspiration noise level
 - voice_irregularity: Jitter + shimmer style perturbation proxy
 - openness: Vocal-tract openness proxy
+- aperiodicity: Aperiodic energy ratio
+- formant_shift: Vocal-tract length proxy
+- vocal_effort: Phonatory effort level
+- creak: Subharmonic / vocal fry presence
 
 Usage:
     from tmrvc_data.voice_state import VoiceStateEstimator
 
     estimator = VoiceStateEstimator(device="cuda")
-    voice_state = estimator.estimate(mel, f0)  # [B, T, 8]
+    voice_state = estimator.estimate(mel, f0)  # [B, T, 12]
 """
 
 from __future__ import annotations
@@ -30,9 +34,9 @@ from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 logger = logging.getLogger(__name__)
 
 # Voice state dimensions
-VOICE_STATE_DIM = 8
+VOICE_STATE_DIM = 12
 
-# Parameter indices (canonical 8-D physical registry)
+# Parameter indices (canonical 12-D physical registry)
 IDX_PITCH_LEVEL = 0
 IDX_PITCH_RANGE = 1
 IDX_ENERGY_LEVEL = 2
@@ -41,6 +45,10 @@ IDX_SPECTRAL_TILT = 4
 IDX_BREATHINESS = 5
 IDX_VOICE_IRREGULARITY = 6
 IDX_OPENNESS = 7
+IDX_APERIODICITY = 8
+IDX_FORMANT_SHIFT = 9
+IDX_VOCAL_EFFORT = 10
+IDX_CREAK = 11
 
 
 @dataclass
@@ -113,7 +121,7 @@ class VoiceStateEstimator(nn.Module):
             f0: F0 contour [B, 1, T] or [B, T].
 
         Returns:
-            voice_state: [B, T, 8] voice state parameters.
+            voice_state: [B, T, 12] voice state parameters.
         """
         # Ensure correct shapes
         if mel.dim() == 3 and mel.shape[1] != self.n_mels:
@@ -143,6 +151,12 @@ class VoiceStateEstimator(nn.Module):
             pitch_level, energy_level, spectral_tilt, breathiness
         )
 
+        # New 12-D dimensions: default to neutral values
+        aperiodicity = torch.full_like(pitch_level, 0.2)
+        formant_shift = torch.full_like(pitch_level, 0.5)
+        vocal_effort = torch.full_like(pitch_level, 0.4)
+        creak = torch.full_like(pitch_level, 0.1)
+
         voice_state = torch.stack(
             [
                 pitch_level,
@@ -153,9 +167,13 @@ class VoiceStateEstimator(nn.Module):
                 breathiness,
                 voice_irregularity,
                 openness,
+                aperiodicity,
+                formant_shift,
+                vocal_effort,
+                creak,
             ],
             dim=-1,
-        )  # [B, T, 8]
+        )  # [B, T, 12]
 
         return voice_state
 
@@ -291,7 +309,7 @@ def extract_voice_state(
         device: Device to run on.
 
     Returns:
-        voice_state: [B, T, 8]
+        voice_state: [B, T, 12]
     """
     estimator = VoiceStateEstimator(device=device)
     return estimator.estimate(mel, f0)
@@ -301,7 +319,7 @@ def voice_state_to_dict(voice_state: torch.Tensor) -> dict[str, torch.Tensor]:
     """Convert voice state tensor to named dictionary.
 
     Args:
-        voice_state: [B, T, 8] or [T, 8] voice state tensor.
+        voice_state: [B, T, 12] or [T, 12] voice state tensor.
 
     Returns:
         Dict with named parameters.
@@ -313,8 +331,8 @@ def voice_state_to_dict(voice_state: torch.Tensor) -> dict[str, torch.Tensor]:
 from .wavlm_extractor import WavLMFeatureExtractor
 
 class SSLVoiceStateEstimator(nn.Module):
-    """Extract both explicit (8-dim) and SSL (128-dim) voice state.
-    
+    """Extract both explicit (12-dim) and SSL (128-dim) voice state.
+
     Combines the heuristic VoiceStateEstimator with a WavLM feature extractor.
     """
     def __init__(self, n_mels: int = 80, device: str = "cuda"):
@@ -339,7 +357,7 @@ class SSLVoiceStateEstimator(nn.Module):
             
         Returns:
             dict with:
-                explicit_state: [B, T, 8]
+                explicit_state: [B, T, 12]
                 ssl_state: [B, 128, T] -> transposed to [B, T, 128]
         """
         explicit_state = self.explicit_estimator.estimate(mel, f0)

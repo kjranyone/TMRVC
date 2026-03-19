@@ -1,7 +1,7 @@
 """Stage 6: Prosody / Event Recovery - Extract acting-relevant signals.
 
 Recovers pause spans, pitch (F0) statistics, energy statistics, speech rate,
-and computes canonical 8-D voice_state pseudo-labels with per-dimension
+and computes canonical 12-D voice_state pseudo-labels with per-dimension
 confidence and observed masks.
 
 The canonical voice_state dimensions are:
@@ -13,6 +13,10 @@ The canonical voice_state dimensions are:
   5: breathiness
   6: voice_irregularity
   7: openness
+  8: aperiodicity
+  9: formant_shift
+  10: vocal_effort
+  11: creak
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VOICE_STATE_DIM = 8
+VOICE_STATE_DIM = 12
 VOICE_STATE_NAMES = list(CANONICAL_VOICE_STATE_IDS)
 SILENCE_DB = -50.0
 MIN_PAUSE_SEC = 0.15  # minimum pause duration to record
@@ -389,7 +393,7 @@ def _estimate_jitter_shimmer(
 
 
 # ---------------------------------------------------------------------------
-# 8-D voice_state computation
+# 12-D voice_state computation
 # ---------------------------------------------------------------------------
 
 def compute_voice_state(
@@ -399,11 +403,11 @@ def compute_voice_state(
     energy_stats: Dict[str, Any],
     speech_rate_info: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Compute 8-D voice_state pseudo-labels with confidence and observed mask.
+    """Compute 12-D voice_state pseudo-labels with confidence and observed mask.
 
     Returns:
-        Dict with 'voice_state' (8 floats), 'voice_state_observed_mask' (8 bools),
-        'voice_state_confidence' (8 floats), and 'voice_state_names'.
+        Dict with 'voice_state' (12 floats), 'voice_state_observed_mask' (12 bools),
+        'voice_state_confidence' (12 floats), and 'voice_state_names'.
     """
     voice_state = np.zeros(VOICE_STATE_DIM, dtype=np.float32)
     observed_mask = np.zeros(VOICE_STATE_DIM, dtype=bool)
@@ -482,6 +486,37 @@ def compute_voice_state(
     observed_mask[7] = False
     confidence[7] = 0.1
 
+    # Dim 8: aperiodicity (default — not yet estimated by builtin)
+    voice_state[8] = 0.2
+    observed_mask[8] = False
+    confidence[8] = 0.1
+
+    # Dim 9: formant_shift (default — not yet estimated by builtin)
+    voice_state[9] = 0.5
+    observed_mask[9] = False
+    confidence[9] = 0.1
+
+    # Dim 10: vocal_effort (weak proxy from energy + pitch + pressedness)
+    if f0_mean > 0:
+        voice_state[10] = float(
+            np.clip(
+                0.4 * energy_norm + 0.3 * voice_state[0] + 0.3 * voice_state[3],
+                0.0,
+                1.0,
+            )
+        )
+        observed_mask[10] = True
+        confidence[10] = 0.3
+    else:
+        voice_state[10] = 0.4
+        observed_mask[10] = False
+        confidence[10] = 0.1
+
+    # Dim 11: creak (default — not yet estimated by builtin)
+    voice_state[11] = 0.1
+    observed_mask[11] = False
+    confidence[11] = 0.1
+
     return {
         "voice_state": [round(float(v), 4) for v in voice_state],
         "voice_state_observed_mask": [bool(m) for m in observed_mask],
@@ -505,7 +540,7 @@ def run_prosody_recovery(
     - Pitch (F0) statistics
     - Energy statistics
     - Speech rate
-    - 8-D voice_state pseudo-labels with per-dimension confidence
+    - 12-D voice_state pseudo-labels with per-dimension confidence
 
     Args:
         record: The curation record to process.
@@ -575,7 +610,7 @@ def run_prosody_recovery(
     speech_rate_info = estimate_speech_rate(audio, sr, record.transcript)
     record.attributes["speech_rate"] = speech_rate_info
 
-    # --- 8-D voice_state ---
+    # --- 12-D voice_state ---
     voice_state_result = compute_voice_state(
         audio, sr, pitch_stats, energy_stats, speech_rate_info,
     )

@@ -7,8 +7,7 @@ Fallback: none (unsupported languages emit explicit absence)
 from __future__ import annotations
 
 import logging
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from ..models import CurationRecord, Provenance

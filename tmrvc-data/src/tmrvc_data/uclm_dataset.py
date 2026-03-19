@@ -4,11 +4,9 @@ Loads pre-extracted features from cache:
 - codec_tokens: [n_codebooks, T] from EnCodec
 - voice_state: [T, 8] from VoiceStateEstimator
 - phoneme_ids: [L] from G2P (includes Pitch Accent for Japanese)
-- durations: [L] from MFA (optional in v3 -- never required for pointer mode)
 - spk_embed: [192] from SpeakerEncoder
 
 Worker 03 contract:
-- ``durations.npy`` is NEVER required in v3 pointer mode.
 - ``voice_state.npy`` is the core frame-level inference artifact.
   ``voice_state_targets.npy``, ``voice_state_observed_mask.npy``, and
   ``voice_state_confidence.npy`` are optional supervision artifacts.
@@ -38,16 +36,20 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 # Canonical voice_state dimension names (Worker 03 contract).
-# Order matches the 8 columns of voice_state.npy / voice_state_targets.npy.
+# Order matches the 12 columns of voice_state.npy / voice_state_targets.npy.
 VOICE_STATE_DIMS = (
     "pitch_level",
     "pitch_range",
     "energy_level",
-    "speech_rate",
+    "pressedness",
     "spectral_tilt",
     "breathiness",
     "voice_irregularity",
-    "pause_tendency",
+    "openness",
+    "aperiodicity",
+    "formant_shift",
+    "vocal_effort",
+    "creak",
 )
 
 # Canonical text_suprasegmentals dimension names (Worker 03 contract).
@@ -67,7 +69,6 @@ class UCLMBatch:
     codec_tokens: torch.Tensor  # [B, n_codebooks, T]
     voice_state: torch.Tensor  # [B, T, d_voice_state]
     phoneme_ids: torch.Tensor  # [B, L]
-    durations: Optional[torch.Tensor]  # [B, L] -- None in v3 pointer mode
     spk_embed: torch.Tensor  # [B, d_speaker]
     text: list[str]  # [B]
     utterance_ids: list[str]  # [B]
@@ -95,7 +96,6 @@ class UCLMDataset(Dataset):
         +-- codec_tokens.npy     # [n_codebooks, T]
         +-- voice_state.npy      # [T, 8]
         +-- phoneme_ids.npy      # [L]
-        +-- durations.npy        # [L] (optional -- never required in v3)
         +-- spk_embed.npy        # [192]
         +-- text_suprasegmentals.npy  # [L, 4] (optional)
         +-- voice_state_targets.npy   # [T, 8] (optional supervision)
@@ -111,10 +111,8 @@ class UCLMDataset(Dataset):
         min_frames: Minimum frames per utterance (skip if shorter).
         include_datasets: If set, only include these datasets.
         exclude_speakers: Speaker IDs to exclude.
-        tts_mode: "auto", "pointer", or "legacy_duration".
-            - "pointer": load phoneme_ids but NEVER require durations.npy.
-            - "legacy_duration": require BOTH phoneme_ids.npy AND durations.npy.
-            - "auto": load whatever is available (v2 compat).
+        tts_mode: Only "pointer" is supported. Loads phoneme_ids but never
+            requires durations.npy.
         min_quality_score: Minimum quality_score to include (0.0 = no filter).
         provenance_filter: If set, only include utterances with this provenance_class.
     """
@@ -127,11 +125,9 @@ class UCLMDataset(Dataset):
         min_frames: int = 20,
         include_datasets: list[str] | None = None,
         exclude_speakers: list[str] | None = None,
-        tts_mode: str = "auto",
+        tts_mode: str = "pointer",
         min_quality_score: float = 0.0,
         provenance_filter: str | None = None,
-        # Legacy alias kept for backward compatibility
-        quality_score_threshold: float | None = None,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.datasets = datasets or []
@@ -140,11 +136,7 @@ class UCLMDataset(Dataset):
         self.include_datasets = include_datasets
         self.exclude_speakers = set(exclude_speakers or [])
         self.tts_mode = tts_mode
-        # Support both param names for backward compat
-        if quality_score_threshold is not None and min_quality_score == 0.0:
-            self.min_quality_score = quality_score_threshold
-        else:
-            self.min_quality_score = min_quality_score
+        self.min_quality_score = min_quality_score
         self.provenance_filter = provenance_filter
 
         self.utterances: list[dict[str, Any]] = []
@@ -261,7 +253,6 @@ class UCLMDataset(Dataset):
         Returns a dict compatible with DatasetReport fields.  Distinguishes:
         - text_supervision_coverage (has text in meta)
         - canonical_text_unit_coverage (has phoneme_ids.npy)
-        - legacy_duration_coverage (has durations.npy)
         - voice_state_supervision_coverage (has voice_state_targets.npy)
         - prompt_pairing_coverage (has prompt_eligible in meta)
         """
@@ -270,7 +261,6 @@ class UCLMDataset(Dataset):
         total = len(self.utterances)
         with_text = 0
         with_canonical_text_units = 0
-        with_legacy_duration = 0
         with_voice_state = 0
         with_dialogue_context = 0
         with_suprasegmentals = 0
@@ -293,7 +283,6 @@ class UCLMDataset(Dataset):
             utt_path = utt["path"]
             meta = utt.get("meta", {})
             has_phonemes = (utt_path / "phoneme_ids.npy").exists()
-            has_durations = (utt_path / "durations.npy").exists()
             has_vs_targets = (utt_path / "voice_state_targets.npy").exists()
             has_dialogue = (utt_path / "dialogue_context.npy").exists()
             has_supra = (utt_path / "text_suprasegmentals.npy").exists()
@@ -313,8 +302,6 @@ class UCLMDataset(Dataset):
                         accent_count += sum(1 for p in pids if p in accents)
                 except Exception:
                     pass
-            if has_durations:
-                with_legacy_duration += 1
             if has_supra:
                 with_suprasegmentals += 1
             if has_bootstrap:
@@ -351,7 +338,6 @@ class UCLMDataset(Dataset):
             "num_utterances": total,
             "text_supervision_coverage": with_text / max(total, 1),
             "canonical_text_unit_coverage": with_canonical_text_units / max(total, 1),
-            "legacy_duration_coverage": with_legacy_duration / max(total, 1),
             "unknown_phone_ratio": unk_phones / max(total_phones, 1),
             "direct_hit_ratio": (total_phones - unk_phones) / max(total_phones, 1),
             "alias_hit_ratio": 0.0,  # Requires normalization pass to compute
@@ -416,27 +402,11 @@ class UCLMDataset(Dataset):
         voice_state = np.load(utt_path / "voice_state.npy")
         voice_state = torch.from_numpy(voice_state).float()
 
-        # Load phoneme ids and durations (Worker 03: durations never required in v3)
+        # Load phoneme ids
         phoneme_ids_path = utt_path / "phoneme_ids.npy"
-        durations_path = utt_path / "durations.npy"
-
         phoneme_ids = None
-        durations = None
-
-        if self.tts_mode == "pointer":
-            # v3 pointer mode: load phoneme_ids, NEVER require durations
-            if phoneme_ids_path.exists():
-                phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
-        elif self.tts_mode == "legacy_duration":
-            # Legacy v2 mode: require BOTH phoneme_ids AND durations
-            if phoneme_ids_path.exists() and durations_path.exists():
-                phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
-                durations = torch.from_numpy(np.load(durations_path)).long()
-        else:  # auto
-            if phoneme_ids_path.exists():
-                phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
-                if durations_path.exists():
-                    durations = torch.from_numpy(np.load(durations_path)).long()
+        if phoneme_ids_path.exists():
+            phoneme_ids = torch.from_numpy(np.load(phoneme_ids_path)).long()
 
         # Load speaker embedding
         spk_embed_path = utt_path / "spk_embed.npy"
@@ -505,7 +475,6 @@ class UCLMDataset(Dataset):
             "codec_tokens": codec_tokens,
             "voice_state": voice_state,
             "phoneme_ids": phoneme_ids,
-            "durations": durations,
             "spk_embed": spk_embed,
             "text": utt["text"],
             "utterance_id": utt["utterance_id"],
@@ -556,7 +525,6 @@ def collate_uclm_batch(
     codec_tokens = torch.zeros(B, n_codebooks, max_codec_frames, dtype=torch.long)
     voice_state = torch.zeros(B, max_codec_frames, d_voice_state, dtype=torch.float)
     phoneme_ids = torch.full((B, max_phonemes), pad_id, dtype=torch.long)
-    durations = torch.zeros(B, max_phonemes, dtype=torch.long) if any(s["durations"] is not None for s in batch) else None
     spk_embed = torch.zeros(B, d_speaker, dtype=torch.float)
     frame_lengths = torch.zeros(B, dtype=torch.long)
     phoneme_lengths = torch.zeros(B, dtype=torch.long)
@@ -624,8 +592,6 @@ def collate_uclm_batch(
             n_p = sample["phoneme_ids"].shape[0]
             phoneme_ids[i, :n_p] = sample["phoneme_ids"]
             phoneme_lengths[i] = n_p
-            if durations is not None and sample["durations"] is not None:
-                durations[i, :n_p] = sample["durations"]
             if text_suprasegmentals is not None and sample.get("text_suprasegmentals") is not None:
                 ts = sample["text_suprasegmentals"]
                 text_suprasegmentals[i, :n_p, :] = ts[:n_p]
@@ -668,7 +634,6 @@ def collate_uclm_batch(
         codec_tokens=codec_tokens,
         voice_state=voice_state,
         phoneme_ids=phoneme_ids,
-        durations=durations,
         spk_embed=spk_embed,
         text=text,
         utterance_ids=utterance_ids,

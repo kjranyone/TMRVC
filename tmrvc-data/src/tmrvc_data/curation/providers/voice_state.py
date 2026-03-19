@@ -1,10 +1,10 @@
 """Voice state estimator provider (Worker 08).
 
-Extracts 8-D voice state features per frame with observed masks and
+Extracts 12-D voice state features per frame with observed masks and
 per-dimension confidence.  Uses OSS tools: parselmouth for HNR/jitter/
 shimmer/CPP, librosa for RMS, FCPE/CREPE for F0.
 
-The 8 canonical dimensions (per docs/design/architecture.md and docs/design/curation-contract.md):
+The 12 canonical dimensions (per docs/design/architecture.md and docs/design/curation-contract.md):
   0: pitch_level      - normalised F0 relative to speaker mean
   1: pitch_range      - local F0 range / variability
   2: energy_level     - RMS energy (normalised)
@@ -13,17 +13,20 @@ The 8 canonical dimensions (per docs/design/architecture.md and docs/design/cura
   5: breathiness      - HNR inverse / aspiration noise estimate
   6: voice_irregularity - jitter + shimmer composite
   7: openness         - formant spacing proxy
+  8: aperiodicity     - aperiodic energy ratio
+  9: formant_shift    - vocal-tract length proxy
+  10: vocal_effort    - phonatory effort level
+  11: creak           - subharmonic / vocal fry presence
 
 Output contract (per-record summary):
-  voice_state: [T_frames, 8]
-  voice_state_mask: [T_frames, 8]
-  voice_state_confidence: [T_frames, 8] or [T_frames, 1]
+  voice_state: [T_frames, 12]
+  voice_state_mask: [T_frames, 12]
+  voice_state_confidence: [T_frames, 12] or [T_frames, 1]
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,7 +41,7 @@ from . import (
 
 logger = logging.getLogger(__name__)
 
-VOICE_STATE_DIM = 8
+VOICE_STATE_DIM = 12
 VOICE_STATE_NAMES: List[str] = [
     "pitch_level",
     "pitch_range",
@@ -48,6 +51,10 @@ VOICE_STATE_NAMES: List[str] = [
     "breathiness",
     "voice_irregularity",
     "openness",
+    "aperiodicity",
+    "formant_shift",
+    "vocal_effort",
+    "creak",
 ]
 
 # Canonical frame convention (matches alignment provider)
@@ -60,13 +67,13 @@ CANONICAL_FRAME_SHIFT_SEC = CANONICAL_HOP_LENGTH / CANONICAL_SAMPLE_RATE
 class VoiceStateFrame:
     """Per-frame voice state measurement."""
 
-    values: np.ndarray  # shape [8]
-    mask: np.ndarray    # shape [8], bool
-    confidence: np.ndarray  # shape [8]
+    values: np.ndarray  # shape [12]
+    mask: np.ndarray    # shape [12], bool
+    confidence: np.ndarray  # shape [12]
 
 
 class VoiceStateEstimator(VoiceStateEstimationProvider):
-    """8-D voice state pseudo-label estimator.
+    """12-D voice state pseudo-label estimator.
 
     Uses a combination of OSS acoustic analysis tools to compute
     per-frame voice state features.  In stub mode, returns placeholder
@@ -119,11 +126,11 @@ class VoiceStateEstimator(VoiceStateEstimationProvider):
         """Estimate voice state for the audio in *record*.
 
         Returns a ``ProviderOutput`` with fields:
-        - attributes.voice_state: list of 8 floats (segment summary)
-        - attributes.voice_state_observed_mask: list of 8 bools
-        - attributes.voice_state_confidence: list of 8 floats
-        - attributes.voice_state_names: list of 8 strings
-        - attributes.voice_state_frame_shape: [T, 8] description
+        - attributes.voice_state: list of 12 floats (segment summary)
+        - attributes.voice_state_observed_mask: list of 12 bools
+        - attributes.voice_state_confidence: list of 12 floats
+        - attributes.voice_state_names: list of 12 strings
+        - attributes.voice_state_frame_shape: [T, 12] description
         - attributes.voice_state_estimator_backends: list of str
 
         For the full frame-level tensor, downstream stages should call
@@ -151,7 +158,7 @@ class VoiceStateEstimator(VoiceStateEstimationProvider):
                     "voice_state_observed_mask": [bool(m) for m in observed_mask],
                     "voice_state_confidence": [round(float(c), 4) for c in confidence],
                     "voice_state_names": list(VOICE_STATE_NAMES),
-                    "voice_state_frame_shape_description": "[T_frames, 8]",
+                    "voice_state_frame_shape_description": "[T_frames, 12]",
                     "voice_state_estimator_backends": backend_list,
                     "voice_state_target_source": self.name,
                     "voice_state_hop_length": self.hop_length,
@@ -187,7 +194,7 @@ class VoiceStateEstimator(VoiceStateEstimationProvider):
             sr: sample rate
 
         Returns:
-            Tuple of (values, mask, confidence) each with shape [T, 8].
+            Tuple of (values, mask, confidence) each with shape [T, 12].
             - values: float32 in [0, 1]
             - mask: bool, True where dimension is observed
             - confidence: float32 in [0, 1]
@@ -224,7 +231,7 @@ class VoiceStateEstimator(VoiceStateEstimationProvider):
 
     @staticmethod
     def dimension_names() -> List[str]:
-        """Return the canonical 8-D voice state dimension names."""
+        """Return the canonical 12-D voice state dimension names."""
         return list(VOICE_STATE_NAMES)
 
     @staticmethod

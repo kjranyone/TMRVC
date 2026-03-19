@@ -14,8 +14,6 @@ Each parser returns a list of :class:`EmotionEntry` with unified labels.
 
 from __future__ import annotations
 
-import csv
-import json
 import logging
 import re
 from dataclasses import dataclass

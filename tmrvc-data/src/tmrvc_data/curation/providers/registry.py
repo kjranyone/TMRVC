@@ -91,7 +91,7 @@ MAINLINE_PROVIDERS: Dict[str, ProviderSpec] = {
         license_status="internal",
         gated_access=False,
         fallback_policy="skip",
-        notes="8-D voice state estimator. Uses parselmouth/librosa/FCPE when available.",
+        notes="12-D voice state estimator. Uses parselmouth/librosa/FCPE when available.",
     ),
     "speaker_clustering": ProviderSpec(
         stage="speaker_clustering",

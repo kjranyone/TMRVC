@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 import torchaudio
 
 from tmrvc_core.constants import SAMPLE_RATE

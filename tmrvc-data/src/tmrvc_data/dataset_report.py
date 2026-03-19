@@ -29,8 +29,6 @@ class DatasetReport:
     # Text supervision
     text_supervision_coverage: float = 0.0
     canonical_text_unit_coverage: float = 0.0
-    legacy_duration_coverage: float = 0.0
-
     # Phone normalization quality
     unknown_phone_ratio: float = 0.0
     direct_hit_ratio: float = 0.0
@@ -73,7 +71,6 @@ class DatasetReport:
         for name in (
             "text_supervision_coverage",
             "canonical_text_unit_coverage",
-            "legacy_duration_coverage",
             "unknown_phone_ratio",
             "direct_hit_ratio",
             "alias_hit_ratio",
@@ -122,7 +119,6 @@ REQUIRED_REPORT_FIELDS = frozenset({
     "num_utterances",
     "text_supervision_coverage",
     "canonical_text_unit_coverage",
-    "legacy_duration_coverage",
     "unknown_phone_ratio",
     "direct_hit_ratio",
     "alias_hit_ratio",
