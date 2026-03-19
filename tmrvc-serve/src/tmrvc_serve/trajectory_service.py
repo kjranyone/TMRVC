@@ -97,7 +97,7 @@ class TrajectoryService:
         # Note: This requires frame-aligned traces in Stream A/B
         new_acoustic = base.acoustic_trace.clone()
         new_control = base.control_trace.clone()
-        new_vs = base.voice_state_trajectory.clone()
+        new_vs = base.physical_trajectory.clone()
         
         # Replace the target region
         patch_len = end_frame - start_frame
@@ -110,7 +110,7 @@ class TrajectoryService:
         
         new_acoustic[:, start_frame : start_frame + limit] = patch_record.acoustic_trace[:, :limit]
         new_control[:, start_frame : start_frame + limit] = patch_record.control_trace[:, :limit]
-        new_vs[start_frame : start_frame + limit, :] = patch_record.voice_state_trajectory[:limit, :]
+        new_vs[start_frame : start_frame + limit, :] = patch_record.physical_trajectory[:limit, :]
         
         # 3. Update pointer trace (approximate for v0)
         # TODO: Refine pointer trace stitching for accurate boundary replay
@@ -122,7 +122,7 @@ class TrajectoryService:
             text_suprasegmentals=base.text_suprasegmentals,
             acoustic_trace=new_acoustic,
             control_trace=new_control,
-            voice_state_trajectory=new_vs,
+            physical_trajectory=new_vs,
             applied_pacing=base.applied_pacing,
             speaker_profile_id=base.speaker_profile_id,
             uclm_version=base.uclm_version,
@@ -151,7 +151,7 @@ class TrajectoryService:
     def _dict_to_record(self, data: dict) -> TrajectoryRecord:
         """Deserialize JSON-compatible dict to TrajectoryRecord."""
         # Convert lists back to tensors
-        tensors = ["phoneme_ids", "text_suprasegmentals", "acoustic_trace", "control_trace", "voice_state_trajectory"]
+        tensors = ["phoneme_ids", "text_suprasegmentals", "acoustic_trace", "control_trace", "physical_trajectory"]
         for k in tensors:
             if k in data and data[k] is not None:
                 # Determine dtype based on field

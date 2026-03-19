@@ -1,16 +1,15 @@
-"""``tmrvc-serve`` — Start the Unified UCLM v3 API server.
+"""``tmrvc-serve`` -- Start the Unified UCLM API server.
 
 Usage::
 
     tmrvc-serve --uclm-checkpoint checkpoints/uclm/latest.pt --codec-checkpoint checkpoints/codec/latest.pt
-    tmrvc-serve --port 8000 --api-key $ANTHROPIC_API_KEY
+    tmrvc-serve --port 8000 --llm-model Qwen/Qwen3.5-35B-A3B
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
 from tmrvc_core.constants import SERVE_PORT
@@ -50,9 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Torch device (default: cpu).",
     )
     parser.add_argument(
-        "--api-key",
+        "--llm-model",
         default=None,
-        help="Anthropic API key for context prediction (default: $ANTHROPIC_API_KEY).",
+        help="Open-weight LLM model for Intent Compiler (default: Qwen/Qwen3.5-35B-A3B).",
+    )
+    parser.add_argument(
+        "--use-vllm",
+        action="store_true",
+        help="Use vllm backend for LLM inference (faster, requires vllm installed).",
     )
     parser.add_argument(
         "--reload",
@@ -77,15 +81,14 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
-
     from tmrvc_serve.app import init_app
 
     init_app(
         uclm_checkpoint=args.uclm_checkpoint,
         codec_checkpoint=args.codec_checkpoint,
         device=args.device,
-        api_key=api_key,
+        llm_model=args.llm_model,
+        use_vllm=args.use_vllm,
     )
 
     import uvicorn

@@ -9,16 +9,14 @@ Provides:
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from enum import Enum
 from typing import Any, Callable
 
 from fastapi import HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 

@@ -94,11 +94,11 @@ class VCRequest(BaseModel):
     explicit_voice_state: Optional[list[float]] = Field(
         None,
         description=(
-            "Canonical 8-D voice_state vector ordered as: "
+            "Canonical 12-D physical controls vector ordered as: "
             + ", ".join(CANONICAL_VOICE_STATE_IDS)
         ),
-        min_length=8,
-        max_length=8,
+        min_length=12,
+        max_length=12,
     )
     pitch_shift: float = 0.0
 

@@ -1,4 +1,4 @@
-"""UCLM Engine: contract-friendly unified inference for TTS and VC (v3)."""
+"""UCLM Engine: contract-friendly unified inference for TTS and VC."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from tmrvc_core.constants import (
+    D_MODEL,
     MAX_ACOUSTIC_HISTORY_FRAMES,
     MAX_DIALOGUE_CONTEXT_UNITS,
     MAX_PROMPT_CACHE_BYTES,
@@ -23,7 +24,7 @@ from tmrvc_core.constants import (
 )
 from tmrvc_core.dialogue_types import StyleParams
 from tmrvc_core.types import CFGMode, PointerState, SpeakerProfile
-from tmrvc_core.voice_state import legacy_style_to_canonical_voice_state
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_DEFAULTS
 from tmrvc_train.models import (
     DisentangledUCLM,
     EmotionAwareDecoder,
@@ -54,7 +55,7 @@ class EngineState:
         default_factory=lambda: torch.zeros(1, 4, 200, dtype=torch.long)
     )
     prev_voice_state: torch.Tensor = field(
-        default_factory=lambda: torch.zeros(1, 1, 8)
+        default_factory=lambda: torch.zeros(1, 1, 12)
     )
     prompt_speaker_embed: Optional[torch.Tensor] = None
     prompt_features: Optional[torch.Tensor] = None
@@ -63,7 +64,7 @@ class EngineState:
 
 @dataclass
 class PointerInferenceState:
-    """Runtime pointer state for v3 causal TTS inference."""
+    """Runtime pointer state for causal TTS inference."""
 
     text_index: int = 0
     progress: float = 0.0
@@ -103,6 +104,7 @@ class PointerInferenceState:
             "skip_protection_threshold": self.skip_protection_threshold,
             "forced_advance_count": self.forced_advance_count,
             "skip_protection_count": self.skip_protection_count,
+            "cfg_cache_age": self.cfg_cache_age,
         }
 
     def replay(self, record: TrajectoryRecord) -> Tuple[torch.Tensor, dict]:
@@ -125,13 +127,13 @@ class PointerInferenceState:
         b_t = b_t.to(self.device)
         
         # Realized voice state trajectory
-        vs_full = record.voice_state_trajectory
+        vs_full = record.physical_trajectory
         if vs_full is not None:
-            vs_full = vs_full.to(self.device).unsqueeze(0) # [1, T, 8]
+            vs_full = vs_full.to(self.device).unsqueeze(0)  # [1, T, 12]
         else:
             # Fallback to neutral if somehow missing
             t_frames = a_t.shape[-1]
-            vs_full = torch.zeros((1, t_frames, 8), device=self.device)
+            vs_full = torch.zeros((1, t_frames, 12), device=self.device)
 
         # Decode using the bit-exact realized tokens
         with torch.no_grad():
@@ -147,7 +149,7 @@ class PointerInferenceState:
 
 
 class UCLMEngine:
-    """Orchestrates split models for inference (v3)."""
+    """Orchestrates split models for inference."""
 
     # Frame-index contract constants (Worker 04, task 26)
     FRAME_SAMPLE_RATE: int = 24000
@@ -160,7 +162,7 @@ class UCLMEngine:
         uclm_checkpoint: Path | str | None = None,
         codec_checkpoint: Path | str | None = None,
         device: str = "cpu",
-        d_model: int = 512,
+        d_model: int = D_MODEL,
         tts_mode: str = "pointer",
         speaker_profiles_dir: Path | str | None = None,
     ):
@@ -273,7 +275,7 @@ class UCLMEngine:
         self._invalidate_stale_profiles()
 
         logger.info(
-            "Loaded UCLM v3 checkpoints on %s (distilled_cfg=%s, encoder_version=%s)",
+            "Loaded UCLM checkpoints on %s (distilled_cfg=%s, encoder_version=%s)",
             self.device,
             self._has_distilled_cfg,
             self._encoder_version,
@@ -306,7 +308,7 @@ class UCLMEngine:
         else:
             v_state = (
                 torch.tensor(
-                    legacy_style_to_canonical_voice_state(style), device=self.device
+                    CANONICAL_VOICE_STATE_DEFAULTS, device=self.device
                 )
                 .float()
                 .unsqueeze(0)
@@ -444,7 +446,7 @@ class UCLMEngine:
             reference_codec_tokens = self.codec_enc(reference_audio)
 
         if reference_codec_tokens is not None:
-            # UCLM v3: Returns (refined_speaker_embed, prompt_summary_tokens, vq_loss)
+            # Returns (refined_speaker_embed, prompt_summary_tokens, vq_loss)
             refined_embed, summary_tokens, vq_loss = self.uclm_core_model.encode_speaker_prompt(
                 reference_codec_tokens.to(self.device),
                 speaker_embed.to(self.device) if speaker_embed is not None else None,
@@ -457,7 +459,7 @@ class UCLMEngine:
         else:
             raise ValueError("No speaker identity evidence provided")
 
-        # --- Prompt budget enforcement (v3) ---
+        # --- Prompt budget enforcement ---
         if summary_tokens is not None:
             n_tokens = summary_tokens.shape[-2] if summary_tokens.dim() >= 2 else 0
             if n_tokens > MAX_PROMPT_KV_TOKENS:
@@ -592,6 +594,150 @@ class UCLMEngine:
                 len(stale_keys),
             )
 
+    # ------------------------------------------------------------------
+    # v4 Bootstrap Speaker Profile Integration (Phase 4-1)
+    # ------------------------------------------------------------------
+
+    def enroll_bootstrap_speaker(
+        self,
+        pseudo_speaker_id: str,
+        speaker_embed_np: np.ndarray,
+        prompt_codec_tokens_np: np.ndarray | None = None,
+        prompt_summary_tokens_np: np.ndarray | None = None,
+        physical_prior: np.ndarray | None = None,
+        physical_prior_confidence: np.ndarray | None = None,
+        supervision_tier: str = "tier_d",
+        language: str = "ja",
+        display_name: str = "",
+    ) -> SpeakerProfile:
+        """Consume a bootstrap-generated speaker profile as a few-shot enrollment.
+
+        This method converts the raw numpy arrays produced by the v4 bootstrap
+        pipeline into a live ``SpeakerProfile`` suitable for inference, including
+        prompt encoding and FiLM baking.
+
+        Args:
+            pseudo_speaker_id: Cluster-assigned speaker id from bootstrap.
+            speaker_embed_np: [192] L2-normalised speaker embedding.
+            prompt_codec_tokens_np: Optional [T_prompt, 8] codec tokens from
+                the highest-quality utterance for this speaker.
+            prompt_summary_tokens_np: Optional pre-compressed summary tokens.
+            physical_prior: Optional [12] per-speaker average physical controls.
+            physical_prior_confidence: Optional [12] confidence per dimension.
+            supervision_tier: Bootstrap supervision tier string.
+            language: ISO language code.
+            display_name: Human-readable name.
+
+        Returns:
+            A fully enrolled ``SpeakerProfile`` ready for ``tts()`` calls.
+        """
+        self._require_loaded()
+
+        embed_t = torch.from_numpy(speaker_embed_np).float()
+        if embed_t.dim() == 1:
+            embed_t = embed_t.unsqueeze(0)  # [1, 192]
+
+        # Encode prompt tokens if provided
+        prompt_tokens_t = None
+        summary_tokens_t = None
+        if prompt_codec_tokens_np is not None:
+            prompt_tokens_t = torch.from_numpy(prompt_codec_tokens_np).long()
+            if prompt_tokens_t.dim() == 2:
+                prompt_tokens_t = prompt_tokens_t.unsqueeze(0)  # [1, T, 8]
+
+        if prompt_summary_tokens_np is not None:
+            summary_tokens_t = torch.from_numpy(prompt_summary_tokens_np).float()
+        elif prompt_tokens_t is not None:
+            # Encode summary tokens from raw prompt tokens
+            _, summary_tokens_t, _, enc_time = self.encode_speaker_prompt(
+                reference_codec_tokens=prompt_tokens_t.to(self.device),
+                speaker_embed=embed_t.to(self.device),
+            )
+            logger.info(
+                "Bootstrap speaker %s: encoded summary tokens in %.1fms",
+                pseudo_speaker_id, enc_time,
+            )
+
+        profile = SpeakerProfile(
+            speaker_profile_id=pseudo_speaker_id,
+            reference_audio_hash=f"bootstrap-{pseudo_speaker_id}",
+            speaker_embed=embed_t.squeeze(0),
+            prompt_codec_tokens=(
+                prompt_tokens_t.squeeze(0) if prompt_tokens_t is not None
+                else torch.zeros(0, 8)
+            ),
+            prompt_summary_tokens=(
+                summary_tokens_t.cpu() if summary_tokens_t is not None else None
+            ),
+            display_name=display_name or pseudo_speaker_id,
+            language=language,
+            metadata={
+                "source": "v4_bootstrap",
+                "supervision_tier": supervision_tier,
+                "physical_prior": physical_prior.tolist() if physical_prior is not None else None,
+                "physical_prior_confidence": (
+                    physical_prior_confidence.tolist()
+                    if physical_prior_confidence is not None else None
+                ),
+            },
+        )
+
+        # Bake FiLM parameters
+        with torch.no_grad():
+            spk_t = embed_t.to(self.device)
+            baked_film = self.uclm_core_model.bake_film_params(spk_t)
+
+        self._speaker_profile_cache[pseudo_speaker_id] = (
+            profile, self._encoder_version, baked_film,
+        )
+
+        logger.info(
+            "Enrolled bootstrap speaker: %s (tier=%s, lang=%s, has_prompt=%s)",
+            pseudo_speaker_id, supervision_tier, language,
+            prompt_tokens_t is not None,
+        )
+        return profile
+
+    def resolve_physical_controls_v4(
+        self,
+        explicit_controls: list[float] | None = None,
+        confidence_values: list[float] | None = None,
+        confidence_threshold: float = 0.3,
+        speaker_prior: np.ndarray | None = None,
+    ) -> torch.Tensor:
+        """Resolve 12-D physical controls with confidence-aware fallback.
+
+        When bootstrap-derived confidence is below ``confidence_threshold``
+        for a particular dimension, that dimension falls back to the
+        speaker's physical prior (if available) or the canonical default.
+
+        Args:
+            explicit_controls: [12] requested physical control values.
+            confidence_values: [12] per-dimension confidence scores.
+            confidence_threshold: Minimum confidence to trust a dimension.
+            speaker_prior: [12] per-speaker average from bootstrap.
+
+        Returns:
+            [1, 1, 12] tensor suitable for ``explicit_voice_state`` in ``tts()``.
+        """
+        from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_DEFAULTS
+
+        defaults = np.array(CANONICAL_VOICE_STATE_DEFAULTS[:12], dtype=np.float32)
+        prior = speaker_prior if speaker_prior is not None else defaults
+
+        if explicit_controls is None:
+            result = prior.copy()
+        else:
+            result = np.array(explicit_controls[:12], dtype=np.float32)
+
+        if confidence_values is not None:
+            conf = np.array(confidence_values[:12], dtype=np.float32)
+            low_mask = conf < confidence_threshold
+            # Blend: for low-confidence dims, use prior instead
+            result[low_mask] = prior[low_mask]
+
+        return torch.tensor(result, dtype=torch.float32).view(1, 1, 12)
+
     @torch.no_grad()
     def tts(
         self,
@@ -621,7 +767,7 @@ class UCLMEngine:
         local_prosody_plan: dict[int, torch.Tensor] | None = None, # New SOTA field
         disable_circuit_breaker: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
-        """Full causal pointer-based TTS generation (v3).
+        """Full causal pointer-based TTS generation.
 
         Speaker embed priority resolution:
             ``speaker_embed`` is the global timbre anchor and wins for identity.
@@ -652,17 +798,6 @@ class UCLMEngine:
                 before forced advance (default 50).
             disable_circuit_breaker: explicitly disable CFG auto-downgrade (e.g. for eval).
         """
-        if self.tts_mode == "legacy_duration":
-            return self._tts_legacy_duration(
-                phonemes=phonemes,
-                speaker_embed=speaker_embed,
-                style=style,
-                cfg_scale=cfg_scale,
-                temperature=temperature,
-                language_id=language_id,
-                pace=pace,
-                max_frames=max_frames,
-            )
         self._require_loaded()
         t0 = time.perf_counter()
 
@@ -689,13 +824,13 @@ class UCLMEngine:
         style = style or StyleParams.neutral()
         v_state = (
             torch.tensor(
-                legacy_style_to_canonical_voice_state(style), device=self.device
+                CANONICAL_VOICE_STATE_DEFAULTS, device=self.device
             )
             .float()
             .view(1, 1, -1)
         )
 
-        # Override voice state with explicit 8-D vector if provided
+        # Override voice state with explicit 12-D physical controls if provided
         if explicit_voice_state is not None:
             if explicit_voice_state.dim() == 1:
                 explicit_voice_state = explicit_voice_state.unsqueeze(0).unsqueeze(0)
@@ -703,7 +838,7 @@ class UCLMEngine:
                 explicit_voice_state = explicit_voice_state.unsqueeze(0)
             v_state = explicit_voice_state.to(self.device)
 
-        # Apply delta voice state if provided
+        # Apply delta physical controls if provided
         if delta_voice_state is not None:
             if delta_voice_state.dim() == 1:
                 delta_voice_state = delta_voice_state.unsqueeze(0).unsqueeze(0)
@@ -754,12 +889,12 @@ class UCLMEngine:
             # If no summary but raw tokens exist, compute summary once
             elif speaker_profile.prompt_codec_tokens is not None:
                 prompt_tokens = speaker_profile.prompt_codec_tokens.to(self.device).unsqueeze(0)
-                # --- Prompt budget enforcement (v3) ---
+                # --- Prompt budget enforcement ---
                 if prompt_tokens.shape[2] > MAX_PROMPT_FRAMES:
                     prompt_tokens = prompt_tokens[:, :, -MAX_PROMPT_FRAMES:]
                 
                 # Re-encode to get summary tokens (using the model's resampler internally)
-                # Note: encode_speaker_prompt should return summary_tokens in v3
+                # Note: encode_speaker_prompt should return summary_tokens
                 _, prompt_summary_tokens, _, _ = self.encode_speaker_prompt(
                     reference_codec_tokens=prompt_tokens,
                     speaker_embed=speaker_embed
@@ -812,7 +947,7 @@ class UCLMEngine:
 
         # Trajectory collection (Worker 04)
         pointer_trace: List[Tuple[int, int]] = [] # [text_index, frames_spent]
-        vs_trajectory: List[torch.Tensor] = []    # [1, 8] per frame
+        vs_trajectory: List[torch.Tensor] = []    # [1, 12] per frame
         a_trace_list: List[torch.Tensor] = []     # [8, 1] per frame
         
         # Local Prosody Plan (Worker 01/04)
@@ -855,7 +990,7 @@ class UCLMEngine:
             # SOTA: Smoothen transitions between different phoneme states
             v_target = v_state
             if ptr.text_index in local_plan:
-                v_target = local_plan[ptr.text_index].to(self.device).view(1, 1, 8)
+                v_target = local_plan[ptr.text_index].to(self.device).view(1, 1, 12)
             
             # If we just entered a new phoneme, morph from previous target if it was different
             # For simplicity in streaming, we use a small smoothing window
@@ -1130,7 +1265,7 @@ class UCLMEngine:
             "gen_time_ms": float(gen_time * 1000.0),
             "pointer_trace": pointer_trace,
             "phoneme_ids": phoneme_ids, # Store original IDs
-            "voice_state_trajectory": vs_full.squeeze(0),
+            "physical_trajectory": vs_full.squeeze(0),
             "acoustic_trace": torch.cat(a_trace_list, dim=-1) if a_trace_list else None,
             "control_trace": b_t,
             "pointer_state": ptr.to_dict(),
@@ -1213,7 +1348,7 @@ class UCLMEngine:
         ctx_b = torch.zeros(1, 4, 1, dtype=torch.long, device=device)
         kv_caches = None
         
-        vs_trajectory = trajectory.voice_state_trajectory.to(device) if trajectory.voice_state_trajectory is not None else None
+        vs_trajectory = trajectory.physical_trajectory.to(device) if trajectory.physical_trajectory is not None else None
         # Bit-exact acoustic tokens if requested (Worker 01/04)
         a_trace = trajectory.acoustic_trace.to(device) if (use_exact_tokens and trajectory.acoustic_trace is not None) else None
         
@@ -1260,9 +1395,9 @@ class UCLMEngine:
             content_features = all_phoneme_features[:, safe_idx : safe_idx + 1, :]
             
             # SOTA: Allow local overrides even during deterministic replay
-            v_state_curr = vs_trajectory[t].view(1, 1, 8) if vs_trajectory is not None else torch.zeros(1, 1, 8, device=device)
+            v_state_curr = vs_trajectory[t].view(1, 1, 12) if vs_trajectory is not None else torch.zeros(1, 1, 12, device=device)
             if text_idx in local_plan:
-                v_state_curr = local_plan[text_idx].to(device).view(1, 1, 8)
+                v_state_curr = local_plan[text_idx].to(device).view(1, 1, 12)
 
             out = self.uclm_core_model.forward_streaming(
                 queries=content_features,
@@ -1317,30 +1452,6 @@ class UCLMEngine:
             "control_trace": b_t,
         }
 
-    def _tts_legacy_duration(
-        self,
-        phonemes: torch.Tensor,
-        speaker_embed: torch.Tensor,
-        style: StyleParams,
-        cfg_scale: float = 1.5,
-        temperature: float = 0.8,
-        language_id: int = 0,
-        pace: float = 1.0,
-        max_frames: int = 1500,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, dict]:
-        """Legacy duration-based TTS fallback.
-
-        This path uses a DurationPredictor to determine phoneme durations
-        instead of the v3 pointer mechanism. Currently a stub — raises
-        NotImplementedError until a DurationPredictor is integrated.
-        """
-        raise NotImplementedError(
-            "Legacy duration-based TTS is not available. "
-            "DurationPredictor has not been integrated into the serving engine. "
-            "Use tts_mode='pointer' (the default) for v3 pointer-based synthesis."
-        )
-
     def create_trajectory_record(
         self,
         trajectory_id: str,
@@ -1361,7 +1472,7 @@ class UCLMEngine:
             phoneme_ids=phoneme_ids.cpu(),
             text_suprasegmentals=text_suprasegmentals.cpu() if text_suprasegmentals is not None else None,
             pointer_trace=stats["pointer_trace"],
-            voice_state_trajectory=stats["voice_state_trajectory"].cpu(),
+            physical_trajectory=stats["physical_trajectory"].cpu(),
             acoustic_trace=stats["acoustic_trace"].cpu() if "acoustic_trace" in stats else None,
             control_trace=stats["control_trace"].cpu() if "control_trace" in stats else None,
             applied_pacing=PacingControls(

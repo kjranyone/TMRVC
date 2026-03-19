@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import enum
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 from pydantic import BaseModel, Field
 from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 
 StylePreset = Literal["default", "asmr_soft", "asmr_intimate"]
 CFGModeStr = Literal["off", "full", "lazy", "distilled"]
-VOICE_STATE_DESCRIPTION = (
-    "Canonical 8-D voice_state vector ordered as: "
-    + ", ".join(CANONICAL_VOICE_STATE_IDS)
-)
+
+
+# ---------------------------------------------------------------------------
+# v4 Physical Control Names (12-D canonical ordering)
+# ---------------------------------------------------------------------------
+
+V4_PHYSICAL_CONTROL_NAMES: list[str] = [
+    "pitch_level", "pitch_range", "energy_level", "pressedness",
+    "spectral_tilt", "breathiness", "voice_irregularity", "openness",
+    "aperiodicity", "formant_shift", "vocal_effort", "creak",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -37,57 +44,8 @@ class DialogueTurnSchema(BaseModel):
     emotion: str | None = None
 
 
-class TTSRequest(BaseModel):
-    """Request body for POST /tts."""
-
-    text: str = Field(..., min_length=1, max_length=10000)
-    character_id: str = Field(..., min_length=1)
-    emotion: str | None = Field(
-        None, description="Emotion override (e.g. 'happy', 'sad')."
-    )
-    hint: str | None = Field(
-        None,
-        description="Optional acting/style hint. Used as soft style guidance, not mandatory.",
-    )
-    style_preset: StylePreset = Field(
-        "default",
-        description="High-level style preset (default/asmr_soft/asmr_intimate).",
-    )
-    context: list[DialogueTurnSchema] | None = Field(
-        None, description="Conversation history."
-    )
-    situation: str | None = Field(None, description="Scene/situation description.")
-    speed: float = Field(1.0, ge=0.5, le=2.0)
-    pace: float = Field(1.0, ge=0.5, le=3.0, description="Speech pace multiplier (v3 pointer mode).")
-    hold_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward holding current phoneme (v3 pointer mode).")
-    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward phoneme boundaries (v3 pointer mode).")
-    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0, description="Interruption/urgency pressure (v3 acting).")
-    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0, description="Tendency to insert breathing pauses (v3 acting).")
-    dialogue_context: Optional[list[float]] = Field(None, description="Scene/dialogue embedding vector.")
-    acting_intent: Optional[list[float]] = Field(None, description="Utterance-level acting intent vector.")
-    reference_audio_base64: Optional[str] = Field(None, description="Base64-encoded reference audio for few-shot speaker adaptation (3-10 seconds).")
-    reference_text: Optional[str] = Field(None, description="Optional transcript of the reference audio.")
-    explicit_voice_state: Optional[list[float]] = Field(None, description=VOICE_STATE_DESCRIPTION, min_length=8, max_length=8)
-    delta_voice_state: Optional[list[float]] = Field(None, description=f"Canonical 8-D voice_state delta ordered as: {', '.join(CANONICAL_VOICE_STATE_IDS)}", min_length=8, max_length=8)
-    speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
-    wait_for_prompt: bool = Field(True, description="If True, wait for few-shot prompt encoding before starting synthesis (Worker 04).")
-    cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
-    cfg_mode: CFGModeStr = Field("full", description="CFG operating mode: off, full, lazy, or distilled.")
-    language_id: Optional[int] = Field(None, description="Language ID for multilingual support (0=ja, 1=en, 2=zh, 3=ko).")
-    dialogue_text: Optional[str] = Field(None, description="Optional scene/dialogue text for context conditioning.")
-
-
-class TTSResponse(BaseModel):
-    """Response for POST /tts."""
-
-    audio_base64: str = Field(..., description="WAV audio encoded as base64.")
-    sample_rate: int = 24000
-    duration_sec: float = 0.0
-    style_used: dict = Field(default_factory=dict)
-
-
 # ---------------------------------------------------------------------------
-# v3 TTS schemas with pointer telemetry
+# Shared TTS schemas
 # ---------------------------------------------------------------------------
 
 
@@ -105,22 +63,6 @@ class PointerTelemetry(BaseModel):
     forced_advance_count: int = 0
     skip_protection_count: int = 0
     cfg_cache_age: int = 0
-
-
-class TTSResponseV3(BaseModel):
-    """Extended response for POST /tts with v3 pointer telemetry."""
-
-    audio_base64: str = Field(..., description="WAV audio encoded as base64.")
-    sample_rate: int = 24000
-    duration_sec: float = 0.0
-    style_used: dict = Field(default_factory=dict)
-    pointer_telemetry: Optional[PointerTelemetry] = None
-    rtf: float = 0.0
-    gen_time_ms: float = 0.0
-    prompt_encoding_time_ms: float = 0.0
-    cfg_mode: str = "off"
-    forced_advance_count: int = 0
-    skip_protection_count: int = 0
 
 
 class SpeakerProfileResponse(BaseModel):
@@ -180,48 +122,6 @@ class CharacterCreateRequest(BaseModel):
     voice_description: str = ""
     language: Literal["ja", "en", "zh", "ko"] = "ja"
     speaker_file: str | None = Field(None, description="Path to .tmrvc_speaker file.")
-
-
-class TTSStreamRequest(BaseModel):
-    """Request body for POST /tts/stream.
-
-    Same as TTSRequest but returns chunked PCM audio instead of full WAV.
-    """
-
-    text: str = Field(..., min_length=1, max_length=10000)
-    character_id: str = Field(..., min_length=1)
-    emotion: str | None = Field(None, description="Emotion override.")
-    hint: str | None = Field(
-        None,
-        description="Optional acting/style hint. Used as soft style guidance, not mandatory.",
-    )
-    style_preset: StylePreset = Field(
-        "default",
-        description="High-level style preset (default/asmr_soft/asmr_intimate).",
-    )
-    context: list[DialogueTurnSchema] | None = Field(
-        None, description="Conversation history."
-    )
-    situation: str | None = Field(None, description="Scene/situation description.")
-    speed: float = Field(1.0, ge=0.5, le=2.0)
-    pace: float = Field(1.0, ge=0.5, le=3.0, description="Speech pace multiplier (v3 pointer mode).")
-    hold_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward holding current phoneme (v3 pointer mode).")
-    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Bias toward phoneme boundaries (v3 pointer mode).")
-    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0, description="Interruption/urgency pressure (v3 acting).")
-    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0, description="Tendency to insert breathing pauses (v3 acting).")
-    dialogue_context: Optional[list[float]] = Field(None, description="Scene/dialogue embedding vector.")
-    acting_intent: Optional[list[float]] = Field(None, description="Utterance-level acting intent vector.")
-    reference_audio_base64: Optional[str] = Field(None, description="Base64-encoded reference audio for few-shot speaker adaptation (3-10 seconds).")
-    reference_text: Optional[str] = Field(None, description="Optional transcript of the reference audio.")
-    explicit_voice_state: Optional[list[float]] = Field(None, description=VOICE_STATE_DESCRIPTION, min_length=8, max_length=8)
-    delta_voice_state: Optional[list[float]] = Field(None, description=f"Canonical 8-D voice_state delta ordered as: {', '.join(CANONICAL_VOICE_STATE_IDS)}", min_length=8, max_length=8)
-    speaker_profile_id: Optional[str] = Field(None, description="ID of a pre-exported speaker profile to load.")
-    wait_for_prompt: bool = Field(True, description="If True, wait for few-shot prompt encoding before starting synthesis (Worker 04).")
-    cfg_scale: float = Field(1.5, ge=0.5, le=5.0, description="Classifier-free guidance scale.")
-    cfg_mode: CFGModeStr = Field("full", description="CFG operating mode: off, full, lazy, or distilled.")
-    language_id: Optional[int] = Field(None, description="Language ID for multilingual support (0=ja, 1=en, 2=zh, 3=ko).")
-    dialogue_text: Optional[str] = Field(None, description="Optional scene/dialogue text for context conditioning.")
-    chunk_duration_ms: int = Field(100, ge=20, le=500)
 
 
 class HealthResponse(BaseModel):
@@ -496,3 +396,442 @@ class CurationActionRequest(BaseModel):
     expected_version: int
     bucket: Optional[str] = None
     rationale: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Physical / Acting / Pacing Control Schemas
+# ---------------------------------------------------------------------------
+
+
+class PhysicalControls(BaseModel):
+    """12-D explicit physical control vector."""
+    pitch_level: float = Field(0.5, ge=0.0, le=1.0)
+    pitch_range: float = Field(0.3, ge=0.0, le=1.0)
+    energy_level: float = Field(0.5, ge=0.0, le=1.0)
+    pressedness: float = Field(0.35, ge=0.0, le=1.0)
+    spectral_tilt: float = Field(0.5, ge=0.0, le=1.0)
+    breathiness: float = Field(0.2, ge=0.0, le=1.0)
+    voice_irregularity: float = Field(0.15, ge=0.0, le=1.0)
+    openness: float = Field(0.5, ge=0.0, le=1.0)
+    aperiodicity: float = Field(0.2, ge=0.0, le=1.0)
+    formant_shift: float = Field(0.5, ge=0.0, le=1.0)
+    vocal_effort: float = Field(0.4, ge=0.0, le=1.0)
+    creak: float = Field(0.1, ge=0.0, le=1.0)
+
+    def to_list(self) -> list[float]:
+        return [
+            self.pitch_level, self.pitch_range, self.energy_level,
+            self.pressedness, self.spectral_tilt, self.breathiness,
+            self.voice_irregularity, self.openness, self.aperiodicity,
+            self.formant_shift, self.vocal_effort, self.creak,
+        ]
+
+
+class PhysicalControlWithConfidence(BaseModel):
+    """Single physical control dimension with value and confidence.
+
+    Confidence reflects how reliably the value was estimated during
+    bootstrap.  Inference may downweight low-confidence dimensions.
+    """
+    value: float = Field(0.5, ge=0.0, le=1.0, description="Control value [0, 1]")
+    confidence: float = Field(
+        1.0, ge=0.0, le=1.0,
+        description="Estimation confidence.  1.0 = fully trusted; 0.0 = unknown/absent.",
+    )
+
+
+class ConfidenceBearingPhysicalControls(BaseModel):
+    """12-D physical controls where each dimension carries a confidence score.
+
+    Used when the control target originates from the bootstrap pipeline's
+    DSP/SSL extraction stage which may be partially observed.
+    """
+    pitch_level: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    pitch_range: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    energy_level: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    pressedness: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    spectral_tilt: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    breathiness: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    voice_irregularity: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    openness: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    aperiodicity: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    formant_shift: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    vocal_effort: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+    creak: PhysicalControlWithConfidence = Field(default_factory=PhysicalControlWithConfidence)
+
+    def to_value_list(self) -> list[float]:
+        """Return only the 12 values in canonical order."""
+        return [
+            self.pitch_level.value, self.pitch_range.value,
+            self.energy_level.value, self.pressedness.value,
+            self.spectral_tilt.value, self.breathiness.value,
+            self.voice_irregularity.value, self.openness.value,
+            self.aperiodicity.value, self.formant_shift.value,
+            self.vocal_effort.value, self.creak.value,
+        ]
+
+    def to_confidence_list(self) -> list[float]:
+        """Return only the 12 confidence values in canonical order."""
+        return [
+            self.pitch_level.confidence, self.pitch_range.confidence,
+            self.energy_level.confidence, self.pressedness.confidence,
+            self.spectral_tilt.confidence, self.breathiness.confidence,
+            self.voice_irregularity.confidence, self.openness.confidence,
+            self.aperiodicity.confidence, self.formant_shift.confidence,
+            self.vocal_effort.confidence, self.creak.confidence,
+        ]
+
+    def to_plain_controls(self) -> "PhysicalControls":
+        """Downcast to a plain PhysicalControls (drop confidence)."""
+        vals = self.to_value_list()
+        return PhysicalControls(**dict(zip(V4_PHYSICAL_CONTROL_NAMES, vals)))
+
+
+class V4SpeakerProfile(BaseModel):
+    """Speaker profile derived from the v4 bootstrap pipeline.
+
+    This schema carries bootstrap-derived information that enriches
+    the existing ``SpeakerProfile`` core contract for serving.
+    """
+    pseudo_speaker_id: str = Field(
+        ..., description="Cluster-assigned pseudo speaker ID from bootstrap diarization.",
+    )
+    speaker_embed: list[float] = Field(
+        ...,
+        min_length=192, max_length=192,
+        description="192-dim L2-normalised speaker embedding from ECAPA-TDNN.",
+    )
+    display_name: str = ""
+    language: str = "ja"
+    gender: str = "other"
+
+    # Bootstrap quality metadata
+    supervision_tier: str = Field(
+        "tier_d",
+        pattern="^tier_[abcd]$",
+        description="Bootstrap supervision tier (tier_a through tier_d).",
+    )
+    diarization_confidence: float = Field(
+        0.0, ge=0.0, le=1.0,
+        description="Confidence of diarization cluster assignment.",
+    )
+    utterance_count: int = Field(
+        0, ge=0,
+        description="Number of utterances assigned to this speaker in the bootstrap corpus.",
+    )
+
+    # Physical control priors (per-speaker average from bootstrap)
+    physical_prior: Optional[ConfidenceBearingPhysicalControls] = Field(
+        None,
+        description="Per-speaker average 12-D physical controls from bootstrap, with confidence.",
+    )
+
+    # Reference data paths (resolved server-side)
+    prompt_codec_tokens_path: Optional[str] = Field(
+        None,
+        description="Path to pre-encoded prompt codec tokens (.npy).",
+    )
+    prompt_summary_tokens_path: Optional[str] = Field(
+        None,
+        description="Path to pre-encoded summary tokens (.npy).",
+    )
+
+    schema_version: str = "v4.0"
+
+
+class ActingMacroControls(BaseModel):
+    """Acting texture macro controls (user-facing, not raw latent)."""
+    intensity: float = Field(0.5, ge=0.0, le=1.0)
+    instability: float = Field(0.2, ge=0.0, le=1.0)
+    tenderness: float = Field(0.3, ge=0.0, le=1.0)
+    tension: float = Field(0.3, ge=0.0, le=1.0)
+    spontaneity: float = Field(0.5, ge=0.0, le=1.0)
+    reference_mix: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class PacingControlsSchema(BaseModel):
+    """Pacing controls for pointer progression."""
+    pace: float = Field(1.0, ge=0.3, le=3.0)
+    hold_bias: float = Field(0.0, ge=-1.0, le=1.0)
+    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0)
+    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0)
+    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0)
+
+
+class TTSRequestSimple(BaseModel):
+    """Simple-mode TTS request.
+
+    Minimal interface for basic synthesis without explicit physical/acting controls.
+    """
+    text: str
+    speaker_profile_id: Optional[str] = None
+    reference_audio_base64: Optional[str] = Field(None, max_length=67_108_864)
+    language: Optional[str] = None
+    emotion: Optional[str] = None
+    speed: float = Field(1.0, ge=0.3, le=3.0)
+
+    # v4 fields
+    pseudo_speaker_id: Optional[str] = Field(
+        None,
+        description="Bootstrap-derived pseudo speaker ID.  Resolved to a V4SpeakerProfile server-side.",
+    )
+    enriched_transcript: Optional[str] = Field(
+        None,
+        description="Enriched transcript with inline acting tags (e.g. '[laugh] hello [emphasis] world').",
+    )
+
+    schema_version: str = "1.0"
+
+
+class TTSRequestAdvanced(BaseModel):
+    """Advanced physical-control mode TTS request.
+
+    Full 12-D physical control with optional acting macro controls.
+    """
+    text: str
+    speaker_profile_id: Optional[str] = None
+    reference_audio_base64: Optional[str] = Field(None, max_length=67_108_864)
+    language: Optional[str] = None
+
+    # 12-D physical controls
+    physical_controls: PhysicalControls = Field(default_factory=PhysicalControls)
+    delta_physical_controls: Optional[PhysicalControls] = None
+
+    # v4: confidence-bearing physical controls from bootstrap
+    confidence_bearing_controls: Optional[ConfidenceBearingPhysicalControls] = Field(
+        None,
+        description="12-D controls with per-dimension confidence from bootstrap.  "
+                    "When provided, takes precedence over plain physical_controls.",
+    )
+
+    # v4 fields
+    pseudo_speaker_id: Optional[str] = Field(
+        None,
+        description="Bootstrap-derived pseudo speaker ID.",
+    )
+    enriched_transcript: Optional[str] = Field(
+        None,
+        description="Enriched transcript with inline acting tags.",
+    )
+
+    # Acting macro controls
+    acting_controls: ActingMacroControls = Field(default_factory=ActingMacroControls)
+
+    # Pacing
+    pacing: PacingControlsSchema = Field(default_factory=PacingControlsSchema)
+
+    # CFG
+    cfg_scale: float = Field(1.5, ge=0.5, le=5.0)
+    cfg_mode: str = Field("full", pattern="^(off|full|lazy|distilled)$")
+
+    schema_version: str = "1.0"
+
+
+class TTSRequestPrompt(BaseModel):
+    """Prompt/acting mode TTS request.
+
+    Natural language acting instructions compiled via Intent Compiler.
+    """
+    text: str
+    speaker_profile_id: Optional[str] = None
+    reference_audio_base64: Optional[str] = Field(None, max_length=67_108_864)
+    language: Optional[str] = None
+
+    # Acting instruction
+    acting_prompt: str = ""
+    acting_tags: list[str] = Field(default_factory=list)
+    scene_context: str = ""
+
+    # Optional physical overrides
+    physical_overrides: Optional[PhysicalControls] = None
+
+    # Pacing
+    pacing: PacingControlsSchema = Field(default_factory=PacingControlsSchema)
+
+    # CFG
+    cfg_scale: float = Field(1.5, ge=0.5, le=5.0)
+    cfg_mode: str = Field("full", pattern="^(off|full|lazy|distilled)$")
+
+    schema_version: str = "1.0"
+
+
+class TTSRequestReplay(BaseModel):
+    """Trajectory replay mode TTS request.
+
+    Deterministic replay from a frozen TrajectoryRecord.
+    Must NOT silently reinterpret or recompile prompts.
+    """
+    trajectory_id: str
+    speaker_profile_id: Optional[str] = None  # None = same speaker as original
+    schema_version: str = "1.0"
+
+
+class TTSResponse(BaseModel):
+    """TTS response with full provenance."""
+    audio_base64: str
+    sample_rate: int = 24000
+    duration_sec: float = 0.0
+
+    # Provenance
+    trajectory_id: Optional[str] = None
+    provenance: str = "fresh_compile"  # fresh_compile | deterministic_replay | cross_speaker_transfer | patched_replay
+
+    # Telemetry
+    rtf: float = 0.0
+    gen_time_ms: float = 0.0
+    cfg_mode: str = "full"
+    forced_advance_count: int = 0
+    skip_protection_count: int = 0
+
+    schema_version: str = "1.0"
+
+
+class CompileRequest(BaseModel):
+    """Request to compile acting intent into canonical controls."""
+    text: str
+    acting_prompt: str = ""
+    acting_tags: list[str] = Field(default_factory=list)
+    scene_context: str = ""
+    reference_audio_base64: Optional[str] = Field(None, max_length=67_108_864)
+    schema_version: str = "1.0"
+
+
+class CompileResponse(BaseModel):
+    """Compiled intent output."""
+    compile_id: str
+    physical_targets: list[float]     # [12]
+    physical_confidence: list[float]  # [12]
+    acting_macro: ActingMacroControls
+    pacing: PacingControlsSchema
+    warnings: list[str] = Field(default_factory=list)
+    schema_version: str = "1.0"
+
+
+class PatchRequest(BaseModel):
+    """Patch a local region of a trajectory."""
+    start_pointer_index: int
+    end_pointer_index: int
+    physical_overrides: Optional[PhysicalControls] = None
+    acting_macro_overrides: Optional[ActingMacroControls] = None
+    pacing_overrides: Optional[PacingControlsSchema] = None
+    expected_version: int  # Optimistic concurrency
+    schema_version: str = "1.0"
+
+    from pydantic import model_validator
+
+    @model_validator(mode="after")
+    def _check_start_before_end(self) -> "PatchRequest":
+        if self.start_pointer_index >= self.end_pointer_index:
+            raise ValueError(
+                f"start_pointer_index ({self.start_pointer_index}) must be "
+                f"less than end_pointer_index ({self.end_pointer_index})"
+            )
+        return self
+
+
+class TransferRequest(BaseModel):
+    """Transfer a trajectory's acting to a different speaker."""
+    target_speaker_profile_id: str
+    schema_version: str = "1.0"
+
+
+class TrajectoryInfo(BaseModel):
+    """Trajectory artifact metadata for API responses."""
+    trajectory_id: str
+    source_compile_id: str
+    speaker_profile_id: str
+    provenance: str
+    version: int
+    schema_version: str
+    created_at: str
+    n_frames: int = 0
+    duration_sec: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible unified request schemas
+# ---------------------------------------------------------------------------
+
+
+def _validate_12d(v: list[float] | None) -> list[float] | None:
+    if v is not None and len(v) != 12:
+        raise ValueError("must be exactly 12 elements")
+    return v
+
+
+class TTSRequest(BaseModel):
+    """Unified TTS request (backward-compatible with v3 tests)."""
+    text: str
+    character_id: str = ""
+    speaker_profile_id: Optional[str] = None
+    reference_audio_base64: Optional[str] = Field(None, max_length=67_108_864)
+    reference_text: Optional[str] = None
+    language: Optional[str] = None
+    emotion: Optional[str] = None
+
+    # Physical controls (12-D)
+    explicit_voice_state: Optional[list[float]] = None
+    delta_voice_state: Optional[list[float]] = None
+
+    # Pacing
+    pace: float = Field(1.0, ge=0.5, le=3.0)
+    hold_bias: float = Field(0.0, ge=-1.0, le=1.0)
+    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0)
+
+    # Expressive
+    dialogue_context: Optional[list[float]] = None
+    acting_intent: Optional[list[float]] = None
+
+    # Style
+    style_preset: StylePreset = "default"
+
+    # v4 fields
+    pseudo_speaker_id: Optional[str] = None
+    enriched_transcript: Optional[str] = None
+    cfg_scale: float = Field(1.5, ge=0.5, le=5.0)
+
+    schema_version: str = "1.0"
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+
+    from pydantic import model_validator
+
+    @model_validator(mode="after")
+    def _check_voice_state_lengths(self) -> "TTSRequest":
+        _validate_12d(self.explicit_voice_state)
+        _validate_12d(self.delta_voice_state)
+        return self
+
+
+class TTSStreamRequest(BaseModel):
+    """Unified streaming TTS request (backward-compatible with v3 tests)."""
+    text: str
+    character_id: str = ""
+    speaker_profile_id: Optional[str] = None
+    reference_audio_base64: Optional[str] = Field(None, max_length=67_108_864)
+    reference_text: Optional[str] = None
+    language: Optional[str] = None
+
+    explicit_voice_state: Optional[list[float]] = None
+    delta_voice_state: Optional[list[float]] = None
+
+    pace: float = Field(1.0, ge=0.5, le=3.0)
+    hold_bias: float = Field(0.0, ge=-1.0, le=1.0)
+    boundary_bias: float = Field(0.0, ge=-1.0, le=1.0)
+
+    dialogue_context: Optional[list[float]] = None
+    acting_intent: Optional[list[float]] = None
+
+    cfg_scale: float = Field(1.5, ge=0.5, le=5.0)
+
+    schema_version: str = "1.0"
+
+    from pydantic import model_validator
+
+    @model_validator(mode="after")
+    def _check_voice_state_lengths(self) -> "TTSStreamRequest":
+        _validate_12d(self.explicit_voice_state)
+        _validate_12d(self.delta_voice_state)
+        return self

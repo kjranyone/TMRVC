@@ -1,22 +1,21 @@
-"""Admin and Monitoring routes for TMRVC Serve (Worker 04).
+"""Admin and Monitoring routes for TMRVC Serve.
 
 Provides:
-- GET  /admin/health           — detailed system health with VRAM, latency
-- GET  /admin/telemetry        — runtime telemetry
-- POST /admin/load_model       — switch checkpoints
-- GET  /admin/models           — list available checkpoints
-- GET  /admin/runtime_contract — expose pointer/voice_state contract
-- GET  /admin/contract         — legacy alias (kept for backward compat)
+- GET  /admin/health           -- detailed system health with VRAM, latency
+- GET  /admin/telemetry        -- runtime telemetry
+- POST /admin/load_model       -- switch checkpoints
+- GET  /admin/models           -- list available checkpoints
+- GET  /admin/runtime_contract -- expose pointer/voice_state contract
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from tmrvc_core.voice_state import VOICE_STATE_REGISTRY, get_voice_state_dimension_names
@@ -40,7 +39,7 @@ def get_engine():
 
 
 # ---------------------------------------------------------------------------
-# v3 Response / Request schemas (Worker 04, task 13)
+# Response / Request schemas
 # ---------------------------------------------------------------------------
 
 
@@ -92,7 +91,7 @@ class RuntimeContractResponse(BaseModel):
             "skip_protection_count",
         ]
     )
-    voice_state_dims: int = 8
+    voice_state_dims: int = 12
     voice_state_names: List[str] = Field(
         default_factory=get_voice_state_dimension_names
     )
@@ -134,7 +133,7 @@ class ModelInfo(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Legacy schemas (kept for backward compatibility)
+# Additional schemas
 # ---------------------------------------------------------------------------
 
 
@@ -148,7 +147,7 @@ class SystemHealth(BaseModel):
 
 class RuntimeContract(BaseModel):
     pointer_step_ms: float = 10.0
-    voice_state_dims: int = 8
+    voice_state_dims: int = 12
     voice_state_names: List[str]
     max_prompt_frames: int
     cfg_modes: List[str] = ["off", "full", "lazy", "distilled"]
@@ -267,13 +266,13 @@ async def list_models():
 
 
 # ---------------------------------------------------------------------------
-# Legacy alias — kept for backward compatibility
+# Short alias for /admin/contract
 # ---------------------------------------------------------------------------
 
 
 @router.get("/contract", response_model=RuntimeContract)
 async def get_contract():
-    """Expose the frozen runtime contract (legacy alias)."""
+    """Expose the frozen runtime contract."""
     from tmrvc_core.constants import MAX_PROMPT_FRAMES
 
     return RuntimeContract(

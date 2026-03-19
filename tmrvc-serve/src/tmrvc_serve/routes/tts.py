@@ -1,4 +1,4 @@
-"""POST /tts, POST /tts/stream, and POST /tts/stream/sse endpoints (UCLM v3 pointer mode)."""
+"""POST /tts, POST /tts/stream, POST /tts/stream/sse, and POST /tts/stream/v4 endpoints (UCLM pointer mode)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from tmrvc_serve._helpers import (
     _load_speaker_embed,
     _to_dialogue_turns,
 )
-from tmrvc_serve.schemas import TTSRequest, TTSResponse, TTSStreamRequest
+from tmrvc_serve.schemas import TTSRequestAdvanced, TTSResponse
 from tmrvc_serve.style_resolver import (
     _apply_inline_stage_overlay,
     _predict_style_from_inputs,
@@ -35,127 +35,88 @@ router = APIRouter()
 
 
 @router.post("/tts", response_model=TTSResponse)
-async def generate_tts(req: TTSRequest) -> TTSResponse:
+async def generate_tts(req: TTSRequestAdvanced) -> TTSResponse:
     from tmrvc_serve.app import get_engine, _characters, _context_predictor
     from tmrvc_core.text_utils import analyze_inline_stage_directions
     from tmrvc_data.g2p import text_to_phonemes
 
     engine = get_engine()
 
-    character = _characters.get(req.character_id)
-    if character is None:
-        raise HTTPException(status_code=404, detail=f"Character '{req.character_id}' not found.")
-
-    # 1. Analyze text and directions
-    inline_stage = analyze_inline_stage_directions(req.text, language=character.language)
-    spoken_text = inline_stage.spoken_text
-
-    # 2. Predict style
-    history = _to_dialogue_turns(req.context)
-    style = await _predict_style_from_inputs(
-        character=character,
-        text=spoken_text,
-        emotion=req.emotion,
-        history=history,
-        situation=req.situation,
-        hint=req.hint,
-        speaker=req.character_id,
-        context_predictor=_context_predictor,
-    )
-
-    style, preset_cfg = _resolve_style_preset(style, req.style_preset)
-    style = _apply_inline_stage_overlay(style, inline_stage.style_overlay)
-    
-    # 3. G2P: text -> phoneme IDs
-    g2p_result = text_to_phonemes(spoken_text, language=character.language)
+    # 1. G2P: text -> phoneme IDs
+    g2p_result = text_to_phonemes(req.text, language=req.language or "ja")
     phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
 
-    # 4. Load speaker embedding or profile (Worker 04)
+    # 2. Load speaker profile
     speaker_profile = None
+    spk_t = None
     if req.speaker_profile_id:
-        # Load from Casting Gallery (Worker 12 requirement)
         speaker_profile = engine.load_speaker_profile(req.speaker_profile_id)
         if speaker_profile is None:
             raise HTTPException(status_code=404, detail=f"Speaker profile '{req.speaker_profile_id}' not found.")
         spk_t = speaker_profile.speaker_embed.unsqueeze(0).to(engine.device)
-    else:
-        spk_embed = _load_speaker_embed(character)
-        spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0).to(engine.device)
 
-    # 5. Handle on-the-fly few-shot adaptation
+    # 3. Handle on-the-fly few-shot adaptation
     if req.reference_audio_base64:
         ref_audio_bytes = base64.b64decode(req.reference_audio_base64)
-        # Convert to tensor and encode (Worker 01/04)
-        # For simplicity in this route, we assume engine has a helper for this
-        if req.wait_for_prompt:
-            logger.info("Encoding on-the-fly reference audio...")
-            ref_profile = engine.encode_on_the_fly_reference(
-                ref_audio_bytes, text=req.reference_text
-            )
-            speaker_profile = ref_profile
-            spk_t = ref_profile.speaker_embed.unsqueeze(0).to(engine.device)
-        else:
-            # Plan: return 202 Accepted or error if not ready, but here we enforce wait
-            pass
+        logger.info("Encoding on-the-fly reference audio...")
+        ref_profile = engine.encode_on_the_fly_reference(ref_audio_bytes, text=None)
+        speaker_profile = ref_profile
+        spk_t = ref_profile.speaker_embed.unsqueeze(0).to(engine.device)
 
-    # 6. Convert optional embedding lists to tensors
-    dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.dialogue_context is not None else None
-    act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.acting_intent is not None else None
-    
-    explicit_vs = torch.tensor(req.explicit_voice_state, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.explicit_voice_state is not None else None
-    delta_vs = torch.tensor(req.delta_voice_state, dtype=torch.float32).unsqueeze(0).to(engine.device) if req.delta_voice_state is not None else None
+    # 4. Build 12-D physical controls tensor
+    physical_controls_list = req.physical_controls.to_list()
+    explicit_vs = torch.tensor(physical_controls_list, dtype=torch.float32).unsqueeze(0).to(engine.device)
 
-    # 7. Unified Synthesis (UCLM v3)
+    if req.delta_physical_controls is not None:
+        delta_list = req.delta_physical_controls.to_list()
+        delta_vs = torch.tensor(delta_list, dtype=torch.float32).unsqueeze(0).to(engine.device)
+    else:
+        delta_vs = None
+
+    # 5. Extract pacing controls
+    pacing = req.pacing
+
+    # 6. Unified Synthesis
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
         speaker_profile=speaker_profile,
         speaker_embed=spk_t,
-        style=style,
+        style=None,
         language_id=g2p_result.language_id,
-        pace=req.pace,
-        hold_bias=req.hold_bias,
-        boundary_bias=req.boundary_bias,
-        phrase_pressure=req.phrase_pressure,
-        breath_tendency=req.breath_tendency,
-        dialogue_context=dlg_ctx,
-        acting_intent=act_int,
+        pace=pacing.pace,
+        hold_bias=pacing.hold_bias,
+        boundary_bias=pacing.boundary_bias,
+        phrase_pressure=pacing.phrase_pressure,
+        breath_tendency=pacing.breath_tendency,
         explicit_voice_state=explicit_vs,
         delta_voice_state=delta_vs,
         cfg_scale=req.cfg_scale,
         cfg_mode=req.cfg_mode,
     )
-    
+
     audio = audio_t.cpu().numpy()
-
-    # 7. Post-processing
-    audio = _append_silence(
-        audio,
-        leading_ms=inline_stage.leading_silence_ms,
-        trailing_ms=inline_stage.trailing_silence_ms,
-    )
     duration_sec = len(audio) / SAMPLE_RATE
-
     audio_b64 = _audio_to_wav_base64(audio)
 
-    # Prepare metadata for response
-    style_used = vars(style).copy() if style else {}
-    style_used["style_preset"] = req.style_preset
-    style_used["spoken_text"] = spoken_text
-    style_used["metrics"] = metrics
+    trajectory_id = metrics.get("trajectory_id")
 
     return TTSResponse(
         audio_base64=audio_b64,
         sample_rate=SAMPLE_RATE,
         duration_sec=duration_sec,
-        style_used=style_used,
+        trajectory_id=trajectory_id,
+        provenance="fresh_compile",
+        rtf=metrics.get("rtf", 0.0),
+        gen_time_ms=metrics.get("gen_time_ms", 0.0),
+        cfg_mode=metrics.get("cfg_mode", req.cfg_mode),
+        forced_advance_count=metrics.get("forced_advance_count", 0),
+        skip_protection_count=metrics.get("skip_protection_count", 0),
     )
 
 
 @router.post("/tts/stream")
-async def stream_tts(req: TTSStreamRequest) -> StreamingResponse:
+async def stream_tts(req: TTSRequestAdvanced) -> StreamingResponse:
     """Streaming TTS endpoint (batch fallback while full causal streaming is implemented)."""
-    # Batch fallback: returns the full audio as a single chunk while
-    # full causal streaming is being implemented.
     res = await generate_tts(req)
 
     audio_bytes = base64.b64decode(res.audio_base64)
@@ -174,7 +135,7 @@ async def stream_tts(req: TTSStreamRequest) -> StreamingResponse:
 
 
 @router.post("/tts/stream/sse")
-async def stream_tts_sse(req: TTSStreamRequest) -> StreamingResponse:
+async def stream_tts_sse(req: TTSRequestAdvanced) -> StreamingResponse:
     """Server-Sent Events streaming TTS endpoint.
 
     Uses batch fallback (generate full audio, then chunk into SSE events).
@@ -182,99 +143,38 @@ async def stream_tts_sse(req: TTSStreamRequest) -> StreamingResponse:
     the batch generation later without changing the SSE event contract.
 
     Events emitted:
-        ``event: audio``  — base64-encoded PCM float32 chunk.
-        ``event: pointer`` — JSON pointer telemetry snapshot.
-        ``event: done``   — JSON final metrics.
+        ``event: audio``  -- base64-encoded PCM float32 chunk.
+        ``event: pointer`` -- JSON pointer telemetry snapshot.
+        ``event: done``   -- JSON final metrics.
     """
-    from tmrvc_serve.app import get_engine, _characters, _context_predictor
-    from tmrvc_core.text_utils import analyze_inline_stage_directions
-    from tmrvc_data.g2p import text_to_phonemes
+    res = await generate_tts(req)
 
-    engine = get_engine()
+    audio_bytes = base64.b64decode(res.audio_base64)
+    audio = np.frombuffer(audio_bytes, dtype=np.float32) if len(audio_bytes) > 0 else np.array([], dtype=np.float32)
 
-    character = _characters.get(req.character_id)
-    if character is None:
-        raise HTTPException(status_code=404, detail=f"Character '{req.character_id}' not found.")
-
-    # --- Resolve style and phonemes (mirrors /tts) ---
-    inline_stage = analyze_inline_stage_directions(req.text, language=character.language)
-    spoken_text = inline_stage.spoken_text
-
-    history = _to_dialogue_turns(req.context)
-    style = await _predict_style_from_inputs(
-        character=character,
-        text=spoken_text,
-        emotion=req.emotion,
-        history=history,
-        situation=req.situation,
-        hint=req.hint,
-        speaker=req.character_id,
-        context_predictor=_context_predictor,
-    )
-
-    style, preset_cfg = _resolve_style_preset(style, req.style_preset)
-    style = _apply_inline_stage_overlay(style, inline_stage.style_overlay)
-
-    g2p_result = text_to_phonemes(spoken_text, language=character.language)
-    phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
-
-    # 4. Load speaker embedding or profile
-    spk_embed = _load_speaker_embed(character)
-    spk_t = spk_embed.to(dtype=torch.float32).unsqueeze(0)
-
-    # Future: _load_speaker_profile logic to fetch prompt_codec_tokens
-    speaker_profile = None
-
-    dlg_ctx = torch.tensor(req.dialogue_context, dtype=torch.float32).unsqueeze(0) if req.dialogue_context is not None else None
-    act_int = torch.tensor(req.acting_intent, dtype=torch.float32).unsqueeze(0) if req.acting_intent is not None else None
-
-    # --- Batch synthesis (will be replaced by causal streaming) ---
-    audio_t, metrics = engine.tts(
-        phonemes=phonemes_t,
-        speaker_profile=speaker_profile,
-        speaker_embed=spk_t,
-        style=style,
-        language_id=g2p_result.language_id,
-        pace=req.pace,
-        hold_bias=req.hold_bias,
-        boundary_bias=req.boundary_bias,
-        phrase_pressure=req.phrase_pressure,
-        breath_tendency=req.breath_tendency,
-        dialogue_context=dlg_ctx,
-        acting_intent=act_int,
-    )
-
-    audio = audio_t.cpu().numpy().astype(np.float32)
-    audio = _append_silence(
-        audio,
-        leading_ms=inline_stage.leading_silence_ms,
-        trailing_ms=inline_stage.trailing_silence_ms,
-    )
-
-    # --- Chunk audio into SSE events ---
-    chunk_samples = int(SAMPLE_RATE * req.chunk_duration_ms / 1000)
-    pointer_state = metrics.get("pointer_state", {})
+    chunk_samples = int(SAMPLE_RATE * 100 / 1000)  # 100ms chunks
 
     async def _sse_generator():
         total_chunks = max(1, (len(audio) + chunk_samples - 1) // chunk_samples)
 
-        for i in range(0, len(audio), chunk_samples):
+        for i in range(0, max(1, len(audio)), chunk_samples):
             chunk = audio[i : i + chunk_samples]
             chunk_b64 = base64.b64encode(chunk.tobytes()).decode("ascii")
             yield f"event: audio\ndata: {chunk_b64}\n\n"
 
-            # Interleave pointer telemetry (interpolated position)
             chunk_idx = i // chunk_samples
             progress_frac = (chunk_idx + 1) / total_chunks
-            tel = dict(pointer_state)
-            tel["stream_progress"] = round(progress_frac, 4)
+            tel = {"stream_progress": round(progress_frac, 4)}
             yield f"event: pointer\ndata: {json.dumps(tel)}\n\n"
 
-            # Yield control to the event loop between chunks
             await asyncio.sleep(0)
 
-        # Final done event
-        yield f"event: done\ndata: {json.dumps(metrics)}\n\n"
+        done_data = {
+            "rtf": res.rtf,
+            "gen_time_ms": res.gen_time_ms,
+            "cfg_mode": res.cfg_mode,
+        }
+        yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
 
     return StreamingResponse(
         _sse_generator(),
@@ -282,5 +182,229 @@ async def stream_tts_sse(req: TTSStreamRequest) -> StreamingResponse:
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+        },
+    )
+
+
+_V4_SCHEMA_VERSION = "1.0"
+
+
+@router.post("/tts/stream/v4")
+async def tts_stream_v4(req: TTSRequestAdvanced) -> StreamingResponse:
+    """Real causal streaming TTS with v4 physical + acting controls.
+
+    Returns Server-Sent Events with incremental audio chunks and telemetry.
+    v4 does not permit batch fallback to count as claim-valid streaming.
+
+    Events emitted:
+        ``event: audio``      -- base64-encoded PCM float32 chunk (one per frame group).
+        ``event: telemetry``  -- pointer state, physical trajectory slice, RTF snapshot.
+        ``event: done``       -- final trajectory_id, provenance, and aggregate metrics.
+    """
+    from tmrvc_serve.app import get_engine
+    from tmrvc_core.text_utils import analyze_inline_stage_directions
+    from tmrvc_data.g2p import text_to_phonemes
+
+    # --- Schema version gate ---
+    if req.schema_version != _V4_SCHEMA_VERSION:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"v4 streaming requires schema_version='{_V4_SCHEMA_VERSION}', "
+                f"got '{req.schema_version}'."
+            ),
+        )
+
+    engine = get_engine()
+
+    # 1. G2P: text -> phoneme IDs
+    g2p_result = text_to_phonemes(req.text, language=req.language or "ja")
+    phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+
+    # 2. Load speaker profile
+    speaker_profile = None
+    spk_t = None
+    if req.speaker_profile_id:
+        speaker_profile = engine.load_speaker_profile(req.speaker_profile_id)
+        if speaker_profile is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Speaker profile '{req.speaker_profile_id}' not found.",
+            )
+        spk_t = speaker_profile.speaker_embed.unsqueeze(0).to(engine.device)
+
+    # 3. Handle on-the-fly few-shot adaptation
+    if req.reference_audio_base64:
+        ref_audio_bytes = base64.b64decode(req.reference_audio_base64)
+        logger.info("v4-stream: encoding on-the-fly reference audio...")
+        ref_profile = engine.encode_on_the_fly_reference(ref_audio_bytes, text=None)
+        speaker_profile = ref_profile
+        spk_t = ref_profile.speaker_embed.unsqueeze(0).to(engine.device)
+
+    # 4. Build 12-D physical controls tensor
+    physical_controls_list = req.physical_controls.to_list()
+    explicit_vs = (
+        torch.tensor(physical_controls_list, dtype=torch.float32)
+        .unsqueeze(0)
+        .to(engine.device)
+    )
+
+    if req.delta_physical_controls is not None:
+        delta_list = req.delta_physical_controls.to_list()
+        delta_vs = (
+            torch.tensor(delta_list, dtype=torch.float32)
+            .unsqueeze(0)
+            .to(engine.device)
+        )
+    else:
+        delta_vs = None
+
+    # 5. Pacing controls
+    pacing = req.pacing
+
+    # 6. Causal streaming generation
+    #    Use engine.tts_stream() if available, otherwise fall back to
+    #    frame-by-frame slicing of a full generation.  The SSE contract
+    #    remains identical either way, but the v4 endpoint marks its
+    #    provenance accordingly so callers can distinguish true causal
+    #    streaming from structured-batch streaming.
+    import time as _time
+
+    gen_start = _time.monotonic()
+
+    has_causal = hasattr(engine, "tts_stream")
+
+    if has_causal:
+        # Real causal path: engine yields (chunk_audio, pointer_telemetry) tuples
+        stream_iter = engine.tts_stream(
+            phonemes=phonemes_t,
+            speaker_profile=speaker_profile,
+            speaker_embed=spk_t,
+            style=None,
+            language_id=g2p_result.language_id,
+            pace=pacing.pace,
+            hold_bias=pacing.hold_bias,
+            boundary_bias=pacing.boundary_bias,
+            phrase_pressure=pacing.phrase_pressure,
+            breath_tendency=pacing.breath_tendency,
+            explicit_voice_state=explicit_vs,
+            delta_voice_state=delta_vs,
+            cfg_scale=req.cfg_scale,
+            cfg_mode=req.cfg_mode,
+        )
+        provenance = "causal_stream_v4"
+    else:
+        # Structured-batch path: generate fully, then chunk.
+        # Marked as structured_batch so claim auditing can distinguish it.
+        audio_t, metrics = engine.tts(
+            phonemes=phonemes_t,
+            speaker_profile=speaker_profile,
+            speaker_embed=spk_t,
+            style=None,
+            language_id=g2p_result.language_id,
+            pace=pacing.pace,
+            hold_bias=pacing.hold_bias,
+            boundary_bias=pacing.boundary_bias,
+            phrase_pressure=pacing.phrase_pressure,
+            breath_tendency=pacing.breath_tendency,
+            explicit_voice_state=explicit_vs,
+            delta_voice_state=delta_vs,
+            cfg_scale=req.cfg_scale,
+            cfg_mode=req.cfg_mode,
+        )
+        provenance = "structured_batch_v4"
+        stream_iter = None
+
+    chunk_samples = int(SAMPLE_RATE * 100 / 1000)  # 100 ms
+
+    async def _v4_sse_generator():
+        trajectory_id = None
+        total_frames = 0
+        total_samples = 0
+        physical_trajectory: list[list[float]] = []
+
+        if has_causal and stream_iter is not None:
+            # --- True causal streaming ---
+            for chunk_audio_t, pointer_state in stream_iter:
+                chunk_np = chunk_audio_t.cpu().numpy().ravel()
+                total_samples += len(chunk_np)
+                total_frames += 1
+
+                # Audio event
+                chunk_b64 = base64.b64encode(chunk_np.astype(np.float32).tobytes()).decode("ascii")
+                yield f"event: audio\ndata: {chunk_b64}\n\n"
+
+                # Telemetry event
+                elapsed = _time.monotonic() - gen_start
+                audio_sec = total_samples / SAMPLE_RATE
+                rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
+
+                tel = {
+                    "pointer": pointer_state if isinstance(pointer_state, dict) else {},
+                    "physical_trajectory_slice": physical_controls_list,
+                    "rtf": round(rtf, 4),
+                    "frames_emitted": total_frames,
+                    "samples_emitted": total_samples,
+                }
+                yield f"event: telemetry\ndata: {json.dumps(tel)}\n\n"
+
+                await asyncio.sleep(0)
+
+            trajectory_id = getattr(stream_iter, "trajectory_id", None)
+        else:
+            # --- Structured-batch streaming ---
+            audio_np = audio_t.cpu().numpy().ravel()
+            trajectory_id = metrics.get("trajectory_id")
+
+            num_chunks = max(1, (len(audio_np) + chunk_samples - 1) // chunk_samples)
+
+            for i in range(0, max(1, len(audio_np)), chunk_samples):
+                chunk = audio_np[i : i + chunk_samples]
+                total_samples += len(chunk)
+                total_frames += 1
+
+                chunk_b64 = base64.b64encode(chunk.astype(np.float32).tobytes()).decode("ascii")
+                yield f"event: audio\ndata: {chunk_b64}\n\n"
+
+                elapsed = _time.monotonic() - gen_start
+                audio_sec = total_samples / SAMPLE_RATE
+                rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
+                progress_frac = total_frames / num_chunks
+
+                tel = {
+                    "pointer": {
+                        "progress": round(progress_frac, 4),
+                        "frames_generated": total_frames,
+                    },
+                    "physical_trajectory_slice": physical_controls_list,
+                    "rtf": round(rtf, 4),
+                    "frames_emitted": total_frames,
+                    "samples_emitted": total_samples,
+                }
+                yield f"event: telemetry\ndata: {json.dumps(tel)}\n\n"
+
+                await asyncio.sleep(0)
+
+        # Done event
+        gen_elapsed = _time.monotonic() - gen_start
+        done_data = {
+            "trajectory_id": trajectory_id,
+            "provenance": provenance,
+            "schema_version": _V4_SCHEMA_VERSION,
+            "total_frames": total_frames,
+            "total_samples": total_samples,
+            "duration_sec": round(total_samples / SAMPLE_RATE, 4) if total_samples > 0 else 0.0,
+            "gen_time_ms": round(gen_elapsed * 1000, 2),
+            "rtf": round(gen_elapsed / (total_samples / SAMPLE_RATE), 4) if total_samples > 0 else 0.0,
+        }
+        yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
+
+    return StreamingResponse(
+        _v4_sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Schema-Version": _V4_SCHEMA_VERSION,
         },
     )

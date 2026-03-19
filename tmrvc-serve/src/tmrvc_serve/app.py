@@ -30,8 +30,8 @@ from tmrvc_serve.middleware import IdempotencyMiddleware
 
 app = FastAPI(
     title="TMRVC TTS/VC Server",
-    description="Real-time Unified TTS/VC using UCLM v3 pointer-based architecture.",
-    version="0.3.0",
+    description="Real-time Unified TTS/VC using UCLM pointer-based architecture.",
+    version="1.0.0",
 )
 
 # Idempotency middleware for UI-originated write endpoints (Worker 04, task 21)
@@ -80,7 +80,8 @@ def init_app(
     uclm_checkpoint: str | Path | None = None,
     codec_checkpoint: str | Path | None = None,
     device: str = "cpu",
-    api_key: str | None = None,
+    llm_model: str | None = None,
+    use_vllm: bool = False,
     curation_db: str | Path | None = "data/curation/curation.db",
     curation_dir: str | Path | None = "data/curation",
 ) -> None:
@@ -122,12 +123,21 @@ def init_app(
     else:
         logger.warning("UCLM or Codec checkpoint missing; engine not initialized.")
 
+    # Initialize Intent Compiler with open-weight LLM backend
+    # (replaces Anthropic-based ContextStylePredictor per track_serving.md SS8)
     try:
-        from tmrvc_train.context_predictor import ContextStylePredictor
-        _context_predictor = ContextStylePredictor(api_key=api_key)
+        from tmrvc_serve.intent_compiler import IntentCompiler
+        _context_predictor = IntentCompiler(
+            model_name=llm_model, device=device, use_vllm=use_vllm,
+        )
+        _context_predictor.ensure_loaded()
+        logger.info(
+            "Intent Compiler initialized (backend=%s)",
+            _context_predictor._llm.backend_type,
+        )
     except Exception as e:
         logger.warning(
-            "Context predictor unavailable; using local fallback only: %s", e
+            "Intent Compiler unavailable; context prediction disabled: %s", e
         )
         _context_predictor = None
 
