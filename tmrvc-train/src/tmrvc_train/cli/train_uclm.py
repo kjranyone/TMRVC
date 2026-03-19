@@ -64,29 +64,23 @@ def _build_sampler(
 def _collect_tts_supervision_by_dataset(
     utterances: list[dict],
 ) -> dict[str, dict[str, int]]:
-    """Collect text and duration supervision statistics per dataset.
+    """Collect text supervision statistics per dataset.
 
-    Reports three categories:
-    - text_supervised: has phoneme_ids.npy (sufficient for v3 pointer mode)
-    - legacy_duration_supervised: has both phoneme_ids.npy and durations.npy
-    - tts_supervised: alias for legacy_duration_supervised (backward compat)
+    Reports:
+    - text_supervised: has phoneme_ids.npy (sufficient for pointer mode)
     """
     stats: dict[str, dict[str, int]] = {}
     for utt in utterances:
         ds = str(utt.get("dataset", "unknown"))
         rec = stats.setdefault(
             ds,
-            {"total": 0, "tts_supervised": 0, "text_supervised": 0, "legacy_duration_supervised": 0},
+            {"total": 0, "text_supervised": 0},
         )
         rec["total"] += 1
         utt_dir = Path(utt["path"])
         has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
-        has_durations = (utt_dir / "durations.npy").exists()
         if has_phonemes:
             rec["text_supervised"] += 1
-        if has_phonemes and has_durations:
-            rec["tts_supervised"] += 1
-            rec["legacy_duration_supervised"] += 1
     return stats
 
 
@@ -103,7 +97,7 @@ def collate_fn(batch):
         "target_a": [], "target_b": [], "source_a_t": [],
         "explicit_state": [], "ssl_state": [], "speaker_embed": [],
         "speaker_id": [], "f0_condition": [],
-        "phoneme_ids": [], "phoneme_lens": [], "durations": [], "language_id": []
+        "phoneme_ids": [], "phoneme_lens": [], "language_id": []
     }
 
     for item in batch:
@@ -131,16 +125,11 @@ def collate_fn(batch):
             P = len(item["phoneme_ids"])
             p_pad = max_phonemes - P
             collated["phoneme_ids"].append(nn.functional.pad(item["phoneme_ids"], (0, p_pad), value=0))
-            if item.get("durations") is not None:
-                collated["durations"].append(nn.functional.pad(item["durations"], (0, p_pad), value=0))
-            else:
-                collated["durations"].append(None)
             collated["phoneme_lens"].append(item["phoneme_lens"])
             collated["language_id"].append(item["language_id"])
         elif max_phonemes > 0:
             # Empty placeholders if some items lack TTS data
             collated["phoneme_ids"].append(torch.zeros(max_phonemes, dtype=torch.long))
-            collated["durations"].append(None)
             collated["phoneme_lens"].append(torch.tensor(0))
             collated["language_id"].append(torch.tensor(0))
 
@@ -149,17 +138,7 @@ def collate_fn(batch):
     for k, v in collated.items():
         if not v:
             continue
-        # durations may contain None entries (v3 pointer mode)
-        if any(x is None for x in v):
-            if all(x is None for x in v):
-                # All None -> omit from batch (pointer mode, no durations)
-                continue
-            # Mixed: stack non-None with zero placeholders for None entries
-            ref = next(x for x in v if x is not None)
-            filled = [x if x is not None else torch.zeros_like(ref) for x in v]
-            res[k] = torch.stack(filled)
-        else:
-            res[k] = torch.stack(v)
+        res[k] = torch.stack(v)
     return res
 
 
@@ -179,7 +158,6 @@ def train_uclm(
     progress_loss_weight: float = 0.2,
     alignment_loss_type: str = "none",
     pointer_target_source: str = "heuristic_bootstrap",
-    legacy_duration_loss_weight: float = 0.0,
     voice_state_loss_weight: float = 0.0,
     delta_voice_state_loss_weight: float = 0.0,
     conditioning_dropout_prob: float = 0.15,
@@ -237,9 +215,8 @@ def train_uclm(
         stage3_start=curriculum_stage3_start,
         stage3_replay_mix_ratio=stage3_replay_mix_ratio,
     )
-    # Validation data (Worker 06)
-    val_dataset = UCLMDataset(cache_dir, datasets=datasets_list, split="val")
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2) if len(val_dataset) > 0 else None
+    # Validation data (Worker 06) — reuse same dataset class (no split support yet)
+    val_loader = None
 
     trainer = UCLMTrainer(
         model, optimizer, device=device, tts_mode=tts_mode,
@@ -247,7 +224,6 @@ def train_uclm(
         progress_loss_weight=progress_loss_weight,
         alignment_loss_type=alignment_loss_type,
         pointer_target_source=pointer_target_source,
-        legacy_duration_loss_weight=legacy_duration_loss_weight,
         voice_state_loss_weight=voice_state_loss_weight,
         delta_voice_state_loss_weight=delta_voice_state_loss_weight,
         conditioning_dropout_prob=conditioning_dropout_prob,
@@ -313,9 +289,9 @@ def main(argv: list[str] | None = None):
     )
     p.add_argument(
         "--tts-mode",
-        choices=["legacy_duration", "pointer"],
+        choices=["pointer"],
         default="pointer",
-        help="TTS training mode: 'pointer' (v3, MFA-free, default) or 'legacy_duration' (v2, requires durations.npy).",
+        help="TTS training mode: 'pointer' (MFA-free, default).",
     )
     p.add_argument(
         "--pointer-loss-weight",
@@ -337,15 +313,9 @@ def main(argv: list[str] | None = None):
     )
     p.add_argument(
         "--pointer-target-source",
-        choices=["mas", "ctc", "legacy_duration", "heuristic_bootstrap"],
+        choices=["mas", "ctc", "heuristic_bootstrap"],
         default="heuristic_bootstrap",
-        help="Source for pointer targets: 'heuristic_bootstrap' (default), 'legacy_duration', 'mas', or 'ctc'.",
-    )
-    p.add_argument(
-        "--legacy-duration-loss-weight",
-        type=float,
-        default=0.0,
-        help="Weight for legacy duration loss (default: 0.0).",
+        help="Source for pointer targets: 'heuristic_bootstrap' (default), 'mas', or 'ctc'.",
     )
     p.add_argument(
         "--voice-state-loss-weight",

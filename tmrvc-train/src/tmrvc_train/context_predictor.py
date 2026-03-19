@@ -4,6 +4,11 @@ Uses Claude API to predict appropriate emotion and style parameters
 based on character profile, conversation history, and the next utterance text.
 
 Falls back to rule-based heuristics when API is unavailable.
+
+MIGRATION(v4): This module will be replaced by an open-weight LLM backend.
+  Primary:  Qwen/Qwen3.5-35B-A3B (MoE, 3B active)
+  Fallback: Qwen/Qwen3.5-4B (dense)
+  See: plan/track_architecture.md §5a, plan/track_serving.md §8
 """
 
 from __future__ import annotations

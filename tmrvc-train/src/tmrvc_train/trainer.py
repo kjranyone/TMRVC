@@ -5,22 +5,35 @@ import torch.nn.functional as F
 import random
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Optional
 
 from .models import DisentangledUCLM
 from .models.uclm_loss import (
     uclm_loss,
     monotonic_alignment_search,
     voice_state_supervision_loss,
-    pointer_advance_loss,
-    progress_regression_loss,
     boundary_confidence_loss,
 )
 from .models.reference_encoder import ReferenceEncoderFromWaveform
 
+# v4 imports: biological constraints, acting losses, v4 loss composition
+from .models.biological_constraints import BiologicalConstraintRegularizer
+from .models.acting_latent import ActingLatentEncoder, ActingLatentPredictor
+from .models.acting_losses import (
+    acting_latent_kl_loss,
+    acting_latent_usage_loss,
+    disentanglement_loss,
+    semantic_alignment_loss,
+)
+from .v4_loss import V4LossConfig, V4LossResult, compute_v4_total_loss
+
+# Supervision tier weighting (Task 3-1)
+TIER_WEIGHTS = {"A": 1.0, "B": 0.7, "C": 0.3, "D": 0.1}
+# Map from dataset tier string to TIER_WEIGHTS key
+_TIER_KEY_MAP = {"tier_a": "A", "tier_b": "B", "tier_c": "C", "tier_d": "D"}
+
 
 class CurriculumScheduler:
-    """3-stage training curriculum for UCLM v3.
+    """3-stage training curriculum for UCLM.
 
     Stage 1 (Base LM): Next-token codec prediction, VC-focused. Steps 0 to stage2_start.
     Stage 2 (Alignment & Pointer): Text-aligned pointer training. Steps stage2_start to stage3_start.
@@ -90,8 +103,7 @@ class UCLMTrainer:
         - Multi-task training (randomly switch between TTS and VC)
         - Classifier-Free Guidance (CFG) dropout
         - Adversarial disentanglement loss
-        - Duration prediction loss (TTS legacy mode)
-        - Pointer-based TTS training (v3 pointer mode)
+        - Pointer-based TTS training
         - Monotonic Alignment Search (MAS) for pointer targets
         - 3-stage training curriculum (Base, Align, Drama)
         - Flow-matching prosody loss
@@ -112,7 +124,6 @@ class UCLMTrainer:
         alignment_loss_type: str = "none",
         pointer_target_source: str = "heuristic_bootstrap",
         pointer_supervision_mode: str = "latent_only",
-        legacy_duration_loss_weight: float = 0.0,
         bootstrap_alignment_required: bool = False,
         voice_state_loss_weight: float = 0.0,
         delta_voice_state_loss_weight: float = 0.0,
@@ -131,6 +142,19 @@ class UCLMTrainer:
         cfg_scale_default: float = 2.0,
         reference_encoder: ReferenceEncoderFromWaveform | None = None,
         training_stage: str = "base",
+        # v4 Phase 3 parameters
+        v4_loss_config: V4LossConfig | None = None,
+        enable_v4_losses: bool = False,
+        bio_constraint_weight: float = 1.0,
+        acting_latent_encoder: ActingLatentEncoder | None = None,
+        acting_latent_predictor: ActingLatentPredictor | None = None,
+        speaker_consistency_weight: float = 0.5,
+        prosody_prediction_weight: float = 0.5,
+        semantic_alignment_weight: float = 0.5,
+        acting_kl_weight: float = 0.01,
+        disentanglement_weight: float = 0.1,
+        use_enriched_transcript: bool = False,
+        enriched_transcript_prob: float = 0.5,
     ):
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -149,7 +173,6 @@ class UCLMTrainer:
         self.alignment_loss_type = alignment_loss_type
         self.pointer_target_source = pointer_target_source
         self.pointer_supervision_mode = pointer_supervision_mode
-        self.legacy_duration_loss_weight = legacy_duration_loss_weight
         self.bootstrap_alignment_required = bootstrap_alignment_required
         self.voice_state_loss_weight = voice_state_loss_weight
         self.delta_voice_state_loss_weight = delta_voice_state_loss_weight
@@ -167,16 +190,59 @@ class UCLMTrainer:
         self.cfg_distillation_temperature = cfg_distillation_temperature
         self.cfg_scale_default = cfg_scale_default
         self.training_stage = training_stage
+
+        # --- v4 Phase 3: Loss composition and bio constraints ---
+        self.enable_v4_losses = enable_v4_losses
+        self.v4_loss_config = v4_loss_config or V4LossConfig()
+        self.bio_constraint_weight = bio_constraint_weight
+        self.speaker_consistency_weight = speaker_consistency_weight
+        self.prosody_prediction_weight = prosody_prediction_weight
+        self.semantic_alignment_weight = semantic_alignment_weight
+        self.acting_kl_weight = acting_kl_weight
+        self.disentanglement_weight = disentanglement_weight
+        self.use_enriched_transcript = use_enriched_transcript
+        self.enriched_transcript_prob = enriched_transcript_prob
+
+        # Biological constraint regularizer (Task 3-2)
+        self.bio_regularizer: BiologicalConstraintRegularizer | None = None
+        self.bio_physical_head: nn.Linear | None = None
+        if self.enable_v4_losses:
+            self.bio_regularizer = BiologicalConstraintRegularizer().to(device)
+            # Projection head: hidden_states [B, T, D_MODEL] -> [B, T, 12]
+            from tmrvc_core.constants import D_MODEL as _D_MODEL
+            self.bio_physical_head = nn.Linear(_D_MODEL, 12).to(device)
+
+        # Acting latent encoder/predictor (Task 3-3)
+        self.acting_latent_encoder = acting_latent_encoder
+        if self.acting_latent_encoder is not None:
+            self.acting_latent_encoder = self.acting_latent_encoder.to(device)
+        self.acting_latent_predictor = acting_latent_predictor
+        if self.acting_latent_predictor is not None:
+            self.acting_latent_predictor = self.acting_latent_predictor.to(device)
+
+        # T3 fix: add v4 module parameters to the optimizer
+        v4_params = []
+        if self.bio_regularizer is not None:
+            v4_params.extend(self.bio_regularizer.parameters())
+        if self.bio_physical_head is not None:
+            v4_params.extend(self.bio_physical_head.parameters())
+        if self.acting_latent_encoder is not None:
+            v4_params.extend(self.acting_latent_encoder.parameters())
+        if self.acting_latent_predictor is not None:
+            v4_params.extend(self.acting_latent_predictor.parameters())
+        if v4_params:
+            self.optimizer.add_param_group({"params": v4_params})
+
         self._global_step = 0
         self._validate_config()
 
     def _validate_config(self) -> None:
         """Validate training configuration at init time."""
-        valid_tts_modes = {"pointer", "legacy_duration"}
+        valid_tts_modes = {"pointer"}
         if self.tts_mode not in valid_tts_modes:
             raise ValueError(f"tts_mode must be one of {valid_tts_modes}, got {self.tts_mode!r}")
 
-        valid_sources = {"none", "heuristic_bootstrap", "bootstrap_projection", "legacy_duration", "mas", "ctc"}
+        valid_sources = {"none", "heuristic_bootstrap", "bootstrap_projection", "mas", "ctc"}
         if self.pointer_target_source not in valid_sources:
             raise ValueError(
                 f"pointer_target_source must be one of {valid_sources}, got {self.pointer_target_source!r}"
@@ -361,10 +427,10 @@ class UCLMTrainer:
         """Compute voice_state variance across utterances for anti-collapse monitoring."""
         diagnostics = {}
         with torch.no_grad():
-            # Use first 8 dims as voice state proxy
-            vs_proxy = hidden_states[:, :, :8]  # [B, T, 8]
+            # Use first 12 dims as voice state proxy
+            vs_proxy = hidden_states[:, :, :12]  # [B, T, 12]
             # Per-utterance mean
-            vs_means = vs_proxy.mean(dim=1)  # [B, 8]
+            vs_means = vs_proxy.mean(dim=1)  # [B, 12]
             # Variance across utterances
             if vs_means.shape[0] > 1:
                 diagnostics["voice_state_between_utt_variance"] = vs_means.var(dim=0).mean().item()
@@ -420,10 +486,14 @@ class UCLMTrainer:
         if prompt_codec_tokens is not None:
             prompt_codec_tokens = prompt_codec_tokens.to(self.device)
             # Encode prompt audio evidence into KV cache and refined embedding
-            speaker_embed, prompt_kv_cache, prompt_vq_loss = self.model.encode_speaker_prompt(
+            _prompt_result = self.model.encode_speaker_prompt(
                 prompt_codec_tokens=prompt_codec_tokens,
                 speaker_embed=speaker_embed,
             )
+            # encode_speaker_prompt returns (refined_embed, summary_tokens, vq_loss, indices)
+            speaker_embed = _prompt_result[0]
+            prompt_kv_cache = _prompt_result[1]
+            prompt_vq_loss = _prompt_result[2]
 
         # Classifier-Free Guidance Dropout (Worker 01 frozen contract)
         cfg_dropped = random.random() < conditioning_dropout_prob
@@ -454,8 +524,7 @@ class UCLMTrainer:
         # Multi-task sampling: decide vc vs tts
         mode = "vc"
         has_phonemes = batch.get("phoneme_ids") is not None
-        has_durations = batch.get("durations") is not None
-        can_do_tts = has_phonemes and (self.tts_mode == "pointer" or has_durations)
+        can_do_tts = has_phonemes
         if can_do_tts and random.random() < tts_prob:
             mode = "tts"
 
@@ -488,10 +557,26 @@ class UCLMTrainer:
         else:
             # TTS path
             phonemes = batch["phoneme_ids"].to(self.device)
+            # --- v4: enriched transcript routing ---
+            if (self.use_enriched_transcript
+                    and batch.get("enriched_phoneme_ids") is not None
+                    and isinstance(batch["enriched_phoneme_ids"], torch.Tensor)):
+                enriched = batch["enriched_phoneme_ids"].to(self.device)
+                use_flags = batch.get("use_enriched", [False] * phonemes.shape[0])
+                mask = (torch.tensor(use_flags, dtype=torch.bool, device=self.device)
+                        if isinstance(use_flags, list)
+                        else use_flags.to(self.device).bool())
+                # Pad to same length + per-sample routing
+                max_len = max(phonemes.shape[1], enriched.shape[1])
+                if phonemes.shape[1] < max_len:
+                    phonemes = F.pad(phonemes, (0, max_len - phonemes.shape[1]))
+                if enriched.shape[1] < max_len:
+                    enriched = F.pad(enriched, (0, max_len - enriched.shape[1]))
+                phonemes = torch.where(mask.unsqueeze(1).expand_as(phonemes), enriched, phonemes)
             language_ids = batch["language_id"].to(self.device)
             B = phonemes.shape[0]
             target_length = target_a.shape[-1]
-            
+
             # --- Replay Mix (Worker 02 Task 15) ---
             if is_replay:
                 dialogue_context = None
@@ -519,52 +604,126 @@ class UCLMTrainer:
             if text_suprasegmentals is not None:
                 text_suprasegmentals = text_suprasegmentals.to(self.device)
 
-            if self.tts_mode == "pointer":
-                losses = self._tts_pointer_step(
-                    phonemes=phonemes,
-                    language_ids=language_ids,
-                    speaker_embed=speaker_embed,
-                    speaker_labels=speaker_labels,
-                    explicit_state=explicit_state,
-                    ssl_state=ssl_state,
-                    target_a=target_a,
-                    target_b=target_b,
-                    target_length=target_length,
-                    f0_condition=f0_condition,
-                    dialogue_context=dialogue_context,
-                    acting_intent=acting_intent,
-                    prosody_targets=prosody_targets,
-                    delta_voice_state=delta_voice_state,
-                    text_suprasegmentals=text_suprasegmentals,
-                    prompt_kv_cache=prompt_kv_cache,
-                    batch=batch,
-                    current_step=current_step,
-                    pointer_loss_weight=pointer_loss_weight,
+            losses = self._tts_pointer_step(
+                phonemes=phonemes,
+                language_ids=language_ids,
+                speaker_embed=speaker_embed,
+                speaker_labels=speaker_labels,
+                explicit_state=explicit_state,
+                ssl_state=ssl_state,
+                target_a=target_a,
+                target_b=target_b,
+                target_length=target_length,
+                f0_condition=f0_condition,
+                dialogue_context=dialogue_context,
+                acting_intent=acting_intent,
+                prosody_targets=prosody_targets,
+                delta_voice_state=delta_voice_state,
+                text_suprasegmentals=text_suprasegmentals,
+                prompt_kv_cache=prompt_kv_cache,
+                batch=batch,
+                current_step=current_step,
+                pointer_loss_weight=pointer_loss_weight,
+            )
+            # Add prompt VQ loss if present
+            if prompt_vq_loss is not None:
+                losses["loss"] = losses["loss"] + prompt_vq_loss
+                losses["loss_prompt_vq"] = prompt_vq_loss
+
+        # --- v4 Phase 3: Physical supervision with mask (Task 3-1) ---
+        # Physical supervision is supervision-dependent, so it must be
+        # accumulated BEFORE tier weighting is applied.
+        if self.enable_v4_losses:
+            physical_targets = batch.get("physical_targets")
+            physical_mask = batch.get("physical_observed_mask")
+            if physical_targets is not None:
+                physical_targets = physical_targets.to(self.device)
+                physical_pred = explicit_state[:, :, :12] if explicit_state.shape[-1] >= 12 else explicit_state
+                # Align temporal dimensions
+                T_pred = physical_pred.shape[1]
+                T_tgt = physical_targets.shape[1]
+                T_min = min(T_pred, T_tgt)
+                physical_pred_aligned = physical_pred[:, :T_min, :]
+                physical_targets_aligned = physical_targets[:, :T_min, :]
+
+                # Physical loss with mask: don't treat NaN/masked as zero
+                # Replace NaN in targets with 0 to avoid NaN propagation
+                physical_targets_safe = torch.nan_to_num(physical_targets_aligned, nan=0.0)
+                phys_loss = F.mse_loss(
+                    physical_pred_aligned, physical_targets_safe, reduction='none',
                 )
-                # Add prompt VQ loss if present
-                if prompt_vq_loss is not None:
-                    losses["loss"] = losses["loss"] + prompt_vq_loss
-                    losses["loss_prompt_vq"] = prompt_vq_loss
-            else:
-                # Legacy duration-based TTS
-                losses = self._tts_legacy_step(
-                    phonemes=phonemes,
-                    language_ids=language_ids,
-                    speaker_embed=speaker_embed,
-                    speaker_labels=speaker_labels,
-                    explicit_state=explicit_state,
-                    ssl_state=ssl_state,
-                    target_a=target_a,
-                    target_b=target_b,
-                    target_length=target_length,
-                    f0_condition=f0_condition,
-                    dialogue_context=dialogue_context,
-                    acting_intent=acting_intent,
-                    prosody_targets=prosody_targets,
-                    delta_voice_state=delta_voice_state,
-                    text_suprasegmentals=text_suprasegmentals,
-                    batch=batch,
+                if physical_mask is not None:
+                    physical_mask = physical_mask.to(self.device)[:, :T_min, :]
+                    # Zero out loss for unobserved dimensions
+                    phys_loss = phys_loss * physical_mask.float()
+                    denom = physical_mask.float().sum().clamp(min=1.0)
+                    phys_loss_scalar = phys_loss.sum() / denom
+                else:
+                    phys_loss_scalar = phys_loss.mean()
+
+                losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_physical * phys_loss_scalar
+                losses["loss_physical_12d"] = phys_loss_scalar
+
+        # --- v4 Phase 3: Tier-aware sample weighting (Task 3-1) ---
+        # Apply tier weighting ONLY to supervision-dependent terms (codec loss,
+        # physical loss, pointer loss) accumulated above.  Supervision-
+        # independent terms (biological constraints, acting latent KL,
+        # disentanglement, semantic alignment) are added AFTER this block and
+        # remain at full weight regardless of tier.
+        if self.enable_v4_losses:
+            supervision_tier = batch.get("supervision_tier")
+            if supervision_tier is not None:
+                # supervision_tier can be a string or list of strings
+                if isinstance(supervision_tier, str):
+                    tier_key = _TIER_KEY_MAP.get(supervision_tier, "D")
+                    sample_weight = TIER_WEIGHTS[tier_key]
+                elif isinstance(supervision_tier, (list, tuple)):
+                    # Per-sample tier: average the weights across batch
+                    sample_weight = sum(
+                        TIER_WEIGHTS.get(_TIER_KEY_MAP.get(t, "D"), 0.1)
+                        for t in supervision_tier
+                    ) / len(supervision_tier)
+                else:
+                    sample_weight = 1.0
+                losses["loss"] = losses["loss"] * sample_weight
+                losses["tier_sample_weight"] = torch.tensor(sample_weight)
+
+        # --- v4 Phase 3: Biological constraint regularization (Task 3-2) ---
+        # Supervision-independent: NOT tier-weighted.
+        if self.enable_v4_losses and self.bio_regularizer is not None:
+            # T2 fix: use model's hidden_states projected to 12-D so gradients
+            # flow back through the model, instead of using the detached input
+            # explicit_state which would make the regularizer a no-op.
+            hidden_states = losses.get("_hidden_states")
+            bio_losses = None
+            if hidden_states is not None and self.bio_physical_head is not None:
+                physical_for_bio = self.bio_physical_head(hidden_states)  # [B, T, 12]
+                bio_losses = self.bio_regularizer(physical_for_bio)
+            elif explicit_state.dim() == 3 and explicit_state.shape[-1] >= 12:
+                # Fallback for VC mode where hidden_states may not be available
+                physical_for_bio = explicit_state[:, :, :12]
+                bio_losses = self.bio_regularizer(physical_for_bio)
+            if bio_losses is not None:
+                bio_total = (
+                    self.v4_loss_config.lambda_bio_covariance * bio_losses["bio_covariance_loss"]
+                    + self.v4_loss_config.lambda_bio_transition * bio_losses["bio_transition_loss"]
+                    + self.v4_loss_config.lambda_bio_implausibility * bio_losses["bio_implausibility_loss"]
                 )
+                losses["loss"] = losses["loss"] + self.bio_constraint_weight * bio_total
+                losses["loss_bio_covariance"] = bio_losses["bio_covariance_loss"]
+                losses["loss_bio_transition"] = bio_losses["bio_transition_loss"]
+                losses["loss_bio_implausibility"] = bio_losses["bio_implausibility_loss"]
+
+        # --- v4 Phase 3: Full v4 loss composition (Task 3-3) ---
+        # Acting latent KL, disentanglement, semantic alignment are
+        # supervision-independent: NOT tier-weighted.
+        if self.enable_v4_losses:
+            losses = self._compute_v4_additional_losses(
+                losses, batch, explicit_state, ssl_state, speaker_embed,
+            )
+
+        # Remove internal-only keys before backward
+        losses.pop("_hidden_states", None)
 
         # Optimization
         losses["loss"].backward()
@@ -577,6 +736,101 @@ class UCLMTrainer:
         res["is_replay"] = 1 if is_replay else 0
         res["cfg_dropped"] = 1 if cfg_dropped else 0
         return res
+
+    def _compute_v4_additional_losses(
+        self,
+        losses: dict,
+        batch: dict,
+        explicit_state: torch.Tensor,
+        ssl_state: torch.Tensor,
+        speaker_embed: torch.Tensor,
+    ) -> dict:
+        """Compute all 9 v4 loss terms (Task 3-3).
+
+        Loss terms:
+        1. codec token prediction - already in losses["loss_a"] from uclm_loss
+        2. control token prediction - already in losses["loss_b"] from uclm_loss
+        3. pointer progression - already in losses from _tts_pointer_step
+        4. explicit physical supervision (12-D) - handled separately in train_step
+        5. acting latent regularization (KL) - computed here
+        6. disentanglement loss - computed here
+        7. speaker consistency loss - computed here
+        8. prosody prediction loss - already in losses from _tts_pointer_step
+        9. semantic alignment loss - computed here
+        """
+        device = self.device
+
+        # --- Loss 5: Acting latent regularization (KL) ---
+        if self.acting_latent_encoder is not None and ssl_state is not None:
+            # ssl_state should be [B, T, d_ssl=128]; ensure correct layout
+            ssl_for_acting = ssl_state
+            d_input = self.acting_latent_encoder.encoder[0].in_features  # 128
+            if ssl_for_acting.dim() == 3 and ssl_for_acting.shape[-1] != d_input:
+                if ssl_for_acting.shape[1] == d_input:
+                    # [B, d_ssl, T] -> transpose to [B, T, d_ssl]
+                    ssl_for_acting = ssl_for_acting.transpose(1, 2)
+
+            latent, mu, logvar = self.acting_latent_encoder(ssl_for_acting)
+
+            # KL regularization
+            kl_loss = acting_latent_kl_loss(mu, logvar)
+            losses["loss"] = losses["loss"] + self.acting_kl_weight * kl_loss
+            losses["loss_acting_kl"] = kl_loss
+
+            # Usage loss (anti-collapse)
+            usage_loss = acting_latent_usage_loss(latent)
+            losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_acting_usage * usage_loss
+            losses["loss_acting_usage"] = usage_loss
+
+            # --- Loss 6: Disentanglement loss ---
+            physical_pred = explicit_state
+            if physical_pred.dim() == 3 and physical_pred.shape[-1] >= 12:
+                physical_for_dis = physical_pred[:, :, :12]
+                dis_loss = disentanglement_loss(physical_for_dis, latent)
+                losses["loss"] = losses["loss"] + self.disentanglement_weight * dis_loss
+                losses["loss_disentanglement"] = dis_loss
+
+            # --- Loss 9: Semantic alignment loss ---
+            if self.acting_latent_predictor is not None:
+                # Use text features if available, otherwise use a pooled ssl_state proxy
+                text_features = batch.get("text_features")
+                if text_features is not None:
+                    text_features = text_features.to(device)
+                else:
+                    # Pool ssl_state as proxy for text features
+                    text_features = ssl_for_acting.mean(dim=1)  # [B, d_ssl]
+
+                predicted_latent = self.acting_latent_predictor(text_features)
+                sem_loss = semantic_alignment_loss(predicted_latent, latent)
+                losses["loss"] = losses["loss"] + self.semantic_alignment_weight * sem_loss
+                losses["loss_semantic_alignment"] = sem_loss
+
+        # --- Loss 7: Speaker consistency loss ---
+        # Encourage consistent speaker embeddings across same-speaker utterances
+        if speaker_embed is not None and speaker_embed.shape[0] > 1:
+            # Compute pairwise cosine similarity within batch
+            spk_norm = F.normalize(speaker_embed, dim=-1)  # [B, d_speaker]
+            similarity_matrix = spk_norm @ spk_norm.T  # [B, B]
+
+            # Speaker IDs for contrastive comparison
+            speaker_ids = batch.get("speaker_id")
+            if speaker_ids is not None and isinstance(speaker_ids, torch.Tensor):
+                speaker_ids = speaker_ids.to(device)
+                # Build same-speaker mask
+                same_speaker = (speaker_ids.unsqueeze(0) == speaker_ids.unsqueeze(1)).float()
+                # Exclude diagonal
+                mask_diag = 1.0 - torch.eye(speaker_embed.shape[0], device=device)
+                same_speaker = same_speaker * mask_diag
+
+                if same_speaker.sum() > 0:
+                    # Same-speaker pairs should be similar (high cosine)
+                    positive_sim = (similarity_matrix * same_speaker).sum() / same_speaker.sum().clamp(min=1)
+                    # Loss: 1 - average positive similarity
+                    spk_loss = 1.0 - positive_sim
+                    losses["loss"] = losses["loss"] + self.speaker_consistency_weight * spk_loss
+                    losses["loss_speaker_consistency"] = spk_loss
+
+        return losses
 
     def _tts_pointer_step(
         self,
@@ -642,13 +896,10 @@ class UCLMTrainer:
             prompt_kv_cache=prompt_kv_cache,
             bootstrap_alignment=bootstrap_data,
             text_suprasegmentals=text_suprasegmentals,
-            phoneme_indices=pos_indices_init,
+            position_indices=pos_indices_init,
         )
 
         # --- Alignment Target Generation (Stage 2 Annealing Logic) ---
-        warmup = self.pointer_aux_alignment_warmup_steps
-        anneal = self.pointer_aux_alignment_anneal_steps
-
         if annealing_phase == "hard_bootstrap":
             # Phase 1: Use Bootstrap Alignment as ground truth
             if pos_indices_init is not None:
@@ -726,11 +977,26 @@ class UCLMTrainer:
                     ca_mask[b, 0, t_idx, w_start:w_end] = 0.0
 
         # Worker 01/02: Second forward pass with correct position_indices AND frame_offsets for RoPE
-...
+        out = self.model.forward_tts_pointer(
+            phoneme_ids=phonemes,
+            language_ids=language_ids,
+            pointer_state=None,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            target_length=target_length,
+            f0_condition=f0_condition,
+            dialogue_context=dialogue_context,
+            acting_intent=acting_intent,
+            prosody_latent=prosody_targets,
+            delta_voice_state=delta_voice_state,
+            prompt_kv_cache=prompt_kv_cache,
+            text_suprasegmentals=text_suprasegmentals,
             position_indices=pos_indices,
             frame_offsets=frame_offsets,
-            text_suprasegmentals=text_suprasegmentals,
-            cross_attn_mask=ca_mask, # New SOTA field
+            cross_attn_mask=ca_mask,
         )
 
         # Generate boundary confidence targets
@@ -837,9 +1103,9 @@ class UCLMTrainer:
             and vs_targets is not None
             and out.get("hidden_states") is not None
         ):
-            # Use hidden_states[:, :, :8] as proxy for voice state prediction
+            # Use hidden_states[:, :, :12] as proxy for voice state prediction
             # (real implementation uses a dedicated head)
-            vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :8]
+            vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :12]
             loss_vs = voice_state_supervision_loss(
                 vs_pred,
                 vs_targets,
@@ -862,73 +1128,9 @@ class UCLMTrainer:
             for k, v in vs_diag.items():
                 losses[k] = torch.tensor(v)
 
-        return losses
-
-    def _tts_legacy_step(
-        self,
-        phonemes: torch.Tensor,
-        language_ids: torch.Tensor,
-        speaker_embed: torch.Tensor,
-        speaker_labels: torch.Tensor,
-        explicit_state: torch.Tensor,
-        ssl_state: torch.Tensor,
-        target_a: torch.Tensor,
-        target_b: torch.Tensor,
-        target_length: int,
-        f0_condition: torch.Tensor | None,
-        dialogue_context: torch.Tensor | None,
-        acting_intent: torch.Tensor | None,
-        prosody_targets: torch.Tensor | None,
-        delta_voice_state: torch.Tensor | None,
-        text_suprasegmentals: torch.Tensor | None,
-        batch: dict,
-    ) -> dict:
-        """Legacy duration-based TTS training step (v2 compatibility)."""
-        B = phonemes.shape[0]
-        L = phonemes.shape[1]
-
-        # Legacy mode uses forward_tts_pointer with no pointer state
-        # and relies on duration-based targets.
-        out = self.model.forward_tts_pointer(
-            phoneme_ids=phonemes,
-            language_ids=language_ids,
-            pointer_state=None,
-            speaker_embed=speaker_embed,
-            explicit_state=explicit_state,
-            ssl_state=ssl_state,
-            target_a=target_a,
-            target_b=target_b,
-            target_length=target_length,
-            f0_condition=f0_condition,
-            dialogue_context=dialogue_context,
-            acting_intent=acting_intent,
-            prosody_latent=prosody_targets,
-            delta_voice_state=delta_voice_state,
-            text_suprasegmentals=text_suprasegmentals,
-        )
-
-        has_durations = batch.get("durations") is not None
-        if has_durations:
-            durations = batch["durations"].to(self.device)
-            adv_targets, prog_targets = self._generate_pointer_targets(durations, target_length)
-        else:
-            dummy_durations = torch.full((B, L), target_length / L, device=self.device)
-            adv_targets, prog_targets = self._generate_pointer_targets(dummy_durations, target_length)
-
-        losses = uclm_loss(
-            logits_a=out["logits_a"],
-            logits_b=out["logits_b"],
-            target_a=target_a,
-            target_b=target_b,
-            adv_logits=out.get("adv_logits"),
-            speaker_labels=speaker_labels,
-            pointer_logits=out.get("advance_logit"),
-            advance_targets=adv_targets,
-            progress_delta=out.get("progress_delta"),
-            progress_targets=prog_targets,
-            lambda_pointer=self.legacy_duration_loss_weight,
-            lambda_progress=self.legacy_duration_loss_weight * 0.4,
-        )
+        # Pass hidden_states through for bio regularizer (T2 fix: use model output)
+        if out.get("hidden_states") is not None:
+            losses["_hidden_states"] = out["hidden_states"]
 
         return losses
 

@@ -354,7 +354,7 @@ class TrainingPipeline:
         if self.base_checkpoint:
             train_args.extend(["--base-checkpoint", str(self.base_checkpoint)])
         tts_mode = self.config.get("tts_mode", "pointer")
-        if tts_mode in ("pointer", "legacy_duration"):
+        if tts_mode == "pointer":
             train_args.extend(["--tts-mode", tts_mode])
         if "pointer_loss_weight" in self.config:
             train_args.extend(["--pointer-loss-weight", str(self.config["pointer_loss_weight"])])
@@ -365,8 +365,6 @@ class TrainingPipeline:
             train_args.extend(["--alignment-loss-type", alignment_loss_type])
         if "pointer_target_source" in self.config:
             train_args.extend(["--pointer-target-source", str(self.config["pointer_target_source"])])
-        if "legacy_duration_loss_weight" in self.config:
-            train_args.extend(["--legacy-duration-loss-weight", str(self.config["legacy_duration_loss_weight"])])
         if "voice_state_loss_weight" in self.config:
             train_args.extend(["--voice-state-loss-weight", str(self.config["voice_state_loss_weight"])])
         if "delta_voice_state_loss_weight" in self.config:
@@ -489,16 +487,12 @@ class TrainingPipeline:
                 except Exception:
                     waveform_length_errors += 1
 
-            # Text supervision coverage (v3)
+            # Text supervision coverage
             text_supervised = 0
-            legacy_duration_supervised = 0
             for utt_dir in valid_dirs:
                 has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
-                has_durations = (utt_dir / "durations.npy").exists()
                 if has_phonemes:
                     text_supervised += 1
-                if has_phonemes and has_durations:
-                    legacy_duration_supervised += 1
 
             dataset_report = {
                 "total_entries": total,
@@ -512,7 +506,6 @@ class TrainingPipeline:
                 "waveform_tail_remainders": waveform_tail_remainders,
                 "waveform_length_errors": waveform_length_errors,
                 "text_supervised": text_supervised,
-                "legacy_duration_supervised": legacy_duration_supervised,
                 "pointer_target_coverage": text_supervised,
                 "canonical_text_unit_coverage": text_supervised / max(len(valid_dirs), 1),
             }

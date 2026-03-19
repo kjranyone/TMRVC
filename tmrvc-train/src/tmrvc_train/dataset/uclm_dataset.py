@@ -8,7 +8,7 @@ import json
 from typing import Optional, Any
 
 # Valid tts_mode values
-_VALID_TTS_MODES = {"auto", "pointer", "legacy_duration"}
+_VALID_TTS_MODES = {"pointer"}
 
 
 class DisentangledUCLMDataset(Dataset):
@@ -18,14 +18,8 @@ class DisentangledUCLMDataset(Dataset):
         cache_dir: Root directory of the feature cache.
         max_frames: Maximum number of frames per utterance (for batching).
         include_datasets: Optional whitelist of dataset names to include.
-        tts_mode: Controls how text supervision artifacts are loaded.
-            - ``"auto"`` (default): load whatever is available (phoneme_ids
-              and/or durations).  This preserves the original v2 behaviour.
-            - ``"pointer"``: load ``phoneme_ids.npy`` but never require or
-              load ``durations.npy``.  This is the recommended mode for
-              UCLM v3 pointer-based text progression.
-            - ``"legacy_duration"``: require *both* ``phoneme_ids.npy`` **and**
-              ``durations.npy`` for a sample to have text supervision.
+        tts_mode: Text supervision loading mode. Only ``"pointer"`` is supported.
+            Loads ``phoneme_ids.npy`` but never requires ``durations.npy``.
         min_quality_score: Minimum quality_score to include (0.0 = no filter).
         provenance_filter: If set, only include utterances with this provenance_class.
     """
@@ -35,7 +29,7 @@ class DisentangledUCLMDataset(Dataset):
         cache_dir: str | Path,
         max_frames: int = 400,
         include_datasets: list[str] | None = None,
-        tts_mode: str = "auto",
+        tts_mode: str = "pointer",
         min_quality_score: float = 0.0,
         provenance_filter: str | None = None,
         require_tts_supervision: bool = False,
@@ -138,14 +132,12 @@ class DisentangledUCLMDataset(Dataset):
         Returns a dict with coverage and UNK ratio.  Distinguishes:
         - text_supervision_coverage (has text in meta)
         - canonical_text_unit_coverage (has phoneme_ids.npy)
-        - legacy_duration_coverage (has durations.npy)
         """
         from tmrvc_data.g2p import UNK_ID, PHONE2ID
 
         total = len(self.utterances)
         with_text = 0
         with_canonical_text_units = 0
-        with_legacy_duration = 0
         with_voice_state = 0
         with_suprasegmentals = 0
         with_prompt_eligible = 0
@@ -160,7 +152,6 @@ class DisentangledUCLMDataset(Dataset):
             utt_dir = utt["path"]
             meta = utt.get("meta", {})
             has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
-            has_durations = (utt_dir / "durations.npy").exists()
             has_vs_targets = (utt_dir / "voice_state_targets.npy").exists()
             has_supra = (utt_dir / "text_suprasegmentals.npy").exists()
 
@@ -168,8 +159,6 @@ class DisentangledUCLMDataset(Dataset):
                 with_text += 1
             if has_phonemes:
                 with_canonical_text_units += 1
-                if has_durations:
-                    with_legacy_duration += 1
                 try:
                     pids = np.load(utt_dir / "phoneme_ids.npy")
                     total_phones += len(pids)
@@ -189,7 +178,6 @@ class DisentangledUCLMDataset(Dataset):
             "total": total,
             "text_supervision_coverage": with_text / max(total, 1),
             "canonical_text_unit_coverage": with_canonical_text_units / max(total, 1),
-            "legacy_duration_coverage": with_legacy_duration / max(total, 1),
             "unknown_phone_ratio": round(unk_phones / max(total_phones, 1), 6),
             "pitch_accent_coverage": round(accent_count / max(total_phones, 1), 6),
             "voice_state_supervision_coverage": with_voice_state / max(total, 1),
@@ -278,23 +266,8 @@ class DisentangledUCLMDataset(Dataset):
             prosody_targets = torch.from_numpy(pt).float()
 
         phoneme_ids = None
-        durations = None
-        has_phonemes = (utt_dir / "phoneme_ids.npy").exists()
-        has_durations = (utt_dir / "durations.npy").exists()
-
-        if self.tts_mode == "pointer":
-            # v3 pointer mode: never require durations
-            if has_phonemes:
-                phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
-        elif self.tts_mode == "legacy_duration":
-            if has_phonemes and has_durations:
-                phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
-                durations = torch.from_numpy(np.load(utt_dir / "durations.npy")).long()
-        else:
-            if has_phonemes:
-                phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
-                if has_durations:
-                    durations = torch.from_numpy(np.load(utt_dir / "durations.npy")).long()
+        if (utt_dir / "phoneme_ids.npy").exists():
+            phoneme_ids = torch.from_numpy(np.load(utt_dir / "phoneme_ids.npy")).long()
 
         phoneme_lens = None
         if phoneme_ids is not None:
@@ -344,7 +317,6 @@ class DisentangledUCLMDataset(Dataset):
             "speaker_id": torch.tensor(spk_int).long(),
             "phoneme_ids": phoneme_ids,
             "phoneme_lens": phoneme_lens,
-            "durations": durations,
             "f0_condition": f0_condition,
             "language_id": torch.tensor(meta.get("language_id", 0)).long(),
             "text": meta.get("text", ""),

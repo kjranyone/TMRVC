@@ -220,9 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tts-mode",
-        choices=["legacy_duration", "pointer"],
+        choices=["pointer"],
         default="pointer",
-        help="TTS training mode: 'pointer' (v3, MFA-free, default) or 'legacy_duration' (v2).",
+        help="TTS training mode: 'pointer' (MFA-free, default).",
     )
     parser.add_argument(
         "--experiment-name",
