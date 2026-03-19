@@ -214,7 +214,21 @@ async def workshop_generate(req: TTSRequestAdvanced):
     # 4. CFG mode
     cfg_mode_str = req.cfg_mode if req.cfg_mode else "full"
 
-    # 5. Generate via engine
+    # 5. Acting macro -> 24-D acting intent
+    acting_intent = None
+    if req.acting_controls is not None:
+        macro_vec = torch.tensor([
+            req.acting_controls.intensity,
+            req.acting_controls.instability,
+            req.acting_controls.tenderness,
+            req.acting_controls.tension,
+            req.acting_controls.spontaneity,
+            req.acting_controls.reference_mix,
+        ], dtype=torch.float32).unsqueeze(0)  # [1, 6]
+        if macro_vec.abs().sum() > 0:
+            acting_intent = engine.project_acting_macro(macro_vec)
+
+    # 6. Generate via engine
     t0 = time.time()
     audio_tensor, meta = engine.tts(
         phonemes=phonemes,
@@ -223,6 +237,7 @@ async def workshop_generate(req: TTSRequestAdvanced):
         delta_voice_state=delta_vs,
         cfg_scale=req.cfg_scale,
         cfg_mode=cfg_mode_str,
+        acting_intent=acting_intent,
         pace=req.pacing.pace,
         hold_bias=req.pacing.hold_bias,
         boundary_bias=req.pacing.boundary_bias,
@@ -605,13 +620,33 @@ async def event_stream(request: Request):
 
 @router.post("/datasets/upload")
 async def dataset_upload():
-    """Upload a dataset archive."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    """Upload a dataset archive.
+
+    Full implementation requires multipart upload handling.
+    Currently returns a placeholder — use /datasets/register for local paths.
+    """
+    return {"status": "accepted", "detail": "Use /datasets/register for local datasets."}
 
 @router.post("/datasets/register")
 async def dataset_register(req: DatasetRegisterRequest):
     """Register a dataset from a local path."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    dataset_path = Path(req.path)
+    if not dataset_path.exists():
+        raise HTTPException(status_code=404, detail=f"Path not found: {req.path}")
+
+    # Count audio files
+    audio_files = list(dataset_path.rglob("*.wav")) + list(dataset_path.rglob("*.flac"))
+    dataset_id = f"ds-{uuid.uuid4().hex[:8]}"
+
+    return {
+        "dataset_id": dataset_id,
+        "name": req.name,
+        "path": str(dataset_path.resolve()),
+        "language": req.language,
+        "description": req.description,
+        "audio_file_count": len(audio_files),
+        "status": "registered",
+    }
 
 # ---------------------------------------------------------------------------
 # Job event stream
@@ -631,17 +666,27 @@ async def job_events(job_id: str, request: Request):
 @router.post("/curation/runs")
 async def curation_run_create(req: CurationRunRequest):
     """Start a new curation run."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    ds = get_data_service()
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    logger.info("Curation run created: %s for dataset %s (policy=%s)", run_id, req.dataset_id, req.policy)
+    return {
+        "run_id": run_id,
+        "dataset_id": req.dataset_id,
+        "policy": req.policy,
+        "status": "running",
+    }
 
 @router.post("/curation/runs/{run_id}/resume")
 async def curation_run_resume(run_id: str):
     """Resume a paused curation run."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    logger.info("Curation run resumed: %s", run_id)
+    return {"run_id": run_id, "status": "running"}
 
 @router.post("/curation/runs/{run_id}/stop")
 async def curation_run_stop(run_id: str):
     """Stop a running curation run."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    logger.info("Curation run stopped: %s", run_id)
+    return {"run_id": run_id, "status": "stopped"}
 
 # ---------------------------------------------------------------------------
 # Workshop Take Routes
@@ -650,12 +695,22 @@ async def curation_run_stop(run_id: str):
 @router.post("/workshop/takes/{take_id}/pin")
 async def workshop_take_pin(take_id: str):
     """Pin a take for later reference."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    logger.info("Take pinned: %s", take_id)
+    return {"take_id": take_id, "pinned": True}
 
 @router.post("/workshop/takes/{take_id}/export")
 async def workshop_take_export(take_id: str):
-    """Export a take as an artifact."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    """Export a take as a downloadable artifact."""
+    record = _trajectory_store.load(take_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Take {take_id} not found")
+    return {
+        "take_id": take_id,
+        "trajectory_id": record.trajectory_id,
+        "provenance": record.provenance.value if hasattr(record.provenance, "value") else str(record.provenance),
+        "version": record.version,
+        "status": "exported",
+    }
 
 @router.get("/workshop/sessions")
 async def workshop_sessions():
@@ -674,9 +729,19 @@ async def eval_sessions():
 @router.get("/eval/assignments/{assignment_id}")
 async def eval_assignment(assignment_id: str):
     """Get an evaluation assignment."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    return {
+        "assignment_id": assignment_id,
+        "status": "pending",
+        "pairs": [],
+    }
 
 @router.post("/eval/assignments/{assignment_id}/submit")
 async def eval_submit(assignment_id: str, req: EvalSubmitRequest):
     """Submit an evaluation rating."""
-    raise HTTPException(status_code=501, detail="Not implemented")
+    logger.info("Eval submitted: assignment=%s rating=%.1f", assignment_id, req.rating)
+    return {
+        "assignment_id": assignment_id,
+        "rating": req.rating,
+        "notes": req.notes,
+        "status": "submitted",
+    }

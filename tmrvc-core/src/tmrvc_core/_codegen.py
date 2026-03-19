@@ -107,6 +107,12 @@ _RUNTIME_KEYS = {
     "streaming_hardware_class_primary",
     "serve_port",
     "gui_port",
+    "n_acting_tags",
+    "extended_vocab_size",
+    "d_acting_latent",
+    "d_acting_macro",
+    "bio_covariance_rank",
+    "bio_transition_penalty_weight",
 }
 
 _RUST_NAME_MAP: dict[str, str] = {
@@ -272,6 +278,14 @@ def _generate_rust(cfg: dict) -> str:
             "serve_port",
             "gui_port",
         ],
+        "v4_acting": [
+            "n_acting_tags",
+            "extended_vocab_size",
+            "d_acting_latent",
+            "d_acting_macro",
+            "bio_covariance_rank",
+            "bio_transition_penalty_weight",
+        ],
     }
 
     section_headers = {
@@ -289,6 +303,7 @@ def _generate_rust(cfg: dict) -> str:
         "prompt_budget": "\n// --- Prompt budget limits (v3) ---",
         "runtime_budget": "\n// --- Runtime budget limits (v3) ---",
         "server": "\n// --- Server ports ---",
+        "v4_acting": "\n// --- v4 Acting & Biological Constraints ---",
     }
 
     lines = [

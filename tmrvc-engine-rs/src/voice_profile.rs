@@ -186,6 +186,7 @@ pub fn create_voice_profile(
         style_embed: None,
         reference_tokens: None,
         ssl_state: None,
+        acting_latent: None,
         f0_mean: 220.0,
     };
 
@@ -198,7 +199,9 @@ pub fn create_voice_profile(
         reference_tokens: None,
         lora_delta: Some(lora_delta),
         ssl_state: None,
+        acting_latent: None,
         metadata,
+        version: 3,
     };
     speaker_file.save(output_path)?;
 

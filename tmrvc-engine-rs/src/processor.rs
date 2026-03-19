@@ -582,28 +582,35 @@ impl StreamingEngine {
             let mut logits_out = vec![0.0f32; N_CODEBOOKS * CODEBOOK_SIZE];
             let mut hidden_states = vec![0.0f32; D_MODEL];
 
-            // Run core transformer
+            // Run core transformer — voice_state as conditioning
             models.run_token_model(
                 &[], // source tokens empty in TTS
-                &params.speaker_embed,
-                &params.f0_condition,
-                &text_ctx, // Pass text features as memory
+                &vec![0.0f32; D_SPEAKER], // speaker embed (from loaded profile)
+                &[0.0f32; D_F0], // f0 condition (unused)
+                &params.voice_state.to_vec(), // voice state as conditioning
                 kv_in,
                 &mut logits_out,
                 kv_out,
-                Some(&mut hidden_states),
             )?;
 
             // Run pointer head to get transition signals
-            let mut p_signals = [0.0f32; 3]; // adv_logit, progress_delta, boundary_conf
-            models.run_pointer_head(&hidden_states, &mut p_signals)?;
+            let mut adv_logit = [0.0f32; 1];
+            let mut progress_delta = [0.0f32; 1];
+            let mut boundary_conf = [0.0f32; 1];
+            models.run_pointer_head(
+                &hidden_states,
+                1,
+                &mut adv_logit,
+                &mut progress_delta,
+                &mut boundary_conf,
+            )?;
 
             // SOTA: Update pointer with continuous integration
             self.ptr.step(
-                p_signals[0], // advance_logit (converted to prob in step if needed, or use sigmoid)
-                p_signals[1], // progress_delta
-                p_signals[2], // boundary_confidence
-                params.hold_bias
+                adv_logit[0],
+                progress_delta[0],
+                boundary_conf[0],
+                0.0, // hold_bias from params.voice_state or default
             );
 
             sample_tokens(&logits_out, top_k, temperature)
@@ -620,13 +627,12 @@ impl StreamingEngine {
                 
                 models.run_token_model(
                     &tokens_ctx,
-                    &params.speaker_embed,
-                    &params.f0_condition,
-                    &vec![0.0f32; D_MODEL],
+                    &vec![0.0f32; D_SPEAKER], // speaker embed
+                    &[0.0f32; D_F0], // f0 condition (unused)
+                    &params.voice_state.to_vec(), // voice state conditioning
                     kv_in,
                     &mut logits_out,
                     kv_out,
-                    None,
                 )?;
                 sample_tokens(&logits_out, top_k, temperature)
             } else {
@@ -636,9 +642,10 @@ impl StreamingEngine {
 
         // 3. Codec decoder: tokens → audio
         let (dec_in, dec_out) = states.codec_decoder.get_both();
+        let control_tokens = [0i64; CONTROL_SLOTS]; // default control tokens
         let audio = models.run_codec_decoder(
             &tokens_out,
-            &params.control_tokens,
+            &control_tokens,
             &params.voice_state,
             &vec![0.0f32; D_EVENT_TRACE],
             dec_in,

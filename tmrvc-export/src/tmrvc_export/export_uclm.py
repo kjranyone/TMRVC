@@ -25,6 +25,7 @@ import torch.nn as nn
 
 from tmrvc_core.constants import (
     CONTROL_VOCAB_SIZE,
+    D_ACTING_LATENT,
     D_MODEL,
     D_SPEAKER,
     D_VOICE_STATE_EXPLICIT,
@@ -104,6 +105,7 @@ class UCLMCoreExportWrapper(nn.Module):
         b_ctx: [B, 4, L] - control token context [op, type, dur, int]
         spk_embed: [B, 192] - speaker embedding
         state_cond: [B, d_model] - voice state condition (single frame)
+        acting_intent: [B, D_ACTING_LATENT] - acting intent vector (zeros if unused)
         cfg_scale: [1] - CFG amplification scale
         kv_cache_in: [B, kv_cache_size] - flattened KV cache (zeros for first frame)
 
@@ -116,6 +118,7 @@ class UCLMCoreExportWrapper(nn.Module):
     def __init__(self, model: DisentangledUCLM, max_seq_len: int = 200):
         super().__init__()
         self.uclm_core = model.uclm_core
+        self.acting_proj = model.acting_proj if hasattr(model, "acting_proj") else None
         self.max_seq_len = max_seq_len
         self.n_heads = model.uclm_core.n_heads
         self.n_layers = model.uclm_core.n_layers
@@ -132,21 +135,27 @@ class UCLMCoreExportWrapper(nn.Module):
         b_ctx: torch.Tensor,
         spk_embed: torch.Tensor,
         state_cond: torch.Tensor,
+        acting_intent: torch.Tensor,
         cfg_scale: torch.Tensor,
         kv_cache_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """ONNX forward pass.
-        
+
         Args:
             content_features: [B, d_model, L]
             b_ctx: [B, 4, L]
             spk_embed: [B, 192]
             state_cond: [B, d_model]
+            acting_intent: [B, D_ACTING_LATENT] - 24-D acting latent (zeros = no acting)
             cfg_scale: [1]
             kv_cache_in: [B, kv_cache_size] - Flattened KV cache
         """
         B, D, L = content_features.shape
-        
+
+        # Apply acting intent projection if available and non-zero
+        if self.acting_proj is not None and acting_intent.abs().sum() > 0:
+            content_features = content_features + self.acting_proj(acting_intent).unsqueeze(2)
+
         # Now uses the improved CodecTransformer which supports flattened tensor cache
         logits_a_full, logits_b_full, kv_cache_out = self.uclm_core(
             content_features.transpose(1, 2),
@@ -406,6 +415,7 @@ def export_uclm_core(
     dummy_b_ctx = torch.zeros(1, 4, context_frames, dtype=torch.long, device=device)
     dummy_spk = torch.zeros(1, D_SPEAKER, device=device)
     dummy_state_cond = torch.zeros(1, D_MODEL, device=device)
+    dummy_acting = torch.zeros(1, D_ACTING_LATENT, device=device)
     dummy_cfg_scale = torch.tensor([1.5], device=device)
     dummy_kv_cache = torch.zeros(1, kv_cache_size, device=device)
 
@@ -416,6 +426,7 @@ def export_uclm_core(
             dummy_b_ctx,
             dummy_spk,
             dummy_state_cond,
+            dummy_acting,
             dummy_cfg_scale,
             dummy_kv_cache,
         ),
@@ -425,6 +436,7 @@ def export_uclm_core(
             "b_ctx",
             "spk_embed",
             "state_cond",
+            "acting_intent",
             "cfg_scale",
             "kv_cache_in",
         ],
@@ -434,6 +446,7 @@ def export_uclm_core(
             "b_ctx": {0: "batch", 2: "L"},
             "spk_embed": {0: "batch"},
             "state_cond": {0: "batch"},
+            "acting_intent": {0: "batch"},
             "cfg_scale": {},
             "kv_cache_in": {0: "batch"},
             "logits_a": {0: "batch"},

@@ -214,6 +214,28 @@ class UCLMEngine:
         self._loaded = True
         logger.info("Initialized UCLMEngine with RANDOM weights on %s", self.device)
 
+    def project_acting_macro(self, macro_controls: torch.Tensor) -> torch.Tensor:
+        """Project 6-D acting macro controls to 24-D acting latent.
+
+        Args:
+            macro_controls: [B, 6] macro control values
+
+        Returns:
+            acting_intent: [B, 24] acting latent vector
+        """
+        self._require_loaded()
+        if hasattr(self.uclm_core_model, "acting_macro_proj"):
+            with torch.no_grad():
+                return self.uclm_core_model.acting_macro_proj(
+                    macro_controls.to(self.device)
+                )
+        # Fallback: zero-pad to 24-D if projector not available
+        from tmrvc_core.constants import D_ACTING_LATENT
+        B = macro_controls.shape[0]
+        latent = torch.zeros(B, D_ACTING_LATENT, device=self.device)
+        latent[:, :macro_controls.shape[1]] = macro_controls.to(self.device)
+        return latent
+
     def load_models(
         self,
         uclm_path: Path | str | None = None,
