@@ -1,5 +1,6 @@
 import torch
 
+from tmrvc_core.constants import RVQ_VOCAB_SIZE, CONTROL_VOCAB_SIZE
 from tmrvc_train.cli.train_uclm import collate_fn
 from tmrvc_train.models.uclm_model import DisentangledUCLM
 
@@ -9,7 +10,7 @@ def _make_item(T: int) -> dict[str, torch.Tensor]:
         "target_a": torch.randint(0, 1024, (8, T), dtype=torch.long),
         "target_b": torch.randint(0, 64, (4, T), dtype=torch.long),
         "source_a_t": torch.randint(0, 1024, (8, T), dtype=torch.long),
-        "explicit_state": torch.randn(T, 8),
+        "explicit_state": torch.randn(T, 12),
         "ssl_state": torch.randn(T, 128),
         "speaker_embed": torch.randn(192),
         "speaker_id": torch.tensor(0, dtype=torch.long),
@@ -29,7 +30,7 @@ def test_collate_source_padding_stays_embedding_safe():
 
 def test_forward_vc_accepts_padded_target_b_context():
     B, T = 2, 16
-    model = DisentangledUCLM(d_model=256, n_heads=4, n_layers=2, vq_bins=64)
+    model = DisentangledUCLM()
 
     source_a_t = torch.randint(0, 1024, (B, 8, T), dtype=torch.long)
     target_b = torch.randint(0, 64, (B, 4, T), dtype=torch.long)
@@ -38,17 +39,17 @@ def test_forward_vc_accepts_padded_target_b_context():
     out = model.forward_vc(
         source_a_t=source_a_t,
         target_b=target_b,
-        explicit_state=torch.randn(B, T, 8),
+        explicit_state=torch.randn(B, T, 12),
         ssl_state=torch.randn(B, T, 128),
         speaker_embed=torch.randn(B, 192),
     )
-    assert out["logits_a"].shape == (B, 8, T, 1024)
-    assert out["logits_b"].shape == (B, 4, T, 64)
+    assert out["logits_a"].shape == (B, 8, T, RVQ_VOCAB_SIZE)
+    assert out["logits_b"].shape == (B, 4, T, CONTROL_VOCAB_SIZE)
 
 
 def test_forward_tts_pointer_accepts_padded_target_b_context():
     B, L, T = 2, 6, 16
-    model = DisentangledUCLM(d_model=256, n_heads=4, n_layers=2, vq_bins=64)
+    model = DisentangledUCLM()
 
     target_b = torch.randint(0, 64, (B, 4, T), dtype=torch.long)
     target_b[:, :, -3:] = -1
@@ -58,11 +59,11 @@ def test_forward_tts_pointer_accepts_padded_target_b_context():
         language_ids=torch.zeros((B,), dtype=torch.long),
         pointer_state=None,
         speaker_embed=torch.randn(B, 192),
-        explicit_state=torch.randn(B, T, 8),
+        explicit_state=torch.randn(B, T, 12),
         ssl_state=torch.randn(B, T, 128),
         target_a=torch.zeros(B, 8, T, dtype=torch.long),
         target_b=target_b,
         target_length=T,
     )
-    assert out["logits_a"].shape == (B, 8, T, 1024)
-    assert out["logits_b"].shape == (B, 4, T, 64)
+    assert out["logits_a"].shape == (B, 8, T, RVQ_VOCAB_SIZE)
+    assert out["logits_b"].shape == (B, 4, T, CONTROL_VOCAB_SIZE)

@@ -37,13 +37,13 @@ class TestConfigValidation:
     def test_invalid_tts_mode_raises(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         with pytest.raises(ValueError, match="tts_mode"):
-            UCLMTrainer(model=model, optimizer=optimizer, tts_mode="invalid")
+            UCLMTrainer(model=model, optimizer=optimizer, device="cpu", tts_mode="invalid")
 
     def test_invalid_pointer_target_source_raises(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         with pytest.raises(ValueError, match="pointer_target_source"):
             UCLMTrainer(
-                model=model, optimizer=optimizer,
+                model=model, optimizer=optimizer, device="cpu",
                 pointer_target_source="nonexistent_source",
             )
 
@@ -51,14 +51,14 @@ class TestConfigValidation:
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         with pytest.raises(ValueError, match="alignment_loss_type"):
             UCLMTrainer(
-                model=model, optimizer=optimizer,
+                model=model, optimizer=optimizer, device="cpu",
                 alignment_loss_type="invalid",
             )
 
     def test_valid_pointer_config_accepted(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         t = UCLMTrainer(
-            model=model, optimizer=optimizer,
+            model=model, optimizer=optimizer, device="cpu",
             tts_mode="pointer",
             pointer_target_source="heuristic_bootstrap",
             alignment_loss_type="none",
@@ -68,7 +68,7 @@ class TestConfigValidation:
     def test_latent_only_accepted_without_bootstrap(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         t = UCLMTrainer(
-            model=model, optimizer=optimizer,
+            model=model, optimizer=optimizer, device="cpu",
             pointer_target_source="none",
         )
         assert t.pointer_target_source == "none"
@@ -194,7 +194,7 @@ class TestVoiceStateLossConfig:
     def test_zero_weight_accepted(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         t = UCLMTrainer(
-            model=model, optimizer=optimizer,
+            model=model, optimizer=optimizer, device="cpu",
             voice_state_loss_weight=0.0,
         )
         assert t.voice_state_loss_weight == 0.0
@@ -202,7 +202,7 @@ class TestVoiceStateLossConfig:
     def test_nonzero_weight_accepted(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         t = UCLMTrainer(
-            model=model, optimizer=optimizer,
+            model=model, optimizer=optimizer, device="cpu",
             voice_state_loss_weight=0.5,
         )
         assert t.voice_state_loss_weight == 0.5

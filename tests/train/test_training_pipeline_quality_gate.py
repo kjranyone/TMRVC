@@ -98,9 +98,11 @@ def test_quality_gate_fails_on_waveform_length_mismatch(tmp_path: Path):
     exp = tmp_path / "exp"
     cache = tmp_path / "cache"
     utt = _write_valid_cache_entry(cache, "jvs", "jvs_spk1", "utt1")
-    # n_frames=8 in meta -> expected 8 * 240 = 1920 samples.
+    # n_frames=8 in meta -> expected 8 * HOP_LENGTH samples.
     # Severe mismatch (> 1 frame) should fail.
-    np.save(utt / "waveform.npy", np.zeros((1, 2161), dtype=np.float32))
+    from tmrvc_core.constants import HOP_LENGTH
+    expected = 8 * HOP_LENGTH
+    np.save(utt / "waveform.npy", np.zeros((1, expected + HOP_LENGTH + 1), dtype=np.float32))
 
     p = TrainingPipeline(
         experiment_dir=exp,
@@ -117,12 +119,21 @@ def test_quality_gate_fails_on_waveform_length_mismatch(tmp_path: Path):
     assert not p._run_training()
 
 
-def test_quality_gate_allows_subframe_waveform_tail_remainder(tmp_path: Path):
+def test_quality_gate_allows_subframe_waveform_tail_remainder(monkeypatch, tmp_path: Path):
     exp = tmp_path / "exp"
     cache = tmp_path / "cache"
     utt = _write_valid_cache_entry(cache, "jvs", "jvs_spk1", "utt1")
-    # n_frames=8 in meta -> expected 1920. +1 sample tail remainder should pass.
-    np.save(utt / "waveform.npy", np.zeros((1, 1921), dtype=np.float32))
+    # n_frames=8 in meta -> expected 8 * HOP_LENGTH. +1 sample tail remainder should pass.
+    from tmrvc_core.constants import HOP_LENGTH
+    expected = 8 * HOP_LENGTH
+    np.save(utt / "waveform.npy", np.zeros((1, expected + 1), dtype=np.float32))
+
+    called: list[list[str]] = []
+
+    def fake_train_main(argv: list[str]) -> None:
+        called.append(argv)
+
+    monkeypatch.setattr("tmrvc_train.cli.train_uclm.main", fake_train_main)
 
     p = TrainingPipeline(
         experiment_dir=exp,

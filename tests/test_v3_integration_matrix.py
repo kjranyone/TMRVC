@@ -36,7 +36,7 @@ def _make_tts_batch(
         "language_ids": torch.zeros(batch_size, phoneme_len, dtype=torch.long, device=device),
         "speaker_embed": torch.randn(batch_size, 192, device=device),
         "speaker_id": torch.zeros(batch_size, dtype=torch.long, device=device),
-        "explicit_state": torch.randn(batch_size, target_length, 8, device=device),
+        "explicit_state": torch.randn(batch_size, target_length, 12, device=device),
         "ssl_state": torch.randn(batch_size, target_length, 128, device=device),
         "target_a": torch.zeros(batch_size, n_codebooks, target_length, dtype=torch.long, device=device),
         "target_b": torch.zeros(batch_size, n_slots, target_length, dtype=torch.long, device=device),
@@ -66,7 +66,6 @@ class TestV3PointerTrainingSmoke:
         )
         assert trainer.tts_mode == "pointer"
         assert trainer.pointer_target_source == "heuristic_bootstrap"
-        assert trainer.legacy_duration_loss_weight == 0.0
 
     def test_model_forward_tts_pointer_with_grad(self):
         """DisentangledUCLM.forward_tts_pointer must run a differentiable
@@ -79,7 +78,7 @@ class TestV3PointerTrainingSmoke:
             "language_ids": torch.zeros(1, 8, dtype=torch.long),
             "pointer_state": None,
             "speaker_embed": torch.randn(1, 192),
-            "explicit_state": torch.randn(1, 20, 8),
+            "explicit_state": torch.randn(1, 20, 12),
             "ssl_state": torch.randn(1, 20, 128),
             "target_a": torch.zeros(1, 8, 20, dtype=torch.long),
             "target_b": torch.zeros(1, 4, 20, dtype=torch.long),
@@ -110,7 +109,6 @@ class TestV3PointerTrainingSmoke:
             device="cpu",
             tts_mode="pointer",
         )
-        assert trainer.legacy_duration_loss_weight == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +134,7 @@ class TestV3PointerInferenceSmoke:
             "language_ids": torch.zeros(1, 8, dtype=torch.long),
             "pointer_state": None,
             "speaker_embed": torch.randn(1, 192),
-            "explicit_state": torch.randn(1, 20, 8),
+            "explicit_state": torch.randn(1, 20, 12),
             "ssl_state": torch.randn(1, 20, 128),
             "target_a": torch.zeros(1, 8, 20, dtype=torch.long),
             "target_b": torch.zeros(1, 4, 20, dtype=torch.long),
@@ -160,6 +158,7 @@ class TestV3PointerInferenceSmoke:
         assert not pis.finished
 
         pis.text_index = 5
+        pis.frames_on_current_unit = 5
         assert pis.finished
 
 
@@ -186,7 +185,7 @@ class TestONNXExportSmoke:
             "language_ids": torch.zeros(1, 8, dtype=torch.long),
             "pointer_state": None,
             "speaker_embed": torch.randn(1, 192),
-            "explicit_state": torch.randn(1, 10, 8),
+            "explicit_state": torch.randn(1, 10, 12),
             "ssl_state": torch.randn(1, 10, 128),
             "target_a": torch.zeros(1, 8, 10, dtype=torch.long),
             "target_b": torch.zeros(1, 4, 10, dtype=torch.long),
@@ -202,6 +201,7 @@ class TestONNXExportSmoke:
 
     def test_onnx_export_wrapper_importable(self):
         """The ONNX export module must be importable."""
+        pytest.importorskip("tmrvc_export", reason="tmrvc-export not installed")
         from tmrvc_export.export_onnx import CodecEncoderWrapper, UCLM_CoreWrapper
         assert CodecEncoderWrapper is not None
         assert UCLM_CoreWrapper is not None

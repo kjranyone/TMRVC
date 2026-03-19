@@ -36,7 +36,7 @@ def _make_utt_dir(
     utt_id: str = "utt001",
     n_frames: int = 100,
     n_codebooks: int = 8,
-    d_voice_state: int = 8,
+    d_voice_state: int = 12,
     n_phones: int = 10,
     include_durations: bool = False,
     include_suprasegmentals: bool = False,
@@ -76,9 +76,9 @@ def _make_utt_dir(
 
     # Optional: voice state supervision
     if include_voice_state_targets:
-        np.save(utt_dir / "voice_state_targets.npy", np.random.randn(n_frames, 8).astype(np.float32))
-        np.save(utt_dir / "voice_state_observed_mask.npy", np.ones((n_frames, 8), dtype=bool))
-        np.save(utt_dir / "voice_state_confidence.npy", np.ones((n_frames, 8), dtype=np.float32) * 0.9)
+        np.save(utt_dir / "voice_state_targets.npy", np.random.randn(n_frames, 12).astype(np.float32))
+        np.save(utt_dir / "voice_state_observed_mask.npy", np.ones((n_frames, 12), dtype=bool))
+        np.save(utt_dir / "voice_state_confidence.npy", np.ones((n_frames, 12), dtype=np.float32) * 0.9)
 
     # Optional: bootstrap alignment
     if include_bootstrap_alignment:
@@ -166,42 +166,16 @@ class TestDurationsOptional:
         assert len(ds) == 1
         sample = ds[0]
         assert sample["phoneme_ids"] is not None
-        assert sample["durations"] is None
+        assert "durations" not in sample
 
-    def test_auto_mode_loads_without_durations(self, cache_dir_pointer_mode):
-        from tmrvc_data.uclm_dataset import UCLMDataset
-
-        ds = UCLMDataset(cache_dir=cache_dir_pointer_mode, tts_mode="auto")
-        assert len(ds) == 1
-        sample = ds[0]
-        assert sample["phoneme_ids"] is not None
-        assert sample["durations"] is None
-
-    def test_legacy_mode_skips_without_durations(self, cache_dir_pointer_mode):
-        from tmrvc_data.uclm_dataset import UCLMDataset
-
-        ds = UCLMDataset(cache_dir=cache_dir_pointer_mode, tts_mode="legacy_duration")
-        assert len(ds) == 1
-        sample = ds[0]
-        # legacy_duration mode: phoneme_ids is None when durations missing
-        assert sample["phoneme_ids"] is None
-        assert sample["durations"] is None
-
-    def test_with_durations_loaded_in_auto(self, cache_dir_with_durations):
-        from tmrvc_data.uclm_dataset import UCLMDataset
-
-        ds = UCLMDataset(cache_dir=cache_dir_with_durations, tts_mode="auto")
-        sample = ds[0]
-        assert sample["phoneme_ids"] is not None
-        assert sample["durations"] is not None
-
-    def test_pointer_mode_ignores_existing_durations(self, cache_dir_with_durations):
+    def test_pointer_mode_with_durations_dir(self, cache_dir_with_durations):
+        """Pointer mode loads phoneme_ids but ignores durations.npy."""
         from tmrvc_data.uclm_dataset import UCLMDataset
 
         ds = UCLMDataset(cache_dir=cache_dir_with_durations, tts_mode="pointer")
         sample = ds[0]
         assert sample["phoneme_ids"] is not None
-        assert sample["durations"] is None
+        assert "durations" not in sample
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +247,7 @@ class TestVoiceStateSupervision:
         ds = UCLMDataset(cache_dir=cache_dir_full, tts_mode="pointer")
         sample = ds[0]
         assert sample["voice_state_targets"] is not None
-        assert sample["voice_state_targets"].shape == (100, 8)
+        assert sample["voice_state_targets"].shape == (100, 12)
 
     def test_observed_mask_loaded(self, cache_dir_full):
         from tmrvc_data.uclm_dataset import UCLMDataset
@@ -282,7 +256,7 @@ class TestVoiceStateSupervision:
         sample = ds[0]
         assert sample["voice_state_observed_mask"] is not None
         assert sample["voice_state_observed_mask"].dtype == torch.bool
-        assert sample["voice_state_observed_mask"].shape == (100, 8)
+        assert sample["voice_state_observed_mask"].shape == (100, 12)
 
     def test_confidence_loaded(self, cache_dir_full):
         from tmrvc_data.uclm_dataset import UCLMDataset
@@ -290,7 +264,7 @@ class TestVoiceStateSupervision:
         ds = UCLMDataset(cache_dir=cache_dir_full, tts_mode="pointer")
         sample = ds[0]
         assert sample["voice_state_confidence"] is not None
-        assert sample["voice_state_confidence"].shape == (100, 8)
+        assert sample["voice_state_confidence"].shape == (100, 12)
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +352,6 @@ class TestQualityFiltering:
         ds = UCLMDataset(cache_dir=cache_dir_quality_filtered, min_quality_score=0.4)
         assert len(ds) == 2
 
-    def test_backward_compat_quality_score_threshold(self, cache_dir_quality_filtered):
-        """Legacy quality_score_threshold param still works."""
-        from tmrvc_data.uclm_dataset import UCLMDataset
-
-        ds = UCLMDataset(cache_dir=cache_dir_quality_filtered, quality_score_threshold=0.8)
-        assert len(ds) == 1
-
 
 # ---------------------------------------------------------------------------
 # Task 2: Supervision report
@@ -401,11 +368,9 @@ class TestSupervisionReport:
         report = ds.supervision_report()
         assert "text_supervision_coverage" in report
         assert "canonical_text_unit_coverage" in report
-        assert "legacy_duration_coverage" in report
         # All should be 1.0 since the full cache has everything
         assert report["text_supervision_coverage"] == 1.0
         assert report["canonical_text_unit_coverage"] == 1.0
-        assert report["legacy_duration_coverage"] == 1.0
 
     def test_report_voice_state_coverage(self, cache_dir_full):
         from tmrvc_data.uclm_dataset import UCLMDataset
@@ -529,7 +494,8 @@ class TestCollationPointerMode:
         ds = UCLMDataset(cache_dir=cache_dir_pointer_mode, tts_mode="pointer")
         sample = ds[0]
         batch = collate_uclm_batch([sample])
-        assert batch.durations is None
+        # durations field removed in v4 (pointer-only); verify it's absent
+        assert not hasattr(batch, "durations")
         assert batch.phoneme_ids is not None
         assert batch.phoneme_ids.shape[0] == 1
 
@@ -564,7 +530,7 @@ class TestCanonicalDimConstants:
     def test_voice_state_dims_count(self):
         from tmrvc_data.uclm_dataset import VOICE_STATE_DIMS
 
-        assert len(VOICE_STATE_DIMS) == 8
+        assert len(VOICE_STATE_DIMS) == 12
 
     def test_voice_state_dims_names(self):
         from tmrvc_data.uclm_dataset import VOICE_STATE_DIMS

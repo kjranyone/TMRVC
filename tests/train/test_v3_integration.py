@@ -1,8 +1,8 @@
-"""Integration tests for UCLM v3 pointer-based TTS training.
+"""Integration tests for pointer-based TTS training.
 
 Tests cover:
-a) v3 pointer training without durations.npy
-b) v2 legacy training still works with durations.npy
+a) Pointer training without durations.npy
+b) Auto mode with durations as pointer targets
 c) CLI arg parsing for --tts-mode
 """
 
@@ -31,7 +31,7 @@ def _write_core_files(utt_dir: Path, *, speaker_id: str = "spk0") -> None:
     """Write the minimal required files for a valid utterance."""
     utt_dir.mkdir(parents=True, exist_ok=True)
     np.save(utt_dir / "codec_tokens.npy", np.random.randint(0, 1024, (8, _T)))
-    np.save(utt_dir / "explicit_state.npy", np.random.randn(_T, 8).astype(np.float32))
+    np.save(utt_dir / "explicit_state.npy", np.random.randn(_T, 12).astype(np.float32))
     np.save(utt_dir / "ssl_state.npy", np.random.randn(_T, 128).astype(np.float32))
     np.save(utt_dir / "spk_embed.npy", np.random.randn(192).astype(np.float32))
     meta = {"speaker_id": speaker_id, "language_id": 0, "text": "hello"}
@@ -75,7 +75,7 @@ class TestV3PointerTrainWithoutDurations:
 
         sample = ds[0]
         assert sample["phoneme_ids"] is not None
-        assert sample["durations"] is None
+        assert "durations" not in sample
 
     def test_trainer_step_pointer_no_durations(self, tmp_path: Path):
         """Full integration: dataset -> collate -> trainer.train_step in pointer mode."""
@@ -95,7 +95,7 @@ class TestV3PointerTrainWithoutDurations:
 
         batch = next(iter(loader))
         # In pointer mode, durations should NOT be in the batch (all None -> omitted)
-        assert "durations" not in batch or batch.get("durations") is None
+        assert "durations" not in batch
 
         metrics = trainer.train_step(batch)
         assert "loss" in metrics
@@ -103,30 +103,19 @@ class TestV3PointerTrainWithoutDurations:
 
 
 # ---------------------------------------------------------------------------
-# b) v2 legacy train still works
+# b) Auto mode with durations as pointer targets
 # ---------------------------------------------------------------------------
 
 
-class TestV2LegacyDatasetStillWorks:
-    def test_dataset_loads_legacy_mode(self, tmp_path: Path):
-        """Dataset in legacy_duration mode should load both phoneme_ids and durations."""
-        cache = _build_cache(tmp_path, with_durations=True)
-        ds = DisentangledUCLMDataset(cache, tts_mode="legacy_duration")
-        assert len(ds) == 2
-
-        sample = ds[0]
-        assert sample["phoneme_ids"] is not None
-        assert sample["durations"] is not None
-
-    def test_trainer_uses_durations_as_pointer_targets(self, tmp_path: Path):
-        """When durations are available (auto mode), trainer uses them as pointer targets."""
+class TestPointerModeWithDurationsDir:
+    def test_trainer_ignores_durations_files(self, tmp_path: Path):
+        """Even when durations.npy exists on disk, pointer mode ignores them."""
         from tmrvc_train.models.uclm_model import DisentangledUCLM
         from tmrvc_train.trainer import UCLMTrainer
         from tmrvc_train.cli.train_uclm import collate_fn
 
         cache = _build_cache(tmp_path, with_durations=True)
-        # Use auto mode to load both phoneme_ids and durations
-        ds = DisentangledUCLMDataset(cache, tts_mode="auto")
+        ds = DisentangledUCLMDataset(cache, tts_mode="pointer")
         loader = torch.utils.data.DataLoader(ds, batch_size=2, collate_fn=collate_fn)
 
         model = DisentangledUCLM(
@@ -136,23 +125,12 @@ class TestV2LegacyDatasetStillWorks:
         trainer = UCLMTrainer(model, optimizer, device="cpu", tts_prob=1.0, tts_mode="pointer")
 
         batch = next(iter(loader))
-        # In auto mode with durations files, durations should be available
-        assert batch.get("durations") is not None
+        # Pointer mode: durations are never loaded
+        assert "durations" not in batch
 
         metrics = trainer.train_step(batch)
         assert "loss" in metrics
         assert metrics["mode"] == 1  # TTS
-
-    def test_legacy_mode_ignores_phoneme_only_utterances(self, tmp_path: Path):
-        """In legacy_duration mode, utterances with phoneme_ids but no durations
-        should have phoneme_ids=None (i.e. treated as VC-only)."""
-        cache = _build_cache(tmp_path, with_durations=False)
-        ds = DisentangledUCLMDataset(cache, tts_mode="legacy_duration")
-        assert len(ds) == 2
-
-        sample = ds[0]
-        assert sample["phoneme_ids"] is None
-        assert sample["durations"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -185,26 +163,6 @@ class TestCliTtsModeArgParsing:
             "--datasets", "ds1",
         ]
         # This will run 1 training step; we just want to verify no crash.
-        main(argv)
-        assert (output / "uclm_final.pt").exists()
-
-    def test_parse_legacy_duration_mode(self, tmp_path: Path):
-        """--tts-mode legacy_duration should be accepted."""
-        cache = _build_cache(tmp_path, with_durations=True)
-        output = tmp_path / "out"
-
-        from tmrvc_train.cli.train_uclm import main
-
-        argv = [
-            "--cache-dir", str(cache),
-            "--output-dir", str(output),
-            "--batch-size", "2",
-            "--max-steps", "1",
-            "--device", "cpu",
-            "--lr", "1e-3",
-            "--tts-mode", "legacy_duration",
-            "--datasets", "ds1",
-        ]
         main(argv)
         assert (output / "uclm_final.pt").exists()
 

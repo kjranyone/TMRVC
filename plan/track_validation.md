@@ -1,11 +1,11 @@
-# Worker 06: v4 Validation And Claim Gating
+# Track: v4 Validation And Claim Gating
 
 ## Scope
 
-Worker 06 owns the validation gates for the `v4` single-cutover program.
+This track owns the validation gates for the `v4` single-cutover program.
 This includes both repository-internal release gates and competitor-facing claim gates.
 
-Worker 06 is the only owner allowed to unblock "beats Fish Audio S2" language.
+This track is the only owner allowed to unblock "beats Fish Audio S2" language.
 
 ## Primary Files
 
@@ -38,6 +38,8 @@ Rules:
 - low-confidence pseudo-labels must be measured, not silently treated as dense truth
 - bootstrap quality is a release gate, not an offline curiosity
 
+Ownership: track_validation defines the acceptance thresholds and produces the sign-off report. track_data_bootstrap implements the measurement code within the bootstrap pipeline. If thresholds are not met, track_data_bootstrap must fix the pipeline; track_validation must not lower thresholds without re-review.
+
 ### 2. Add `v4` controllability and editability metrics
 
 Required metrics:
@@ -48,6 +50,8 @@ Required metrics:
 - edit locality
 - cross-speaker acting transfer quality
 - semantic prompt-following quality
+- inline acting tag instruction-following rate
+- RL reward compliance (instruction-following + physical compliance + intelligibility)
 
 Each metric needs:
 
@@ -74,6 +78,7 @@ Required `v4` parity suites:
 - batch vs streaming numerical parity
 - physical-control ordering and scaling parity
 - acting-latent ordering and scaling parity
+- codec encode/decode parity: Python Mimi vs ONNX export (if applicable)
 
 If parity fails, the release is blocked.
 
@@ -87,12 +92,13 @@ Every evaluation report must declare which claim is being tested:
 - programmable expressive speech
 - cross-speaker acting transfer
 - real-time causal runtime
+- inline instruction following
 
 If a claim lacks its required evidence, it is blocked rather than softened in prose.
 
 ### 6. Freeze the Fish S2 head-to-head protocol for `v4`
 
-Worker 06 must maintain the frozen Fish S2 competitor protocol.
+This track must maintain the frozen Fish S2 competitor protocol.
 
 Mandatory axes for any "beats Fish Audio S2" language:
 
@@ -123,6 +129,8 @@ Claim rule:
 - runtime-parity report
 - claim matrix mapping each public claim to evidence
 - Fish S2 head-to-head report with frozen artifact/version, prompt rule, and subset definition
+- instruction-following report: tag compliance rate before and after RL, broken down by tag category
+- physical compliance under RL: monotonicity and calibration preserved after RL phase
 
 ## Out Of Scope
 
@@ -134,8 +142,9 @@ Do not reopen:
 
 ## Exit Criteria
 
-- bootstrap QC gates exist and are enforced
-- controllability and editability metrics are implemented
-- parity reports cover Python, ONNX, Rust, and streaming paths
-- reports explicitly separate compile variance, replay variance, and transfer variance
-- Fish S2 claim rules are frozen before any competitor-facing language is used
+- bootstrap QC gates exist and produce reports with pass/fail against defined thresholds
+- controllability metrics are implemented and meet thresholds defined in `docs/design/acceptance-thresholds.md` §V4-1
+- parity reports cover Python, ONNX, Rust, and streaming paths and meet thresholds defined in `docs/design/acceptance-thresholds.md` §V4-5
+- reports explicitly separate compile variance, replay variance, and transfer variance (no mixed buckets)
+- Fish S2 claim rules are frozen per `docs/design/acceptance-thresholds.md` §V4-9 with explicit axis definitions, subset sizes, and statistical significance requirements
+- each public claim maps to a specific report with measured evidence

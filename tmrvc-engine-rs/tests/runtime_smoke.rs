@@ -86,7 +86,7 @@ fn smoke_processor_runs_frame_inference() {
         temperature_b: 1.0,
         top_k_a: 50,
         top_k_b: 20,
-        voice_state: [0.5; 8],
+        voice_state: [0.5; 12],
     };
 
     let mut input = [0.0f32; FRAME_SIZE];

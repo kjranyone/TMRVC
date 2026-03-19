@@ -89,7 +89,7 @@ class TestRuntimeContractResponse:
         assert "progress" in resp.pointer_fields
         assert "finished" in resp.pointer_fields
         assert "stall_frames" in resp.pointer_fields
-        assert resp.voice_state_dims == 8
+        assert resp.voice_state_dims == 12
         assert resp.supports_few_shot is True
         assert resp.supports_dialogue_context is True
         assert resp.supports_acting_intent is True
@@ -100,10 +100,10 @@ class TestRuntimeContractResponse:
             assert ctrl in resp.pacing_controls, f"Missing pacing control: {ctrl}"
 
     def test_serialization_roundtrip(self):
-        resp = RuntimeContractResponse(tts_mode="legacy_duration")
+        resp = RuntimeContractResponse(tts_mode="pointer")
         data = resp.model_dump()
         restored = RuntimeContractResponse(**data)
-        assert restored.tts_mode == "legacy_duration"
+        assert restored.tts_mode == "pointer"
 
 
 class TestLoadModelRequest:

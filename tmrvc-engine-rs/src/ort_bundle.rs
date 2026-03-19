@@ -94,7 +94,7 @@ impl OrtBundle {
         })
     }
 
-    /// Legacy alias for compatibility
+    /// Alias used by processor.rs
     pub fn new_codec_latent(model_dir: &Path) -> Result<Self> {
         Self::new_uclm(model_dir)
     }
@@ -126,19 +126,6 @@ impl OrtBundle {
         Ok(tokens_arr)
     }
 
-    /// Legacy codec encoder for old processor.rs compatibility.
-    /// Returns tokens vec and state vec (allocates).
-    #[deprecated(note = "Use run_codec_encoder with pre-allocated buffers for RT-safe")]
-    pub fn run_codec_encoder_legacy(
-        &mut self,
-        audio: &[f32],
-        state_in: &[f32],
-    ) -> Result<(Vec<i64>, Vec<f32>)> {
-        let mut state_out = vec![0.0f32; ENC_STATE_DIM * ENC_STATE_FRAMES];
-        let tokens = self.run_codec_encoder(audio, state_in, &mut state_out)?;
-        Ok((tokens.to_vec(), state_out))
-    }
-
     /// Run VC encoder (VQ bottleneck): source_A_t → vq_content_features
     ///
     /// Input: `[1, 8, L]` source acoustic tokens (context)
@@ -164,7 +151,7 @@ impl OrtBundle {
 
     /// Run voice state encoder: explicit + SSL + delta → state_cond
     ///
-    /// Input: `[1, 8]` explicit, `[1, 128]` ssl_state, `[1, 8]` delta_state
+    /// Input: `[1, 12]` explicit, `[1, 128]` ssl_state, `[1, 12]` delta_state
     /// Output: `[1, d_model]` fused state condition
     /// RT-safe: writes to pre-allocated buffer
     pub fn run_voice_state_enc(
@@ -250,7 +237,7 @@ impl OrtBundle {
         Ok(())
     }
 
-    /// Legacy method name for compatibility
+    /// Convenience wrapper: encode + run UCLM core in one call.
     pub fn run_token_model(
         &mut self,
         tokens_ctx: &[i64],
@@ -288,40 +275,12 @@ impl OrtBundle {
         )
     }
 
-    /// Legacy token model for old processor.rs compatibility (Vec-based).
-    #[deprecated(note = "Use run_token_model with pre-allocated buffers for RT-safe")]
-    pub fn run_token_model_legacy(
-        &mut self,
-        tokens_ctx: &[i64],
-        spk_embed: &[f32],
-        kv_cache_in: &[f32],
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let context_len = tokens_ctx.len() / N_CODEBOOKS;
-        let mut logits_out = vec![0.0f32; N_CODEBOOKS * CODEBOOK_SIZE * context_len];
-        let mut kv_cache_out = vec![0.0f32; kv_cache_in.len()];
-
-        let voice_state_ctx = vec![0.0f32; D_MODEL];
-        let f0_condition = vec![0.0f32; context_len * 2];
-
-        self.run_token_model(
-            tokens_ctx,
-            spk_embed,
-            &f0_condition,
-            &voice_state_ctx,
-            kv_cache_in,
-            &mut logits_out,
-            &mut kv_cache_out,
-        )?;
-
-        Ok((logits_out, kv_cache_out))
-    }
-
     /// Run codec decoder: tokens → audio
     ///
     /// Inputs:
     /// - acoustic_tokens: `[1, 8]` A_t
     /// - control_tokens: `[1, 4]` B_t
-    /// - voice_state: `[1, 8]`
+    /// - voice_state: `[1, 12]`
     /// - event_trace_in: `[1, D_EVENT_TRACE]`
     /// - state_in: decoder state
     ///
@@ -358,33 +317,6 @@ impl OrtBundle {
         state_out[..st_len].copy_from_slice(&state.1[..st_len]);
 
         Ok(audio_arr)
-    }
-
-    /// Legacy codec decoder for old processor.rs compatibility.
-    /// Returns audio vec and state vec (allocates).
-    #[deprecated(note = "Use run_codec_decoder with pre-allocated buffers for RT-safe")]
-    pub fn run_codec_decoder_legacy(
-        &mut self,
-        acoustic_tokens: &[i64; N_CODEBOOKS],
-        state_in: &[f32],
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let control_tokens = [0i64; CONTROL_SLOTS];
-        let voice_state = [0.5f32; D_VOICE_STATE];
-        let event_trace_in = vec![0.0f32; D_EVENT_TRACE];
-        let mut event_trace_out = vec![0.0f32; D_EVENT_TRACE];
-        let mut state_out = vec![0.0f32; state_in.len()];
-
-        let audio = self.run_codec_decoder(
-            acoustic_tokens,
-            &control_tokens,
-            &voice_state,
-            &event_trace_in,
-            state_in,
-            &mut event_trace_out,
-            &mut state_out,
-        )?;
-
-        Ok((audio.to_vec(), state_out))
     }
 
     pub fn run_text_encoder(

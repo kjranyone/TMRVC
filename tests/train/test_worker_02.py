@@ -66,7 +66,7 @@ class TestUCLMTrainerV3:
             "target_a": torch.randint(0, 1024, (B, 8, T)),
             "target_b": torch.randint(0, 64, (B, 4, T)),
             "source_a_t": torch.randint(0, 1024, (B, 8, T)),
-            "explicit_state": torch.randn(B, T, 8),
+            "explicit_state": torch.randn(B, T, 12),
             "ssl_state": torch.randn(B, T, 128),
             "speaker_embed": torch.randn(B, 192),
             "speaker_id": torch.zeros(B, dtype=torch.long),
@@ -93,7 +93,7 @@ class TestUCLMTrainerV3:
             "target_a": torch.randint(0, 1024, (B, 8, T)),
             "target_b": torch.randint(0, 64, (B, 4, T)),
             "source_a_t": torch.randint(0, 1024, (B, 8, T)),
-            "explicit_state": torch.ones(B, T, 8), # all ones
+            "explicit_state": torch.ones(B, T, 12), # all ones
             "ssl_state": torch.ones(B, T, 128),
             "speaker_embed": torch.ones(B, 192),
             "speaker_id": torch.zeros(B, dtype=torch.long),
@@ -120,7 +120,7 @@ class TestUCLMTrainerV3:
             "target_a": torch.randint(0, 1024, (B, 8, T)),
             "target_b": torch.randint(0, 64, (B, 4, T)),
             "source_a_t": torch.randint(0, 1024, (B, 8, T)),
-            "explicit_state": torch.randn(B, T, 8),
+            "explicit_state": torch.randn(B, T, 12),
             "ssl_state": torch.randn(B, T, 128),
             "speaker_embed": torch.randn(B, 192),
             "speaker_id": torch.zeros(B, dtype=torch.long),

@@ -37,7 +37,7 @@ def _make_model_inputs(
         "language_ids": torch.zeros(batch_size, phoneme_len, dtype=torch.long),
         "pointer_state": None,
         "speaker_embed": torch.randn(batch_size, 192),
-        "explicit_state": torch.randn(batch_size, target_length, 8),
+        "explicit_state": torch.randn(batch_size, target_length, 12),
         "ssl_state": torch.randn(batch_size, target_length, 128),
         "target_a": torch.zeros(batch_size, 8, target_length, dtype=torch.long),
         "target_b": torch.zeros(batch_size, 4, target_length, dtype=torch.long),
@@ -144,15 +144,15 @@ class TestControlResponsiveness:
             f"model may not be responsive to voice_state changes"
         )
 
-    def test_eight_dim_voice_state_each_produces_movement(self):
-        """Each of the 8 voice_state dimensions should produce directional movement."""
+    def test_twelve_dim_voice_state_each_produces_movement(self):
+        """Each of the 12 voice_state dimensions should produce directional movement."""
         model = DisentangledUCLM()
         model.eval()
 
         base_inputs = _make_model_inputs(target_length=10)
         responsive_dims = 0
 
-        for dim_idx in range(8):
+        for dim_idx in range(12):
             outputs = []
             for level in [-1.0, 1.0]:
                 inputs = {**base_inputs}
@@ -210,7 +210,7 @@ class TestCFGResponsiveness:
             dialogue_context=torch.randn(1, 256),
             acting_intent=torch.randn(1, 64),
             prosody_latent=torch.randn(1, 128),
-            delta_voice_state=torch.randn(1, 10, 8),
+            delta_voice_state=torch.randn(1, 10, 12),
         )
 
         unguided_inputs = {**inputs}

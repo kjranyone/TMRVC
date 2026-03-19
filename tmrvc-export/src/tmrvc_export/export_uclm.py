@@ -69,9 +69,9 @@ class VoiceStateEncExportWrapper(nn.Module):
     Per-frame version: takes single-frame inputs including delta_state.
 
     Inputs:
-        explicit_state: [B, 8] - heuristic voice parameters
+        explicit_state: [B, 12] - heuristic voice parameters (12-D physical controls)
         ssl_state: [B, 128] - WavLM latent style features
-        delta_state: [B, 8] - voice_state_t - voice_state_{t-1}
+        delta_state: [B, 12] - voice_state_t - voice_state_{t-1}
 
     Outputs:
         state_cond: [B, d_model] - fused style condition

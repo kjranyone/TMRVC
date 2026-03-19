@@ -38,15 +38,19 @@ class _MockUCLMCoreModel:
         a_ctx=None,
         b_ctx=None,
         speaker_embed=None,
-        state_cond=None,
+        explicit_state=None,
+        ssl_state=None,
+        delta_voice_state=None,
         cfg_scale=1.0,
         kv_caches=None,
+        f0_condition=None,
         dialogue_context=None,
         acting_intent=None,
         prosody_latent=None,
         prompt_summary_tokens=None,
         # Legacy positional support
         content_features=None,
+        **kwargs,
     ):
         q = queries if queries is not None else content_features
         B = q.shape[0]
@@ -334,7 +338,7 @@ class TestDistilledCFGTrainingLoss:
         phoneme_ids = torch.randint(1, 200, (B, L))
         language_ids = torch.zeros(B, L, dtype=torch.long)
         speaker_embed = torch.randn(B, 192)
-        explicit_state = torch.randn(B, T, 8)
+        explicit_state = torch.randn(B, T, 12)
         ssl_state = torch.randn(B, T, 128)
         target_a = torch.randint(0, 1024, (B, 8, T))
         target_b = torch.randint(0, 64, (B, 4, T))
@@ -352,8 +356,9 @@ class TestDistilledCFGTrainingLoss:
             )
         assert "logits_a" in out
         assert "logits_b" in out
-        assert out["logits_a"].shape == (B, 8, T, 1024)
-        assert out["logits_b"].shape == (B, 4, T, 64)
+        from tmrvc_core.constants import RVQ_VOCAB_SIZE, CONTROL_VOCAB_SIZE
+        assert out["logits_a"].shape == (B, 8, T, RVQ_VOCAB_SIZE)
+        assert out["logits_b"].shape == (B, 4, T, CONTROL_VOCAB_SIZE)
 
     def test_cfg_scale_embed_exists_on_model(self):
         """DisentangledUCLM should have cfg_scale_embed module."""
@@ -415,7 +420,7 @@ class TestTrainerCFGDistillation:
             "target_a": torch.randint(0, 1024, (B, 8, T)),
             "target_b": torch.randint(0, 64, (B, 4, T)),
             "source_a_t": torch.randint(0, 1024, (B, 8, T)),
-            "explicit_state": torch.randn(B, T, 8),
+            "explicit_state": torch.randn(B, T, 12),
             "ssl_state": torch.randn(B, T, 128),
             "speaker_embed": torch.randn(B, 192),
             "speaker_id": torch.zeros(B, dtype=torch.long),

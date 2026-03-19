@@ -68,24 +68,23 @@ def test_collect_tts_supervision_by_dataset_reports_per_dataset(tmp_path: Path):
     ]
     stats = _collect_tts_supervision_by_dataset(utterances)
     assert stats["d1"]["total"] == 2
-    assert stats["d1"]["tts_supervised"] == 1
+    # In v4, tts_supervised was renamed to text_supervised (phoneme_ids.npy only)
+    assert stats["d1"]["text_supervised"] == 2
     assert stats["d2"]["total"] == 1
-    assert stats["d2"]["tts_supervised"] == 0
+    assert stats["d2"]["text_supervised"] == 0
 
 
-def test_collect_tts_supervision_reports_text_and_legacy_separately(tmp_path: Path):
-    """v3 update: _collect_tts_supervision_by_dataset now reports text_supervised
-    and legacy_duration_supervised as separate counters."""
+def test_collect_tts_supervision_reports_text_supervised(tmp_path: Path):
+    """_collect_tts_supervision_by_dataset reports text_supervised counter."""
     d1_u1 = tmp_path / "d1_u1"
     d1_u2 = tmp_path / "d1_u2"
     d1_u3 = tmp_path / "d1_u3"
     for p in (d1_u1, d1_u2, d1_u3):
         p.mkdir(parents=True, exist_ok=True)
 
-    # d1_u1: has phoneme_ids + durations (both text_supervised and legacy_duration)
+    # d1_u1: has phoneme_ids
     (d1_u1 / "phoneme_ids.npy").write_bytes(b"x")
-    (d1_u1 / "durations.npy").write_bytes(b"x")
-    # d1_u2: has phoneme_ids only (text_supervised but NOT legacy_duration)
+    # d1_u2: has phoneme_ids only
     (d1_u2 / "phoneme_ids.npy").write_bytes(b"x")
     # d1_u3: has nothing
 
@@ -99,7 +98,3 @@ def test_collect_tts_supervision_reports_text_and_legacy_separately(tmp_path: Pa
     assert stats["d1"]["total"] == 3
     # text_supervised counts utterances with phoneme_ids.npy
     assert stats["d1"]["text_supervised"] == 2
-    # legacy_duration_supervised counts utterances with both phoneme_ids + durations
-    assert stats["d1"]["legacy_duration_supervised"] == 1
-    # tts_supervised is an alias for legacy_duration_supervised (backward compat)
-    assert stats["d1"]["tts_supervised"] == stats["d1"]["legacy_duration_supervised"]

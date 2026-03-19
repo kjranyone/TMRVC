@@ -28,7 +28,7 @@ class TestMelSpectrogram:
         assert mel.dim() == 3
         assert mel.shape[0] == 1  # batch
         assert mel.shape[1] == N_MELS
-        assert mel.shape[2] == 100
+        assert mel.shape[2] == expected_frames_1s
 
     def test_output_shape_batched(self, synth_waveform):
         mel_fn = MelSpectrogram()
@@ -70,7 +70,7 @@ class TestComputeStft:
         stft = compute_stft(synth_waveform)  # [1, T] → [1, n_freq, T_frames]
         assert stft.shape[0] == 1  # batch
         assert stft.shape[1] == N_FFT // 2 + 1
-        assert stft.shape[2] == 100
+        assert stft.shape[2] == expected_frames_1s
 
     def test_non_negative(self, synth_waveform):
         stft = compute_stft(synth_waveform)

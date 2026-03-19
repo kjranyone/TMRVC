@@ -7,7 +7,7 @@ TMRVC は、`10 ms` 因果クロックで動作する unified codec language mod
 | Component | Section | Key Idea |
 |---|---|---|
 | Pointer Head | 3.4 | `advance/hold` decision per 10 ms frame; no MFA dependency |
-| 8-D Voice State | 3.5 | Physical-first supervision with masks, confidences, and provenance |
+| 12-D Voice State | 3.5 | Physical-first supervision with masks, confidences, and provenance |
 | CFG | v3 Components: CFG-Compatible Conditioning | Condition dropout training + inference guidance scale |
 | Few-Shot Speaker Prompt | v3 Components: Speaker Prompt Encoder | 3-10 s reference -> speaker embed + prompt KV cache |
 | Prosody Predictor | v3 Components: Prosody Predictor | Preferred expressive path; fallback path retained until pointer-core proof closes |
@@ -44,9 +44,9 @@ For plan details, see `plan/worker_01_architecture.md`.
 
 ### 1.5 Physical-First Control
 
-- 話者性と内容を分離した上で、8 次元 voice state と local prosody latent を条件に使う
+- 話者性と内容を分離した上で、12 次元 voice state と local prosody latent を条件に使う
 - 抽象ラベルより、連続的で編集可能な制御量を優先する
-- 8 次元 voice state は UI 上のつまみではなく、data -> export -> train -> runtime を貫く supervision contract として扱う
+- 12 次元 voice state は UI 上のつまみではなく、data -> export -> train -> runtime を貫く supervision contract として扱う
 
 ### 1.6 Release Scope
 
@@ -60,7 +60,7 @@ v3 は以下の 3 層に分けて管理する。
 
 - pointer-based causal TTS
 - shared runtime/schema contract
-- 8-D physical control with masks/confidences/provenance
+- 12-D physical control with masks/confidences/provenance
 - bounded dialogue context
 - few-shot speaker prompting under a reproducible contract
 - prompt-based `SpeakerProfile` contract with no runtime weight mutation
@@ -130,7 +130,7 @@ TTS path:
 
 ### 3.5 Voice State / Prosody
 
-- `explicit_voice_state`: 8 次元の物理パラメータ
+- `explicit_voice_state`: 12 次元の物理パラメータ
 - `ssl_voice_state`: frame-level の潜在状態
 - `local_prosody_latent`: 局所的な間、勢い、語尾処理の自由度
 - timing の一次制御は `pace`, `hold_bias`, `boundary_bias` が担う
@@ -215,9 +215,9 @@ runtime/export の pointer state は離散で serializable である。訓練時
 
 | Tensor | Shape | Description |
 |---|---|---|
-| `voice_state_targets` | `[B, T, 8]` | curated or direct-labeled physical targets |
-| `voice_state_observed_mask` | `[B, T, 8]` | 次元ごとの観測可否。unknown を 0 とみなさないための mask |
-| `voice_state_confidence` | `[B, T, 8]` or `[B, T, 1]` | pseudo-label reliability |
+| `voice_state_targets` | `[B, T, 12]` | curated or direct-labeled physical targets |
+| `voice_state_observed_mask` | `[B, T, 12]` | 次元ごとの観測可否。unknown を 0 とみなさないための mask |
+| `voice_state_confidence` | `[B, T, 12]` or `[B, T, 1]` | pseudo-label reliability |
 | `voice_state_target_source` | serializable enum / record | direct / pseudo-labeled / absent の provenance |
 
 unknown や低信頼な次元は loss から除外し、dense zero で埋めて neutral state と誤解させてはならない。

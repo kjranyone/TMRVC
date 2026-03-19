@@ -1,8 +1,8 @@
-# Worker 04: v4 Serving And Runtime Cutover
+# Track: v4 Serving And Runtime Cutover
 
 ## Scope
 
-Worker 04 owns the serve/export/runtime cutover for `v4`.
+This track owns the serve/export/runtime cutover for `v4`.
 This is not a request to keep extending the current `v3` request surface.
 
 The critical-path `v4` slice is:
@@ -69,7 +69,7 @@ Rules:
 
 ### 3. Persist `v4` trajectory artifacts with optimistic versioning
 
-Worker 04 owns the authoritative persistence layer for trajectory artifacts.
+This track owns the authoritative persistence layer for trajectory artifacts.
 
 Minimum requirements:
 
@@ -109,6 +109,9 @@ Required behavior:
 - parity with the declared runtime contract
 - measurable latency and RTF on the frozen hardware class
 
+With Mimi at 12.5 Hz, each audio frame spans 80 ms. First-token latency target: < 160 ms (2 codec frames).
+Streaming granularity is 80 ms per chunk, not 10 ms. Control telemetry can still be emitted at higher rate.
+
 ### 6. Keep canonical backend speaker enrollment
 
 Serving must provide the authoritative encode/persist behavior used by the UI.
@@ -136,6 +139,23 @@ At minimum, the runtime surface must tolerate:
 - real causal streaming test
 - Python vs ONNX vs Rust input-contract parity test
 
+### 8. Migrate `ContextStylePredictor` from Claude API to open-weight LLM
+
+> See `track_architecture.md` §6 for model selection rationale. This section covers implementation migration only.
+
+The current `context_predictor.py` uses `claude-haiku-4-5-20251001` via Anthropic API.
+This must be replaced with the open-weight Intent Compiler model selected in `track_architecture.md`:
+
+- Primary: `Qwen/Qwen3.5-35B-A3B`
+- Fallback: `Qwen/Qwen3.5-4B`
+
+Required changes:
+
+- replace `anthropic` client with `transformers` or `vllm` backend
+- keep the existing rule-based fallback as a no-GPU safety net
+- ensure compile output is deterministic for a given model + prompt
+- add model version to `IntentCompilerOutput.provenance`
+
 ## Out Of Scope
 
 Do not reopen:
@@ -146,9 +166,10 @@ Do not reopen:
 
 ## Exit Criteria
 
-- the `v4` serve schema is canonical and versioned
-- trajectory compile / replay / patch / transfer routes exist
-- deterministic replay does not recompile prompts
-- real causal streaming exists on the serve path
-- export and Rust runtime consume the same conditioning contract
-- canonical backend enrollment is the only claim-valid path
+- the `v4` serve schema is canonical and versioned (schema version field present and validated)
+- trajectory compile / replay / patch / transfer routes exist and return correct HTTP status codes
+- deterministic replay produces bit-identical output for the same `TrajectoryRecordV4` input (see `docs/design/acceptance-thresholds.md` §V4-7)
+- real causal streaming exists on the serve path and meets thresholds defined in `docs/design/acceptance-thresholds.md` §V4-6
+- export and Rust runtime consume the same conditioning tensor shapes (verified by cross-runtime parity test)
+- canonical backend enrollment is the only claim-valid path (no dummy embedding code paths remain)
+- `ContextStylePredictor` uses open-weight LLM (no Anthropic API dependency in mainline)

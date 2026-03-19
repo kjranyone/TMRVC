@@ -273,6 +273,9 @@ The literature does **not** yet remove the need for TMRVC-specific proof on:
 
 ## Decisions Taken for the Plan
 
+> **Superseded by v4.** The v3.0 decisions below are retained for historical context only.
+> The active mainline decisions are in `docs/design/v4-master-plan.md` and the `track_*` files.
+
 ### Required for v3.0 Mainline
 
 - causal pointer-driven TTS
@@ -302,3 +305,132 @@ The literature does **not** yet remove the need for TMRVC-specific proof on:
   - multi-runtime parity
 
 - Therefore, whenever this plan claims a design is "supported by the literature", that is an informed architectural direction, not a substitute for the repository's parity and evaluation gates.
+
+
+## v4 Research Gaps
+
+The following topics are required for the v4 program but are NOT covered by the v3-era survey above.
+
+### 1. Physical + latent hybrid acting control
+
+v4 decomposes acting conditioning into explicit physical controls (12-D) and acting texture latent (24-D). The v3 survey does not cover:
+
+- residual latent design for capturing non-physical acting qualities
+- disentanglement between physical controls and latent residuals
+- collapse prevention in residual latent paths
+
+Relevant search directions:
+
+- variational information bottleneck for style residuals
+- adversarial disentanglement in multi-axis speech control
+- residual latent regularization in conditional generation
+
+### 2. Biological constraints on speech parameter co-occurrence
+
+v4 introduces low-rank covariance priors and transition regularization. The v3 survey does not cover:
+
+- learned co-occurrence priors for speech physical parameters
+- frame-level transition smoothness constraints under causal operation
+- physically implausible combination detection and penalty
+
+Relevant search directions:
+
+- articulatory constraint modeling in parametric speech synthesis
+- physiologically-informed speech generation priors
+- causal temporal regularization in autoregressive speech models
+
+### 3. Supervision tier-aware training
+
+v4 uses a 4-tier supervision quality classification (A/B/C/D). The v3 survey does not cover:
+
+- confidence-weighted loss for heterogeneous pseudo-label quality
+- curriculum learning strategies for mixed-quality speech data
+- partial-label training in multi-dimensional speech control
+
+Relevant search directions:
+
+- noisy label learning for speech synthesis
+- confidence-based sample weighting in TTS
+- semi-supervised prosody control
+
+### 4. Intent compilation as an explicit intermediate representation
+
+v4 introduces an Intent Compiler that converts natural-language prompts into serializable control artifacts. The v3 survey does not cover:
+
+- explicit intermediate control representations between prompt and acoustic model
+- deterministic replay from compiled intent artifacts
+- LLM-to-physical-control compilation for speech synthesis
+
+Relevant search directions:
+
+- structured generation from LLM for speech control parameters
+- instruction-following TTS with explicit control decomposition
+- deterministic reproducibility in prompt-conditioned generation
+
+### 5. Cross-speaker acting trajectory transfer
+
+v4 treats acting as a transferable trajectory artifact. The v3 survey does not cover:
+
+- speaker-normalized acting trajectory extraction
+- cross-speaker transfer quality metrics
+- trajectory-level (not utterance-level) acting representation
+
+Relevant search directions:
+
+- speaker-independent prosody transfer
+- disentangled style transfer in zero-shot TTS
+- trajectory-level style metrics beyond utterance-global embeddings
+
+### 6. Rich-transcription and inline instruction following for TTS
+
+Fish Audio S2 demonstrates that embedding vocal events and acting directives as inline text tags
+(e.g. `[angry]`, `[whisper]`, `[prolonged laugh]`) in training transcripts enables the TTS model
+to learn text-conditioned acting control without an external LLM at inference time.
+
+v4 adopts this as a complementary conditioning path alongside physical controls and acting latent.
+The v3 survey does not cover:
+
+- rich-transcription ASR that outputs vocal events and speaker behavior tags
+- inline acting instruction following as a learned text-to-audio mapping
+- tag vocabulary design and standardization for TTS training
+
+Relevant search directions:
+
+- rich-transcription / verbalized ASR (vocal event detection in transcripts)
+- instruction-following TTS with inline control tags
+- tag-conditioned speech synthesis
+
+### 7. Reinforcement learning for TTS instruction compliance
+
+Fish Audio S2 uses RL fine-tuning where generated audio is re-transcribed by a rich-transcription ASR,
+and the model is penalized for failing to follow inline instructions or dropping words.
+
+v4 extends this with physical-control compliance rewards unique to the hybrid architecture.
+The v3 survey does not cover:
+
+- RL fine-tuning for instruction-following in speech synthesis
+- re-transcription as a reward signal for TTS compliance
+- multi-objective RL rewards combining instruction following, physical control compliance, and intelligibility
+- stability of physical control editability under RL fine-tuning
+
+Relevant search directions:
+
+- RLHF / RLAIF for speech synthesis
+- reward modeling for controllable TTS
+- multi-objective reinforcement learning for generation quality
+- post-training alignment for speech models
+
+### 8. Neural audio codec selection for LM-based speech synthesis
+
+v4 adopts Mimi (Kyutai, 2024) as the frozen audio codec. The v3 survey did not cover:
+
+- 2024–2026 codec landscape: Mimi, SNAC, WavTokenizer, X-Codec 2, DAC improvements
+- low-frame-rate codecs (12.5–50 Hz) and their impact on LM sequence length
+- semantic/acoustic codebook separation for controllable generation
+- dual-rate architectures: codec tokens at low rate, control at high rate
+
+Relevant search directions:
+
+- neural audio codec benchmarks for TTS/SLM use cases
+- streaming codec design for real-time synthesis
+- multi-rate token prediction in autoregressive speech models

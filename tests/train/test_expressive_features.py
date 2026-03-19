@@ -92,7 +92,7 @@ class TestModelExpressiveInputs:
             language_ids=torch.zeros(B, dtype=torch.long),
             pointer_state=None,
             speaker_embed=torch.randn(B, 192),
-            explicit_state=torch.randn(B, T, 8),
+            explicit_state=torch.randn(B, T, 12),
             ssl_state=torch.randn(B, T, 128),
             target_a=torch.zeros(B, 8, T, dtype=torch.long),
             target_b=torch.zeros(B, 4, T, dtype=torch.long),
@@ -110,7 +110,7 @@ class TestModelExpressiveInputs:
             language_ids=torch.zeros(B, dtype=torch.long),
             pointer_state=None,
             speaker_embed=torch.randn(B, 192),
-            explicit_state=torch.randn(B, T, 8),
+            explicit_state=torch.randn(B, T, 12),
             ssl_state=torch.randn(B, T, 128),
             target_a=torch.zeros(B, 8, T, dtype=torch.long),
             target_b=torch.zeros(B, 4, T, dtype=torch.long),
@@ -130,7 +130,8 @@ class TestModelExpressiveInputs:
             a_ctx=torch.zeros(B, 8, 1, dtype=torch.long),
             b_ctx=torch.zeros(B, 4, 1, dtype=torch.long),
             speaker_embed=torch.randn(B, 192),
-            state_cond=torch.randn(B, 1, 256),
+            explicit_state=torch.randn(B, 1, 12),
+            ssl_state=torch.randn(B, 1, 128),
             dialogue_context=torch.randn(B, 256),
             acting_intent=torch.randn(B, 64),
         )
@@ -227,30 +228,30 @@ class TestContextDiversityLoss:
 
 class TestSchemaActingFields:
     def test_tts_request_phrase_pressure_default(self):
-        from tmrvc_serve.schemas import TTSRequest
-        req = TTSRequest(text="hello", character_id="test")
-        assert req.phrase_pressure == 0.0
+        from tmrvc_serve.schemas import PacingControlsSchema
+        pacing = PacingControlsSchema()
+        assert pacing.phrase_pressure == 0.0
 
     def test_tts_request_breath_tendency_default(self):
-        from tmrvc_serve.schemas import TTSRequest
-        req = TTSRequest(text="hello", character_id="test")
-        assert req.breath_tendency == 0.0
+        from tmrvc_serve.schemas import PacingControlsSchema
+        pacing = PacingControlsSchema()
+        assert pacing.breath_tendency == 0.0
 
     def test_tts_request_phrase_pressure_range(self):
-        from tmrvc_serve.schemas import TTSRequest
-        req = TTSRequest(text="hello", character_id="test", phrase_pressure=0.5)
-        assert req.phrase_pressure == 0.5
+        from tmrvc_serve.schemas import PacingControlsSchema
+        pacing = PacingControlsSchema(phrase_pressure=0.5)
+        assert pacing.phrase_pressure == 0.5
         with pytest.raises(Exception):
-            TTSRequest(text="hello", character_id="test", phrase_pressure=2.0)
+            PacingControlsSchema(phrase_pressure=2.0)
 
-    def test_tts_stream_request_acting_fields(self):
-        from tmrvc_serve.schemas import TTSStreamRequest
-        req = TTSStreamRequest(
-            text="hello", character_id="test",
-            phrase_pressure=0.3, breath_tendency=-0.5,
+    def test_tts_advanced_request_pacing_fields(self):
+        from tmrvc_serve.schemas import TTSRequestAdvanced
+        req = TTSRequestAdvanced(
+            text="hello",
+            pacing={"phrase_pressure": 0.3, "breath_tendency": -0.5},
         )
-        assert req.phrase_pressure == 0.3
-        assert req.breath_tendency == -0.5
+        assert req.pacing.phrase_pressure == 0.3
+        assert req.pacing.breath_tendency == -0.5
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ def _build_basic_cache(
         utt_dir = cache / "ds1" / "train" / "spk0" / f"utt{i}"
         utt_dir.mkdir(parents=True, exist_ok=True)
         np.save(utt_dir / "codec_tokens.npy", np.random.randint(0, 1024, (8, T)))
-        np.save(utt_dir / "explicit_state.npy", np.random.randn(T, 8).astype(np.float32))
+        np.save(utt_dir / "explicit_state.npy", np.random.randn(T, 12).astype(np.float32))
         np.save(utt_dir / "ssl_state.npy", np.random.randn(T, 128).astype(np.float32))
         np.save(utt_dir / "spk_embed.npy", np.random.randn(192).astype(np.float32))
         text = "hello" if same_text else f"text{i}"

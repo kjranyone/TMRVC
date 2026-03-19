@@ -305,7 +305,7 @@ class TestVoiceStateExport:
         vs_path = tmp_path / "rec_vs_001" / "voice_state.npy"
         assert vs_path.exists()
         arr = np.load(vs_path)
-        assert arr.shape == (100, 8)
+        assert arr.shape == (100, VOICE_STATE_NDIM)
         assert arr.dtype == np.float32
 
     def test_voice_state_mask_exported(self, tmp_path):
@@ -316,7 +316,7 @@ class TestVoiceStateExport:
         mask_path = tmp_path / "rec_vs_001" / "voice_state_observed_mask.npy"
         assert mask_path.exists()
         arr = np.load(mask_path)
-        assert arr.shape == (100, 8)
+        assert arr.shape == (100, VOICE_STATE_NDIM)
         assert arr.dtype == bool
 
     def test_voice_state_confidence_exported(self, tmp_path):
@@ -327,7 +327,7 @@ class TestVoiceStateExport:
         conf_path = tmp_path / "rec_vs_001" / "voice_state_confidence.npy"
         assert conf_path.exists()
         arr = np.load(conf_path)
-        assert arr.shape == (100, 8)
+        assert arr.shape == (100, VOICE_STATE_NDIM)
         assert arr.dtype == np.float32
 
     def test_voice_state_meta_json_exported(self, tmp_path):
@@ -686,7 +686,7 @@ class TestProvenanceGuardrails:
         record = _make_record(
             record_id="rec_partial_vs",
             attributes={
-                "voice_state": np.zeros((50, 8), dtype=np.float32),
+                "voice_state": np.zeros((50, VOICE_STATE_NDIM), dtype=np.float32),
                 "voice_state_meta": {
                     "has_voice_state": True,
                     "has_observed_mask": False,

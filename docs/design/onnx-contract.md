@@ -136,8 +136,8 @@ Inputs:
 | `ctx_b` | `[1, 4, K]` | `int64` | control history |
 | `speaker_embed` | `[1, d_speaker]` | `float32` | target speaker embedding |
 | `prompt_kv_cache` | implementation-defined | `float32` | few-shot prompt cache |
-| `explicit_voice_state` | `[1, 1, 8]` | `float32` | current 8-D physical control |
-| `delta_voice_state` | `[1, 1, 8]` | `float32` | frame-to-frame physical delta |
+| `explicit_voice_state` | `[1, 1, 12]` | `float32` | current 12-D physical control |
+| `delta_voice_state` | `[1, 1, 12]` | `float32` | frame-to-frame physical delta |
 | `ssl_voice_state` | `[1, 1, d_ssl]` | `float32` | optional SSL-derived state evidence |
 | `dialogue_context` | `[1, C_ctx, d_model]` or `[1, d_model]` | `float32` | bounded multi-turn text context |
 | `acting_intent` | `[1, d_act]` | `float32` | utterance-level acting intent |
@@ -174,7 +174,7 @@ Inputs:
 |---|---|---|
 | `acoustic_tokens` | `[1, 8]` | `int64` |
 | `control_tokens` | `[1, 4]` | `int64` |
-| `explicit_voice_state` | `[1, 1, 8]` | `float32` |
+| `explicit_voice_state` | `[1, 1, 12]` | `float32` |
 | `decoder_state_in` | implementation-defined | `float32` |
 
 Outputs:

@@ -196,8 +196,8 @@ def forward_tts_pointer(
     pointer_state: PointerState | None,# streaming 推論用 pointer state
     acoustic_history: torch.Tensor,    # [B, n_codebooks, T_hist] or embedded equivalent
     speaker_embed: torch.Tensor,       # [B, d_speaker]
-    explicit_voice_state: torch.Tensor | None = None,   # [B, T, 8] or [B, 8]
-    delta_voice_state: torch.Tensor | None = None,      # [B, T, 8] or [B, 8]
+    explicit_voice_state: torch.Tensor | None = None,   # [B, T, 12] or [B, 12]
+    delta_voice_state: torch.Tensor | None = None,      # [B, T, 12] or [B, 12]
     ssl_voice_state: torch.Tensor | None = None,        # [B, T, d_ssl]
     target_b: torch.Tensor | None = None,               # teacher forcing only
     target_length: int | None = None,                   # training/eval only
@@ -281,7 +281,7 @@ speaker prompt は timbre のみを提供する。韻律は以下から独立に
 
 - `ProsodyPredictor`: テキストとコンテキストから予測
 - `dialogue_context` / `acting_intent`: DialogueContextProjector 経由で conditioning
-- `explicit_voice_state`: 8 次元の物理パラメータによる直接制御
+- `explicit_voice_state`: 12 次元の物理パラメータによる直接制御
 
 この分離により、同一話者で異なる感情・演技スタイルの音声を生成できる。
 

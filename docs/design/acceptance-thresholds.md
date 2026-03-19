@@ -1,9 +1,157 @@
-# v3 Acceptance Thresholds
+# Acceptance Thresholds
 
-This document defines the explicit release gates for UCLM v3.
-These gates must stay consistent with `plan/worker_06_validation.md`.
+This document defines the explicit release gates for UCLM.
 If a threshold changes here, the validation plan and benchmark scripts must be
 updated in the same change.
+
+---
+
+# v4 Acceptance Thresholds
+
+These gates must stay consistent with `plan/track_validation.md` and `plan/track_training.md`.
+All `v4` track files reference this section as the single source of truth for numeric thresholds.
+
+Threshold ownership follows a tiered freeze policy:
+
+- `Tier 0`: must freeze before v4 dataset contract freeze
+- `Tier 1`: may be estimated from pilot runs, must freeze before v4 checkpoint training
+- `Tier 2`: protocol freezes early, final numeric cutoffs freeze before release sign-off
+
+---
+
+## V4-1. Physical Control Responsiveness
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Physical control response monotonicity | > 0.8 correlation | 1 | Sweep each of the 12-D controls independently, measure output feature correlation |
+| Physical calibration error | < 0.15 RMSE | 1 | Compare realized physical features against explicit physical targets on held-out set |
+
+**Pass condition:** All 12-D physical controls show monotonic response and calibration within budget.
+
+---
+
+## V4-2. Acting Latent Health
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Acting latent utilization | > 0.1 | 1 | Measure residual latent variance usage vs total acting variance |
+| Disentanglement: latent does not duplicate physical | Qualitative + ablation | 1 | Remove latent path, measure physical-only reconstruction gap |
+
+**Pass condition:** Latent path is measurably used and captures non-physical acting residue.
+
+---
+
+## V4-3. Supervision Tier Weighting
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Tier D loss contribution | < 10% of total loss | 0 | Log per-tier loss fraction during training |
+| Low-confidence pseudo-label masking | Active | 0 | Verify mask/downweight code path in trainer |
+
+**Pass condition:** Low-quality supervision does not dominate training signal.
+
+---
+
+## V4-4. Biological Constraint Regularization
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Implausible combination reduction | > 50% vs unconstrained baseline | 1 | Compare violation count with and without biological regularization on held-out set |
+| Non-zero gradients | All constraint terms produce non-zero gradients | 0 | Smoke test gradient check |
+
+**Pass condition:** Biological priors produce measurable reduction in implausible outputs.
+
+---
+
+## V4-5. Cross-Runtime Parity
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Python vs ONNX parity | < 1e-4 max abs diff | 0 | Paired output comparison on frozen inputs |
+| Python vs Rust parity | < 1e-4 max abs diff | 0 | Paired output comparison on frozen inputs |
+| Batch vs streaming numerical parity | < 1e-4 max abs diff | 0 | Paired output comparison on frozen inputs |
+| Physical-control ordering parity | Identical | 0 | Cross-runtime shape and order assertion |
+| Acting-latent ordering parity | Identical | 0 | Cross-runtime shape and order assertion |
+
+**Pass condition:** All runtime paths produce numerically identical results within tolerance.
+
+---
+
+## V4-6. Serve-Path Streaming
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| First-token latency | < 500 ms | 1 | Streaming endpoint measurement on target GPU class |
+| Real-time factor (RTF) | < 1.0 | 1 | End-to-end RTF measurement on target GPU class |
+
+**Pass condition:** Real causal streaming meets latency budget on the frozen hardware class.
+
+---
+
+## V4-7. Replay And Transfer Fidelity
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Deterministic replay fidelity | Bit-identical output for same TrajectoryRecordV4 | 0 | Automated replay comparison |
+| Edit locality | TBD (freeze before release sign-off) | 2 | Measure change outside patched region |
+| Cross-speaker transfer quality | TBD (freeze before release sign-off) | 2 | A/B evaluation on transferred vs fresh compile |
+
+**Pass condition:** Replay is deterministic; edit and transfer quality meet frozen thresholds.
+
+---
+
+## V4-8. RL Fine-Tuning Safety
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Instruction-following improvement | > 20% relative vs supervised-only baseline | 1 | Tag compliance rate before and after RL |
+| Physical control monotonicity after RL | > 0.8 | 1 | Same protocol as V4-1 after RL phase |
+| Plain-text naturalness degradation | < 5% | 1 | Held-out no-tag TTS quality comparison |
+
+**Pass condition:** RL improves instruction following without degrading physical editability or plain-text quality.
+
+---
+
+## V4-9. Fish S2 Head-To-Head
+
+| Gate | Threshold | Tier | Method |
+|------|-----------|------|--------|
+| Acting editability win | Required for any "beats Fish S2" claim | 2 | Frozen evaluation bundle |
+| Trajectory replay fidelity win | Required for any "beats Fish S2" claim | 2 | Frozen evaluation bundle |
+| Edit locality win | Required for any "beats Fish S2" claim | 2 | Frozen evaluation bundle |
+| First-take naturalness guardrail | No clear loss | 2 | Blind A/B preference test |
+| Few-shot speaker similarity guardrail | No clear loss | 2 | Frozen speaker similarity protocol |
+| Latency class disclosure | Required | 0 | Report hardware class and RTF |
+
+**Pass condition:** Claim is scoped to axes where TMRVC wins; guardrail axes show no clear deficit.
+
+---
+
+## V4 Summary Checklist
+
+| # | Criterion | Status |
+|---|-----------|--------|
+| V4-1 | Physical control responsiveness | [ ] |
+| V4-2 | Acting latent health | [ ] |
+| V4-3 | Supervision tier weighting | [ ] |
+| V4-4 | Biological constraint regularization | [ ] |
+| V4-5 | Cross-runtime parity | [ ] |
+| V4-6 | Serve-path streaming | [ ] |
+| V4-7 | Replay and transfer fidelity | [ ] |
+| V4-8 | RL fine-tuning safety | [ ] |
+| V4-9 | Fish S2 head-to-head | [ ] |
+
+All v4 criteria must pass before the v4 release candidate is promoted.
+
+---
+---
+
+# v3 Acceptance Thresholds (Historical)
+
+> **Superseded by v4.** Retained for reference only.
+
+The gates below were defined for the UCLM v3 release.
+These gates were consistent with the former `plan/worker_06_validation.md`.
 
 Threshold ownership follows a tiered freeze policy:
 
@@ -212,3 +360,58 @@ pointer update, `uclm_core`, and the active waveform decoder used in the real-ti
 | 12 | Human evaluation QC | [ ] |
 
 All criteria must pass before the v3 release candidate is promoted.
+
+---
+
+## v4 Bootstrap Quality Thresholds
+
+> **Status: FROZEN** (2026-03-17)
+>
+> These thresholds gate the acceptance of v4 bootstrap-generated training data.
+> They correspond to the seven quality metrics computed by
+> `tmrvc_data.bootstrap.quality_gates` (Phase 1-9) and are enforced by
+> `tests/test_bootstrap_quality.py`.
+>
+> Changes to any threshold below require simultaneous updates to
+> `tmrvc_data/bootstrap/quality_gates.py`, `tests/test_bootstrap_quality.py`,
+> and this document.
+
+| # | Metric | Threshold | Direction | Method |
+|---|--------|-----------|-----------|--------|
+| B1 | `diarization_purity` | >= 0.85 | higher is better | NMI / purity score on labeled diarization subset |
+| B2 | `speaker_cluster_consistency` | >= 0.80 | higher is better | Cross-file cluster agreement on known-speaker subset |
+| B3 | `overlap_rejection_precision` | >= 0.90 | higher is better | Precision on annotated overlap segments |
+| B4 | `transcript_wer` | <= 0.15 | lower is better | WER on audited transcript subset (Whisper re-transcription) |
+| B5 | `physical_label_coverage` | >= 0.70 | higher is better | Fraction of (utterance, dimension) pairs with `observed_mask=True` |
+| B6 | `physical_confidence_calibration_error` | <= 0.20 | lower is better | ECE between reported confidence and actual error quantile |
+| B7 | `language_coverage` | all target languages >= 100 utterances | per-language floor | Bootstrap corpus inventory count per language |
+
+### Pass Condition
+
+All seven thresholds must be met on the bootstrap corpus before the
+resulting `v4_cache/` is eligible for supervised training.  A corpus
+that fails any single gate is quarantined until the offending stage is
+re-run or the corpus is excluded.
+
+### Tier Interaction
+
+Bootstrap quality gates are orthogonal to per-utterance supervision
+tiers (A/B/C/D).  A corpus can pass all seven gates while still
+containing individual Tier-D utterances; those utterances receive
+reduced loss weight during training (see Phase 3-1).
+
+---
+
+## Summary Checklist (v4 addendum)
+
+| # | Criterion | Status |
+|---|-----------|--------|
+| B1 | Diarization purity | [ ] |
+| B2 | Speaker cluster consistency | [ ] |
+| B3 | Overlap rejection precision | [ ] |
+| B4 | Transcript WER | [ ] |
+| B5 | Physical label coverage | [ ] |
+| B6 | Physical confidence calibration error | [ ] |
+| B7 | Language coverage | [ ] |
+
+All seven bootstrap gates must pass before v4 training data is accepted.

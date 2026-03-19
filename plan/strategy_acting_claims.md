@@ -42,7 +42,7 @@ The main UI artifact must be the compiled or replayed trajectory, not only a pro
 
 ### 5. Replay / locality / transfer evidence
 
-The claim is blocked until Worker 06 reports:
+The claim is blocked until track_validation reports:
 
 - replay fidelity
 - edit locality
@@ -50,7 +50,7 @@ The claim is blocked until Worker 06 reports:
 
 ### 6. Runtime-class claim discipline
 
-- Python serve may carry the full drama-grade claim once validated
+- Python serve may carry the full drama-grade claim once `track_validation` exit criteria are met
 - Rust / ONNX / VST paths may claim parity and latency only until they pass the same `v4` artifact-aware validation
 
 ## Allowed Claims Before Closure

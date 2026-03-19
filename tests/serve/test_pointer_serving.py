@@ -1,4 +1,4 @@
-"""Tests for UCLM v3 pointer-based TTS serving.
+"""Tests for UCLM pointer-based TTS serving.
 
 Covers:
 a) PointerInferenceState creation and .finished property
@@ -227,24 +227,10 @@ class TestEngineTtsMode:
         engine = UCLMEngine()
         assert engine.tts_mode == "pointer"
 
-    def test_engine_tts_mode_legacy_raises(self):
-        """Legacy duration mode should raise NotImplementedError."""
-        engine = UCLMEngine(tts_mode="legacy_duration")
-        assert engine.tts_mode == "legacy_duration"
-
-        import torch
-        from tmrvc_core.dialogue_types import StyleParams
-
-        with pytest.raises(NotImplementedError, match="Legacy duration-based TTS"):
-            engine.tts(
-                phonemes=torch.zeros(1, 5, dtype=torch.long),
-                speaker_embed=torch.zeros(1, 192),
-                style=StyleParams.neutral(),
-            )
 
 
 # ---------------------------------------------------------------------------
-# g) PointerInferenceState stall_frames and max_stall (v3)
+# g) PointerInferenceState stall_frames and max_stall
 # ---------------------------------------------------------------------------
 
 
@@ -278,11 +264,11 @@ class TestPointerStateStallFields:
 
 
 # ---------------------------------------------------------------------------
-# h) TTSRequest new v3 fields
+# h) TTSRequest fields
 # ---------------------------------------------------------------------------
 
 
-class TestTTSRequestV3Fields:
+class TestTTSRequestFields:
     def test_reference_audio_base64_default_none(self):
         """reference_audio_base64 should default to None."""
         req = TTSRequest(text="hello", character_id="test")
@@ -308,14 +294,14 @@ class TestTTSRequestV3Fields:
         req = TTSRequest(text="hello", character_id="test")
         assert req.explicit_voice_state is None
 
-    def test_explicit_voice_state_accepts_8d(self):
-        """explicit_voice_state should accept an 8-dimensional vector."""
-        vs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    def test_explicit_voice_state_accepts_12d(self):
+        """explicit_voice_state should accept a 12-dimensional vector."""
+        vs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.1, 0.2, 0.3, 0.4]
         req = TTSRequest(text="hello", character_id="test", explicit_voice_state=vs)
         assert req.explicit_voice_state == vs
 
     def test_explicit_voice_state_rejects_wrong_length(self):
-        """explicit_voice_state must be exactly 8 elements."""
+        """explicit_voice_state must be exactly 12 elements."""
         with pytest.raises(Exception):
             TTSRequest(text="hello", character_id="test", explicit_voice_state=[0.1, 0.2])
 
@@ -324,24 +310,24 @@ class TestTTSRequestV3Fields:
         req = TTSRequest(text="hello", character_id="test")
         assert req.delta_voice_state is None
 
-    def test_delta_voice_state_accepts_8d(self):
-        """delta_voice_state should accept an 8-dimensional vector."""
-        dvs = [0.0] * 8
+    def test_delta_voice_state_accepts_12d(self):
+        """delta_voice_state should accept a 12-dimensional vector."""
+        dvs = [0.0] * 12
         req = TTSRequest(text="hello", character_id="test", delta_voice_state=dvs)
         assert req.delta_voice_state == dvs
 
     def test_delta_voice_state_rejects_wrong_length(self):
-        """delta_voice_state must be exactly 8 elements."""
+        """delta_voice_state must be exactly 12 elements."""
         with pytest.raises(Exception):
             TTSRequest(text="hello", character_id="test", delta_voice_state=[0.1] * 3)
 
 
 # ---------------------------------------------------------------------------
-# i) TTSStreamRequest same new v3 fields
+# i) TTSStreamRequest fields
 # ---------------------------------------------------------------------------
 
 
-class TestTTSStreamRequestV3Fields:
+class TestTTSStreamRequestFields:
     def test_reference_audio_base64(self):
         req = TTSStreamRequest(text="hi", character_id="c", reference_audio_base64="abc")
         assert req.reference_audio_base64 == "abc"
@@ -351,12 +337,12 @@ class TestTTSStreamRequestV3Fields:
         assert req.reference_text == "ref text"
 
     def test_explicit_voice_state(self):
-        vs = [0.0] * 8
+        vs = [0.0] * 12
         req = TTSStreamRequest(text="hi", character_id="c", explicit_voice_state=vs)
         assert req.explicit_voice_state == vs
 
     def test_delta_voice_state(self):
-        dvs = [0.1] * 8
+        dvs = [0.1] * 12
         req = TTSStreamRequest(text="hi", character_id="c", delta_voice_state=dvs)
         assert req.delta_voice_state == dvs
 

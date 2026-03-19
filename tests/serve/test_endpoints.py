@@ -66,7 +66,8 @@ def test_tts_import_integrity(client, monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert "audio_base64" in data
-    assert data["style_used"]["emotion"] == "happy"
+    assert "provenance" in data
+    assert "rtf" in data
 
 def test_character_list(client):
     """Verify characters endpoint works."""

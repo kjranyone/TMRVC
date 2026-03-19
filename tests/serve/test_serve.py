@@ -35,23 +35,39 @@ class TestUCLMEngineLogic:
 
     def test_vc_frame_processing(self, monkeypatch):
         engine = UCLMEngine(device="cpu")
+
+        class _MockUCLMCoreModelVC:
+            def forward_streaming(self, queries=None, memory=None, a_ctx=None, b_ctx=None,
+                                  speaker_embed=None, explicit_state=None, ssl_state=None,
+                                  delta_voice_state=None, cfg_scale=1.0, kv_caches=None,
+                                  f0_condition=None, dialogue_context=None, acting_intent=None,
+                                  prosody_latent=None, prompt_summary_tokens=None,
+                                  content_features=None, **kwargs):
+                q = queries if queries is not None else content_features
+                B = q.shape[0]
+                return {
+                    "logits_a": torch.zeros(B, 8, 1, 1024),
+                    "logits_b": torch.zeros(B, 4, 1, 64),
+                    "kv_cache_out": kv_caches,
+                    "hidden_states": torch.zeros(B, 1, 512),
+                }
+
         # Mock sub-components
         engine.codec_enc = torch.nn.Module()
         engine.vc_enc = torch.nn.Module()
         engine.voice_state_enc = torch.nn.Module()
         engine.uclm_core = torch.nn.Module()
+        engine.uclm_core_model = _MockUCLMCoreModelVC()
         engine.codec_dec = torch.nn.Module()
 
         def mock_enc(audio, states): return torch.zeros(1, 8, 1), None, states
         def mock_vc(tokens): return torch.zeros(1, 512, 1), None
         def mock_vstate(v, s): return (torch.zeros(1, 1, 512),)
-        def mock_uclm(c, ctx_a, ctx_b, spk, st, cfg, kv, f0_condition=None, **kwargs): return torch.zeros(1, 8, 1, 1024), torch.zeros(1, 4, 1, 64), kv, torch.zeros(1, 1, 512)
         def mock_dec(a, b, v, s): return torch.zeros(1, 1, 240), s
 
         engine.codec_enc.forward = mock_enc
         engine.vc_enc.forward = mock_vc
         engine.voice_state_enc.forward = mock_vstate
-        engine.uclm_core.forward = mock_uclm
         engine.codec_dec.forward = mock_dec
         engine._loaded = True
 
@@ -80,7 +96,7 @@ class TestUCLMEngineLogic:
         class _MockUCLMCoreModel:
             text_encoder = _MockTextEncoder()
 
-            def forward_streaming(self, queries=None, memory=None, a_ctx=None, b_ctx=None, speaker_embed=None, state_cond=None, cfg_scale=1.0, kv_caches=None, dialogue_context=None, acting_intent=None, prosody_latent=None, prompt_summary_tokens=None, content_features=None):
+            def forward_streaming(self, queries=None, memory=None, a_ctx=None, b_ctx=None, speaker_embed=None, explicit_state=None, ssl_state=None, delta_voice_state=None, cfg_scale=1.0, kv_caches=None, f0_condition=None, dialogue_context=None, acting_intent=None, prosody_latent=None, prompt_summary_tokens=None, content_features=None, **kwargs):
                 q = queries if queries is not None else content_features
                 B = q.shape[0]
                 return {

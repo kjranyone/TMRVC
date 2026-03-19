@@ -396,10 +396,15 @@ class TestFrameConvention:
         assert yaml_constants["sample_rate"] == 24000
 
     def test_hop_length(self, yaml_constants):
+        """Mel frontend hop_length = 240 (10ms @ 24kHz)."""
         assert yaml_constants["hop_length"] == 240
 
+    def test_codec_hop_length(self, yaml_constants):
+        """EnCodec hop_length = 320 (75 Hz @ 24kHz)."""
+        assert yaml_constants["codec_hop_length"] == 320
+
     def test_frame_duration_is_10ms(self, yaml_constants):
-        """10 ms frame step = sample_rate * 0.01 = hop_length."""
+        """Mel frontend: 10 ms frame step = sample_rate * 0.01 = hop_length."""
         expected_hop = int(yaml_constants["sample_rate"] * 0.01)
         assert yaml_constants["hop_length"] == expected_hop
 
@@ -430,21 +435,16 @@ class TestPhonemeVocabCapacity:
 
 
 class TestVoiceStateDimensionality:
-    """voice_state must be 8-D everywhere."""
+    """voice_state must be 12-D everywhere."""
 
     def test_yaml_value(self, yaml_constants):
-        assert yaml_constants["d_voice_state"] == 8
+        assert yaml_constants["d_voice_state"] == 12
 
     def test_explicit_equals_total(self, yaml_constants):
         assert yaml_constants["d_voice_state_explicit"] == yaml_constants["d_voice_state"]
 
     def test_serve_schema(self):
-        from tmrvc_serve.schemas import TTSRequest
+        from tmrvc_serve.schemas import PhysicalControls
 
-        field = TTSRequest.model_fields["explicit_voice_state"]
-        # Pydantic metadata includes min_length/max_length
-        for meta in field.metadata:
-            if hasattr(meta, "min_length"):
-                assert meta.min_length == 8
-            if hasattr(meta, "max_length"):
-                assert meta.max_length == 8
+        pc = PhysicalControls()
+        assert len(pc.to_list()) == 12

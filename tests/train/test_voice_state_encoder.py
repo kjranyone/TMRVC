@@ -41,16 +41,16 @@ class TestGradientReversal:
 class TestVoiceStateEncoder:
     def test_forward_shape_3d(self):
         encoder = VoiceStateEncoder(
-            d_voice_state_explicit=8,
+            d_voice_state_explicit=12,
             d_voice_state_ssl=128,
-            d_voice_state_delta=8,
+            d_voice_state_delta=12,
             d_model=512,
         )
 
         B, T = 2, 10
-        explicit = torch.randn(B, T, 8)
+        explicit = torch.randn(B, T, 12)
         ssl = torch.randn(B, T, 128)
-        delta = torch.randn(B, T, 8)
+        delta = torch.randn(B, T, 12)
 
         state_cond, adv_logits = encoder(explicit, ssl, delta)
 
@@ -61,9 +61,9 @@ class TestVoiceStateEncoder:
         encoder = VoiceStateEncoder(d_model=512)
 
         B = 2
-        explicit = torch.randn(B, 8)
+        explicit = torch.randn(B, 12)
         ssl = torch.randn(B, 128)
-        delta = torch.randn(B, 8)
+        delta = torch.randn(B, 12)
 
         state_cond, adv_logits = encoder(explicit, ssl, delta)
 
@@ -79,9 +79,9 @@ class TestVoiceStateEncoder:
         )
 
         B, T = 2, 10
-        explicit = torch.randn(B, T, 8)
+        explicit = torch.randn(B, T, 12)
         ssl = torch.randn(B, T, 128)
-        delta = torch.randn(B, T, 8)
+        delta = torch.randn(B, T, 12)
 
         state_cond, adv_logits = encoder(explicit, ssl, delta)
 
@@ -98,9 +98,9 @@ class TestVoiceStateEncoder:
         )
 
         B, T = 2, 10
-        explicit = torch.randn(B, T, 8)
+        explicit = torch.randn(B, T, 12)
         ssl = torch.randn(B, T, 128)
-        delta = torch.randn(B, T, 8)
+        delta = torch.randn(B, T, 12)
 
         state_cond, adv_logits = encoder(explicit, ssl, delta)
 
@@ -110,16 +110,16 @@ class TestVoiceStateEncoder:
 class TestVoiceStateEncoderForStreaming:
     def test_forward_shape(self):
         encoder = VoiceStateEncoderForStreaming(
-            d_voice_state_explicit=8,
+            d_voice_state_explicit=12,
             d_voice_state_ssl=128,
-            d_voice_state_delta=8,
+            d_voice_state_delta=12,
             d_model=512,
         )
 
         B = 2
-        explicit = torch.randn(B, 8)
+        explicit = torch.randn(B, 12)
         ssl = torch.randn(B, 128)
-        delta = torch.randn(B, 8)
+        delta = torch.randn(B, 12)
 
         out = encoder(explicit, ssl, delta)
 
@@ -128,9 +128,9 @@ class TestVoiceStateEncoderForStreaming:
     def test_single_frame(self):
         encoder = VoiceStateEncoderForStreaming(d_model=512)
 
-        explicit = torch.randn(1, 8)
+        explicit = torch.randn(1, 12)
         ssl = torch.randn(1, 128)
-        delta = torch.randn(1, 8)
+        delta = torch.randn(1, 12)
 
         out = encoder(explicit, ssl, delta)
 
@@ -140,9 +140,9 @@ class TestVoiceStateEncoderForStreaming:
         # Streaming encoder should not have temporal_conv
         encoder = VoiceStateEncoderForStreaming(d_model=512)
         # Check that forward works without temporal dimension
-        explicit = torch.randn(2, 8)
+        explicit = torch.randn(2, 12)
         ssl = torch.randn(2, 128)
-        delta = torch.randn(2, 8)
+        delta = torch.randn(2, 12)
 
         out = encoder(explicit, ssl, delta)
         assert out.shape == (2, 512)
@@ -170,9 +170,9 @@ class TestCreateVoiceStateEncoder:
         assert isinstance(encoder, VoiceStateEncoder)
 
         B, T = 1, 5
-        explicit = torch.randn(B, T, 8)
+        explicit = torch.randn(B, T, 12)
         ssl = torch.randn(B, T, 128)
-        delta = torch.randn(B, T, 8)
+        delta = torch.randn(B, T, 12)
 
         state_cond, adv_logits = encoder(explicit, ssl, delta)
         assert adv_logits is not None
@@ -185,13 +185,13 @@ class TestIntegration:
         B, T = 2, 100
 
         # Explicit voice state (breathiness, tension, etc.)
-        explicit = torch.randn(B, T, 8)
+        explicit = torch.randn(B, T, 12)
 
         # SSL state from WavLM
         ssl = torch.randn(B, T, 128)
 
         # Delta state (change from previous frame)
-        delta = torch.randn(B, T, 8)
+        delta = torch.randn(B, T, 12)
 
         # Create encoder
         encoder = VoiceStateEncoder(d_model=512)

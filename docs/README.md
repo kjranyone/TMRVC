@@ -33,6 +33,14 @@ Updated: 2026-03-08
 | `design/auth-spec.md` | auth / audit / optimistic locking 契約 |
 | `training/README.md` | 学習文書の入口 |
 
+## 設計決定・参照
+
+| File | 役割 |
+|---|---|
+| `design/decision-model-scale.md` | 248M モデル規模の決定記録 |
+| `design/arxiv-survey.md` | arXiv 音声合成サーベイ (2026-03-07) |
+| `design/v4-master-plan.md` | v4 マスタープラン |
+
 ## 実装計画
 
 現行の active backlog は `plan/` が正本です。
@@ -40,13 +48,16 @@ Updated: 2026-03-08
 | File | 役割 |
 |---|---|
 | `../plan/README.md` | 全体計画と依存関係 |
-| `../plan/worker_01_architecture.md` | モデル設計 |
-| `../plan/worker_04_serving.md` | serving / runtime |
-| `../plan/worker_06_validation.md` | validation / acceptance |
-| `../plan/worker_12_gradio_control_plane.md` | Gradio/WebUI control plane |
-| `../plan/dramatic_acting_requirements.md` | drama-grade acting requirement |
-| `../plan/fish_audio_s2_competitive_strategy.md` | 競争戦略 |
-| `../plan/repo_remaining_inventory_2026_03.md` | repo 全体の pending-only inventory |
+| `../plan/track_architecture.md` | v4 スキーマ・契約 |
+| `../plan/track_data_bootstrap.md` | raw-audio ブートストラップ |
+| `../plan/track_training.md` | v4 訓練パイプライン |
+| `../plan/track_serving.md` | v4 サービング・ランタイム |
+| `../plan/track_validation.md` | v4 検証ゲート |
+| `../plan/track_gui.md` | v4 GUI 刷新 |
+| `../plan/track_codec_strategy.md` | コーデック選定 |
+| `../plan/track_workflow.md` | ブートストラップワークフロー |
+| `../plan/strategy_competitive.md` | Fish S2 対抗戦略 |
+| `../plan/strategy_acting_claims.md` | 演技品質主張ブロッカー |
 
 ## 学習文書
 

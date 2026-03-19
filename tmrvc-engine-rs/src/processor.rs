@@ -55,7 +55,7 @@ pub struct FrameParams {
     pub top_k_a: usize,
     /// Top-k for control token sampling
     pub top_k_b: usize,
-    /// Voice state parameters [breathiness, tension, arousal, valence, roughness, voicing, energy, rate]
+    /// Voice state parameters (12-D physical controls)
     pub voice_state: [f32; D_VOICE_STATE],
 }
 

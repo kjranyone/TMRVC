@@ -10,10 +10,11 @@ def test_sample_rate():
     assert constants.SAMPLE_RATE == 24000
 
 
-def test_hop_length_is_10ms():
-    # 10ms @ 24kHz = 240 samples
+def test_hop_length_matches_codec():
+    # Codec hop_length is a separate constant from mel frontend hop_length.
+    # EnCodec: 320 samples (75 Hz). Mel frontend: 240 samples (100 Hz).
+    assert constants.CODEC_HOP_LENGTH == 320
     assert constants.HOP_LENGTH == 240
-    assert constants.HOP_LENGTH == constants.SAMPLE_RATE * 10 // 1000
 
 
 def test_n_freq_bins():
@@ -42,7 +43,7 @@ def test_n_ir_params():
 
 
 def test_n_voice_source_params():
-    assert constants.N_VOICE_SOURCE_PARAMS == 8
+    assert constants.N_VOICE_SOURCE_PARAMS == 12
 
 
 @pytest.mark.skip(reason="Acoustic params calculation changed in UCLM v2")

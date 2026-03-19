@@ -99,7 +99,7 @@ class StreamingCodecDecoder(nn.Module):
         Args:
             acoustic_tokens: [B, 8] A_t indices
             control_tokens: [B, 4] B_t [op, type, dur, int]
-            voice_state: [B, 8] voice state parameters
+            voice_state: [B, 12] voice state parameters (12-D physical controls)
             event_trace_in: [B, EVENT_TRACE_DIM] event hysteresis
             state_in: [B, DEC_STATE_DIM, DEC_STATE_FRAMES] decoder state (unused)
 

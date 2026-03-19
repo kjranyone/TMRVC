@@ -43,13 +43,12 @@ def synth_waveform_short() -> torch.Tensor:
 
 @pytest.fixture
 def expected_frames_1s() -> int:
-    """Expected number of mel frames for 1 second of audio."""
-    from tmrvc_core.constants import N_FFT, WINDOW_LENGTH
-    # center=False with left padding of (window_length - hop_length):
-    # padded_len = SAMPLE_RATE + (WINDOW_LENGTH - HOP_LENGTH)
-    # torch.stft uses n_fft (not window_length) for frame count:
-    # n_frames = (padded_len - N_FFT) // HOP_LENGTH + 1
-    padded = SAMPLE_RATE + (WINDOW_LENGTH - HOP_LENGTH)
+    """Expected number of mel frames for 1 second of audio.
+
+    Formula: ceil(N / hop_length) — matches MelSpectrogram and codec tokens.
+    """
+    import math
+    return math.ceil(SAMPLE_RATE / HOP_LENGTH)
 
 @pytest.fixture
 def mock_feature_set() -> UCLMFeatureSet:
@@ -58,7 +57,7 @@ def mock_feature_set() -> UCLMFeatureSet:
     return UCLMFeatureSet(
         codec_tokens_a=torch.zeros(8, n_frames, dtype=torch.long),
         codec_tokens_b=torch.zeros(4, n_frames, dtype=torch.long),
-        voice_state_explicit=torch.randn(n_frames, 8),
+        voice_state_explicit=torch.randn(n_frames, 12),
         voice_state_ssl=torch.randn(n_frames, 128),
         spk_embed=torch.randn(D_SPEAKER),
         utterance_id="test_utt_001",

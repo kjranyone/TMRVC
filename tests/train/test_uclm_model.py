@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tmrvc_core.constants import D_VOICE_STATE_EXPLICIT
 from tmrvc_core.types import PointerState
 from tmrvc_train.models.uclm_model import (
     DialogueContextProjector,
@@ -33,6 +34,7 @@ _D_SPEAKER = 32
 _D_PROSODY = 16
 _D_DIALOGUE = 32
 _D_ACTING = 16
+_D_EXPLICIT = D_VOICE_STATE_EXPLICIT  # canonical: 12
 
 
 def _make_model(**overrides):
@@ -44,7 +46,7 @@ def _make_model(**overrides):
         rvq_vocab_size=128,
         n_codebooks=8,
         control_vocab_size=32,
-        d_explicit=8,
+        d_explicit=_D_EXPLICIT,
         d_ssl=32,
         d_speaker=_D_SPEAKER,
         vq_bins=32,
@@ -71,14 +73,14 @@ def test_uclm_vc_forward():
         rvq_vocab_size=1024,
         n_codebooks=8,
         control_vocab_size=64,
-        d_explicit=8,
+        d_explicit=_D_EXPLICIT,
         d_ssl=128,
         d_speaker=192,
         vq_bins=64,
     )
 
     source_a_t = torch.randint(0, 1024, (B, 8, T))
-    explicit_state = torch.randn(B, T, 8)
+    explicit_state = torch.randn(B, T, _D_EXPLICIT)
     ssl_state = torch.randn(B, T, 128)
     speaker_embed = torch.randn(B, 192)
 
@@ -103,7 +105,7 @@ def test_uclm_tts_pointer_forward():
         rvq_vocab_size=1024,
         n_codebooks=8,
         control_vocab_size=64,
-        d_explicit=8,
+        d_explicit=_D_EXPLICIT,
         d_ssl=128,
         d_speaker=192,
         vq_bins=64,
@@ -113,7 +115,7 @@ def test_uclm_tts_pointer_forward():
     phoneme_ids = torch.randint(0, 256, (B, L))
     language_ids = torch.zeros((B,), dtype=torch.long)
 
-    explicit_state = torch.randn(B, T, 8)
+    explicit_state = torch.randn(B, T, _D_EXPLICIT)
     ssl_state = torch.randn(B, T, 128)
     speaker_embed = torch.randn(B, 192)
 
@@ -162,7 +164,7 @@ class TestSpeakerPromptEncoder:
         enc = SpeakerPromptEncoder(d_model=_D_MODEL, d_speaker=_D_SPEAKER)
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
 
-        timbre, prompt_feats = enc(tokens, speaker_embed=None)
+        timbre, prompt_feats, vq_loss, indices = enc(tokens, speaker_embed=None)
 
         assert timbre.shape == (B, _D_MODEL)
         assert prompt_feats.shape == (B, T_prompt, _D_MODEL)
@@ -174,7 +176,7 @@ class TestSpeakerPromptEncoder:
         tokens = torch.randint(0, 1024, (B, T_prompt, n_codebooks))
         spk = torch.randn(B, _D_SPEAKER)
 
-        timbre, prompt_feats = enc(tokens, speaker_embed=spk)
+        timbre, prompt_feats, vq_loss, indices = enc(tokens, speaker_embed=spk)
 
         assert timbre.shape == (B, _D_MODEL)
         assert prompt_feats.shape == (B, T_prompt, _D_MODEL)
@@ -441,7 +443,7 @@ class TestForwardTtsPointerV3Fields:
             language_ids=torch.zeros((B,), dtype=torch.long),
             pointer_state=None,
             speaker_embed=torch.randn(B, _D_SPEAKER),
-            explicit_state=torch.randn(B, T, 8),
+            explicit_state=torch.randn(B, T, _D_EXPLICIT),
             ssl_state=torch.randn(B, T, 32),
             target_a=torch.randint(0, 128, (B, 8, T)),
             target_b=torch.randint(0, 32, (B, 4, T)),
@@ -462,7 +464,7 @@ class TestForwardTtsPointerV3Fields:
             language_ids=torch.zeros((B,), dtype=torch.long),
             pointer_state=None,
             speaker_embed=torch.randn(B, _D_SPEAKER),
-            explicit_state=torch.randn(B, T, 8),
+            explicit_state=torch.randn(B, T, _D_EXPLICIT),
             ssl_state=torch.randn(B, T, 32),
             target_a=torch.randint(0, 128, (B, 8, T)),
             target_b=torch.randint(0, 32, (B, 4, T)),
@@ -482,7 +484,7 @@ class TestForwardTtsPointerV3Fields:
             language_ids=torch.zeros((B,), dtype=torch.long),
             pointer_state=None,
             speaker_embed=torch.randn(B, _D_SPEAKER),
-            explicit_state=torch.randn(B, T, 8),
+            explicit_state=torch.randn(B, T, _D_EXPLICIT),
             ssl_state=torch.randn(B, T, 32),
             target_a=torch.randint(0, 128, (B, 8, T)),
             target_b=torch.randint(0, 32, (B, 4, T)),

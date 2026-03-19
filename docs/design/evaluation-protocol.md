@@ -255,3 +255,96 @@ Every sign-off bundle must include:
 - human evaluation export
 - rater QC report
 - failure-case appendix
+
+---
+
+## 13. v4 Control Taxonomy Matrix
+
+> **Status: FROZEN** (2026-03-17)
+
+### 13.1 Control Mode Classification
+
+| Control Mode | Description | Example Systems |
+|-------------|-------------|-----------------|
+| **Prompt-only** | Natural language prompt describes the desired output; no explicit physical parameters | ChatTTS, Bark |
+| **Physical-only** | Explicit numeric parameters for acoustic properties (F0, energy, etc.); no semantic prompt | Traditional parametric TTS |
+| **Hybrid** | Combines prompt-based control with explicit physical overrides | CosyVoice 3, Qwen3-TTS |
+| **Reference-driven** | Clones style from a reference audio; no explicit control axes | YourTTS, VALL-E |
+
+### 13.2 Competitor Mapping
+
+| System | Primary Mode | Physical Dims | Inline Tags | Latent Control | Trajectory Replay |
+|--------|-------------|---------------|-------------|----------------|-------------------|
+| Fish Audio S2 | Hybrid (rich-transcript + RL) | None explicit | Yes (via ASR) | No | No |
+| CosyVoice 3 | Hybrid (prompt + reference) | Partial | Limited | No | No |
+| Qwen3-TTS | Prompt-only | None | Limited | No | No |
+| ChatTTS | Prompt-only | None | Limited | No | No |
+| **TMRVC v4** | **3-layer** | **12-D explicit** | **35 acting tags** | **24-D acting latent** | **Yes (deterministic)** |
+
+### 13.3 TMRVC v4 Unique 3-Layer Control Architecture
+
+TMRVC v4 implements a unique 3-layer control architecture:
+
+**Layer 1: Inline Acting Tags**
+- 35 frozen acting tags embedded directly in the enriched transcript
+- Tags include vocal events (`[laugh]`, `[inhale]`), prosodic markers (`[emphasis]`, `[pause]`), and acting directives (`[angry]`, `[whisper]`)
+- Consumed by the text encoder alongside phoneme tokens
+- Enables frame-precise control over local speech events
+
+**Layer 2: Explicit Physical Controls (12-D)**
+- 12 named physical dimensions: pitch_level, pitch_range, energy_level, pressedness, spectral_tilt, breathiness, voice_irregularity, openness, aperiodicity, formant_shift, vocal_effort, creak
+- Each dimension is [0, 1] normalised with per-dimension confidence from bootstrap
+- Supports per-frame or per-utterance specification
+- Regularised by biological plausibility constraints (covariance prior + transition penalty)
+
+**Layer 3: Acting Texture Latent (24-D)**
+- Learned latent space capturing residual acting qualities not covered by physical controls
+- User-facing via 6 macro controls: intensity, instability, tenderness, tension, spontaneity, reference_mix
+- Can also be derived from reference audio (reference-driven mode)
+- Disentangled from physical controls via explicit training objective
+
+**Unique Properties:**
+- All three layers compose: a single generation can use inline tags + physical targets + latent modulation simultaneously
+- TrajectoryRecord captures all three layers for deterministic replay
+- Edit locality: patching any layer in a local frame range does not affect other frames
+- Cross-speaker transfer: acting trajectory (physical + latent) can be transferred to a different speaker identity
+
+---
+
+## 14. Fish S2 Victory Conditions
+
+> **Status: FROZEN** (2026-03-17)
+
+### 14.1 Victory Axes (TMRVC v4 Must Win)
+
+| # | Axis | Metric | Target |
+|---|------|--------|--------|
+| V1 | Acting editability | Trajectory distance between 3+ acting configurations | TMRVC > Fish S2 |
+| V2 | Trajectory replay fidelity | Bit-exact token match rate on deterministic replay | TMRVC = 1.0 (Fish S2 has no replay) |
+| V3 | Edit locality | Max change outside patched region | TMRVC < 1e-5 (Fish S2 has no patch API) |
+
+### 14.2 Guardrail Axes (TMRVC v4 Must Not Clearly Lose)
+
+| # | Axis | Metric | Threshold |
+|---|------|--------|-----------|
+| G1 | First-take naturalness | Blind A/B preference (30+ raters) | No clear deficit vs Fish S2 |
+| G2 | Few-shot speaker similarity | ECAPA-TDNN cosine sim at 3s/5s/10s reference | No clear deficit vs Fish S2 |
+| G3 | Latency class disclosure | RTF + time-to-first-audio + hardware class | Must be disclosed; no evasion |
+
+### 14.3 Claim Narrowing Rule
+
+If TMRVC v4 wins on a victory axis but loses on a guardrail axis, the public claim **must** be narrowed:
+
+- Win V1+V2+V3, no guardrail deficit: **Broad claim** ("TMRVC v4 beats Fish S2 on acting programmability")
+- Win V1+V2 only, no deficit: **Narrow claim** ("TMRVC v4 beats Fish S2 on editability and replay fidelity")
+- Win V1 but G1 deficit: **Caveat claim** ("TMRVC v4 beats Fish S2 on editability; naturalness gap noted")
+- No victory wins: **No claim permitted**
+
+### 14.4 Protocol
+
+1. Freeze Fish S2 artifact version before any comparison run
+2. Use the frozen evaluation set (`tmrvc_eval_public_v1_2026_03_08`)
+3. Run `scripts/eval/fish_s2_comparison.py` to generate blind bundle
+4. Collect human ratings (30+ unique raters for release sign-off)
+5. Apply claim narrowing rule to determine valid claim scope
+6. Store the full evaluation bundle as a release artifact

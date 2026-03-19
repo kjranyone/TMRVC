@@ -291,16 +291,16 @@ class TestVoiceStateEstimator:
         from tmrvc_data.curation.providers.voice_state import VoiceStateEstimator
 
         names = VoiceStateEstimator.dimension_names()
-        assert len(names) == 8
+        assert len(names) == 12
         assert "pitch_level" in names
         assert "breathiness" in names
         assert "openness" in names
 
     def test_dimension_index(self):
-        from tmrvc_data.curation.providers.voice_state import VoiceStateEstimator
+        from tmrvc_data.curation.providers.voice_state import VoiceStateEstimator, VOICE_STATE_NAMES
 
         assert VoiceStateEstimator.dimension_index("pitch_level") == 0
-        assert VoiceStateEstimator.dimension_index("openness") == 7
+        assert VoiceStateEstimator.dimension_index("openness") == VOICE_STATE_NAMES.index("openness")
 
         with pytest.raises(ValueError, match="Unknown voice state dimension"):
             VoiceStateEstimator.dimension_index("nonexistent")
@@ -318,10 +318,10 @@ class TestVoiceStateEstimator:
         output = est.process(record)
         assert 0.0 <= output.confidence <= 1.0
         attrs = output.fields["attributes"]
-        assert len(attrs["voice_state"]) == 8
-        assert len(attrs["voice_state_observed_mask"]) == 8
-        assert len(attrs["voice_state_confidence"]) == 8
-        assert len(attrs["voice_state_names"]) == 8
+        assert len(attrs["voice_state"]) == 12
+        assert len(attrs["voice_state_observed_mask"]) == 12
+        assert len(attrs["voice_state_confidence"]) == 12
+        assert len(attrs["voice_state_names"]) == 12
         assert output.provenance is not None
 
     def test_estimate_frames(self):
@@ -332,8 +332,8 @@ class TestVoiceStateEstimator:
         audio = np.random.randn(24000).astype(np.float32) * 0.1
         values, mask, confidence = est.estimate_frames(audio, sr=24000)
 
-        # Should produce ~100 frames (24000 / 240)
-        assert values.shape[1] == 8
+        # Should produce frames at canonical hop rate
+        assert values.shape[1] == 12
         assert mask.shape == values.shape
         assert confidence.shape == values.shape
         assert values.shape[0] > 0

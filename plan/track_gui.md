@@ -1,8 +1,8 @@
-# Worker 12: v4 Control Plane Cutover
+# Track: v4 Control Plane Cutover
 
 ## Scope
 
-Worker 12 owns the GUI/control-plane cutover for `v4`.
+This track owns the GUI/control-plane cutover for `v4`.
 This is not a request to keep polishing the current `8-D` workshop.
 
 The critical-path UI slice is:
@@ -84,7 +84,7 @@ The UI must label each result as:
 
 ### 5. Add structured evaluation review modes
 
-When Worker 06 enables the protocols, the UI must support review flows for:
+When the validation track enables the protocols, the UI must support review flows for:
 
 - bootstrap QC review
 - replay fidelity review
@@ -109,7 +109,8 @@ Do not reopen:
 
 ## Exit Criteria
 
-- no dummy enrollment path remains in the claim-valid flow
-- the Workshop presents the `v4` physical-plus-latent control model
-- trajectory patch/replay/transfer are first-class UI actions
-- result provenance is visible to the user
+- no dummy enrollment path remains in the claim-valid flow (verified by code search for dummy/mock embedding paths)
+- the Workshop presents the `v4` physical-plus-latent control model with basic (6 controls) and advanced (12 controls) panels
+- trajectory patch/replay/transfer are accessible UI actions with distinct result labels (fresh compile / deterministic replay / cross-speaker transfer / patched replay)
+- result provenance is visible to the user as a label on every generated output
+- acting macro panel exposes at least 4 macro controls (intensity, instability, tenderness, tension)

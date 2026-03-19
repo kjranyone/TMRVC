@@ -55,6 +55,7 @@ class TestCurationRecordFields:
         assert d["diarization_confidence"] == 0.88
 
 
+@pytest.mark.skip(reason="Legacy pseudo_annotation module removed in v4")
 class TestPseudoAnnotationQualitySummary:
     """Verify quality_summary returns expected keys."""
 

@@ -33,7 +33,7 @@ class TestCFGMaskContract:
 
     def test_apply_cfg_unconditional_mask(self):
         """apply_cfg_unconditional_mask zeroes all conditioning tensors."""
-        B, T, D = 2, 10, 8
+        B, T, D = 2, 10, 12
         explicit = torch.randn(B, T, D)
         ssl = torch.randn(B, T, 128)
         spk = torch.randn(B, 192)
@@ -62,7 +62,7 @@ class TestCFGMaskContract:
 
     def test_apply_cfg_mask_none_inputs(self):
         """None optional inputs remain None after masking."""
-        B, T, D = 2, 10, 8
+        B, T, D = 2, 10, 12
         result = DisentangledUCLM.apply_cfg_unconditional_mask(
             explicit_state=torch.randn(B, T, D),
             ssl_state=torch.randn(B, T, 128),
@@ -82,22 +82,22 @@ class TestVoiceStateSupervisionLoss:
     """Verify voice_state_supervision_loss properly handles masks."""
 
     def test_basic_loss(self):
-        pred = torch.ones(2, 10, 8)
-        target = torch.zeros(2, 10, 8)
+        pred = torch.ones(2, 10, 12)
+        target = torch.zeros(2, 10, 12)
         loss = voice_state_supervision_loss(pred, target)
         assert loss.item() > 0
 
     def test_observed_mask_excludes_unobserved(self):
         """Loss should be zero when all dimensions are masked out."""
-        pred = torch.ones(2, 10, 8)
-        target = torch.zeros(2, 10, 8)
-        mask = torch.zeros(2, 10, 8, dtype=torch.bool)  # all unobserved
+        pred = torch.ones(2, 10, 12)
+        target = torch.zeros(2, 10, 12)
+        mask = torch.zeros(2, 10, 12, dtype=torch.bool)  # all unobserved
         loss = voice_state_supervision_loss(pred, target, observed_mask=mask)
         assert loss.item() == 0.0
 
     def test_observed_mask_partial(self):
         """Loss should only consider observed dimensions."""
-        B, T, D = 1, 5, 8
+        B, T, D = 1, 5, 12
         pred = torch.ones(B, T, D)
         target = torch.zeros(B, T, D)
         # Only first 4 dims observed
@@ -110,7 +110,7 @@ class TestVoiceStateSupervisionLoss:
 
     def test_confidence_weighting(self):
         """Higher confidence should weight more."""
-        B, T, D = 1, 5, 8
+        B, T, D = 1, 5, 12
         pred = torch.ones(B, T, D)
         target = torch.zeros(B, T, D)
         high_conf = torch.ones(B, T, D)
@@ -123,7 +123,7 @@ class TestVoiceStateSupervisionLoss:
 
     def test_frame_mask(self):
         """Frame-level padding mask should exclude padded frames."""
-        B, T, D = 1, 10, 8
+        B, T, D = 1, 10, 12
         pred = torch.ones(B, T, D)
         target = torch.zeros(B, T, D)
         # Mask out last 5 frames
@@ -141,12 +141,12 @@ class TestVoiceStateSupervisionLoss:
 class TestVoiceStateSupervisionDataclass:
     def test_creation(self):
         vs = VoiceStateSupervision(
-            targets=torch.randn(2, 10, 8),
-            observed_mask=torch.ones(2, 10, 8, dtype=torch.bool),
-            confidence=torch.ones(2, 10, 8),
+            targets=torch.randn(2, 10, 12),
+            observed_mask=torch.ones(2, 10, 12, dtype=torch.bool),
+            confidence=torch.ones(2, 10, 12),
             provenance="test_estimator_v1",
         )
-        assert vs.targets.shape == (2, 10, 8)
+        assert vs.targets.shape == (2, 10, 12)
         assert vs.provenance == "test_estimator_v1"
 
 
@@ -167,7 +167,7 @@ class TestForwardInferenceMode:
             "language_ids": torch.zeros(B, L, dtype=torch.long),
             "pointer_state": None,
             "speaker_embed": torch.randn(B, 192),
-            "explicit_state": torch.randn(B, T, 8),
+            "explicit_state": torch.randn(B, T, 12),
             "ssl_state": torch.randn(B, T, 128),
             "target_length": T,
         }

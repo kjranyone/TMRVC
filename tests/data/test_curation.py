@@ -283,13 +283,15 @@ class TestScoring:
 
 class TestExport:
     def _make_promoted_record(self, record_id="r1", bucket=PromotionBucket.TTS_MAINLINE):
-        return CurationRecord(
+        r = CurationRecord(
             record_id=record_id, source_path="/a.wav", audio_hash="h",
             transcript="hello", language="ja", quality_score=0.9,
             status=RecordStatus.PROMOTED, promotion_bucket=bucket,
             source_legality="owned",
             conversation_id="conv1", turn_index=1,
         )
+        r.attributes["phoneme_ids_list"] = [10, 11, 12, 20, 21]
+        return r
 
     def test_export_subset_writes_manifest(self, tmp_path):
         exporter = CurationExporter()

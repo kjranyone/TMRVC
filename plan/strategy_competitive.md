@@ -198,28 +198,12 @@ Introduce a shared transformation path that can:
 - normalize speaker-specific residue
 - recondition target TTS or VC generation with the recovered acting trajectory
 
-## Worker Impact
+## Track Impact
 
-### Worker 01
+Execution details are in the respective track files:
 
-- freeze the `v4` physical registry
-- freeze acting texture latent contract
-- freeze `IntentCompilerOutput`
-- freeze `TrajectoryRecord`
-
-### Worker 04
-
-- expose creator-facing and deterministic inference APIs separately
-- cut over serve/export/runtime to the `v4` contract
-- support TTS and VC consumption of the same acting trajectory schema
-
-### Worker 06
-
-- define bootstrap QC gates
-- define physical calibration, replay fidelity, edit locality, and transfer metrics
-- freeze Fish S2 claim rules
-
-### Worker 12
-
-- replace the old `8-D` workshop with the `v4` physical-plus-latent control plane
-- expose compile / patch / replay / transfer in the UI
+- `track_data_bootstrap.md` — raw-audio bootstrap pipeline
+- `track_architecture.md` — v4 physical registry, latent contract, IntentCompilerOutput, TrajectoryRecord
+- `track_serving.md` — creator-facing and deterministic APIs, TTS/VC shared trajectory schema
+- `track_validation.md` — bootstrap QC, calibration, replay fidelity, Fish S2 claim rules
+- `track_gui.md` — v4 physical-plus-latent control plane, compile/patch/replay/transfer UI

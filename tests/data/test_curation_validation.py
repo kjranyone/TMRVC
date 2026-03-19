@@ -369,7 +369,7 @@ class TestDownstreamComparison:
         records_curated = _make_records(
             5,
             attributes={
-                "voice_state_observed_mask": [True] * 8,
+                "voice_state_observed_mask": [True] * 12,
             },
         )
         naive = DownstreamComparison.compute_metrics(records_naive, "naive")
@@ -388,7 +388,7 @@ class TestVoiceStateValidator:
         validator = VoiceStateValidator(min_coverage_per_dim=0.50)
         records = _make_records(
             5,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         result = validator.check_coverage(records)
         assert result["pass"] is True
@@ -398,7 +398,7 @@ class TestVoiceStateValidator:
         validator = VoiceStateValidator(min_coverage_per_dim=0.50)
         records = _make_records(
             5,
-            attributes={"voice_state_observed_mask": [False] * 8},
+            attributes={"voice_state_observed_mask": [False] * 12},
         )
         result = validator.check_coverage(records)
         assert result["pass"] is False
@@ -412,8 +412,8 @@ class TestVoiceStateValidator:
         validator = VoiceStateValidator(min_coverage_per_dim=0.50)
         # 3 records with all observed, 2 with none
         records = (
-            _make_records(3, attributes={"voice_state_observed_mask": [True] * 8})
-            + _make_records(2, attributes={"voice_state_observed_mask": [False] * 8})
+            _make_records(3, attributes={"voice_state_observed_mask": [True] * 12})
+            + _make_records(2, attributes={"voice_state_observed_mask": [False] * 12})
         )
         # Deduplicate record IDs
         for i, r in enumerate(records):
@@ -424,16 +424,16 @@ class TestVoiceStateValidator:
 
     def test_calibration_passes(self):
         validator = VoiceStateValidator(max_calibration_mae=0.20)
-        predicted = [[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]]
-        reference = [[0.5, 0.6, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5]]
+        predicted = [[0.5] * 12]
+        reference = [[0.5, 0.6, 0.4] + [0.5] * 9]
         result = validator.check_calibration(predicted, reference)
         assert result["pass"] is True
         assert result["overall_mae"] <= 0.20
 
     def test_calibration_fails_high_mae(self):
         validator = VoiceStateValidator(max_calibration_mae=0.05)
-        predicted = [[0.1] * 8]
-        reference = [[0.9] * 8]
+        predicted = [[0.1] * 12]
+        reference = [[0.9] * 12]
         result = validator.check_calibration(predicted, reference)
         assert result["pass"] is False
         assert result["overall_mae"] > 0.05
@@ -686,7 +686,7 @@ class TestComprehensiveValidator:
         validator = ComprehensiveValidator()
         records = _make_records(
             10, metadata_version=3,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         report = validator.run_all(records)
         assert report["overall"]["pass"] is True
@@ -698,7 +698,7 @@ class TestComprehensiveValidator:
         validator = ComprehensiveValidator()
         records = _make_records(
             3, metadata_version=3,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         audit_entries = [
             {
@@ -725,7 +725,7 @@ class TestComprehensiveValidator:
         validator = ComprehensiveValidator()
         records = _make_records(
             5, metadata_version=3,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         report = validator.run_all(records, holdout_ids={"r0"})
         # r0 is in tts_mainline but should be holdout
@@ -735,7 +735,7 @@ class TestComprehensiveValidator:
         validator = ComprehensiveValidator()
         records = _make_records(
             5, metadata_version=3,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         report = validator.run_all(records)
         path = tmp_path / "comprehensive_report.json"
@@ -747,7 +747,7 @@ class TestComprehensiveValidator:
         validator = ComprehensiveValidator()
         records = _make_records(
             5, metadata_version=3,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         report = validator.run_all(records)
         assert report["overall"]["n_checks"] > 0
@@ -758,7 +758,7 @@ class TestComprehensiveValidator:
         records = _make_records(
             5,
             metadata_version=3,
-            attributes={"voice_state_observed_mask": [True] * 8},
+            attributes={"voice_state_observed_mask": [True] * 12},
         )
         report = validator.run_all(records)
         assert "voice_state_coverage" in report
