@@ -9,14 +9,10 @@ from tmrvc_train.models.uclm_model import (
     SpeakerPromptEncoder,
     ProsodyPredictor,
 )
+from tmrvc_train.models.uclm_transformer import CodecTransformer
 from tmrvc_train.models.uclm_loss import uclm_loss
-from tmrvc_train.models.duration_predictor import DurationPredictor, duration_loss
 from tmrvc_train.models.speaker_encoder import SpeakerEncoderWithLoRA
 from tmrvc_train.models.text_encoder import TextEncoder
-from tmrvc_train.models.text_features import (
-    TextFeatureExpander,
-    expand_phonemes_to_frames,
-)
 from tmrvc_train.models.voice_state_film import VoiceStateFiLM, MultiVoiceStateFiLM
 from tmrvc_train.models.voice_state_encoder import (
     VoiceStateEncoder,
@@ -34,10 +30,6 @@ from tmrvc_train.models.control_encoder import (
     ControlEncoder,
     ControlEncoderTemporal,
     CONTROL_VOCAB,
-    encode_duration_bin,
-    encode_intensity_bin,
-    decode_duration_bin,
-    decode_intensity_bin,
 )
 from tmrvc_train.models.control_tokenizer import (
     ControlTokenizer,
@@ -74,7 +66,21 @@ from tmrvc_train.models.disentangle_losses import (
     breath_energy_coupling_loss,
     delta_state_consistency_loss,
     long_event_consistency_loss,
-    duration_calibration_loss,
+)
+from tmrvc_train.models.acting_latent import (
+    ActingLatentEncoder,
+    ActingLatentPredictor,
+    ActingMacroProjector,
+    ActingLatentConditioner,
+)
+from tmrvc_train.models.biological_constraints import (
+    BiologicalConstraintRegularizer,
+)
+from tmrvc_train.models.acting_losses import (
+    acting_latent_kl_loss,
+    acting_latent_usage_loss,
+    disentanglement_loss,
+    semantic_alignment_loss,
 )
 
 __all__ = [
@@ -88,12 +94,9 @@ __all__ = [
     "DialogueContextProjector",
     "DisentangledUCLM",
     "PointerHead",
-    "PointerState",
     "SpeakerPromptEncoder",
     "ProsodyPredictor",
     "uclm_loss",
-    "DurationPredictor",
-    "duration_loss",
     # SSL Extractor
     "SSLProjection",
     "WavLMSSLExtractor",
@@ -103,18 +106,12 @@ __all__ = [
     # Encoders
     "SpeakerEncoderWithLoRA",
     "TextEncoder",
-    "TextFeatureExpander",
-    "expand_phonemes_to_frames",
     # Emotion-Aware Codec (Token Spec)
     "VoiceStateFiLM",
     "MultiVoiceStateFiLM",
     "ControlEncoder",
     "ControlEncoderTemporal",
     "CONTROL_VOCAB",
-    "encode_duration_bin",
-    "encode_intensity_bin",
-    "decode_duration_bin",
-    "decode_intensity_bin",
     "ControlTokenizer",
     "ControlEvent",
     "EventTrace",
@@ -131,7 +128,6 @@ __all__ = [
     "breath_energy_coupling_loss",
     "delta_state_consistency_loss",
     "long_event_consistency_loss",
-    "duration_calibration_loss",
     # Reference Encoder (GST-style prosody extraction)
     "ReferenceEncoder",
     "ReferenceEncoderFromWaveform",
@@ -144,4 +140,16 @@ __all__ = [
     "VocosDecoder",
     "HiFiGANDecoder",
     "create_vocoder",
+    # Acting Latent (v4)
+    "ActingLatentEncoder",
+    "ActingLatentPredictor",
+    "ActingMacroProjector",
+    "ActingLatentConditioner",
+    # Biological Constraints (v4)
+    "BiologicalConstraintRegularizer",
+    # Acting Losses (v4)
+    "acting_latent_kl_loss",
+    "acting_latent_usage_loss",
+    "disentanglement_loss",
+    "semantic_alignment_loss",
 ]

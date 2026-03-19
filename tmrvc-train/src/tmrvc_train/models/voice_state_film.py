@@ -1,17 +1,19 @@
 import torch
 import torch.nn as nn
 
+from tmrvc_core.constants import D_MODEL
+
 
 class VoiceStateFiLM(nn.Module):
     """Feature-wise Linear Modulation with voice_state.
 
-    voice_state [B, 8] -> gamma, beta [B, d_model]
+    voice_state [B, 12] -> gamma, beta [B, d_model]
     y = gamma * x + beta
 
     Used in decoder to modulate features based on voice state parameters.
     """
 
-    def __init__(self, d_voice_state: int = 8, d_model: int = 512):
+    def __init__(self, d_voice_state: int = 12, d_model: int = D_MODEL):
         super().__init__()
         self.d_voice_state = d_voice_state
         self.d_model = d_model
@@ -51,7 +53,7 @@ class VoiceStateFiLM(nn.Module):
 class MultiVoiceStateFiLM(nn.Module):
     """Multiple FiLM layers for different decoder stages."""
 
-    def __init__(self, d_voice_state: int = 8, d_model: int = 512, n_layers: int = 4):
+    def __init__(self, d_voice_state: int = 12, d_model: int = D_MODEL, n_layers: int = 4):
         super().__init__()
         self.layers = nn.ModuleList(
             [VoiceStateFiLM(d_voice_state, d_model) for _ in range(n_layers)]

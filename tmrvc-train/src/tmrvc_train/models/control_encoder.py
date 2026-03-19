@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 
+from tmrvc_core.constants import D_MODEL
+
 
 class ControlEncoder(nn.Module):
-    def __init__(self, vocab_size: int = 64, d_model: int = 512):
+    def __init__(self, vocab_size: int = 64, d_model: int = D_MODEL):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -19,7 +21,7 @@ class ControlEncoder(nn.Module):
 
 
 class ControlEncoderTemporal(nn.Module):
-    def __init__(self, vocab_size: int = 64, d_model: int = 512):
+    def __init__(self, vocab_size: int = 64, d_model: int = D_MODEL):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -45,18 +47,3 @@ CONTROL_VOCAB = {
     "reserved": [62, 63],
 }
 
-def encode_duration_bin(duration_ms: float) -> int:
-    bin_idx = int(duration_ms / 50)
-    bin_idx = max(1, min(40, bin_idx))
-    return CONTROL_VOCAB["duration_start"] + bin_idx - 1
-
-def encode_intensity_bin(intensity: float) -> int:
-    bin_idx = int(intensity * 8)
-    bin_idx = max(0, min(7, bin_idx))
-    return CONTROL_VOCAB["intensity_start"] + bin_idx
-
-def decode_duration_bin(bin_idx: int) -> int:
-    return (bin_idx - CONTROL_VOCAB["duration_start"] + 1) * 50
-
-def decode_intensity_bin(bin_idx: int) -> float:
-    return (bin_idx - CONTROL_VOCAB["intensity_start"]) / 7.0

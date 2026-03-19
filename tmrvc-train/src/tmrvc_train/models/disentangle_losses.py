@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
+from tmrvc_core.constants import D_MODEL
+
 
 class GradientReversalFunction(torch.autograd.Function):
     """Gradient Reversal Layer for adversarial training."""
@@ -52,7 +54,7 @@ class DisentanglementLoss(nn.Module):
 
     def __init__(
         self,
-        d_acoustic: int = 512,
+        d_acoustic: int = D_MODEL,
         d_control: int = 128,
         n_emotions: int = 12,
         n_phonemes: int = 200,
@@ -227,21 +229,3 @@ def long_event_consistency_loss(
     return 1.0 - consistency
 
 
-def duration_calibration_loss(
-    predicted_dur_bins: torch.Tensor,
-    actual_duration_frames: torch.Tensor,
-) -> torch.Tensor:
-    """Calibrate predicted duration bins with actual durations.
-
-    Args:
-        predicted_dur_bins: [B, T] predicted duration bin indices
-        actual_duration_frames: [B, T] ground truth duration in frames
-    """
-    predicted_ms = (predicted_dur_bins - 14 + 1) * 50
-    actual_ms = actual_duration_frames * 10
-
-    valid_mask = (predicted_dur_bins >= 14) & (predicted_dur_bins <= 53)
-    valid_mask = valid_mask.float()
-
-    diff = (predicted_ms - actual_ms).abs() * valid_mask
-    return diff.sum() / (valid_mask.sum() + 1e-8)

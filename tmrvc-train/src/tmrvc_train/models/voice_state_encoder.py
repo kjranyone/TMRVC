@@ -1,6 +1,6 @@
 """Voice State Encoder for UCLM conditioning.
 
-Combines 8-dim explicit parameters, 128-dim SSL features, and 8-dim delta state
+Combines 12-dim explicit parameters, 128-dim SSL features, and 12-dim delta state
 into a single 512-dim state condition for the UCLM core.
 
 Design reference: docs/design/onnx-contract.md Section 3.3
@@ -9,6 +9,8 @@ Design reference: docs/design/onnx-contract.md Section 3.3
 import torch
 import torch.nn as nn
 from typing import Optional
+
+from tmrvc_core.constants import D_MODEL
 
 from .ssl_extractor import SSLProjection
 
@@ -45,17 +47,17 @@ class VoiceStateEncoder(nn.Module):
     """Encodes voice state for UCLM conditioning.
 
     Inputs:
-        - explicit_state: [B, T, 8] or [B, 8] — manual/heuristic parameters
+        - explicit_state: [B, T, 12] or [B, 12] — manual/heuristic parameters
         - ssl_state: [B, T, 128] or [B, 128] — WavLM latent style
-        - delta_state: [B, T, 8] or [B, 8] — voice_state_t - voice_state_{t-1}
+        - delta_state: [B, T, 12] or [B, 12] — voice_state_t - voice_state_{t-1}
 
     Output:
         - state_cond: [B, T, d_model] or [B, d_model] — fused condition
 
     Architecture:
-        - explicit_proj: Linear(8, d_model // 3)
+        - explicit_proj: Linear(12, d_model // 3)
         - ssl_proj: Linear(128, d_model // 3)
-        - delta_proj: Linear(8, d_model // 3)
+        - delta_proj: Linear(12, d_model // 3)
         - fusion: Linear(d_model, d_model)
         - temporal_conv: CausalConv1d for temporal smoothing
         - GRL adversarial classifier for disentanglement
@@ -63,10 +65,10 @@ class VoiceStateEncoder(nn.Module):
 
     def __init__(
         self,
-        d_voice_state_explicit: int = 8,
+        d_voice_state_explicit: int = 12,
         d_voice_state_ssl: int = 128,
-        d_voice_state_delta: int = 8,
-        d_model: int = 512,
+        d_voice_state_delta: int = 12,
+        d_model: int = D_MODEL,
         num_speakers: int = 0,
         num_phonemes: int = 0,
         use_grl: bool = True,
@@ -132,9 +134,9 @@ class VoiceStateEncoder(nn.Module):
         """Forward pass.
 
         Args:
-            explicit_state: [B, T, 8] or [B, 8]
+            explicit_state: [B, T, 12] or [B, 12]
             ssl_state: [B, T, 128] or [B, 128], optional
-            delta_state: [B, T, 8] or [B, 8], optional
+            delta_state: [B, T, 12] or [B, 12], optional
 
         Returns:
             state_cond: [B, T, d_model] or [B, d_model]
@@ -149,7 +151,7 @@ class VoiceStateEncoder(nn.Module):
             shape = (B, T, 128) if T is not None else (B, 128)
             ssl_state = torch.zeros(shape, device=device)
         if delta_state is None:
-            shape = (B, T, 8) if T is not None else (B, 8)
+            shape = (B, T, 12) if T is not None else (B, 12)
             delta_state = torch.zeros(shape, device=device)
 
         x_exp = self.explicit_proj(explicit_state)
@@ -186,10 +188,10 @@ class VoiceStateEncoderForStreaming(nn.Module):
 
     def __init__(
         self,
-        d_voice_state_explicit: int = 8,
+        d_voice_state_explicit: int = 12,
         d_voice_state_ssl: int = 128,
-        d_voice_state_delta: int = 8,
-        d_model: int = 512,
+        d_voice_state_delta: int = 12,
+        d_model: int = D_MODEL,
     ):
         super().__init__()
 
@@ -209,9 +211,9 @@ class VoiceStateEncoderForStreaming(nn.Module):
         """Forward pass for single frame.
 
         Args:
-            explicit_state: [B, 8]
+            explicit_state: [B, 12]
             ssl_state: [B, 128]
-            delta_state: [B, 8]
+            delta_state: [B, 12]
 
         Returns:
             state_cond: [B, d_model]
@@ -227,7 +229,7 @@ class VoiceStateEncoderForStreaming(nn.Module):
 
 
 def create_voice_state_encoder(
-    d_model: int = 512,
+    d_model: int = D_MODEL,
     for_streaming: bool = False,
     use_grl: bool = True,
     num_speakers: int = 0,

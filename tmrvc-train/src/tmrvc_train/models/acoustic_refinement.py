@@ -18,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tmrvc_core.constants import D_MODEL
+
 
 class RefinementBlock(nn.Module):
     """Single transformer block for the refinement network.
@@ -26,7 +28,7 @@ class RefinementBlock(nn.Module):
     Conditioning is injected via adaptive layer norm (FiLM-style).
     """
 
-    def __init__(self, d_model: int = 512, n_heads: int = 8, d_cond: int = 512):
+    def __init__(self, d_model: int = D_MODEL, n_heads: int = 8, d_cond: int = D_MODEL):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(
@@ -96,12 +98,12 @@ class AcousticRefinementModule(nn.Module):
         n_coarse: int = 2,
         n_full: int = 8,
         codebook_size: int = 1024,
-        d_model: int = 512,
+        d_model: int = D_MODEL,
         n_heads: int = 8,
         n_layers: int = 4,
         n_steps: int = 4,
         d_speaker: int = 192,
-        d_voice_state: int = 512,
+        d_voice_state: int = D_MODEL,
     ):
         super().__init__()
         self.n_coarse = n_coarse

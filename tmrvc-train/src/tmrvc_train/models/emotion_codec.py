@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
+from tmrvc_core.constants import D_MODEL
+
 from .voice_state_film import VoiceStateFiLM
 from .control_encoder import ControlEncoderTemporal
 
@@ -86,7 +88,7 @@ class ResidualVectorQuantizer(nn.Module):
 
 
 class EmotionAwareEncoder(nn.Module):
-    def __init__(self, d_model: int = 512):
+    def __init__(self, d_model: int = D_MODEL):
         super().__init__()
         self.conv1 = CausalConv1d(1, 64, 7)
         self.conv2 = CausalConv1d(64, 128, 5)
@@ -110,7 +112,7 @@ class EmotionAwareEncoder(nn.Module):
 
 
 class EmotionAwareDecoder(nn.Module):
-    def __init__(self, d_model: int = 512):
+    def __init__(self, d_model: int = D_MODEL):
         super().__init__()
         self.codebook_embeds = nn.ModuleList([nn.Embedding(1024, d_model // 8) for _ in range(8)])
         self.control_encoder = ControlEncoderTemporal(vocab_size=64, d_model=d_model)
@@ -132,7 +134,7 @@ class EmotionAwareDecoder(nn.Module):
 
 
 class EmotionAwareCodec(nn.Module):
-    def __init__(self, d_model: int = 512):
+    def __init__(self, d_model: int = D_MODEL):
         super().__init__()
         self.encoder = EmotionAwareEncoder(d_model=d_model)
         self.decoder = EmotionAwareDecoder(d_model=d_model)

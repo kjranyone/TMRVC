@@ -18,6 +18,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from tmrvc_core.constants import D_MODEL
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +65,7 @@ class CodecNativeDecoder(VocoderBase):
     stream and voice state conditioning.
     """
 
-    def __init__(self, d_model: int = 512, output_sr: int = 24000):
+    def __init__(self, d_model: int = D_MODEL, output_sr: int = 24000):
         super().__init__()
         from .emotion_codec import EmotionAwareDecoder
 
@@ -197,7 +199,7 @@ class HiFiGANDecoder(VocoderBase):
         n_codebooks: int = 8,
         codebook_size: int = 1024,
         n_mels: int = 80,
-        d_model: int = 512,
+        d_model: int = D_MODEL,
         output_sr: int = 24000,
     ):
         super().__init__()

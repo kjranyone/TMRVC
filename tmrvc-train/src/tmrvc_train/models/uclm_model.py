@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tmrvc_core.constants import D_MODEL, UCLM_N_HEADS, UCLM_N_LAYERS
 from tmrvc_core.types import PointerState
 
 from .text_encoder import TextEncoder
@@ -79,7 +80,7 @@ class VectorQuantizer(nn.Module):
 class VCEncoder(nn.Module):
     """Encodes source A_t tokens and applies VQ bottleneck to remove style/speaker info."""
 
-    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=512, vq_bins=128):
+    def __init__(self, n_codebooks=8, vocab_size=1024, d_model=D_MODEL, vq_bins=128):
         super().__init__()
         # Each codebook gets d_model // n_codebooks dimensions to concat into d_model
         self.codebook_embeds = nn.ModuleList(
@@ -135,7 +136,7 @@ class PointerHead(nn.Module):
             current phoneme (0-1, after sigmoid).
     """
 
-    def __init__(self, d_model: int = 512):
+    def __init__(self, d_model: int = D_MODEL):
         super().__init__()
         self.advance_proj = nn.Sequential(
             nn.Linear(d_model, d_model // 4),
@@ -167,7 +168,7 @@ class SpeakerPromptEncoder(nn.Module):
     Designed to disentangle timbre (speaker identity) from prosody.
     """
 
-    def __init__(self, d_model: int = 512, d_speaker: int = 192):
+    def __init__(self, d_model: int = D_MODEL, d_speaker: int = 192):
         super().__init__()
         # Project raw speaker embedding to model space
         self.speaker_proj = nn.Linear(d_speaker, d_model)
@@ -234,7 +235,7 @@ class ProsodyPredictor(nn.Module):
         Euler steps to produce a prosody latent.
     """
 
-    def __init__(self, d_model: int = 512, d_prosody: int = 128, n_ode_steps: int = 4):
+    def __init__(self, d_model: int = D_MODEL, d_prosody: int = 128, n_ode_steps: int = 4):
         super().__init__()
         self.d_prosody = d_prosody
         self.n_ode_steps = n_ode_steps
@@ -391,7 +392,7 @@ class DialogueContextProjector(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 512,
+        d_model: int = D_MODEL,
         d_dialogue: int = 256,
         d_acting: int = 64,
         d_prosody: int = 128,
@@ -440,13 +441,13 @@ class DisentangledUCLM(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 512,
-        n_heads: int = 8,
-        n_layers: int = 12,
+        d_model: int = D_MODEL,
+        n_heads: int = UCLM_N_HEADS,
+        n_layers: int = UCLM_N_LAYERS,
         rvq_vocab_size: int = 1024,
         n_codebooks: int = 8,
         control_vocab_size: int = 64,
-        d_explicit: int = 8,
+        d_explicit: int = 12,
         d_ssl: int = 128,
         d_speaker: int = 192,
         vq_bins: int = 128,
@@ -455,6 +456,7 @@ class DisentangledUCLM(nn.Module):
         d_dialogue: int = 256,
         d_acting: int = 64,
         d_prosody: int = 128,
+        acting_tag_vocab_size: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -470,7 +472,8 @@ class DisentangledUCLM(nn.Module):
         )
 
         self.text_encoder = TextEncoder(
-            vocab_size=vocab_size, d_model=d_model, n_layers=6
+            vocab_size=vocab_size, d_model=d_model, n_layers=6,
+            acting_tag_vocab_size=acting_tag_vocab_size,
         )
 
         self.voice_state_enc = VoiceStateEncoder(
@@ -640,14 +643,6 @@ class DisentangledUCLM(nn.Module):
             "hidden_states": x_out,
         }
 
-    def forward_tts(self, **kwargs) -> dict:
-        """Legacy TTS forward (v2 compatibility wrapper).
-
-        Delegates to forward_tts_pointer. Retained for backward compatibility
-        with code that calls forward_tts directly.
-        """
-        return self.forward_tts_pointer(**kwargs)
-
     @torch.no_grad()
     def forward_streaming(
         self,
@@ -811,12 +806,11 @@ class DisentangledUCLM(nn.Module):
             if idx.ndim == 1:
                 idx = idx.unsqueeze(1).expand(-1, target_length)
             content_features = phoneme_features[torch.arange(B).unsqueeze(1), idx, :]
-        elif phoneme_indices is not None:
+        elif position_indices is not None:
             # Explicit teacher-forced indices (from MAS or bootstrap)
-            content_features = phoneme_features[torch.arange(B).unsqueeze(1), phoneme_indices, :]
+            content_features = phoneme_features[torch.arange(B).unsqueeze(1), position_indices, :]
         else:
-            # Legacy fallback: Uniform distribution (Warn in v3)
-            # Worker 01 constraint: Avoid this in release recipes.
+            # Fallback: uniform distribution over phoneme sequence
             frame_indices = torch.arange(target_length, device=phoneme_features.device)
             idx = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
             content_features = phoneme_features[:, idx, :]
@@ -894,6 +888,80 @@ class DisentangledUCLM(nn.Module):
             "hidden_states": x_out,
             "pointer_logits": advance_logit,  # backward-compat alias
             "next_pointer_state": None,  # populated at inference time
+        }
+
+    @torch.no_grad()
+    def generate(
+        self,
+        text_ids: torch.Tensor,
+        speaker_embed: torch.Tensor | None = None,
+        max_frames: int = 1000,
+        **kw,
+    ) -> dict:
+        """RL rollout generation — autoregressive codec token sampling.
+
+        Wraps forward_tts_pointer in autoregressive mode: at each frame,
+        sample codec tokens from logits and feed back as context.
+
+        Args:
+            text_ids: [B, L] phoneme / acting-tag token IDs.
+            speaker_embed: [B, d_speaker] speaker embedding.
+            max_frames: maximum number of frames to generate.
+
+        Returns:
+            dict with ``audio`` (None), ``codec_tokens`` [B, n_codebooks, T],
+            ``log_probs`` [B, T], ``hidden_states`` [B, T, D].
+        """
+        B, L = text_ids.shape
+        device = text_ids.device
+
+        if speaker_embed is None:
+            speaker_embed = torch.zeros(B, self.uclm_core.d_speaker, device=device)
+
+        # Create dummy conditioning
+        language_ids = torch.zeros_like(text_ids)
+        d_explicit = self.voice_state_enc.explicit_proj[0].in_features
+        d_ssl = self.voice_state_enc.ssl_proj[0].in_features
+        explicit_state = torch.zeros(B, max_frames, d_explicit, device=device)
+        ssl_state = torch.zeros(B, max_frames, d_ssl, device=device)
+
+        # Teacher-forced pass with zero targets to get logits over all frames
+        target_a = torch.zeros(B, self.n_codebooks, max_frames, dtype=torch.long, device=device)
+        target_b = torch.zeros(B, 4, max_frames, dtype=torch.long, device=device)
+
+        out = self.forward_tts_pointer(
+            phoneme_ids=text_ids,
+            language_ids=language_ids,
+            pointer_state=None,
+            speaker_embed=speaker_embed,
+            explicit_state=explicit_state,
+            ssl_state=ssl_state,
+            target_a=target_a,
+            target_b=target_b,
+            target_length=max_frames,
+        )
+
+        logits_a = out["logits_a"]  # [B, n_codebooks, T, V]
+        hidden_states = out["hidden_states"]  # [B, T, D]
+
+        # Sample codec tokens from logits (greedy for stability)
+        # logits_a shape: [B, n_codebooks, T, rvq_vocab_size]
+        codec_tokens = logits_a.argmax(dim=-1)  # [B, n_codebooks, T]
+
+        # Compute log probs of sampled tokens
+        log_probs_all = F.log_softmax(logits_a, dim=-1)  # [B, n_codebooks, T, V]
+        # Gather log probs for the sampled tokens
+        sampled_lp = log_probs_all.gather(
+            -1, codec_tokens.unsqueeze(-1),
+        ).squeeze(-1)  # [B, n_codebooks, T]
+        # Average across codebooks for per-frame log prob
+        log_probs = sampled_lp.mean(dim=1)  # [B, T]
+
+        return {
+            "audio": None,  # RL reward side runs vocoder
+            "codec_tokens": codec_tokens,
+            "log_probs": log_probs,
+            "hidden_states": hidden_states,
         }
 
     def forward_tts_distilled_cfg(

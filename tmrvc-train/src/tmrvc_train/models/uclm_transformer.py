@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tmrvc_core.constants import D_MODEL, UCLM_N_HEADS
+
 # ---------------------------------------------------------------------------
 # FlashAttention2 conditional import
 # ---------------------------------------------------------------------------
@@ -120,7 +122,7 @@ def apply_rotary_emb(
         return x * cos_2d + _rotate_half(x) * sin_2d
 
     elif position_indices is not None:
-        # Legacy 1D mode
+        # 1D position index mode (pointer-based text progression)
         indices = position_indices.long().clamp(max=cos.shape[0] - 1)
         cos_b = cos[indices].unsqueeze(1)
         sin_b = sin[indices].unsqueeze(1)
@@ -471,8 +473,8 @@ class ModernTransformerBlock(nn.Module):
 class CodecTransformer(nn.Module):
     def __init__(
         self,
-        d_model=512,
-        n_heads=8,
+        d_model=D_MODEL,
+        n_heads=UCLM_N_HEADS,
         n_layers=12,
         rvq_vocab_size=1024,
         n_codebooks=8,
@@ -679,7 +681,7 @@ class CodecTransformer(nn.Module):
         # Dual-stream heads
         logits_a = torch.stack(
             [head(x) for head in self.acoustic_heads], dim=1,
-        )  # [B, 8, T, 1024]
+        )  # [B, 8, T, 2048]
         logits_b = torch.stack(
             [head(x) for head in self.control_heads], dim=1,
         )  # [B, 4, T, 64]
@@ -709,6 +711,8 @@ class CodecTransformer(nn.Module):
         prompt_tokens=None,
         prompt_summary_tokens=None,
         position_indices=None,
+        frame_offsets=None,
+        cross_attn_mask=None,
     ):
         """Non-streaming forward for training. History must be shifted."""
         la, lb, _, x = self.forward(
@@ -723,5 +727,7 @@ class CodecTransformer(nn.Module):
             cfg_scale=cfg_scale,
             f0_condition=f0_condition,
             position_indices=position_indices,
+            frame_offsets=frame_offsets,
+            cross_attn_mask=cross_attn_mask,
         )
         return la, lb, x

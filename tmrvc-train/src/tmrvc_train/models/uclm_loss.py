@@ -427,7 +427,7 @@ def uclm_loss(
     speaker_embeds: torch.Tensor | None = None,
     prosody_latents: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute the multi-task loss for Disentangled UCLM (v3)."""
+    """Compute the multi-task loss for Disentangled UCLM."""
     B, n_cb, T, vocab_a = logits_a.shape
     _, n_slots, _, vocab_b = logits_b.shape
 
@@ -473,7 +473,7 @@ def uclm_loss(
         total_loss = total_loss + lambda_adv * loss_adv
         components["loss_adv"] = loss_adv
 
-    # v3 pointer losses
+    # Pointer losses
     if pointer_logits is not None and advance_targets is not None:
         loss_ptr = pointer_advance_loss(pointer_logits, advance_targets, frame_mask)
         total_loss = total_loss + lambda_pointer * loss_ptr

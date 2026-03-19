@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tmrvc_core.constants import D_MODEL
+
 
 class ReferenceEncoder(nn.Module):
     """Extracts prosody latent from target waveform for flow-matching training.
@@ -30,7 +32,7 @@ class ReferenceEncoder(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 512,
+        d_model: int = D_MODEL,
         d_prosody: int = 128,
         n_mels: int = 80,
         n_cnn_layers: int = 6,
@@ -146,7 +148,7 @@ class ReferenceEncoderFromWaveform(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 512,
+        d_model: int = D_MODEL,
         d_prosody: int = 128,
         n_mels: int = 80,
         sample_rate: int = 24000,
