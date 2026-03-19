@@ -1,18 +1,19 @@
 """ContextStylePredictor: LLM-based emotion/style inference from dialogue context.
 
-Uses Claude API to predict appropriate emotion and style parameters
-based on character profile, conversation history, and the next utterance text.
+Uses the open-weight Qwen LLM backend to predict appropriate emotion and style
+parameters based on character profile, conversation history, and the next
+utterance text.
 
-Falls back to rule-based heuristics when API is unavailable.
-
-MIGRATION(v4): This module will be replaced by an open-weight LLM backend.
+Model selection (from track_architecture.md SS5a):
   Primary:  Qwen/Qwen3.5-35B-A3B (MoE, 3B active)
   Fallback: Qwen/Qwen3.5-4B (dense)
-  See: plan/track_architecture.md §5a, plan/track_serving.md §8
+
+Falls back to rule-based heuristics when no GPU or model is available.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -80,43 +81,34 @@ _KEYWORD_RULES: list[tuple[str, dict[str, Any]]] = [
 
 
 class ContextStylePredictor:
-    """Predict emotion/style from dialogue context using Claude API.
+    """Predict emotion/style from dialogue context using Qwen LLM backend.
+
+    Uses the open-weight Qwen models via the LLMBackend from tmrvc-serve.
+    Falls back to rule-based heuristics when no GPU or model is available.
 
     Args:
-        api_key: Anthropic API key. If None, only rule-based fallback is available.
-        model: Claude model to use.
+        model: Qwen model name to use.
         max_history: Maximum dialogue turns to include in context.
-        timeout: API request timeout in seconds.
     """
 
     def __init__(
         self,
-        api_key: str | None = None,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "Qwen/Qwen3.5-35B-A3B",
         max_history: int = 10,
-        timeout: float = 10.0,
     ) -> None:
-        self.api_key = api_key
         self.model = model
         self.max_history = max_history
-        self.timeout = timeout
-        self._client: Any | None = None
+        self._backend: Any | None = None
+        self._backend_loaded: bool = False
 
-    def _get_client(self) -> Any:
-        """Lazily create Anthropic client."""
-        if self._client is None:
-            try:
-                import anthropic
-            except ImportError as e:
-                raise ImportError(
-                    "anthropic package is required for ContextStylePredictor. "
-                    "Install with: pip install anthropic"
-                ) from e
-            self._client = anthropic.Anthropic(
-                api_key=self.api_key,
-                timeout=self.timeout,
-            )
-        return self._client
+    def _get_backend(self) -> Any:
+        """Lazily create and load the LLMBackend."""
+        if self._backend is None:
+            from tmrvc_serve.llm_backend import LLMBackend
+
+            self._backend = LLMBackend(model_name=self.model)
+            self._backend_loaded = self._backend.load()
+        return self._backend
 
     def _build_user_prompt(
         self,
@@ -149,6 +141,16 @@ class ContextStylePredictor:
 
         return "\n".join(parts)
 
+    def _generate(self, user_prompt: str) -> str:
+        """Generate a response using the LLM backend.
+
+        Prepends the system prompt to the user prompt so the backend
+        receives full context regardless of its internal system prompt.
+        """
+        backend = self._get_backend()
+        full_prompt = f"{_SYSTEM_PROMPT}\n\n{user_prompt}"
+        return backend.generate(full_prompt, max_tokens=256, temperature=0.0)
+
     async def predict(
         self,
         character: CharacterProfile,
@@ -156,41 +158,30 @@ class ContextStylePredictor:
         next_text: str,
         situation: str | None = None,
     ) -> StyleParams:
-        """Predict style from context using Claude API (async).
+        """Predict style from context using Qwen LLM backend (async).
 
-        Falls back to rule-based prediction on API failure.
+        Falls back to rule-based prediction when the model is unavailable.
         """
-        if self.api_key is None:
-            logger.debug("No API key, using rule-based fallback")
-            return self.predict_rule_based(next_text, character)
-
         try:
-            client = self._get_client()
+            backend = self._get_backend()
+            if backend.backend_type == "rule_based":
+                logger.debug("LLM backend is rule-based, using rule-based fallback")
+                return self.predict_rule_based(next_text, character)
+
             user_prompt = self._build_user_prompt(
                 character, history, next_text, situation,
             )
 
-            # Use async client if available
-            try:
-                import anthropic
-                async_client = anthropic.AsyncAnthropic(
-                    api_key=self.api_key,
-                    timeout=self.timeout,
-                )
-                response = await async_client.messages.create(
-                    model=self.model,
-                    max_tokens=256,
-                    system=_SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": user_prompt}],
-                )
-            except Exception:
-                # Fallback to sync in async context
-                return self.predict_sync(character, history, next_text, situation)
+            # Run synchronous generation in a thread to avoid blocking
+            loop = asyncio.get_running_loop()
+            response_text = await loop.run_in_executor(
+                None, self._generate, user_prompt,
+            )
 
-            return self._parse_response(response.content[0].text)
+            return self._parse_response(response_text)
 
         except Exception as e:
-            logger.warning("API call failed, using rule-based fallback: %s", e)
+            logger.warning("LLM generation failed, using rule-based fallback: %s", e)
             return self.predict_rule_based(next_text, character)
 
     def predict_sync(
@@ -200,31 +191,25 @@ class ContextStylePredictor:
         next_text: str,
         situation: str | None = None,
     ) -> StyleParams:
-        """Predict style from context using Claude API (sync).
+        """Predict style from context using Qwen LLM backend (sync).
 
-        Falls back to rule-based prediction on API failure.
+        Falls back to rule-based prediction when the model is unavailable.
         """
-        if self.api_key is None:
-            logger.debug("No API key, using rule-based fallback")
-            return self.predict_rule_based(next_text, character)
-
         try:
-            client = self._get_client()
+            backend = self._get_backend()
+            if backend.backend_type == "rule_based":
+                logger.debug("LLM backend is rule-based, using rule-based fallback")
+                return self.predict_rule_based(next_text, character)
+
             user_prompt = self._build_user_prompt(
                 character, history, next_text, situation,
             )
 
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-
-            return self._parse_response(response.content[0].text)
+            response_text = self._generate(user_prompt)
+            return self._parse_response(response_text)
 
         except Exception as e:
-            logger.warning("API call failed, using rule-based fallback: %s", e)
+            logger.warning("LLM generation failed, using rule-based fallback: %s", e)
             return self.predict_rule_based(next_text, character)
 
     def _parse_response(self, text: str) -> StyleParams:
@@ -255,7 +240,7 @@ class ContextStylePredictor:
         text: str,
         character: CharacterProfile | None = None,
     ) -> StyleParams:
-        """Predict style using rule-based heuristics (no API needed).
+        """Predict style using rule-based heuristics (no LLM needed).
 
         Analyzes punctuation, keywords, and character defaults to estimate
         appropriate emotion parameters.

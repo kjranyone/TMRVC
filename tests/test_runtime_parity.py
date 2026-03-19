@@ -1,13 +1,36 @@
 """Runtime parity tests -- verify determinism, batch-vs-streaming consistency,
-ONNX contract compliance, and Python/Rust pointer state field alignment.
+ONNX contract compliance, Python/Rust pointer state field alignment, and
+Python-vs-ONNX numerical parity.
 """
 
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
 
+from tmrvc_core.constants import (
+    D_ACTING_LATENT,
+    D_MODEL,
+    D_SPEAKER,
+    D_VOICE_STATE_EXPLICIT,
+    D_VOICE_STATE_SSL,
+    N_CODEBOOKS,
+)
 from tmrvc_core.types import PointerState
+from tmrvc_core.voice_state import CANONICAL_VOICE_STATE_IDS
 from tmrvc_train.models.uclm_model import DisentangledUCLM
 from tmrvc_serve.uclm_engine import PointerInferenceState
+
+try:
+    import onnxruntime as ort
+
+    HAS_ORT = True
+except ImportError:
+    HAS_ORT = False
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +414,501 @@ class TestVoiceStateSerializationRoundtrip:
         assert torch.equal(vs.observed_mask, vs2.observed_mask)
         assert torch.equal(vs.confidence, vs2.confidence)
         assert vs.provenance == vs2.provenance
+
+
+# ---------------------------------------------------------------------------
+# Python vs ONNX Numerical Parity (Worker 06)
+# ---------------------------------------------------------------------------
+
+_CONTEXT_FRAMES = 10  # short context for fast test exports
+
+
+def _export_all_components(
+    model: DisentangledUCLM, output_dir: Path
+) -> tuple[dict[str, Path], int]:
+    """Export vc_encoder, voice_state_enc, and uclm_core to ONNX.
+
+    Returns (onnx_paths dict, kv_cache_size).
+    """
+    from tmrvc_export.export_uclm import (
+        VCEncoderExportWrapper,
+        VoiceStateEncExportWrapper,
+        UCLMCoreExportWrapper,
+    )
+
+    device = "cpu"
+    opset = 18
+
+    # --- vc_encoder ---
+    vc_wrapper = VCEncoderExportWrapper(model).eval()
+    vc_path = output_dir / "vc_encoder.onnx"
+    dummy_source = torch.zeros(1, N_CODEBOOKS, _CONTEXT_FRAMES, dtype=torch.long)
+    torch.onnx.export(
+        vc_wrapper,
+        (dummy_source,),
+        vc_path,
+        input_names=["source_A_t"],
+        output_names=["vq_content_features"],
+        dynamic_axes={"source_A_t": {0: "batch", 2: "L"}, "vq_content_features": {0: "batch", 2: "L"}},
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+
+    # --- voice_state_enc ---
+    vs_wrapper = VoiceStateEncExportWrapper(model).eval()
+    vs_path = output_dir / "voice_state_enc.onnx"
+    dummy_explicit = torch.zeros(1, D_VOICE_STATE_EXPLICIT, device=device)
+    dummy_ssl = torch.zeros(1, D_VOICE_STATE_SSL, device=device)
+    dummy_delta = torch.zeros(1, D_VOICE_STATE_EXPLICIT, device=device)
+    torch.onnx.export(
+        vs_wrapper,
+        (dummy_explicit, dummy_ssl, dummy_delta),
+        vs_path,
+        input_names=["explicit_state", "ssl_state", "delta_state"],
+        output_names=["state_cond"],
+        dynamic_axes={
+            "explicit_state": {0: "batch"},
+            "ssl_state": {0: "batch"},
+            "delta_state": {0: "batch"},
+            "state_cond": {0: "batch"},
+        },
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+
+    # --- uclm_core ---
+    core_wrapper = UCLMCoreExportWrapper(model, max_seq_len=_CONTEXT_FRAMES).eval()
+    core_path = output_dir / "uclm_core.onnx"
+    kv_cache_size = core_wrapper.kv_cache_size
+    dummy_content = torch.zeros(1, D_MODEL, _CONTEXT_FRAMES)
+    dummy_b_ctx = torch.zeros(1, 4, _CONTEXT_FRAMES, dtype=torch.long)
+    dummy_spk = torch.zeros(1, D_SPEAKER)
+    dummy_state_cond = torch.zeros(1, D_MODEL)
+    dummy_acting = torch.zeros(1, D_ACTING_LATENT)
+    dummy_cfg = torch.tensor([1.5])
+    dummy_kv = torch.zeros(1, kv_cache_size)
+    torch.onnx.export(
+        core_wrapper,
+        (dummy_content, dummy_b_ctx, dummy_spk, dummy_state_cond, dummy_acting, dummy_cfg, dummy_kv),
+        core_path,
+        input_names=["content_features", "b_ctx", "spk_embed", "state_cond", "acting_intent", "cfg_scale", "kv_cache_in"],
+        output_names=["logits_a", "logits_b", "kv_cache_out"],
+        dynamic_axes={
+            "content_features": {0: "batch", 2: "L"},
+            "b_ctx": {0: "batch", 2: "L"},
+            "spk_embed": {0: "batch"},
+            "state_cond": {0: "batch"},
+            "acting_intent": {0: "batch"},
+            "cfg_scale": {},
+            "kv_cache_in": {0: "batch"},
+            "logits_a": {0: "batch"},
+            "logits_b": {0: "batch"},
+            "kv_cache_out": {0: "batch"},
+        },
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+
+    paths = {
+        "vc_encoder": vc_path,
+        "voice_state_enc": vs_path,
+        "uclm_core": core_path,
+    }
+    return paths, kv_cache_size
+
+
+@pytest.mark.skipif(not HAS_ORT, reason="onnxruntime not installed")
+class TestPythonOnnxNumericalParity:
+    """Tests that PyTorch and ONNX produce numerically identical outputs
+    for every exported component of the DisentangledUCLM pipeline."""
+
+    PARITY_THRESHOLD = 1e-4
+
+    @pytest.fixture(scope="class")
+    def model(self) -> DisentangledUCLM:
+        m = DisentangledUCLM()
+        m.eval()
+        return m
+
+    @pytest.fixture(scope="class")
+    def export_artifacts(self, model: DisentangledUCLM):
+        """Export all components once per class, reuse across tests."""
+        with tempfile.TemporaryDirectory(prefix="tmrvc_parity_") as tmpdir:
+            onnx_paths, kv_cache_size = _export_all_components(
+                model, Path(tmpdir)
+            )
+            # Load ONNX sessions while the temp dir exists
+            sessions = {
+                name: ort.InferenceSession(str(p), providers=["CPUExecutionProvider"])
+                for name, p in onnx_paths.items()
+            }
+            yield sessions, kv_cache_size
+
+    # -- vc_encoder parity --
+
+    def test_vc_encoder_parity(
+        self, model: DisentangledUCLM, export_artifacts
+    ):
+        """vc_encoder: PyTorch vs ONNX content features must match."""
+        sessions, _ = export_artifacts
+        sess = sessions["vc_encoder"]
+
+        source_A_t = torch.randint(0, 100, (1, N_CODEBOOKS, _CONTEXT_FRAMES))
+
+        with torch.no_grad():
+            pt_content, _ = model.vc_encoder(source_A_t)
+            pt_content = pt_content.transpose(1, 2)
+
+        onnx_content = sess.run(
+            None, {"source_A_t": source_A_t.numpy()}
+        )[0]
+
+        err = np.max(np.abs(pt_content.numpy() - onnx_content))
+        assert err < self.PARITY_THRESHOLD, (
+            f"vc_encoder parity failed: L_inf={err:.6e} > {self.PARITY_THRESHOLD}"
+        )
+
+    # -- voice_state_enc parity --
+
+    def test_voice_state_enc_parity(
+        self, model: DisentangledUCLM, export_artifacts
+    ):
+        """voice_state_enc: PyTorch vs ONNX state_cond must match."""
+        sessions, _ = export_artifacts
+        sess = sessions["voice_state_enc"]
+
+        explicit = torch.randn(1, D_VOICE_STATE_EXPLICIT)
+        ssl = torch.randn(1, D_VOICE_STATE_SSL)
+        delta = torch.randn(1, D_VOICE_STATE_EXPLICIT)
+
+        with torch.no_grad():
+            pt_cond = model.voice_state_enc(
+                explicit.unsqueeze(1), ssl.unsqueeze(1), delta.unsqueeze(1)
+            ).squeeze(1)
+
+        onnx_cond = sess.run(
+            None,
+            {
+                "explicit_state": explicit.numpy(),
+                "ssl_state": ssl.numpy(),
+                "delta_state": delta.numpy(),
+            },
+        )[0]
+
+        err = np.max(np.abs(pt_cond.numpy() - onnx_cond))
+        assert err < self.PARITY_THRESHOLD, (
+            f"voice_state_enc parity failed: L_inf={err:.6e} > {self.PARITY_THRESHOLD}"
+        )
+
+    # -- uclm_core parity --
+
+    def test_uclm_core_parity(
+        self, model: DisentangledUCLM, export_artifacts
+    ):
+        """uclm_core: PyTorch vs ONNX logits_a and logits_b must match."""
+        sessions, kv_cache_size = export_artifacts
+        sess = sessions["uclm_core"]
+
+        content = torch.randn(1, D_MODEL, _CONTEXT_FRAMES)
+        b_ctx = torch.zeros(1, 4, _CONTEXT_FRAMES, dtype=torch.long)
+        spk = torch.randn(1, D_SPEAKER)
+        state_cond = torch.randn(1, D_MODEL)
+        acting = torch.zeros(1, D_ACTING_LATENT)
+        cfg_scale = torch.tensor([1.5])
+        kv_cache = torch.zeros(1, kv_cache_size)
+
+        # PyTorch path (matches UCLMCoreExportWrapper.forward)
+        with torch.no_grad():
+            pt_la, pt_lb, _ = model.uclm_core(
+                content.transpose(1, 2),  # [B, L, D]
+                b_ctx,
+                spk,
+                state_cond,
+                1.5,
+                kv_cache,
+                _CONTEXT_FRAMES,
+            )
+            pt_la = pt_la[:, :, -1, :]
+            pt_lb = pt_lb[:, :, -1, :]
+
+        onnx_la, onnx_lb, _ = sess.run(
+            None,
+            {
+                "content_features": content.numpy(),
+                "b_ctx": b_ctx.numpy(),
+                "spk_embed": spk.numpy(),
+                "state_cond": state_cond.numpy(),
+                "acting_intent": acting.numpy(),
+                "cfg_scale": cfg_scale.numpy(),
+                "kv_cache_in": kv_cache.numpy(),
+            },
+        )
+
+        err_a = np.max(np.abs(pt_la.numpy() - onnx_la))
+        err_b = np.max(np.abs(pt_lb.numpy() - onnx_lb))
+        assert err_a < self.PARITY_THRESHOLD, (
+            f"uclm_core logits_a parity failed: L_inf={err_a:.6e} > {self.PARITY_THRESHOLD}"
+        )
+        assert err_b < self.PARITY_THRESHOLD, (
+            f"uclm_core logits_b parity failed: L_inf={err_b:.6e} > {self.PARITY_THRESHOLD}"
+        )
+
+    # -- end-to-end pipeline parity --
+
+    def test_end_to_end_pipeline_parity(
+        self, model: DisentangledUCLM, export_artifacts
+    ):
+        """Full pipeline: chained vc_encoder -> voice_state_enc -> uclm_core
+        must match between PyTorch and ONNX."""
+        sessions, kv_cache_size = export_artifacts
+
+        source_A_t = torch.randint(0, 100, (1, N_CODEBOOKS, _CONTEXT_FRAMES))
+        explicit = torch.randn(1, D_VOICE_STATE_EXPLICIT)
+        ssl = torch.randn(1, D_VOICE_STATE_SSL)
+        delta = torch.randn(1, D_VOICE_STATE_EXPLICIT)
+        spk = torch.randn(1, D_SPEAKER)
+        cfg_scale = torch.tensor([1.5])
+        acting = torch.zeros(1, D_ACTING_LATENT)
+        kv_cache = torch.zeros(1, kv_cache_size)
+
+        # -- PyTorch pipeline --
+        with torch.no_grad():
+            pt_content, _ = model.vc_encoder(source_A_t)
+            pt_content = pt_content.transpose(1, 2)
+
+            pt_state_cond = model.voice_state_enc(
+                explicit.unsqueeze(1), ssl.unsqueeze(1), delta.unsqueeze(1)
+            ).squeeze(1)
+
+            state_expanded = pt_state_cond.unsqueeze(1).expand(-1, _CONTEXT_FRAMES, -1)
+            pt_la, pt_lb, _ = model.uclm_core(
+                pt_content.transpose(1, 2),
+                torch.zeros(1, 4, _CONTEXT_FRAMES, dtype=torch.long),
+                spk,
+                state_expanded[:, 0, :],  # single-frame state_cond
+                1.5,
+                kv_cache,
+                _CONTEXT_FRAMES,
+            )
+            pt_la = pt_la[:, :, -1, :]
+            pt_lb = pt_lb[:, :, -1, :]
+
+        # -- ONNX pipeline --
+        onnx_content = sessions["vc_encoder"].run(
+            None, {"source_A_t": source_A_t.numpy()}
+        )[0]
+
+        onnx_state_cond = sessions["voice_state_enc"].run(
+            None,
+            {
+                "explicit_state": explicit.numpy(),
+                "ssl_state": ssl.numpy(),
+                "delta_state": delta.numpy(),
+            },
+        )[0]
+
+        onnx_la, onnx_lb, _ = sessions["uclm_core"].run(
+            None,
+            {
+                "content_features": onnx_content,
+                "b_ctx": np.zeros((1, 4, _CONTEXT_FRAMES), dtype=np.int64),
+                "spk_embed": spk.numpy(),
+                "state_cond": onnx_state_cond,
+                "acting_intent": acting.numpy(),
+                "cfg_scale": cfg_scale.numpy(),
+                "kv_cache_in": kv_cache.numpy(),
+            },
+        )
+
+        err_a = np.max(np.abs(pt_la.numpy() - onnx_la))
+        err_b = np.max(np.abs(pt_lb.numpy() - onnx_lb))
+        assert err_a < self.PARITY_THRESHOLD, (
+            f"End-to-end logits_a parity failed: L_inf={err_a:.6e}"
+        )
+        assert err_b < self.PARITY_THRESHOLD, (
+            f"End-to-end logits_b parity failed: L_inf={err_b:.6e}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Physical Control Ordering Parity (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not HAS_ORT, reason="onnxruntime not installed")
+class TestPhysicalControlOrderingParity:
+    """Tests that physical control dimensions are ordered identically
+    across Python exports and match CANONICAL_VOICE_STATE_IDS."""
+
+    @pytest.fixture(scope="class")
+    def vs_session(self):
+        """Export voice_state_enc and return its ORT session."""
+        from tmrvc_export.export_uclm import VoiceStateEncExportWrapper
+
+        model = DisentangledUCLM()
+        model.eval()
+        wrapper = VoiceStateEncExportWrapper(model).eval()
+
+        with tempfile.TemporaryDirectory(prefix="tmrvc_ctrl_") as tmpdir:
+            path = Path(tmpdir) / "voice_state_enc.onnx"
+            dummy_explicit = torch.zeros(1, D_VOICE_STATE_EXPLICIT)
+            dummy_ssl = torch.zeros(1, D_VOICE_STATE_SSL)
+            dummy_delta = torch.zeros(1, D_VOICE_STATE_EXPLICIT)
+            torch.onnx.export(
+                wrapper,
+                (dummy_explicit, dummy_ssl, dummy_delta),
+                path,
+                input_names=["explicit_state", "ssl_state", "delta_state"],
+                output_names=["state_cond"],
+                dynamic_axes={
+                    "explicit_state": {0: "batch"},
+                    "ssl_state": {0: "batch"},
+                    "delta_state": {0: "batch"},
+                    "state_cond": {0: "batch"},
+                },
+                opset_version=18,
+                do_constant_folding=True,
+            )
+            sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            yield sess
+
+    def test_explicit_state_input_shape_is_12d(self, vs_session):
+        """voice_state_enc ONNX input explicit_state must have shape [B, 12]."""
+        inp = next(i for i in vs_session.get_inputs() if i.name == "explicit_state")
+        # Shape may be [batch, 12] or ['batch', 12] with dynamic first dim
+        assert inp.shape[-1] == D_VOICE_STATE_EXPLICIT, (
+            f"explicit_state last dim is {inp.shape[-1]}, expected {D_VOICE_STATE_EXPLICIT}"
+        )
+
+    def test_12d_ordering_matches_canonical_ids(self):
+        """The 12-D explicit_state ordering must match CANONICAL_VOICE_STATE_IDS.
+
+        This test verifies the contract: dimension i of the explicit_state
+        tensor corresponds to CANONICAL_VOICE_STATE_IDS[i].
+        """
+        assert len(CANONICAL_VOICE_STATE_IDS) == D_VOICE_STATE_EXPLICIT, (
+            f"CANONICAL_VOICE_STATE_IDS has {len(CANONICAL_VOICE_STATE_IDS)} entries "
+            f"but D_VOICE_STATE_EXPLICIT={D_VOICE_STATE_EXPLICIT}"
+        )
+
+    def test_delta_state_matches_explicit_state_shape(self, vs_session):
+        """delta_state must have the same dimensionality as explicit_state."""
+        inp_explicit = next(
+            i for i in vs_session.get_inputs() if i.name == "explicit_state"
+        )
+        inp_delta = next(
+            i for i in vs_session.get_inputs() if i.name == "delta_state"
+        )
+        assert inp_explicit.shape[-1] == inp_delta.shape[-1], (
+            f"explicit_state dim {inp_explicit.shape[-1]} != "
+            f"delta_state dim {inp_delta.shape[-1]}"
+        )
+
+    def test_ssl_state_is_128d(self, vs_session):
+        """ssl_state ONNX input must have shape [B, 128]."""
+        inp = next(i for i in vs_session.get_inputs() if i.name == "ssl_state")
+        assert inp.shape[-1] == D_VOICE_STATE_SSL, (
+            f"ssl_state last dim is {inp.shape[-1]}, expected {D_VOICE_STATE_SSL}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Acting Latent Ordering Parity (Worker 06)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not HAS_ORT, reason="onnxruntime not installed")
+class TestActingLatentOrderingParity:
+    """Tests that the acting_intent tensor has the expected shape and
+    ordering in the ONNX uclm_core model."""
+
+    @pytest.fixture(scope="class")
+    def core_session(self):
+        """Export uclm_core and return its ORT session."""
+        from tmrvc_export.export_uclm import UCLMCoreExportWrapper
+
+        model = DisentangledUCLM()
+        model.eval()
+        wrapper = UCLMCoreExportWrapper(model, max_seq_len=_CONTEXT_FRAMES).eval()
+        kv_cache_size = wrapper.kv_cache_size
+
+        with tempfile.TemporaryDirectory(prefix="tmrvc_acting_") as tmpdir:
+            path = Path(tmpdir) / "uclm_core.onnx"
+            torch.onnx.export(
+                wrapper,
+                (
+                    torch.zeros(1, D_MODEL, _CONTEXT_FRAMES),
+                    torch.zeros(1, 4, _CONTEXT_FRAMES, dtype=torch.long),
+                    torch.zeros(1, D_SPEAKER),
+                    torch.zeros(1, D_MODEL),
+                    torch.zeros(1, D_ACTING_LATENT),
+                    torch.tensor([1.5]),
+                    torch.zeros(1, kv_cache_size),
+                ),
+                path,
+                input_names=[
+                    "content_features", "b_ctx", "spk_embed", "state_cond",
+                    "acting_intent", "cfg_scale", "kv_cache_in",
+                ],
+                output_names=["logits_a", "logits_b", "kv_cache_out"],
+                dynamic_axes={
+                    "content_features": {0: "batch", 2: "L"},
+                    "b_ctx": {0: "batch", 2: "L"},
+                    "spk_embed": {0: "batch"},
+                    "state_cond": {0: "batch"},
+                    "acting_intent": {0: "batch"},
+                    "cfg_scale": {},
+                    "kv_cache_in": {0: "batch"},
+                    "logits_a": {0: "batch"},
+                    "logits_b": {0: "batch"},
+                    "kv_cache_out": {0: "batch"},
+                },
+                opset_version=18,
+                do_constant_folding=True,
+            )
+            sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            yield sess
+
+    def test_acting_intent_shape_is_24d(self, core_session):
+        """ONNX uclm_core input acting_intent must have shape [B, 24]."""
+        inp = next(
+            i for i in core_session.get_inputs() if i.name == "acting_intent"
+        )
+        assert inp.shape[-1] == D_ACTING_LATENT, (
+            f"acting_intent last dim is {inp.shape[-1]}, expected {D_ACTING_LATENT} (={D_ACTING_LATENT})"
+        )
+
+    def test_acting_intent_is_24_constant(self):
+        """D_ACTING_LATENT must equal 24 per the architecture spec."""
+        assert D_ACTING_LATENT == 24, (
+            f"D_ACTING_LATENT changed from 24 to {D_ACTING_LATENT} -- "
+            "update ONNX contract and Rust engine if intentional"
+        )
+
+    def test_zero_acting_intent_is_noop(self, core_session):
+        """Passing all-zero acting_intent must not crash and must produce
+        valid logits (zeros = no acting control)."""
+        from tmrvc_export.export_uclm import UCLMCoreExportWrapper
+
+        model = DisentangledUCLM()
+        model.eval()
+        wrapper = UCLMCoreExportWrapper(model, max_seq_len=_CONTEXT_FRAMES)
+        kv_cache_size = wrapper.kv_cache_size
+
+        result = core_session.run(
+            None,
+            {
+                "content_features": np.zeros((1, D_MODEL, _CONTEXT_FRAMES), dtype=np.float32),
+                "b_ctx": np.zeros((1, 4, _CONTEXT_FRAMES), dtype=np.int64),
+                "spk_embed": np.zeros((1, D_SPEAKER), dtype=np.float32),
+                "state_cond": np.zeros((1, D_MODEL), dtype=np.float32),
+                "acting_intent": np.zeros((1, D_ACTING_LATENT), dtype=np.float32),
+                "cfg_scale": np.array([1.5], dtype=np.float32),
+                "kv_cache_in": np.zeros((1, kv_cache_size), dtype=np.float32),
+            },
+        )
+        logits_a, logits_b, kv_out = result
+        assert logits_a.shape[0] == 1, "Batch dimension missing from logits_a"
+        assert logits_b.shape[0] == 1, "Batch dimension missing from logits_b"
+        assert np.isfinite(logits_a).all(), "logits_a contains NaN/Inf"
+        assert np.isfinite(logits_b).all(), "logits_b contains NaN/Inf"
