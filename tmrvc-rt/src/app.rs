@@ -926,7 +926,7 @@ fn processor_thread(
                 temperature_b: 1.0,
                 top_k_a: 50,
                 top_k_b: 20,
-                voice_state: [0.5f32; 8],
+                voice_state: [0.5f32; 12],
             };
             engine.process_one_frame(&input_buf, &mut output_buf, &frame_params);
             let frame_ms = status.inference_ms.load(Ordering::Relaxed);
