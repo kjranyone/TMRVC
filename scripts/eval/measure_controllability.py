@@ -34,6 +34,53 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Variance bucket classification for each metric
+METRIC_BUCKET_MAP: dict[str, str] = {
+    "monotonicity": "compile",
+    "calibration_error": "compile",
+    "replay_fidelity": "replay",
+    "edit_locality": "replay",
+    "transfer_correlation": "transfer",
+    "tag_compliance": "compile",
+    "cfg_responsiveness": "compile",
+    "speaker_similarity": "transfer",
+    "naturalness_utmos": "compile",
+}
+
+
+def validate_no_mixed_buckets(metric_results: dict[str, dict]) -> bool:
+    """Validate that metrics from different variance buckets are not mixed.
+
+    Each metric belongs to exactly one variance bucket (compile, replay, transfer).
+    This function checks that metrics are properly categorized and reports
+    any inconsistencies.
+
+    Args:
+        metric_results: dict mapping metric_name -> {bucket: str, value: float, ...}
+
+    Returns:
+        True if no violations detected.
+    """
+    bucket_metrics: dict[str, list[str]] = {"compile": [], "replay": [], "transfer": []}
+
+    for metric_name, result in metric_results.items():
+        expected_bucket = METRIC_BUCKET_MAP.get(metric_name)
+        actual_bucket = result.get("bucket", expected_bucket)
+
+        if expected_bucket and actual_bucket and expected_bucket != actual_bucket:
+            logger.warning(
+                "Mixed bucket violation: metric '%s' expected bucket '%s' but got '%s'",
+                metric_name, expected_bucket, actual_bucket,
+            )
+            return False
+
+        bucket = actual_bucket or expected_bucket or "unknown"
+        if bucket in bucket_metrics:
+            bucket_metrics[bucket].append(metric_name)
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Thresholds (frozen, from docs/design/acceptance-thresholds.md V4-1)
 # ---------------------------------------------------------------------------

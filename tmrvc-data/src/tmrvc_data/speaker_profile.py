@@ -51,9 +51,6 @@ class CastingGalleryStore:
             data["speaker_embed"] = torch.tensor(data["speaker_embed"])
         if "prompt_codec_tokens" in data and data["prompt_codec_tokens"] is not None:
             data["prompt_codec_tokens"] = torch.tensor(data["prompt_codec_tokens"])
-        if "prompt_text_tokens" in data and data["prompt_text_tokens"] is not None:
-            data["prompt_text_tokens"] = torch.tensor(data["prompt_text_tokens"])
-
         return SpeakerProfile(**data)
 
     def save_profile(self, profile: SpeakerProfile) -> None:
@@ -66,8 +63,6 @@ class CastingGalleryStore:
             data["speaker_embed"] = data["speaker_embed"].tolist()
         if isinstance(data["prompt_codec_tokens"], torch.Tensor):
             data["prompt_codec_tokens"] = data["prompt_codec_tokens"].tolist()
-        if isinstance(data["prompt_text_tokens"], torch.Tensor):
-            data["prompt_text_tokens"] = data["prompt_text_tokens"].tolist()
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

@@ -1,4 +1,4 @@
-"""POST /tts, POST /tts/stream, POST /tts/stream/sse, and POST /tts/stream/v4 endpoints (UCLM pointer mode)."""
+"""POST /tts, POST /tts/stream, POST /tts/stream/sse, POST /tts/stream/v4, POST /tts/simple, POST /tts/prompt endpoints (UCLM pointer mode)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import logging
 import torch
 
 import numpy as np
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from tmrvc_core.constants import SAMPLE_RATE
@@ -19,7 +19,7 @@ from tmrvc_serve._helpers import (
     _load_speaker_embed,
     _to_dialogue_turns,
 )
-from tmrvc_serve.schemas import TTSRequestAdvanced, TTSResponse
+from tmrvc_serve.schemas import TTSRequestAdvanced, TTSRequestSimple, TTSRequestPrompt, TTSResponse
 from tmrvc_serve.style_resolver import (
     _apply_inline_stage_overlay,
     _predict_style_from_inputs,
@@ -76,6 +76,11 @@ async def generate_tts(req: TTSRequestAdvanced) -> TTSResponse:
     # 5. Extract pacing controls
     pacing = req.pacing
 
+    # 6a. v4: Acting texture latent
+    acting_tex_t = None
+    if req.acting_texture_latent is not None:
+        acting_tex_t = torch.tensor([req.acting_texture_latent], dtype=torch.float32).to(engine.device)
+
     # 6. Unified Synthesis
     audio_t, metrics = engine.tts(
         phonemes=phonemes_t,
@@ -90,6 +95,7 @@ async def generate_tts(req: TTSRequestAdvanced) -> TTSResponse:
         breath_tendency=pacing.breath_tendency,
         explicit_voice_state=explicit_vs,
         delta_voice_state=delta_vs,
+        acting_texture_latent=acting_tex_t,
         cfg_scale=req.cfg_scale,
         cfg_mode=req.cfg_mode,
     )
@@ -262,6 +268,11 @@ async def tts_stream_v4(req: TTSRequestAdvanced) -> StreamingResponse:
     # 5. Pacing controls
     pacing = req.pacing
 
+    # 5b. v4: Acting texture latent
+    acting_tex_t = None
+    if req.acting_texture_latent is not None:
+        acting_tex_t = torch.tensor([req.acting_texture_latent], dtype=torch.float32).to(engine.device)
+
     # 6. Causal streaming generation
     #    Use engine.tts_stream() if available, otherwise fall back to
     #    frame-by-frame slicing of a full generation.  The SSE contract
@@ -289,6 +300,7 @@ async def tts_stream_v4(req: TTSRequestAdvanced) -> StreamingResponse:
             breath_tendency=pacing.breath_tendency,
             explicit_voice_state=explicit_vs,
             delta_voice_state=delta_vs,
+            acting_texture_latent=acting_tex_t,
             cfg_scale=req.cfg_scale,
             cfg_mode=req.cfg_mode,
         )
@@ -309,6 +321,7 @@ async def tts_stream_v4(req: TTSRequestAdvanced) -> StreamingResponse:
             breath_tendency=pacing.breath_tendency,
             explicit_voice_state=explicit_vs,
             delta_voice_state=delta_vs,
+            acting_texture_latent=acting_tex_t,
             cfg_scale=req.cfg_scale,
             cfg_mode=req.cfg_mode,
         )
@@ -407,4 +420,151 @@ async def tts_stream_v4(req: TTSRequestAdvanced) -> StreamingResponse:
             "X-Accel-Buffering": "no",
             "X-Schema-Version": _V4_SCHEMA_VERSION,
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Simple / Prompt mode endpoints
+# ---------------------------------------------------------------------------
+
+
+def _resolve_speaker(engine, pseudo_speaker_id=None, speaker_profile_id=None):
+    """Resolve speaker embed from available identifiers."""
+    if speaker_profile_id:
+        profile = engine.load_speaker_profile(speaker_profile_id)
+        if profile is not None:
+            return profile.speaker_embed
+    if pseudo_speaker_id:
+        profile = engine.load_speaker_profile(pseudo_speaker_id)
+        if profile is not None:
+            return profile.speaker_embed
+    return np.zeros(192, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Simple mode TTS
+# ---------------------------------------------------------------------------
+
+
+@router.post("/tts/simple")
+async def tts_simple(req: TTSRequestSimple, request: Request):
+    """Simple mode TTS: emotion + speed only."""
+    from tmrvc_serve.app import get_engine
+    from tmrvc_data.g2p import text_to_phonemes
+
+    engine = get_engine()
+
+    # Resolve speaker
+    spk_embed = _resolve_speaker(engine, req.pseudo_speaker_id, req.speaker_profile_id)
+
+    # Convert speed to pace (simple linear mapping)
+    pace = req.speed if req.speed else 1.0
+
+    # Resolve emotion to style
+    style = None
+    if req.emotion:
+        style = _resolve_style_preset(req.emotion)
+
+    # G2P
+    g2p_result = text_to_phonemes(req.text, language=req.language or "ja")
+    phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+    spk_t = torch.from_numpy(np.asarray(spk_embed)).float().to(engine.device)
+    if spk_t.dim() == 1:
+        spk_t = spk_t.unsqueeze(0)
+
+    audio_t, stats = engine.tts(
+        phonemes=phonemes_t,
+        speaker_embed=spk_t,
+        style=style,
+        language_id=g2p_result.language_id,
+        pace=pace,
+    )
+
+    audio = audio_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    audio_b64 = base64.b64encode(audio.tobytes()).decode()
+
+    return TTSResponse(
+        audio_base64=audio_b64,
+        sample_rate=SAMPLE_RATE,
+        duration_sec=len(audio) / SAMPLE_RATE,
+        provenance="simple_mode",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt mode TTS
+# ---------------------------------------------------------------------------
+
+
+@router.post("/tts/prompt")
+async def tts_prompt(req: TTSRequestPrompt, request: Request):
+    """Prompt mode TTS: natural language acting intent -> synthesis."""
+    from tmrvc_serve.app import get_engine
+    from tmrvc_serve.intent_compiler import IntentCompiler
+    from tmrvc_data.g2p import text_to_phonemes
+
+    engine = get_engine()
+
+    # Compile intent
+    compiler = getattr(request.app.state, "intent_compiler", None)
+    if compiler is None:
+        compiler = IntentCompiler(device=engine.device)
+        request.app.state.intent_compiler = compiler
+
+    compiled = compiler.compile(
+        prompt=req.acting_prompt or "",
+        context={
+            "text": req.text,
+            "scene_context": req.scene_context,
+        },
+    )
+
+    # Resolve speaker
+    spk_embed = _resolve_speaker(engine, None, req.speaker_profile_id)
+
+    # G2P
+    g2p_result = text_to_phonemes(req.text, language=req.language or "ja")
+    phonemes_t = g2p_result.phoneme_ids.to(dtype=torch.long).unsqueeze(0)
+    spk_t = torch.from_numpy(np.asarray(spk_embed)).float().to(engine.device)
+    if spk_t.dim() == 1:
+        spk_t = spk_t.unsqueeze(0)
+
+    # Build voice state from compiled physical targets
+    voice_state = compiled.physical_targets.float().to(engine.device)
+    if voice_state.dim() == 1:
+        voice_state = voice_state.unsqueeze(0)
+
+    # Build acting texture latent
+    acting_latent = None
+    if compiled.acting_latent_prior is not None:
+        acting_latent = compiled.acting_latent_prior.float().to(engine.device)
+        if acting_latent.dim() == 1:
+            acting_latent = acting_latent.unsqueeze(0)
+
+    # Extract pacing from compiled output
+    pacing = compiled.pacing
+
+    audio_t, stats = engine.tts(
+        phonemes=phonemes_t,
+        speaker_embed=spk_t,
+        style=None,
+        language_id=g2p_result.language_id,
+        explicit_voice_state=voice_state,
+        acting_texture_latent=acting_latent,
+        pace=pacing.pace,
+        hold_bias=pacing.hold_bias,
+        boundary_bias=pacing.boundary_bias,
+        phrase_pressure=pacing.phrase_pressure,
+        breath_tendency=pacing.breath_tendency,
+    )
+
+    audio = audio_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    audio_b64 = base64.b64encode(audio.tobytes()).decode()
+
+    return TTSResponse(
+        audio_base64=audio_b64,
+        sample_rate=SAMPLE_RATE,
+        duration_sec=len(audio) / SAMPLE_RATE,
+        provenance="prompt_compile",
+        trajectory_id=compiled.compile_id,
     )

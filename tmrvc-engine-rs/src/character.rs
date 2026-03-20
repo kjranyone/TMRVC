@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::constants::*;
 
 const MAGIC: &[u8; 4] = b"TMCH";
-const VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 // 4 (magic) + 4 (version) + 4 (spk) + 4 (lora) + 4 (vs) + 4 (style) + 4 (profile)
 const HEADER_SIZE: usize = 28;
 const CHECKSUM_SIZE: usize = 32; // SHA-256
@@ -25,21 +25,24 @@ pub struct CharacterProfile {
     pub language: String,
 }
 
-/// Parsed .tmrvc_character v1 file.
+/// Parsed .tmrvc_character v1/v2 file.
 ///
 /// Extends .tmrvc_speaker with voice source preset, default emotion style,
 /// and a character profile for context-aware TTS.
+/// v2 adds acting_latent_prior (24-D).
 #[derive(Debug)]
 pub struct CharacterFile {
     pub spk_embed: [f32; D_SPEAKER],
     pub lora_delta: Vec<f32>,
     pub voice_source_preset: [f32; N_VOICE_SOURCE_PARAMS],
     pub default_style: [f32; D_STYLE],
+    pub acting_latent_prior: [f32; D_ACTING_LATENT],
     pub profile: CharacterProfile,
+    pub version: u32,
 }
 
 impl CharacterFile {
-    /// Load and validate a .tmrvc_character v1 file.
+    /// Load and validate a .tmrvc_character v1/v2 file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read(path).context("Failed to read character file")?;
 
@@ -62,11 +65,10 @@ impl CharacterFile {
         }
 
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != VERSION {
+        if version != 1 && version != 2 {
             bail!(
-                "Unsupported character version: {} (expected {})",
-                version,
-                VERSION
+                "Unsupported character version: {} (expected 1 or 2)",
+                version
             );
         }
 
@@ -92,11 +94,13 @@ impl CharacterFile {
         let style_size = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
         let profile_size = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
 
+        let acting_latent_size = if version >= 2 { D_ACTING_LATENT } else { 0 };
         let expected_size = HEADER_SIZE
             + spk_size * 4
             + lora_size * 4
             + vs_size * 4
             + style_size * 4
+            + acting_latent_size * 4
             + profile_size
             + CHECKSUM_SIZE;
         if data.len() != expected_size {
@@ -152,6 +156,20 @@ impl CharacterFile {
         }
         offset += style_size * 4;
 
+        // v2: acting latent prior
+        let mut acting_latent_prior = [0.0f32; D_ACTING_LATENT];
+        if version >= 2 {
+            for (i, chunk) in data[offset..offset + D_ACTING_LATENT * 4]
+                .chunks_exact(4)
+                .enumerate()
+            {
+                if i < D_ACTING_LATENT {
+                    acting_latent_prior[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+                }
+            }
+            offset += D_ACTING_LATENT * 4;
+        }
+
         let profile = if profile_size > 0 {
             let profile_bytes = &data[offset..offset + profile_size];
             serde_json::from_slice(profile_bytes).context("Failed to parse character profile JSON")?
@@ -164,11 +182,13 @@ impl CharacterFile {
             lora_delta,
             voice_source_preset,
             default_style,
+            acting_latent_prior,
             profile,
+            version,
         })
     }
 
-    /// Save a .tmrvc_character v1 file.
+    /// Save a .tmrvc_character v2 file.
     pub fn save(&self, path: &Path) -> Result<()> {
         let profile_json =
             serde_json::to_vec(&self.profile).context("Failed to serialize profile")?;
@@ -178,12 +198,13 @@ impl CharacterFile {
             + LORA_DELTA_SIZE * 4
             + N_VOICE_SOURCE_PARAMS * 4
             + D_STYLE * 4
+            + D_ACTING_LATENT * 4
             + profile_json.len();
         let mut buf = Vec::with_capacity(payload_size + CHECKSUM_SIZE);
 
         // Header
         buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&CURRENT_VERSION.to_le_bytes());
         buf.extend_from_slice(&(D_SPEAKER as u32).to_le_bytes());
         buf.extend_from_slice(&(LORA_DELTA_SIZE as u32).to_le_bytes());
         buf.extend_from_slice(&(N_VOICE_SOURCE_PARAMS as u32).to_le_bytes());
@@ -208,6 +229,11 @@ impl CharacterFile {
 
         // default_style
         for &v in &self.default_style {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // v2: acting_latent_prior
+        for &v in &self.acting_latent_prior {
             buf.extend_from_slice(&v.to_le_bytes());
         }
 
@@ -262,7 +288,9 @@ mod tests {
             lora_delta,
             voice_source_preset: voice_source,
             default_style,
+            acting_latent_prior: [0.0; D_ACTING_LATENT],
             profile: default_profile(),
+            version: CURRENT_VERSION,
         };
 
         let path = std::env::temp_dir().join("test_character_roundtrip.tmrvc_character");
@@ -273,6 +301,7 @@ mod tests {
         assert_eq!(original.lora_delta, loaded.lora_delta);
         assert_eq!(original.voice_source_preset, loaded.voice_source_preset);
         assert_eq!(original.default_style, loaded.default_style);
+        assert_eq!(original.acting_latent_prior, loaded.acting_latent_prior);
         assert_eq!(original.profile, loaded.profile);
 
         let _ = fs::remove_file(&path);
@@ -285,7 +314,9 @@ mod tests {
             lora_delta: vec![0.0; LORA_DELTA_SIZE],
             voice_source_preset: [0.0; N_VOICE_SOURCE_PARAMS],
             default_style: [0.0; D_STYLE],
+            acting_latent_prior: [0.0; D_ACTING_LATENT],
             profile: CharacterProfile::default(),
+            version: CURRENT_VERSION,
         };
 
         let path = std::env::temp_dir().join("test_character_zeros.tmrvc_character");
@@ -307,7 +338,9 @@ mod tests {
             lora_delta: vec![0.0; LORA_DELTA_SIZE],
             voice_source_preset: [0.0; N_VOICE_SOURCE_PARAMS],
             default_style: [0.0; D_STYLE],
+            acting_latent_prior: [0.0; D_ACTING_LATENT],
             profile: default_profile(),
+            version: CURRENT_VERSION,
         };
 
         let path = std::env::temp_dir().join("test_character_corrupt.tmrvc_character");
@@ -331,7 +364,9 @@ mod tests {
             lora_delta: vec![0.0; LORA_DELTA_SIZE],
             voice_source_preset: [0.0; N_VOICE_SOURCE_PARAMS],
             default_style: [0.0; D_STYLE],
+            acting_latent_prior: [0.0; D_ACTING_LATENT],
             profile: CharacterProfile::default(),
+            version: CURRENT_VERSION,
         };
 
         let path = std::env::temp_dir().join("test_character_bad_magic.tmrvc_character");
@@ -362,7 +397,9 @@ mod tests {
             lora_delta: vec![0.0; LORA_DELTA_SIZE],
             voice_source_preset: [0.0; N_VOICE_SOURCE_PARAMS],
             default_style: [0.0; D_STYLE],
+            acting_latent_prior: [0.0; D_ACTING_LATENT],
             profile: profile.clone(),
+            version: 2,
         };
 
         let path = std::env::temp_dir().join("test_character_profile.tmrvc_character");

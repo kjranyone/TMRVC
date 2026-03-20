@@ -87,6 +87,12 @@ fn smoke_processor_runs_frame_inference() {
         top_k_a: 50,
         top_k_b: 20,
         voice_state: [0.5; 12],
+        acting_texture_latent: [0.0; 24],
+        pace: 1.0,
+        hold_bias: 0.0,
+        boundary_bias: 0.0,
+        phrase_pressure: 0.0,
+        breath_tendency: 0.0,
     };
 
     let mut input = [0.0f32; FRAME_SIZE];
@@ -149,4 +155,57 @@ fn smoke_ort_bundle_new_uclm_signature_exists() {
 
     let result = OrtBundle::new_uclm(&model_dir);
     assert!(result.is_ok() || result.is_err());
+}
+
+#[test]
+fn test_pointer_step_pacing_formula() {
+    use tmrvc_engine_rs::processor::PointerState;
+
+    // Test 1: neutral pacing (pace=1.0, all biases=0.0)
+    // advance_logit=0.0 -> modulated=0.0 -> sigmoid(0.0)=0.5
+    // velocity=0.5*1.0=0.5, drag=0.0, progress=0.5
+    // hold_bias=0.0 <= 2.0, so check: advance_prob > 0.5 || progress >= 1.0
+    // 0.5 > 0.5 is false, 0.5 >= 1.0 is false -> no advance
+    let mut ptr = PointerState::default();
+    ptr.max_frames_per_unit = 100;
+    let advanced = ptr.step(0.0, 0.5, 0.8, 1.0, 0.0, 0.0, 0.0, 0.0);
+    assert!(!advanced);
+
+    // Test 2: strong advance signal
+    // advance_logit=2.0 -> sigmoid(2.0) ~ 0.88
+    // velocity=1.5*1.0=1.5, progress=1.5 >= 1.0
+    // advance_prob ~ 0.88 > 0.5, progress >= 1.0
+    // boundary_confidence=0.8 >= skip_protection_threshold(0.5) -> advance
+    let mut ptr2 = PointerState::default();
+    ptr2.max_frames_per_unit = 100;
+    let advanced = ptr2.step(2.0, 1.5, 0.8, 1.0, 0.0, 0.0, 0.0, 0.0);
+    assert!(advanced);
+
+    // Test 3: pace=2.0 speeds things up
+    // advance_logit=0.0, pace=2.0 -> modulated=0.0+(2.0-1.0)*2.0=2.0 -> sigmoid(2.0) ~ 0.88
+    // velocity=1.0*2.0=2.0, progress=2.0 >= 1.0
+    // advance_prob ~ 0.88 > 0.5, boundary=0.8 >= 0.5 -> advance
+    let mut ptr3 = PointerState::default();
+    ptr3.max_frames_per_unit = 100;
+    let advanced = ptr3.step(0.0, 1.0, 0.8, 2.0, 0.0, 0.0, 0.0, 0.0);
+    assert!(advanced);
+
+    // Test 4: hold_bias slows things down
+    // advance_logit=1.0, hold_bias=1.0 -> modulated=1.0-1.0=0.0 -> sigmoid(0.0)=0.5
+    // velocity=0.5*1.0=0.5, drag=1.0*0.02=0.02, progress=0.48
+    // hold_bias=1.0 <= 2.0, so check: advance_prob > 0.5 || progress >= 1.0
+    // 0.5 > 0.5 is false, 0.48 >= 1.0 is false -> no advance
+    let mut ptr4 = PointerState::default();
+    ptr4.max_frames_per_unit = 100;
+    let advanced = ptr4.step(1.0, 0.5, 0.8, 1.0, 1.0, 0.0, 0.0, 0.0);
+    assert!(!advanced);
+
+    // Test 5: phrase_pressure increases advance tendency
+    // advance_logit=0.0, phrase_pressure=0.5 -> modulated=0.0+0.5*1.5=0.75 -> sigmoid(0.75) ~ 0.68
+    // velocity=1.5*1.0=1.5, progress=1.5 >= 1.0
+    // advance_prob ~ 0.68 > 0.5, boundary=0.8 >= 0.5 -> advance
+    let mut ptr5 = PointerState::default();
+    ptr5.max_frames_per_unit = 100;
+    let advanced = ptr5.step(0.0, 1.5, 0.8, 1.0, 0.0, 0.0, 0.5, 0.0);
+    assert!(advanced);
 }

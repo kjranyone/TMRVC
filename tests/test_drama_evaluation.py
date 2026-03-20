@@ -268,7 +268,7 @@ class TestDisentanglementLeakage:
             out2 = model.forward_tts_pointer(**inputs2)
 
         # Pointer logits should still be finite
-        assert torch.isfinite(out2["pointer_logits"]).all()
+        assert torch.isfinite(out2["advance_logit"]).all()
 
         # Outputs should differ (different speaker)
         assert not torch.allclose(

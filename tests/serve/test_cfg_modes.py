@@ -362,11 +362,12 @@ class TestDistilledCFGTrainingLoss:
 
     def test_cfg_scale_embed_exists_on_model(self):
         """DisentangledUCLM should have cfg_scale_embed module."""
+        from tmrvc_core.constants import D_MODEL
         model = DisentangledUCLM(num_speakers=10)
         assert hasattr(model, "cfg_scale_embed")
-        # Should accept [B, 1] input and produce [B, d_speaker]
+        # Should accept [B, 1] input and produce [B, d_model]
         out = model.cfg_scale_embed(torch.tensor([[2.0]]))
-        assert out.shape == (1, 192)
+        assert out.shape == (1, D_MODEL)
 
 
 # ---------------------------------------------------------------------------

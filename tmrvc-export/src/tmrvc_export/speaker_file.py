@@ -1,9 +1,9 @@
-""".tmrvc_speaker v3 binary file format: create and load speaker profiles.
+""".tmrvc_speaker v4 binary file format: create and load speaker profiles.
 
-v3 format supports hierarchical adaptation:
+Format supports hierarchical adaptation:
 - Light: spk_embed only
 - Standard: + style_embed + reference_tokens
-- Full: + lora_delta
+- Full: + lora_delta + acting_latent
 """
 
 from __future__ import annotations
@@ -17,23 +17,23 @@ from pathlib import Path
 
 import numpy as np
 
-from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE, D_VOICE_STATE_SSL, N_CODEBOOKS
+from tmrvc_core.constants import D_ACTING_LATENT, D_SPEAKER, D_VOICE_STATE_SSL, LORA_DELTA_SIZE, N_CODEBOOKS
 
 logger = logging.getLogger(__name__)
 
 MAGIC = b"TMSP"
-VERSION = 3
+VERSION = 4
 
-HEADER_SIZE = 32
+HEADER_SIZE = 40
 CHECKSUM_SIZE = 32
 
 D_STYLE = 128
 
-# Flags
+# Flags (matches Rust speaker.rs)
 FLAG_HAS_STYLE = 1 << 0
 FLAG_HAS_REF_TOKENS = 1 << 1
 FLAG_HAS_LORA = 1 << 2
-FLAG_HAS_SSL_STATE = 1 << 3
+FLAG_HAS_ACTING_LATENT = 1 << 3
 
 # Default metadata template
 _DEFAULT_METADATA = {
@@ -56,14 +56,15 @@ _DEFAULT_METADATA = {
 
 @dataclass
 class SpeakerFile:
-    """Speaker file v3 data container."""
+    """Speaker file v4 data container."""
 
     spk_embed: np.ndarray  # [192]
     f0_mean: float = 220.0  # Mean F0 frequency in Hz
     style_embed: np.ndarray | None = None  # [128]
     reference_tokens: np.ndarray | None = None  # [T, N_CODEBOOKS]
     lora_delta: np.ndarray | None = None  # [LORA_DELTA_SIZE]
-    ssl_state: np.ndarray | None = None  # [128] default SSL state from WavLM
+    ssl_state: np.ndarray | None = None  # [128] default SSL state from WavLM (stored in metadata JSON)
+    acting_latent: np.ndarray | None = None  # [D_ACTING_LATENT]
     metadata: dict | None = None
 
     @property
@@ -84,9 +85,10 @@ def write_speaker_file(
     reference_tokens: np.ndarray | None = None,
     lora_delta: np.ndarray | None = None,
     ssl_state: np.ndarray | None = None,
+    acting_latent: np.ndarray | None = None,
     metadata: dict | None = None,
 ) -> Path:
-    """Write a .tmrvc_speaker v3 binary file.
+    """Write a .tmrvc_speaker v4 binary file.
 
     Args:
         output_path: Output file path.
@@ -95,7 +97,9 @@ def write_speaker_file(
         style_embed: Style embedding array, shape ``(128,)``, float32. (optional)
         reference_tokens: Reference codec tokens, shape ``(T, N_CODEBOOKS)``, int32. (optional)
         lora_delta: LoRA delta array, shape ``(LORA_DELTA_SIZE,)``, float32. (optional)
-        ssl_state: Default SSL state from WavLM, shape ``(128,)``, float32. (optional)
+        ssl_state: Default SSL state from WavLM, shape ``(128,)``, float32.
+            Stored in metadata JSON, not in the binary section. (optional)
+        acting_latent: Acting latent array, shape ``(D_ACTING_LATENT,)``, float32. (optional)
         metadata: Optional metadata dict.
 
     Returns:
@@ -125,17 +129,24 @@ def write_speaker_file(
         )
         assert lora_delta.dtype == np.float32
         flags |= FLAG_HAS_LORA
+    if acting_latent is not None:
+        assert acting_latent.shape == (D_ACTING_LATENT,), (
+            f"Expected ({D_ACTING_LATENT},), got {acting_latent.shape}"
+        )
+        assert acting_latent.dtype == np.float32
+        flags |= FLAG_HAS_ACTING_LATENT
     if ssl_state is not None:
         assert ssl_state.shape == (D_VOICE_STATE_SSL,), (
             f"Expected ({D_VOICE_STATE_SSL},), got {ssl_state.shape}"
         )
         assert ssl_state.dtype == np.float32
-        flags |= FLAG_HAS_SSL_STATE
 
-    # Build metadata (include ssl_state in metadata - it's not in binary section)
+    # Build metadata (ssl_state is stored in metadata JSON, not in binary section)
     meta = {**_DEFAULT_METADATA, **(metadata or {})}
     if ssl_state is not None:
         meta["ssl_state"] = ssl_state.tolist()
+    if acting_latent is not None:
+        meta["acting_latent"] = acting_latent.tolist()
     # NOTE: f0_mean is stored in binary section, NOT in metadata (single source of truth)
     if "adaptation_level" not in meta:
         if flags & FLAG_HAS_LORA:
@@ -147,7 +158,9 @@ def write_speaker_file(
 
     metadata_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
 
-    # Build header (32 bytes)
+    acting_latent_size = D_ACTING_LATENT if acting_latent is not None else 0
+
+    # Build header (40 bytes)
     data = bytearray()
     data += MAGIC
     data += struct.pack("<I", VERSION)  # version
@@ -163,6 +176,8 @@ def write_speaker_file(
         "<I", LORA_DELTA_SIZE if lora_delta is not None else 0
     )  # lora_size
     data += struct.pack("<I", len(metadata_bytes))  # metadata_size
+    data += struct.pack("<I", acting_latent_size)  # acting_latent_size (NEW in v4)
+    data += struct.pack("<I", 0)  # reserved/pad
 
     # Build data section
     data += spk_embed.tobytes()
@@ -173,6 +188,8 @@ def write_speaker_file(
         data += reference_tokens.tobytes()
     if lora_delta is not None:
         data += lora_delta.tobytes()
+    if acting_latent is not None:
+        data += acting_latent.tobytes()
     data += metadata_bytes
 
     # Compute SHA-256 checksum
@@ -181,7 +198,7 @@ def write_speaker_file(
 
     output_path.write_bytes(bytes(data))
     logger.info(
-        "Wrote speaker file v3 to %s (%d bytes, level=%s)",
+        "Wrote speaker file v4 to %s (%d bytes, level=%s)",
         output_path,
         len(data),
         meta["adaptation_level"],
@@ -190,7 +207,7 @@ def write_speaker_file(
 
 
 def read_speaker_file(path: str | Path) -> SpeakerFile:
-    """Read and validate a .tmrvc_speaker v3 binary file.
+    """Read and validate a .tmrvc_speaker v4 binary file.
 
     Args:
         path: Path to the speaker file.
@@ -212,17 +229,17 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
     # Validate version
     version = struct.unpack("<I", data[4:8])[0]
     if version != VERSION:
-        raise ValueError(f"Unsupported version: {version}, expected v3")
+        raise ValueError(f"Unsupported version: {version}, expected v{VERSION}")
 
-    # Parse header
+    # Parse header (40 bytes)
     flags = struct.unpack("<I", data[8:12])[0]
     spk_size = struct.unpack("<I", data[12:16])[0]
     style_size = struct.unpack("<I", data[16:20])[0]
     ref_frames = struct.unpack("<I", data[20:24])[0]
     lora_size = struct.unpack("<I", data[24:28])[0]
     metadata_size = struct.unpack("<I", data[28:32])[0]
-
-    HEADER_SIZE = 32
+    acting_latent_size = struct.unpack("<I", data[32:36])[0]
+    # bytes 36..40 are reserved/pad
 
     # Verify spk_embed size
     if spk_size != D_SPEAKER:
@@ -231,8 +248,8 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
         )
 
     # Verify checksum
-    checksum = data[-32:]
-    payload = data[:-32]
+    checksum = data[-CHECKSUM_SIZE:]
+    payload = data[:-CHECKSUM_SIZE]
     if hashlib.sha256(payload).digest() != checksum:
         raise ValueError("Checksum mismatch: file is corrupted")
 
@@ -274,6 +291,14 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
         ).copy()
         offset += lora_size * 4
 
+    # Extract acting_latent (optional)
+    acting_latent = None
+    if flags & FLAG_HAS_ACTING_LATENT and acting_latent_size > 0:
+        acting_latent = np.frombuffer(
+            data[offset : offset + acting_latent_size * 4], dtype=np.float32
+        ).copy()
+        offset += acting_latent_size * 4
+
     # Extract metadata
     metadata_dict = (
         json.loads(data[offset : offset + metadata_size]) if metadata_size > 0 else {}
@@ -298,5 +323,6 @@ def read_speaker_file(path: str | Path) -> SpeakerFile:
         reference_tokens=reference_tokens,
         lora_delta=lora_delta,
         ssl_state=ssl_state,
+        acting_latent=acting_latent,
         metadata=metadata_dict,
     )

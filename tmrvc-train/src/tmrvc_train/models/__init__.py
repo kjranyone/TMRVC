@@ -47,10 +47,6 @@ from tmrvc_train.models.reference_encoder import (
     ReferenceEncoder,
     ReferenceEncoderFromWaveform,
 )
-from tmrvc_train.models.acoustic_refinement import (
-    AcousticRefinementModule,
-    RefinementBlock,
-)
 from tmrvc_train.models.vocoder import (
     VocoderBase,
     CodecNativeDecoder,
@@ -131,9 +127,6 @@ __all__ = [
     # Reference Encoder (GST-style prosody extraction)
     "ReferenceEncoder",
     "ReferenceEncoderFromWaveform",
-    # Acoustic Refinement (v3.1 coarse-to-full RVQ)
-    "AcousticRefinementModule",
-    "RefinementBlock",
     # Vocoder Interface
     "VocoderBase",
     "CodecNativeDecoder",

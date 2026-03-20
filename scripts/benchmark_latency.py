@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Latency benchmark for UCLM v3 pointer-based TTS inference.
+"""Latency benchmark for UCLM v4 pointer-based TTS inference.
 
 Usage:
     python scripts/benchmark_latency.py --device cpu
@@ -113,14 +113,14 @@ def benchmark_full_tts(device: str, num_phonemes: int = 20, warmup: int = 2, ite
 
 
 def main():
-    parser = argparse.ArgumentParser(description="UCLM v3 latency benchmark (SOTA Enforcement)")
+    parser = argparse.ArgumentParser(description="UCLM v4 latency benchmark (SOTA Enforcement)")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--rtf-threshold", type=float, default=0.8, help="SOTA RTF limit mandated by GEMINI.md")
     args = parser.parse_args()
 
-    print(f"=== UCLM v3 Latency Benchmark (SOTA Enforcement, device={args.device}) ===\n")
+    print(f"=== UCLM v4 Latency Benchmark (SOTA Enforcement, device={args.device}) ===\n")
 
     # 1. Single pointer step benchmark (Micro-latency)
     print("1. Single pointer step benchmark (Budget: 10ms):")

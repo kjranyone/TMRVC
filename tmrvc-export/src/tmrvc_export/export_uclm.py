@@ -105,7 +105,7 @@ class UCLMCoreExportWrapper(nn.Module):
         b_ctx: [B, 4, L] - control token context [op, type, dur, int]
         spk_embed: [B, 192] - speaker embedding
         state_cond: [B, d_model] - voice state condition (single frame)
-        acting_intent: [B, D_ACTING_LATENT] - acting intent vector (zeros if unused)
+        acting_texture_latent: [B, D_ACTING_LATENT] - 24-D acting texture latent (zeros if unused)
         cfg_scale: [1] - CFG amplification scale
         kv_cache_in: [B, kv_cache_size] - flattened KV cache (zeros for first frame)
 
@@ -118,7 +118,7 @@ class UCLMCoreExportWrapper(nn.Module):
     def __init__(self, model: DisentangledUCLM, max_seq_len: int = 200):
         super().__init__()
         self.uclm_core = model.uclm_core
-        self.acting_proj = model.acting_proj if hasattr(model, "acting_proj") else None
+        self.acting_latent_conditioner = model.acting_latent_conditioner
         self.max_seq_len = max_seq_len
         self.n_heads = model.uclm_core.n_heads
         self.n_layers = model.uclm_core.n_layers
@@ -129,13 +129,24 @@ class UCLMCoreExportWrapper(nn.Module):
             2 * self.n_layers * self.n_heads * self.head_dim * max_seq_len
         )
 
+        # Precompute conditioner output for zero input (bias baseline).
+        # Subtracted in forward() so that zeros truly produce zero conditioning,
+        # which is required for correct CFG unconditional semantics in the
+        # Rust runtime where None is not representable.
+        with torch.no_grad():
+            zero_latent = torch.zeros(1, D_ACTING_LATENT)
+            self.register_buffer(
+                "_act_zero_baseline",
+                self.acting_latent_conditioner(zero_latent),
+            )
+
     def forward(
         self,
         content_features: torch.Tensor,
         b_ctx: torch.Tensor,
         spk_embed: torch.Tensor,
         state_cond: torch.Tensor,
-        acting_intent: torch.Tensor,
+        acting_texture_latent: torch.Tensor,
         cfg_scale: torch.Tensor,
         kv_cache_in: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -146,15 +157,19 @@ class UCLMCoreExportWrapper(nn.Module):
             b_ctx: [B, 4, L]
             spk_embed: [B, 192]
             state_cond: [B, d_model]
-            acting_intent: [B, D_ACTING_LATENT] - 24-D acting latent (zeros = no acting)
+            acting_texture_latent: [B, D_ACTING_LATENT] - 24-D acting texture latent (zeros = no acting)
             cfg_scale: [1]
             kv_cache_in: [B, kv_cache_size] - Flattened KV cache
         """
         B, D, L = content_features.shape
 
-        # Apply acting intent projection if available and non-zero
-        if self.acting_proj is not None and acting_intent.abs().sum() > 0:
-            content_features = content_features + self.acting_proj(acting_intent).unsqueeze(2)
+        # v4: Apply acting texture latent conditioning unconditionally.
+        # Subtract the zero-input baseline so that zeros truly produce zero
+        # conditioning (the MLP has biased Linear layers whose f(0) ≠ 0).
+        # This makes the ONNX "zeros = disabled" contract match the Python
+        # "None = disabled" contract used by CFG unconditional passes.
+        act_cond = self.acting_latent_conditioner(acting_texture_latent) - self._act_zero_baseline  # [B, d_model]
+        content_features = content_features + act_cond.unsqueeze(2)
 
         # Now uses the improved CodecTransformer which supports flattened tensor cache
         logits_a_full, logits_b_full, kv_cache_out = self.uclm_core(
@@ -436,7 +451,7 @@ def export_uclm_core(
             "b_ctx",
             "spk_embed",
             "state_cond",
-            "acting_intent",
+            "acting_texture_latent",
             "cfg_scale",
             "kv_cache_in",
         ],
@@ -446,7 +461,7 @@ def export_uclm_core(
             "b_ctx": {0: "batch", 2: "L"},
             "spk_embed": {0: "batch"},
             "state_cond": {0: "batch"},
-            "acting_intent": {0: "batch"},
+            "acting_texture_latent": {0: "batch"},
             "cfg_scale": {},
             "kv_cache_in": {0: "batch"},
             "logits_a": {0: "batch"},

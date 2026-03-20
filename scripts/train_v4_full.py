@@ -69,6 +69,8 @@ def parse_args():
     p.add_argument("--skip-cache", action="store_true")
     p.add_argument("--annotation-model", default="Qwen/Qwen3.5-35B-A3B",
                    help="LLM for semantic annotation + enriched transcripts")
+    p.add_argument("--codec-condition", default="A", choices=["A", "B", "C", "D"],
+                   help="Codec experiment condition (track_codec_strategy.md)")
     return p.parse_args()
 
 
@@ -442,12 +444,16 @@ def main():
     from tmrvc_train.trainer import UCLMTrainer
     from tmrvc_train.v4_loss import V4LossConfig
 
+    codec_cond = args.codec_condition
+    logger.info("Codec condition: %s", codec_cond)
+
     model = DisentangledUCLM(
         d_model=D_MODEL, d_explicit=D_VOICE_STATE, d_ssl=D_VOICE_STATE_SSL,
         d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
         rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
         vocab_size=PHONEME_VOCAB_SIZE, num_speakers=100,
         acting_tag_vocab_size=N_ACTING_TAGS,
+        codec_condition=codec_cond,
     ).to(device)
 
     acting_enc = ActingLatentEncoder().to(device)
@@ -474,6 +480,7 @@ def main():
         semantic_alignment_weight=0.5,
         use_enriched_transcript=True,
         enriched_transcript_prob=0.5,
+        codec_condition=codec_cond,
     )
 
     n_params = sum(p.numel() for p in model.parameters())

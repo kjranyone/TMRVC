@@ -72,14 +72,8 @@ class VoiceStateEncoder(nn.Module):
         num_speakers: int = 0,
         num_phonemes: int = 0,
         use_grl: bool = True,
-        **kwargs,
     ):
         super().__init__()
-
-        # Compatibility shim for old argument names used in tests
-        d_explicit = kwargs.get("d_explicit", d_voice_state_explicit)
-        d_ssl = kwargs.get("d_ssl", d_voice_state_ssl)
-        d_delta = kwargs.get("d_delta", d_voice_state_delta)
 
         self.d_model = d_model
         self.use_grl = use_grl
@@ -87,17 +81,17 @@ class VoiceStateEncoder(nn.Module):
         third = d_model // 3
 
         self.explicit_proj = nn.Sequential(
-            nn.Linear(d_explicit, third),
+            nn.Linear(d_voice_state_explicit, third),
             nn.GELU(),
         )
 
         self.ssl_proj = nn.Sequential(
-            nn.Linear(d_ssl, third),
+            nn.Linear(d_voice_state_ssl, third),
             nn.GELU(),
         )
 
         self.delta_proj = nn.Sequential(
-            nn.Linear(d_delta, third),
+            nn.Linear(d_voice_state_delta, third),
             nn.GELU(),
         )
 

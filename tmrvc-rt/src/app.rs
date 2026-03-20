@@ -927,6 +927,12 @@ fn processor_thread(
                 top_k_a: 50,
                 top_k_b: 20,
                 voice_state: [0.5f32; 12],
+                acting_texture_latent: [0.0f32; 24],
+                pace: 1.0,
+                hold_bias: 0.0,
+                boundary_bias: 0.0,
+                phrase_pressure: 0.0,
+                breath_tendency: 0.0,
             };
             engine.process_one_frame(&input_buf, &mut output_buf, &frame_params);
             let frame_ms = status.inference_ms.load(Ordering::Relaxed);

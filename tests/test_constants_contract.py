@@ -270,19 +270,19 @@ class TestDisentangledUCLMDefaults:
         sig = inspect.signature(DisentangledUCLM.__init__)
         assert sig.parameters["d_speaker"].default == yaml_constants["d_speaker"]
 
-    def test_d_explicit(self, yaml_constants):
+    def test_d_voice_state_explicit(self, yaml_constants):
         from tmrvc_train.models.uclm_model import DisentangledUCLM
         import inspect
 
         sig = inspect.signature(DisentangledUCLM.__init__)
-        assert sig.parameters["d_explicit"].default == yaml_constants["d_voice_state_explicit"]
+        assert sig.parameters["d_voice_state_explicit"].default == yaml_constants["d_voice_state_explicit"]
 
-    def test_d_ssl(self, yaml_constants):
+    def test_d_voice_state_ssl(self, yaml_constants):
         from tmrvc_train.models.uclm_model import DisentangledUCLM
         import inspect
 
         sig = inspect.signature(DisentangledUCLM.__init__)
-        assert sig.parameters["d_ssl"].default == yaml_constants["d_voice_state_ssl"]
+        assert sig.parameters["d_voice_state_ssl"].default == yaml_constants["d_voice_state_ssl"]
 
     def test_n_codebooks(self, yaml_constants):
         from tmrvc_train.models.uclm_model import DisentangledUCLM

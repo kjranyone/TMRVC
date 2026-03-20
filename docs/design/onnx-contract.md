@@ -143,9 +143,6 @@ Inputs:
 | `acting_intent` | `[1, d_act]` | `float32` | utterance-level acting intent |
 | `local_prosody_latent` | `[1, d_prosody]` or `[1, 1, d_prosody]` | `float32` | local prosody control latent |
 | `pointer_state` | structured equivalent | `float32/int64` | `text_index`, `progress_value`, `boundary_confidence`, `stall_frames`, `finished` |
-| `pace` | `[1]` | `float32` | pacing multiplier |
-| `hold_bias` | `[1]` | `float32` | bias toward hold |
-| `boundary_bias` | `[1]` | `float32` | bias toward boundary advance |
 | `cfg_scale` | `[1]` | `float32` | guidance scale |
 | `kv_cache_in` | implementation-defined | `float32` | transformer cache |
 
@@ -164,7 +161,7 @@ Outputs:
 `state_cond` は internal fused representation として export wrapper の内部でのみ許可される。
 `uclm_core.onnx` の canonical public boundary では `state_cond` を mainline input 名として使わない。
 
-timing authority は `pace`, `hold_bias`, `boundary_bias` にある。`explicit_voice_state` / `delta_voice_state` は同じ意味空間を共有するが、runtime の primary timing-control path を置き換えてはならない。
+timing authority は runtime pacing modulation にある (see section 4.7)。`explicit_voice_state` / `delta_voice_state` は physical control を提供するが、runtime の primary timing-control path を置き換えてはならない。
 
 ### 4.5 `codec_decoder.onnx`
 
@@ -197,6 +194,43 @@ Outputs:
 | Name | Shape | Type |
 |---|---|---|
 | `speaker_embed` | `[1, d_speaker]` | `float32` |
+
+### 4.7 Runtime Pacing Modulation Contract
+
+Pacing modulation is a **runtime operation** applied to PointerHead outputs.
+It is NOT an ONNX model input — the formula is applied post-hoc by both the
+Python engine and Rust runtime.
+
+**Canonical Formula** (must be identical in Python and Rust):
+
+```
+modulated_logit = advance_logit
+    - hold_bias
+    + boundary_bias
+    + (pace - 1.0) * 2.0
+    + phrase_pressure * 1.5
+    - breath_tendency * 0.5
+p_advance = sigmoid(modulated_logit)
+
+velocity = progress_delta * pace
+drag = max(0.0, hold_bias * 0.02)
+progress += max(0.0, velocity - drag)
+```
+
+**Parameters** (all runtime-only, not ONNX inputs):
+
+| Parameter | Range | Default | Effect |
+|-----------|-------|---------|--------|
+| pace | 0.3–3.0 | 1.0 | Overall speed multiplier |
+| hold_bias | -1.0–1.0 | 0.0 | Negative = hold longer, positive = advance sooner |
+| boundary_bias | -1.0–1.0 | 0.0 | Positive = encourage boundary transitions |
+| phrase_pressure | -1.0–1.0 | 0.0 | Positive = urgency, negative = restrained |
+| breath_tendency | -1.0–1.0 | 0.0 | Positive = more pauses at boundaries |
+
+**Rationale**: Pacing is PointerHead output post-processing. Baking it into
+ONNX would require model re-export whenever the formula changes. Both Python
+(`uclm_engine.py:1208-1215`) and Rust (`processor.rs:PointerState::step`)
+apply this formula identically at runtime.
 
 ## 5. Canonical CFG Contract
 

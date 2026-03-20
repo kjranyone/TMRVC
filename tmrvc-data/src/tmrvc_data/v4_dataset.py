@@ -261,6 +261,24 @@ class V4UCLMDataset(Dataset):
         result.setdefault("physical_confidence", None)
         result.setdefault("codec_tokens_b", None)
 
+        # v4: Acting texture latent target [24] or [T, 24] (optional)
+        act_latent_path = utt_dir / "acting_texture_latent_target.npy"
+        if act_latent_path.exists():
+            result["acting_texture_latent_target"] = torch.from_numpy(
+                np.load(act_latent_path).astype(np.float32)
+            )
+        else:
+            result["acting_texture_latent_target"] = None
+
+        # v4: Pacing controls [3] or [5] (optional)
+        pacing_path = utt_dir / "pacing_controls.npy"
+        if pacing_path.exists():
+            result["pacing_controls"] = torch.from_numpy(
+                np.load(pacing_path).astype(np.float32)
+            )
+        else:
+            result["pacing_controls"] = None
+
         # Acting annotations
         result["acting_annotations"] = meta.get("acting_annotations", {})
 

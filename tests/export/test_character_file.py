@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from tmrvc_core.constants import (
+    D_ACTING_LATENT,
     D_SPEAKER,
     D_STYLE,
     LORA_DELTA_SIZE,
@@ -37,6 +38,7 @@ def sample_arrays():
 class TestWriteRead:
     def test_roundtrip(self, tmp_path, sample_arrays):
         profile = {"name": "Test Character", "personality": "Happy", "language": "ja"}
+        act_latent = np.random.default_rng(99).standard_normal(D_ACTING_LATENT).astype(np.float32)
         path = write_character_file(
             tmp_path / "test.tmrvc_character",
             sample_arrays["spk_embed"],
@@ -44,16 +46,22 @@ class TestWriteRead:
             sample_arrays["voice_source"],
             sample_arrays["style"],
             profile,
+            acting_latent_prior=act_latent,
+            compiler_fingerprint="test-fp-123",
+            linked_speaker_profile_id="spk-456",
         )
         assert path.exists()
 
-        spk, lora, vs, sty, prof = read_character_file(path)
+        spk, lora, vs, sty, prof, act_prior = read_character_file(path)
         np.testing.assert_array_almost_equal(spk, sample_arrays["spk_embed"])
         np.testing.assert_array_almost_equal(lora, sample_arrays["lora_delta"])
         np.testing.assert_array_almost_equal(vs, sample_arrays["voice_source"])
         np.testing.assert_array_almost_equal(sty, sample_arrays["style"])
+        np.testing.assert_array_almost_equal(act_prior, act_latent)
         assert prof["name"] == "Test Character"
         assert prof["language"] == "ja"
+        assert prof["compiler_fingerprint"] == "test-fp-123"
+        assert prof["linked_speaker_profile_id"] == "spk-456"
 
     def test_defaults_when_none(self, tmp_path, sample_arrays):
         path = write_character_file(
@@ -61,11 +69,12 @@ class TestWriteRead:
             sample_arrays["spk_embed"],
             sample_arrays["lora_delta"],
         )
-        spk, lora, vs, sty, prof = read_character_file(path)
+        spk, lora, vs, sty, prof, act_prior = read_character_file(path)
         np.testing.assert_array_equal(
             vs, np.zeros(N_VOICE_SOURCE_PARAMS, dtype=np.float32)
         )
         np.testing.assert_array_equal(sty, np.zeros(D_STYLE, dtype=np.float32))
+        np.testing.assert_array_equal(act_prior, np.zeros(D_ACTING_LATENT, dtype=np.float32))
         assert prof["name"] == ""
         assert prof["language"] == "ja"
 
@@ -77,7 +86,7 @@ class TestWriteRead:
             sample_arrays["lora_delta"],
             profile=profile,
         )
-        _, _, _, _, prof = read_character_file(path)
+        _, _, _, _, prof, _ = read_character_file(path)
         assert prof["name"] == "桜"
         assert prof["personality"] == "明るい性格"
 
@@ -159,6 +168,6 @@ class TestFromSpeakerFile:
             tmp_path / "test.tmrvc_character",
             profile={"name": "Converted", "personality": "Calm"},
         )
-        spk, lora, vs, sty, prof = read_character_file(char_path)
+        spk, lora, vs, sty, prof, _ = read_character_file(char_path)
         np.testing.assert_array_almost_equal(spk, sample_arrays["spk_embed"])
         assert prof["name"] == "Converted"

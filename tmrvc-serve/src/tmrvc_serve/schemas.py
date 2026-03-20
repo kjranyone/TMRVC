@@ -28,6 +28,13 @@ V4_PHYSICAL_CONTROL_NAMES: list[str] = [
 # ---------------------------------------------------------------------------
 
 
+class InferenceMode(str, enum.Enum):
+    SIMPLE = "simple"
+    ADVANCED = "advanced"
+    PROMPT = "prompt"
+    REPLAY = "replay"
+
+
 class Priority(int, enum.Enum):
     """Speak request priority (lower value = higher priority)."""
 
@@ -152,6 +159,11 @@ class WSSpeakRequest(BaseModel):
     priority: Priority = Priority.NORMAL
     interrupt: bool = False
     speed: float | None = Field(None, ge=0.5, le=2.0)
+    pace: float | None = Field(None, ge=0.3, le=3.0)
+    hold_bias: float | None = Field(None, ge=-1.0, le=1.0)
+    boundary_bias: float | None = Field(None, ge=-1.0, le=1.0)
+    phrase_pressure: float | None = Field(None, ge=-1.0, le=1.0)
+    breath_tendency: float | None = Field(None, ge=-1.0, le=1.0)
 
 
 class WSCancelRequest(BaseModel):
@@ -168,6 +180,11 @@ class WSConfigureRequest(BaseModel):
     situation: str | None = None
     style_preset: StylePreset | None = None
     speed: float | None = Field(None, ge=0.5, le=2.0)
+    pace: float | None = Field(None, ge=0.3, le=3.0)
+    hold_bias: float | None = Field(None, ge=-1.0, le=1.0)
+    boundary_bias: float | None = Field(None, ge=-1.0, le=1.0)
+    phrase_pressure: float | None = Field(None, ge=-1.0, le=1.0)
+    breath_tendency: float | None = Field(None, ge=-1.0, le=1.0)
     scene_reset: bool = Field(
         False,
         description="Reset scene state to initial (zeroed) state.",
@@ -617,6 +634,19 @@ class TTSRequestAdvanced(BaseModel):
     # Acting macro controls
     acting_controls: ActingMacroControls = Field(default_factory=ActingMacroControls)
 
+    # v4: Direct 24-D acting texture latent (overrides macro projection)
+    acting_texture_latent: Optional[list[float]] = Field(
+        None,
+        min_length=24, max_length=24,
+        description="24-D acting texture latent vector. When provided, bypasses macro projection.",
+    )
+
+    # Provenance: compile_id from /workshop/compile for trajectory lineage
+    source_compile_id: Optional[str] = Field(
+        None,
+        description="compile_id from a prior /workshop/compile call, stored in TrajectoryRecord for provenance.",
+    )
+
     # Pacing
     pacing: PacingControlsSchema = Field(default_factory=PacingControlsSchema)
 
@@ -702,6 +732,10 @@ class CompileResponse(BaseModel):
     physical_targets: list[float]     # [12]
     physical_confidence: list[float]  # [12]
     acting_macro: ActingMacroControls
+    acting_texture_latent_prior: list[float] = Field(
+        default_factory=lambda: [0.0] * 24,
+        description="24-D acting texture latent prior from macro projection.",
+    )
     pacing: PacingControlsSchema
     warnings: list[str] = Field(default_factory=list)
     schema_version: str = "1.0"
@@ -749,7 +783,7 @@ class TrajectoryInfo(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible unified request schemas
+# Unified request schemas
 # ---------------------------------------------------------------------------
 
 
@@ -760,7 +794,7 @@ def _validate_12d(v: list[float] | None) -> list[float] | None:
 
 
 class TTSRequest(BaseModel):
-    """Unified TTS request (backward-compatible with v3 tests)."""
+    """Unified TTS request."""
     text: str
     character_id: str = ""
     speaker_profile_id: Optional[str] = None
@@ -777,6 +811,8 @@ class TTSRequest(BaseModel):
     pace: float = Field(1.0, ge=0.5, le=3.0)
     hold_bias: float = Field(0.0, ge=-1.0, le=1.0)
     boundary_bias: float = Field(0.0, ge=-1.0, le=1.0)
+    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0)
+    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0)
 
     # Expressive
     dialogue_context: Optional[list[float]] = None
@@ -806,7 +842,7 @@ class TTSRequest(BaseModel):
 
 
 class TTSStreamRequest(BaseModel):
-    """Unified streaming TTS request (backward-compatible with v3 tests)."""
+    """Unified streaming TTS request."""
     text: str
     character_id: str = ""
     speaker_profile_id: Optional[str] = None
@@ -820,6 +856,8 @@ class TTSStreamRequest(BaseModel):
     pace: float = Field(1.0, ge=0.5, le=3.0)
     hold_bias: float = Field(0.0, ge=-1.0, le=1.0)
     boundary_bias: float = Field(0.0, ge=-1.0, le=1.0)
+    phrase_pressure: float = Field(0.0, ge=-1.0, le=1.0)
+    breath_tendency: float = Field(0.0, ge=-1.0, le=1.0)
 
     dialogue_context: Optional[list[float]] = None
     acting_intent: Optional[list[float]] = None

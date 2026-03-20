@@ -2024,6 +2024,8 @@ def create_app() -> gr.Blocks:
         with gr.Tabs() as tabs:
             with gr.Tab("TTS合成", elem_id="tab-tts"):
                 _build_workshop_tab()
+            with gr.Tab("Prompt Mode", elem_id="tab-prompt"):
+                _build_prompt_mode_tab()
             with gr.Tab("音声変換", elem_id="tab-vc"):
                 _build_realtime_vc()
             with gr.Tab("Personal Voice Training"):
@@ -2075,6 +2077,109 @@ def create_app() -> gr.Blocks:
 # ---------------------------------------------------------------------------
 # Workshop Tab Builder
 # ---------------------------------------------------------------------------
+
+
+def _build_prompt_mode_tab() -> None:
+    """Build the Prompt Mode tab: text input -> compile -> preview -> synthesize."""
+
+    def _compile_intent(text: str, acting_prompt: str, scene_context: str):
+        """Compile acting intent via the Intent Compiler API."""
+        resp = _api_post("/ui/workshop/compile", {
+            "text": text,
+            "acting_prompt": acting_prompt,
+            "scene_context": scene_context,
+        })
+        if resp is None:
+            return "Compilation failed (server unreachable)", None, None
+        summary = (
+            f"Compile ID: {resp.get('compile_id', 'N/A')}\n"
+            f"Physical: {resp.get('physical_targets', [])}\n"
+            f"Acting Macro: {json.dumps(resp.get('acting_macro', {}), indent=2)}\n"
+            f"Acting Latent Prior: {resp.get('acting_texture_latent_prior', [])}\n"
+            f"Pacing: {json.dumps(resp.get('pacing', {}), indent=2)}\n"
+            f"Warnings: {resp.get('warnings', [])}"
+        )
+        return summary, resp.get("compile_id"), resp
+
+    def _synthesize_from_compile(text: str, compiled_json, speaker_id: str):
+        """Synthesize using compiled intent."""
+        if compiled_json is None:
+            return None, "No compiled intent. Press Compile first."
+        body = {
+            "text": text,
+            "speaker_profile_id": speaker_id or None,
+            "acting_texture_latent": compiled_json.get("acting_texture_latent_prior"),
+            "physical_controls": dict(zip(
+                ["pitch_level", "pitch_range", "energy_level", "pressedness",
+                 "spectral_tilt", "breathiness", "voice_irregularity", "openness",
+                 "aperiodicity", "formant_shift", "vocal_effort", "creak"],
+                compiled_json.get("physical_targets", [0.5] * 12),
+            )),
+        }
+        resp = _api_post("/ui/workshop/generate", body)
+        if resp is None:
+            return None, "Synthesis failed"
+        audio_b64 = resp.get("audio_base64", "")
+        if not audio_b64:
+            return None, "No audio in response"
+        import base64 as b64
+        raw = b64.b64decode(audio_b64)
+        sr = resp.get("sample_rate", SAMPLE_RATE)
+        offset_bytes = 44 if len(raw) > 44 and raw[:4] == b"RIFF" else 0
+        audio_np = np.frombuffer(raw[offset_bytes:], dtype=np.float32).copy()
+        info = (
+            f"Duration: {resp.get('duration_sec', 0):.2f}s | "
+            f"RTF: {resp.get('rtf', 0):.3f} | "
+            f"Provenance: {resp.get('provenance', 'N/A')}"
+        )
+        return (sr, audio_np), info
+
+    with gr.Column():
+        gr.Markdown("### Prompt Mode: Compile & Synthesize")
+        gr.Markdown(
+            "Enter text and acting instructions. The Intent Compiler produces "
+            "physical controls and a 24-D acting texture latent prior. "
+            "Preview the compiled result before synthesis."
+        )
+
+        with gr.Row():
+            with gr.Column(scale=2):
+                text_input = gr.Textbox(label="Text to speak", lines=3, placeholder="Enter text...")
+                acting_prompt_input = gr.Textbox(
+                    label="Acting instruction",
+                    lines=2,
+                    placeholder="e.g. 'angry shouting', 'whispered confession', 'cheerful greeting'",
+                )
+                scene_context_input = gr.Textbox(
+                    label="Scene context (optional)",
+                    lines=1,
+                    placeholder="e.g. 'argument scene in a drama'",
+                )
+                speaker_id_input = gr.Textbox(label="Speaker Profile ID (optional)", value="")
+
+            with gr.Column(scale=1):
+                compile_btn = gr.Button("Compile Intent", variant="primary")
+                compile_output = gr.Textbox(label="Compiled Result", lines=10, interactive=False)
+                compile_id_state = gr.State(value=None)
+                compiled_json_state = gr.State(value=None)
+
+        with gr.Row():
+            synthesize_btn = gr.Button("Synthesize from Compiled Intent", variant="secondary")
+
+        with gr.Row():
+            audio_output = gr.Audio(label="Synthesized Audio", type="numpy")
+            synth_info = gr.Textbox(label="Synthesis Info", interactive=False)
+
+        compile_btn.click(
+            fn=_compile_intent,
+            inputs=[text_input, acting_prompt_input, scene_context_input],
+            outputs=[compile_output, compile_id_state, compiled_json_state],
+        )
+        synthesize_btn.click(
+            fn=_synthesize_from_compile,
+            inputs=[text_input, compiled_json_state, speaker_id_input],
+            outputs=[audio_output, synth_info],
+        )
 
 
 def _build_workshop_tab() -> None:
@@ -2141,667 +2246,772 @@ def _build_workshop_tab() -> None:
 
     gr.Markdown("## v4 Programmable Expressive Speech Workshop")
     gr.Markdown(
-        "Physical-plus-latent control plane with 6 panels: "
-        "Basic Physical, Advanced Physical (12-D), Acting Macro, "
-        "Acting Prompt (inline tags), Reference-Driven, and Trajectory."
-    )
-
-    # --- Speaker Selection ---
-    with gr.Row():
-        speaker_profile_id = gr.Dropdown(
-            label="Speaker Profile",
-            choices=[],
-            interactive=True,
-        )
-        enroll_btn = gr.Button("Enroll New Speaker", variant="secondary")
-
-    # --- Text Input ---
-    text_input = gr.Textbox(
-        label="Text",
-        placeholder="Enter text for synthesis (supports inline acting tags like [angry], [whisper], etc.)...",
-        lines=3,
+        "Three inference modes: **Simple** (emotion + speed), "
+        "**Physical Advanced** (full 12-D + acting + trajectory), "
+        "**Prompt** (natural language acting intent)."
     )
 
     # ===============================================================
-    # Panel 1: Basic Physical Controls (6 sliders, all default 0.5)
+    # Mode Selector
     # ===============================================================
-    with gr.Accordion("Panel 1: Basic Physical Controls", open=True):
-        gr.Markdown(
-            "Most frequently used physical voice controls. "
-            "All values range [0.0, 1.0]."
-        )
-        with gr.Row():
-            basic_pitch_level = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Pitch Level",
-                info="Fundamental frequency level",
-            )
-            basic_energy_level = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Energy Level",
-                info="Overall loudness",
-            )
-            basic_breathiness = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Breathiness",
-                info="Aspiration noise level",
-            )
-        with gr.Row():
-            basic_pressedness = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Pressedness",
-                info="Phonation compression",
-            )
-            basic_spectral_tilt = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Spectral Tilt",
-                info="Brightness of vocal source",
-            )
-            basic_vocal_effort = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Vocal Effort",
-                info="Phonatory effort",
-            )
-
-    # ===============================================================
-    # Panel 2: Advanced Physical Controls (full 12-D, default closed)
-    # ===============================================================
-    with gr.Accordion("Panel 2: Advanced Physical Controls (12-D)", open=False):
-        gr.Markdown(
-            "Full 12-dimensional physical control vector. For expert users. "
-            "When this panel is used, its values override the Basic panel."
-        )
-        with gr.Row():
-            adv_pitch_level = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Pitch Level",
-                info="Fundamental frequency level",
-            )
-            adv_pitch_range = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Pitch Range",
-                info="Local melodic variation",
-            )
-            adv_energy_level = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Energy Level",
-                info="Overall loudness",
-            )
-        with gr.Row():
-            adv_pressedness = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Pressedness",
-                info="Phonation compression",
-            )
-            adv_spectral_tilt = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Spectral Tilt",
-                info="Brightness of vocal source",
-            )
-            adv_breathiness = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Breathiness",
-                info="Aspiration noise level",
-            )
-        with gr.Row():
-            adv_voice_irregularity = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Voice Irregularity",
-                info="Jitter + shimmer composite",
-            )
-            adv_openness = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Openness",
-                info="Vocal-tract opening proxy",
-            )
-            adv_aperiodicity = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Aperiodicity",
-                info="Aperiodic energy ratio",
-            )
-        with gr.Row():
-            adv_formant_shift = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Formant Shift",
-                info="Vocal-tract length proxy",
-            )
-            adv_vocal_effort = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Vocal Effort",
-                info="Phonatory effort",
-            )
-            adv_creak = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Creak",
-                info="Subharmonic / vocal fry presence",
-            )
-
-    # ===============================================================
-    # Panel 3: Acting Macro Controls (4 sliders, all default 0.5)
-    # ===============================================================
-    with gr.Accordion("Panel 3: Acting Macro Controls", open=True):
-        gr.Markdown(
-            "High-level acting texture controls. These map to learned "
-            "projections into the acting latent space."
-        )
-        with gr.Row():
-            macro_intensity = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Intensity",
-                info="Overall acting intensity",
-            )
-            macro_instability = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Instability",
-                info="Emotional instability / variance",
-            )
-        with gr.Row():
-            macro_tenderness = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Tenderness",
-                info="Warmth / softness quality",
-            )
-            macro_tension = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.01,
-                label="Tension",
-                info="Internal tension / restraint",
-            )
-
-    # ===============================================================
-    # Panel 4: Acting Prompt (inline tag input + vocabulary display)
-    # ===============================================================
-    with gr.Accordion("Panel 4: Acting Prompt (Inline Tags)", open=True):
-        gr.Markdown(
-            "Enter text with inline acting tags. Tags are consumed by the "
-            "pointer as text units alongside phonemes."
-        )
-        acting_prompt_text = gr.Textbox(
-            label="Enriched Text with Inline Tags",
-            placeholder=(
-                "e.g., [inhale] This is [emphasis] really [angry] unacceptable [pause] "
-                "you know?"
-            ),
-            lines=4,
-            info="Insert acting tags inline with your text. Tags use [bracket] syntax.",
-        )
-
-        # Show available tag vocabulary grouped by category
-        _tag_vocab_display = (
-            "**Vocal Events:** "
-            + ", ".join(VOCAL_EVENT_TAGS)
-            + "\n\n"
-            + "**Prosodic Markers:** "
-            + ", ".join(PROSODIC_MARKER_TAGS)
-            + "\n\n"
-            + "**Acting Directives:** "
-            + ", ".join(ACTING_DIRECTIVE_TAGS)
-            + "\n\n"
-            + "*Free-form tags are also supported, e.g.* `[act: in a hurry]`"
-        )
-        gr.Markdown(_tag_vocab_display)
-
-        scene_context = gr.Textbox(
-            label="Scene Context",
-            placeholder="e.g., 'Late night conversation, quiet room'",
-        )
-        compile_btn = gr.Button("Compile Intent", variant="secondary")
-        compile_output = gr.JSON(label="Compiled Intent", visible=True)
-        compile_warnings = gr.Textbox(label="Warnings", interactive=False)
-
-    # ===============================================================
-    # Panel 5: Reference-Driven (reference audio upload + latent extraction)
-    # ===============================================================
-    with gr.Accordion("Panel 5: Reference-Driven Acting", open=False):
-        gr.Markdown(
-            "Upload a reference audio clip to extract acting latent. "
-            "The extracted latent can be used to drive synthesis with "
-            "the reference's acting style."
-        )
-        reference_audio = gr.Audio(
-            label="Reference Audio",
-            type="filepath",
-            sources=["upload", "microphone"],
-        )
-        extract_latent_btn = gr.Button(
-            "Extract Acting Latent from Reference", variant="secondary",
-        )
-        extracted_latent_display = gr.JSON(
-            label="Extracted Acting Latent Values",
-            value=None,
-        )
-        reference_status = gr.Textbox(
-            label="Extraction Status",
-            interactive=False,
-            value="",
-        )
-
-    # ===============================================================
-    # Pacing Controls (supplementary, closed by default)
-    # ===============================================================
-    with gr.Accordion("Pacing Controls", open=False):
-        with gr.Row():
-            pacing_pace = gr.Slider(
-                0.3, 3.0, value=1.0, step=0.01,
-                label="Pace",
-                info="Overall speed multiplier",
-            )
-            pacing_hold_bias = gr.Slider(
-                -1.0, 1.0, value=0.0, step=0.01,
-                label="Hold Bias",
-                info="Negative = advance sooner, Positive = hold longer",
-            )
-            pacing_boundary_bias = gr.Slider(
-                -1.0, 1.0, value=0.0, step=0.01,
-                label="Boundary Bias",
-                info="Positive = encourage transitions",
-            )
-        with gr.Row():
-            pacing_phrase_pressure = gr.Slider(
-                -1.0, 1.0, value=0.0, step=0.01,
-                label="Phrase Pressure",
-                info="Urgency within phrases",
-            )
-            pacing_breath_tendency = gr.Slider(
-                -1.0, 1.0, value=0.0, step=0.01,
-                label="Breath Tendency",
-                info="Likeliness to pause at boundaries",
-            )
-
-    # --- Generate Button ---
-    with gr.Row():
-        generate_btn = gr.Button("Generate", variant="primary", scale=2)
-        cfg_scale = gr.Slider(
-            0.5, 5.0, value=1.5, step=0.1,
-            label="CFG Scale",
-        )
-        cfg_mode = gr.Dropdown(
-            choices=["off", "full", "lazy", "distilled"],
-            value="full",
-            label="CFG Mode",
-        )
-
-    # --- Output ---
-    audio_output = gr.Audio(label="Generated Audio", type="numpy")
-
-    # --- Provenance Label ---
-    provenance_label = gr.Textbox(
-        label="Provenance",
-        value="(not yet generated)",
-        interactive=False,
-    )
-
-    # --- Generation Telemetry ---
-    generation_telemetry = gr.JSON(
-        label="Generation Telemetry",
-        visible=True,
+    mode_selector = gr.Radio(
+        choices=["Simple", "Physical Advanced", "Prompt"],
+        value="Simple",
+        label="Inference Mode",
     )
 
     # ===============================================================
-    # Panel 6: Trajectory (inspect / patch / replay / transfer)
+    # Simple Mode Group
     # ===============================================================
-    with gr.Accordion("Panel 6: Trajectory Operations", open=False):
-        gr.Markdown(
-            "Inspect, patch, replay, and transfer speech trajectories. "
-            "Each operation produces a provenance-labeled result."
-        )
-        trajectory_id_display = gr.Textbox(
-            label="Current Trajectory ID",
-            interactive=False,
-        )
-        trajectory_version = gr.Number(
-            label="Version",
-            value=1,
-            interactive=False,
-        )
-
+    with gr.Group(visible=True) as simple_group:
+        simple_text = gr.Textbox(label="Text", lines=3)
         with gr.Row():
-            inspect_btn = gr.Button("Inspect", variant="secondary")
-            patch_btn = gr.Button("Patch", variant="secondary")
-            replay_btn = gr.Button("Replay", variant="secondary")
-            transfer_btn = gr.Button("Transfer", variant="secondary")
+            simple_speaker = gr.Dropdown(label="Speaker", choices=[], interactive=True)
+            simple_emotion = gr.Dropdown(
+                label="Emotion",
+                choices=["neutral", "happy", "sad", "angry", "surprised", "fear"],
+                value="neutral",
+            )
+            simple_speed = gr.Slider(
+                label="Speed", minimum=0.5, maximum=3.0, value=1.0, step=0.1,
+            )
+        simple_generate_btn = gr.Button("Generate", variant="primary")
+        simple_audio_out = gr.Audio(label="Output", type="numpy")
 
-        transfer_speaker_id = gr.Dropdown(
-            label="Target Speaker for Transfer",
-            choices=[],
-            interactive=True,
-        )
-
-        # Patch controls
-        gr.Markdown("### Local Region Patch")
-        with gr.Row():
-            patch_start = gr.Number(label="Start Pointer Index", value=0)
-            patch_end = gr.Number(label="End Pointer Index", value=10)
-
-        # Status output area
-        trajectory_status = gr.Textbox(
-            label="Trajectory Operation Status",
-            interactive=False,
-            lines=4,
-            value="",
-        )
-
-        # Trajectory details (populated by Inspect)
-        trajectory_details = gr.JSON(label="Trajectory Details")
-
-    # ---------------------------------------------------------------
-    # Event handlers
-    # ---------------------------------------------------------------
-
-    def _compile_intent(text, enriched_text, context):
-        """Call compile endpoint with inline-tag enriched text."""
-        # Parse inline tags from enriched text
-        from tmrvc_core.acting_tags import parse_enriched_transcript
-        parts = parse_enriched_transcript(enriched_text or "")
-        tags_list = [
-            p[0] for p in parts if p[1] in ("tag", "freeform")
-        ]
-        payload = {
-            "text": text,
-            "acting_prompt": enriched_text or "",
-            "acting_tags": tags_list,
-            "scene_context": context,
-            "schema_version": "1.0",
-        }
-        resp = _api_post(f"{WORKSHOP_API_PREFIX}/compile", payload)
-        if resp is None:
-            return {"error": "API request failed"}, "API request failed"
-        warnings_text = "\n".join(resp.get("warnings", []))
-        return resp, warnings_text
-
-    compile_btn.click(
-        fn=_compile_intent,
-        inputs=[text_input, acting_prompt_text, scene_context],
-        outputs=[compile_output, compile_warnings],
-    )
-
-    def _extract_acting_latent(audio_path):
-        """Extract acting latent from reference audio via the backend."""
-        if not audio_path:
-            return None, "No reference audio provided."
-        try:
-            with open(audio_path, "rb") as f:
-                audio_bytes = f.read()
-            audio_b64 = base64.b64encode(audio_bytes).decode()
+        def _simple_generate(text, speaker_id, emotion, speed):
+            """Call /tts/simple endpoint."""
+            if not text:
+                return None
             payload = {
-                "reference_audio_base64": audio_b64,
+                "text": text,
+                "speaker_profile_id": speaker_id if speaker_id else None,
+                "emotion": emotion,
+                "speed": speed,
                 "schema_version": "1.0",
             }
-            resp = _api_post(f"{WORKSHOP_API_PREFIX}/extract_latent", payload)
-            if resp is None:
-                return None, "Error: API request failed."
-            latent_values = resp.get("acting_latent", resp)
-            return latent_values, "Extraction complete."
-        except Exception as e:
-            logger.exception("Latent extraction failed: %s", e)
-            return None, f"Error: {e}"
+            resp = _api_post("/tts/simple", payload)
+            return _decode_audio_response(resp)
 
-    extract_latent_btn.click(
-        fn=_extract_acting_latent,
-        inputs=[reference_audio],
-        outputs=[extracted_latent_display, reference_status],
-    )
-
-    def _generate(
-        text, speaker_id,
-        # basic physical (panel 1)
-        pitch_level, energy_level, breathiness, pressedness, spectral_tilt, vocal_effort,
-        # advanced physical (panel 2) -- full 12-D
-        adv_pl, adv_pr, adv_el, adv_prs, adv_st, adv_br,
-        adv_vi, adv_op, adv_ap, adv_fs, adv_ve, adv_ck,
-        # acting macro (panel 3)
-        intensity, instability, tenderness, tension,
-        # acting prompt (panel 4)
-        enriched_text,
-        # reference latent (panel 5)
-        extracted_latent,
-        # pacing
-        pace, hold_bias, boundary_bias, phrase_pressure, breath_tendency,
-        # cfg
-        cfg_s, cfg_m,
-    ):
-        """Call generate endpoint with full v4 control surface."""
-        if not text:
-            return None, "(not yet generated)", None, "", 0
-
-        # Parse inline tags from enriched text if provided
-        acting_tags_list = []
-        if enriched_text:
-            from tmrvc_core.acting_tags import parse_enriched_transcript
-            parts = parse_enriched_transcript(enriched_text)
-            acting_tags_list = [p[0] for p in parts if p[1] in ("tag", "freeform")]
-
-        payload = {
-            "text": text,
-            "speaker_profile_id": speaker_id if speaker_id else None,
-            "physical_controls": {
-                "pitch_level": pitch_level,
-                "pitch_range": adv_pr,
-                "energy_level": energy_level,
-                "pressedness": pressedness,
-                "spectral_tilt": spectral_tilt,
-                "breathiness": breathiness,
-                "voice_irregularity": adv_vi,
-                "openness": adv_op,
-                "aperiodicity": adv_ap,
-                "formant_shift": adv_fs,
-                "vocal_effort": vocal_effort,
-                "creak": adv_ck,
-            },
-            "acting_controls": {
-                "intensity": intensity,
-                "instability": instability,
-                "tenderness": tenderness,
-                "tension": tension,
-            },
-            "enriched_transcript": enriched_text or None,
-            "pacing": {
-                "pace": pace,
-                "hold_bias": hold_bias,
-                "boundary_bias": boundary_bias,
-                "phrase_pressure": phrase_pressure,
-                "breath_tendency": breath_tendency,
-            },
-            "cfg_scale": cfg_s,
-            "cfg_mode": cfg_m,
-            "schema_version": "1.0",
-        }
-        # Include extracted reference latent if available
-        if extracted_latent and isinstance(extracted_latent, (dict, list)):
-            payload["reference_acting_latent"] = extracted_latent
-
-        resp = _api_post(f"{WORKSHOP_API_PREFIX}/generate", payload)
-        if resp is None:
-            return None, "Error: API request failed", None, "", 0
-        tid = resp.get("trajectory_id", "")
-        prov_raw = resp.get("provenance", "fresh_compile")
-        prov = _fmt_provenance(prov_raw)
-        telemetry = {
-            "rtf": resp.get("rtf", 0.0),
-            "gen_time_ms": resp.get("gen_time_ms", 0.0),
-            "cfg_mode": resp.get("cfg_mode", cfg_m),
-            "forced_advance_count": resp.get("forced_advance_count", 0),
-            "skip_protection_count": resp.get("skip_protection_count", 0),
-        }
-        audio = _decode_audio_response(resp)
-        return audio, prov, telemetry, tid, 1
-
-    generate_btn.click(
-        fn=_generate,
-        inputs=[
-            text_input, speaker_profile_id,
-            # Panel 1: basic physical
-            basic_pitch_level, basic_energy_level, basic_breathiness,
-            basic_pressedness, basic_spectral_tilt, basic_vocal_effort,
-            # Panel 2: advanced physical (full 12-D)
-            adv_pitch_level, adv_pitch_range, adv_energy_level,
-            adv_pressedness, adv_spectral_tilt, adv_breathiness,
-            adv_voice_irregularity, adv_openness, adv_aperiodicity,
-            adv_formant_shift, adv_vocal_effort, adv_creak,
-            # Panel 3: acting macro
-            macro_intensity, macro_instability, macro_tenderness, macro_tension,
-            # Panel 4: acting prompt
-            acting_prompt_text,
-            # Panel 5: reference latent
-            extracted_latent_display,
-            # Pacing
-            pacing_pace, pacing_hold_bias, pacing_boundary_bias,
-            pacing_phrase_pressure, pacing_breath_tendency,
-            # CFG
-            cfg_scale, cfg_mode,
-        ],
-        outputs=[
-            audio_output, provenance_label, generation_telemetry,
-            trajectory_id_display, trajectory_version,
-        ],
-    )
-
-    # --- Panel 6: Trajectory operations ---
-
-    def _inspect_trajectory(tid):
-        """Inspect a trajectory's full details."""
-        if not tid:
-            return {}, "No trajectory selected."
-        resp = _api_get(f"{WORKSHOP_API_PREFIX}/trajectories/{tid}")
-        if resp is None:
-            return {}, f"Error: Could not fetch trajectory {tid}."
-        return resp, f"Inspected trajectory {tid} (version {resp.get('version', '?')})."
-
-    inspect_btn.click(
-        fn=_inspect_trajectory,
-        inputs=[trajectory_id_display],
-        outputs=[trajectory_details, trajectory_status],
-    )
-
-    def _patch_trajectory(
-        tid, version, start_idx, end_idx,
-        # Use current panel values for the patch overrides
-        pitch_level, energy_level, breathiness, pressedness, spectral_tilt, vocal_effort,
-        adv_pr, adv_vi, adv_op, adv_ap, adv_fs, adv_ck,
-        intensity, instability, tenderness, tension,
-    ):
-        """Apply a local region patch to a trajectory."""
-        if not tid:
-            return None, "[patched replay]", None, "", 0, "No trajectory selected."
-        payload = {
-            "start_pointer_index": int(start_idx),
-            "end_pointer_index": int(end_idx),
-            "physical_overrides": {
-                "pitch_level": pitch_level,
-                "pitch_range": adv_pr,
-                "energy_level": energy_level,
-                "pressedness": pressedness,
-                "spectral_tilt": spectral_tilt,
-                "breathiness": breathiness,
-                "voice_irregularity": adv_vi,
-                "openness": adv_op,
-                "aperiodicity": adv_ap,
-                "formant_shift": adv_fs,
-                "vocal_effort": vocal_effort,
-                "creak": adv_ck,
-            },
-            "acting_macro_overrides": {
-                "intensity": intensity,
-                "instability": instability,
-                "tenderness": tenderness,
-                "tension": tension,
-            },
-            "expected_version": int(version),
-            "schema_version": "1.0",
-        }
-        resp = _api_post(
-            f"{WORKSHOP_API_PREFIX}/trajectories/{tid}/patch", payload,
+        simple_generate_btn.click(
+            fn=_simple_generate,
+            inputs=[simple_text, simple_speaker, simple_emotion, simple_speed],
+            outputs=[simple_audio_out],
         )
-        if resp is None:
-            return None, "Error: API request failed", None, tid, int(version), "Patch failed."
-        prov = _fmt_provenance(resp.get("provenance", "patched_replay"))
-        new_version = resp.get("version", int(version) + 1)
-        audio = _decode_audio_response(resp)
-        status = (
-            f"Patched trajectory {tid} "
-            f"(pointer range [{int(start_idx)}, {int(end_idx)}], "
-            f"new version: {new_version})."
-        )
-        return audio, prov, None, tid, new_version, status
 
-    patch_btn.click(
-        fn=_patch_trajectory,
-        inputs=[
-            trajectory_id_display, trajectory_version,
-            patch_start, patch_end,
-            # Physical overrides from basic panel
-            basic_pitch_level, basic_energy_level, basic_breathiness,
-            basic_pressedness, basic_spectral_tilt, basic_vocal_effort,
-            # Advanced overrides
-            adv_pitch_range, adv_voice_irregularity, adv_openness,
-            adv_aperiodicity, adv_formant_shift, adv_creak,
-            # Acting macro overrides
-            macro_intensity, macro_instability, macro_tenderness, macro_tension,
-        ],
-        outputs=[
-            audio_output, provenance_label, generation_telemetry,
-            trajectory_id_display, trajectory_version, trajectory_status,
-        ],
-    )
+    # ===============================================================
+    # Physical Advanced Mode Group (existing 6-panel workshop)
+    # ===============================================================
+    with gr.Group(visible=False) as advanced_group:
 
-    def _replay(tid, speaker_id):
-        """Deterministic replay of a trajectory."""
-        if not tid:
-            return None, "(not yet generated)", None, "", 0, "No trajectory selected."
-        payload = {
-            "trajectory_id": tid,
-            "speaker_profile_id": speaker_id if speaker_id else None,
-            "schema_version": "1.0",
-        }
-        resp = _api_post(f"{WORKSHOP_API_PREFIX}/trajectories/{tid}/replay", payload)
-        if resp is None:
-            return None, "Error: API request failed", None, tid, 0, "Replay failed."
-        prov_raw = resp.get("provenance", "deterministic_replay")
-        prov = _fmt_provenance(prov_raw)
-        audio = _decode_audio_response(resp)
-        return audio, prov, None, tid, 1, f"Replayed trajectory {tid}."
-
-    replay_btn.click(
-        fn=_replay,
-        inputs=[trajectory_id_display, speaker_profile_id],
-        outputs=[
-            audio_output, provenance_label, generation_telemetry,
-            trajectory_id_display, trajectory_version, trajectory_status,
-        ],
-    )
-
-    def _transfer(tid, target_speaker_id):
-        """Cross-speaker acting transfer."""
-        if not tid or not target_speaker_id:
-            return (
-                None, "(not yet generated)", None, tid or "", 0,
-                "Select trajectory and target speaker.",
+        # --- Speaker Selection ---
+        with gr.Row():
+            speaker_profile_id = gr.Dropdown(
+                label="Speaker Profile",
+                choices=[],
+                interactive=True,
             )
-        payload = {
-            "target_speaker_profile_id": target_speaker_id,
-            "schema_version": "1.0",
-        }
-        resp = _api_post(
-            f"{WORKSHOP_API_PREFIX}/trajectories/{tid}/transfer", payload,
-        )
-        if resp is None:
-            return None, "Error: API request failed", None, tid, 0, "Transfer failed."
-        prov_raw = resp.get("provenance", "cross_speaker_transfer")
-        prov = _fmt_provenance(prov_raw)
-        new_tid = resp.get("trajectory_id", tid)
-        audio = _decode_audio_response(resp)
-        return (
-            audio, prov, None, new_tid, 1,
-            f"Transferred trajectory {tid} to speaker {target_speaker_id}. "
-            f"New trajectory: {new_tid}.",
+            enroll_btn = gr.Button("Enroll New Speaker", variant="secondary")
+
+        # --- Text Input ---
+        text_input = gr.Textbox(
+            label="Text",
+            placeholder="Enter text for synthesis (supports inline acting tags like [angry], [whisper], etc.)...",
+            lines=3,
         )
 
-    transfer_btn.click(
-        fn=_transfer,
-        inputs=[trajectory_id_display, transfer_speaker_id],
-        outputs=[
-            audio_output, provenance_label, generation_telemetry,
-            trajectory_id_display, trajectory_version, trajectory_status,
-        ],
+        # ===============================================================
+        # Panel 1: Basic Physical Controls (6 sliders, all default 0.5)
+        # ===============================================================
+        with gr.Accordion("Panel 1: Basic Physical Controls", open=True):
+            gr.Markdown(
+                "Most frequently used physical voice controls. "
+                "All values range [0.0, 1.0]."
+            )
+            with gr.Row():
+                basic_pitch_level = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Pitch Level",
+                    info="Fundamental frequency level",
+                )
+                basic_energy_level = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Energy Level",
+                    info="Overall loudness",
+                )
+                basic_breathiness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Breathiness",
+                    info="Aspiration noise level",
+                )
+            with gr.Row():
+                basic_pressedness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Pressedness",
+                    info="Phonation compression",
+                )
+                basic_spectral_tilt = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Spectral Tilt",
+                    info="Brightness of vocal source",
+                )
+                basic_vocal_effort = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Vocal Effort",
+                    info="Phonatory effort",
+                )
+
+        # ===============================================================
+        # Panel 2: Advanced Physical Controls (full 12-D, default closed)
+        # ===============================================================
+        with gr.Accordion("Panel 2: Advanced Physical Controls (12-D)", open=False):
+            gr.Markdown(
+                "Full 12-dimensional physical control vector. For expert users. "
+                "When this panel is used, its values override the Basic panel."
+            )
+            with gr.Row():
+                adv_pitch_level = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Pitch Level",
+                    info="Fundamental frequency level",
+                )
+                adv_pitch_range = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Pitch Range",
+                    info="Local melodic variation",
+                )
+                adv_energy_level = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Energy Level",
+                    info="Overall loudness",
+                )
+            with gr.Row():
+                adv_pressedness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Pressedness",
+                    info="Phonation compression",
+                )
+                adv_spectral_tilt = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Spectral Tilt",
+                    info="Brightness of vocal source",
+                )
+                adv_breathiness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Breathiness",
+                    info="Aspiration noise level",
+                )
+            with gr.Row():
+                adv_voice_irregularity = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Voice Irregularity",
+                    info="Jitter + shimmer composite",
+                )
+                adv_openness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Openness",
+                    info="Vocal-tract opening proxy",
+                )
+                adv_aperiodicity = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Aperiodicity",
+                    info="Aperiodic energy ratio",
+                )
+            with gr.Row():
+                adv_formant_shift = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Formant Shift",
+                    info="Vocal-tract length proxy",
+                )
+                adv_vocal_effort = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Vocal Effort",
+                    info="Phonatory effort",
+                )
+                adv_creak = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Creak",
+                    info="Subharmonic / vocal fry presence",
+                )
+
+        # ===============================================================
+        # Panel 3: Acting Macro Controls (4 sliders, all default 0.5)
+        # ===============================================================
+        with gr.Accordion("Panel 3: Acting Macro Controls", open=True):
+            gr.Markdown(
+                "High-level acting texture controls. These map to learned "
+                "projections into the acting latent space."
+            )
+            with gr.Row():
+                macro_intensity = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Intensity",
+                    info="Overall acting intensity",
+                )
+                macro_instability = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Instability",
+                    info="Emotional instability / variance",
+                )
+            with gr.Row():
+                macro_tenderness = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Tenderness",
+                    info="Warmth / softness quality",
+                )
+                macro_tension = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01,
+                    label="Tension",
+                    info="Internal tension / restraint",
+                )
+
+        # ===============================================================
+        # Panel 4: Acting Prompt (inline tag input + vocabulary display)
+        # ===============================================================
+        with gr.Accordion("Panel 4: Acting Prompt (Inline Tags)", open=True):
+            gr.Markdown(
+                "Enter text with inline acting tags. Tags are consumed by the "
+                "pointer as text units alongside phonemes."
+            )
+            acting_prompt_text = gr.Textbox(
+                label="Enriched Text with Inline Tags",
+                placeholder=(
+                    "e.g., [inhale] This is [emphasis] really [angry] unacceptable [pause] "
+                    "you know?"
+                ),
+                lines=4,
+                info="Insert acting tags inline with your text. Tags use [bracket] syntax.",
+            )
+
+            # Show available tag vocabulary grouped by category
+            _tag_vocab_display = (
+                "**Vocal Events:** "
+                + ", ".join(VOCAL_EVENT_TAGS)
+                + "\n\n"
+                + "**Prosodic Markers:** "
+                + ", ".join(PROSODIC_MARKER_TAGS)
+                + "\n\n"
+                + "**Acting Directives:** "
+                + ", ".join(ACTING_DIRECTIVE_TAGS)
+                + "\n\n"
+                + "*Free-form tags are also supported, e.g.* `[act: in a hurry]`"
+            )
+            gr.Markdown(_tag_vocab_display)
+
+            scene_context = gr.Textbox(
+                label="Scene Context",
+                placeholder="e.g., 'Late night conversation, quiet room'",
+            )
+            compile_btn = gr.Button("Compile Intent", variant="secondary")
+            compile_output = gr.JSON(label="Compiled Intent", visible=True)
+            compile_warnings = gr.Textbox(label="Warnings", interactive=False)
+
+        # ===============================================================
+        # Panel 5: Reference-Driven (reference audio upload + latent extraction)
+        # ===============================================================
+        with gr.Accordion("Panel 5: Reference-Driven Acting", open=False):
+            gr.Markdown(
+                "Upload a reference audio clip to extract acting latent. "
+                "The extracted latent can be used to drive synthesis with "
+                "the reference's acting style."
+            )
+            reference_audio = gr.Audio(
+                label="Reference Audio",
+                type="filepath",
+                sources=["upload", "microphone"],
+            )
+            extract_latent_btn = gr.Button(
+                "Extract Acting Latent from Reference", variant="secondary",
+            )
+            extracted_latent_display = gr.JSON(
+                label="Extracted Acting Latent Values",
+                value=None,
+            )
+            reference_status = gr.Textbox(
+                label="Extraction Status",
+                interactive=False,
+                value="",
+            )
+
+        # ===============================================================
+        # Pacing Controls (supplementary, closed by default)
+        # ===============================================================
+        with gr.Accordion("Pacing Controls", open=False):
+            with gr.Row():
+                pacing_pace = gr.Slider(
+                    0.3, 3.0, value=1.0, step=0.01,
+                    label="Pace",
+                    info="Overall speed multiplier",
+                )
+                pacing_hold_bias = gr.Slider(
+                    -1.0, 1.0, value=0.0, step=0.01,
+                    label="Hold Bias",
+                    info="Negative = advance sooner, Positive = hold longer",
+                )
+                pacing_boundary_bias = gr.Slider(
+                    -1.0, 1.0, value=0.0, step=0.01,
+                    label="Boundary Bias",
+                    info="Positive = encourage transitions",
+                )
+            with gr.Row():
+                pacing_phrase_pressure = gr.Slider(
+                    -1.0, 1.0, value=0.0, step=0.01,
+                    label="Phrase Pressure",
+                    info="Urgency within phrases",
+                )
+                pacing_breath_tendency = gr.Slider(
+                    -1.0, 1.0, value=0.0, step=0.01,
+                    label="Breath Tendency",
+                    info="Likeliness to pause at boundaries",
+                )
+
+        # --- Generate Button ---
+        with gr.Row():
+            generate_btn = gr.Button("Generate", variant="primary", scale=2)
+            cfg_scale = gr.Slider(
+                0.5, 5.0, value=1.5, step=0.1,
+                label="CFG Scale",
+            )
+            cfg_mode = gr.Dropdown(
+                choices=["off", "full", "lazy", "distilled"],
+                value="full",
+                label="CFG Mode",
+            )
+
+        # --- Output ---
+        audio_output = gr.Audio(label="Generated Audio", type="numpy")
+
+        # --- Provenance Label ---
+        provenance_label = gr.Textbox(
+            label="Provenance",
+            value="(not yet generated)",
+            interactive=False,
+        )
+
+        # --- Generation Telemetry ---
+        generation_telemetry = gr.JSON(
+            label="Generation Telemetry",
+            visible=True,
+        )
+
+        # ===============================================================
+        # Panel 6: Trajectory (inspect / patch / replay / transfer)
+        # ===============================================================
+        with gr.Accordion("Panel 6: Trajectory Operations", open=False):
+            gr.Markdown(
+                "Inspect, patch, replay, and transfer speech trajectories. "
+                "Each operation produces a provenance-labeled result."
+            )
+            trajectory_id_display = gr.Textbox(
+                label="Current Trajectory ID",
+                interactive=False,
+            )
+            trajectory_version = gr.Number(
+                label="Version",
+                value=1,
+                interactive=False,
+            )
+
+            with gr.Row():
+                inspect_btn = gr.Button("Inspect", variant="secondary")
+                patch_btn = gr.Button("Patch", variant="secondary")
+                replay_btn = gr.Button("Replay", variant="secondary")
+                transfer_btn = gr.Button("Transfer", variant="secondary")
+
+            transfer_speaker_id = gr.Dropdown(
+                label="Target Speaker for Transfer",
+                choices=[],
+                interactive=True,
+            )
+
+            # Patch controls
+            gr.Markdown("### Local Region Patch")
+            with gr.Row():
+                patch_start = gr.Number(label="Start Pointer Index", value=0)
+                patch_end = gr.Number(label="End Pointer Index", value=10)
+
+            # Status output area
+            trajectory_status = gr.Textbox(
+                label="Trajectory Operation Status",
+                interactive=False,
+                lines=4,
+                value="",
+            )
+
+            # Trajectory details (populated by Inspect)
+            trajectory_details = gr.JSON(label="Trajectory Details")
+
+        # ---------------------------------------------------------------
+        # Event handlers
+        # ---------------------------------------------------------------
+
+        def _compile_intent(text, enriched_text, context):
+            """Call compile endpoint with inline-tag enriched text."""
+            # Parse inline tags from enriched text
+            from tmrvc_core.acting_tags import parse_enriched_transcript
+            parts = parse_enriched_transcript(enriched_text or "")
+            tags_list = [
+                p[0] for p in parts if p[1] in ("tag", "freeform")
+            ]
+            payload = {
+                "text": text,
+                "acting_prompt": enriched_text or "",
+                "acting_tags": tags_list,
+                "scene_context": context,
+                "schema_version": "1.0",
+            }
+            resp = _api_post(f"{WORKSHOP_API_PREFIX}/compile", payload)
+            if resp is None:
+                return {"error": "API request failed"}, "API request failed"
+            warnings_text = "\n".join(resp.get("warnings", []))
+            return resp, warnings_text
+
+        compile_btn.click(
+            fn=_compile_intent,
+            inputs=[text_input, acting_prompt_text, scene_context],
+            outputs=[compile_output, compile_warnings],
+        )
+
+        def _extract_acting_latent(audio_path):
+            """Extract acting latent from reference audio via the backend."""
+            if not audio_path:
+                return None, "No reference audio provided."
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                audio_b64 = base64.b64encode(audio_bytes).decode()
+                payload = {
+                    "reference_audio_base64": audio_b64,
+                    "schema_version": "1.0",
+                }
+                resp = _api_post(f"{WORKSHOP_API_PREFIX}/extract_latent", payload)
+                if resp is None:
+                    return None, "Error: API request failed."
+                latent_values = resp.get("acting_latent", resp)
+                return latent_values, "Extraction complete."
+            except Exception as e:
+                logger.exception("Latent extraction failed: %s", e)
+                return None, f"Error: {e}"
+
+        extract_latent_btn.click(
+            fn=_extract_acting_latent,
+            inputs=[reference_audio],
+            outputs=[extracted_latent_display, reference_status],
+        )
+
+        def _generate(
+            text, speaker_id,
+            # basic physical (panel 1)
+            pitch_level, energy_level, breathiness, pressedness, spectral_tilt, vocal_effort,
+            # advanced physical (panel 2) -- full 12-D
+            adv_pl, adv_pr, adv_el, adv_prs, adv_st, adv_br,
+            adv_vi, adv_op, adv_ap, adv_fs, adv_ve, adv_ck,
+            # acting macro (panel 3)
+            intensity, instability, tenderness, tension,
+            # acting prompt (panel 4)
+            enriched_text,
+            # reference latent (panel 5)
+            extracted_latent,
+            # pacing
+            pace, hold_bias, boundary_bias, phrase_pressure, breath_tendency,
+            # cfg
+            cfg_s, cfg_m,
+        ):
+            """Call generate endpoint with full v4 control surface."""
+            if not text:
+                return None, "(not yet generated)", None, "", 0
+
+            # Parse inline tags from enriched text if provided
+            acting_tags_list = []
+            if enriched_text:
+                from tmrvc_core.acting_tags import parse_enriched_transcript
+                parts = parse_enriched_transcript(enriched_text)
+                acting_tags_list = [p[0] for p in parts if p[1] in ("tag", "freeform")]
+
+            payload = {
+                "text": text,
+                "speaker_profile_id": speaker_id if speaker_id else None,
+                "physical_controls": {
+                    "pitch_level": pitch_level,
+                    "pitch_range": adv_pr,
+                    "energy_level": energy_level,
+                    "pressedness": pressedness,
+                    "spectral_tilt": spectral_tilt,
+                    "breathiness": breathiness,
+                    "voice_irregularity": adv_vi,
+                    "openness": adv_op,
+                    "aperiodicity": adv_ap,
+                    "formant_shift": adv_fs,
+                    "vocal_effort": vocal_effort,
+                    "creak": adv_ck,
+                },
+                "acting_controls": {
+                    "intensity": intensity,
+                    "instability": instability,
+                    "tenderness": tenderness,
+                    "tension": tension,
+                },
+                "enriched_transcript": enriched_text or None,
+                "pacing": {
+                    "pace": pace,
+                    "hold_bias": hold_bias,
+                    "boundary_bias": boundary_bias,
+                    "phrase_pressure": phrase_pressure,
+                    "breath_tendency": breath_tendency,
+                },
+                "cfg_scale": cfg_s,
+                "cfg_mode": cfg_m,
+                "schema_version": "1.0",
+            }
+            # Include extracted reference latent if available
+            if extracted_latent and isinstance(extracted_latent, (dict, list)):
+                payload["reference_acting_latent"] = extracted_latent
+
+            resp = _api_post(f"{WORKSHOP_API_PREFIX}/generate", payload)
+            if resp is None:
+                return None, "Error: API request failed", None, "", 0
+            tid = resp.get("trajectory_id", "")
+            prov_raw = resp.get("provenance", "fresh_compile")
+            prov = _fmt_provenance(prov_raw)
+            telemetry = {
+                "rtf": resp.get("rtf", 0.0),
+                "gen_time_ms": resp.get("gen_time_ms", 0.0),
+                "cfg_mode": resp.get("cfg_mode", cfg_m),
+                "forced_advance_count": resp.get("forced_advance_count", 0),
+                "skip_protection_count": resp.get("skip_protection_count", 0),
+            }
+            audio = _decode_audio_response(resp)
+            return audio, prov, telemetry, tid, 1
+
+        generate_btn.click(
+            fn=_generate,
+            inputs=[
+                text_input, speaker_profile_id,
+                # Panel 1: basic physical
+                basic_pitch_level, basic_energy_level, basic_breathiness,
+                basic_pressedness, basic_spectral_tilt, basic_vocal_effort,
+                # Panel 2: advanced physical (full 12-D)
+                adv_pitch_level, adv_pitch_range, adv_energy_level,
+                adv_pressedness, adv_spectral_tilt, adv_breathiness,
+                adv_voice_irregularity, adv_openness, adv_aperiodicity,
+                adv_formant_shift, adv_vocal_effort, adv_creak,
+                # Panel 3: acting macro
+                macro_intensity, macro_instability, macro_tenderness, macro_tension,
+                # Panel 4: acting prompt
+                acting_prompt_text,
+                # Panel 5: reference latent
+                extracted_latent_display,
+                # Pacing
+                pacing_pace, pacing_hold_bias, pacing_boundary_bias,
+                pacing_phrase_pressure, pacing_breath_tendency,
+                # CFG
+                cfg_scale, cfg_mode,
+            ],
+            outputs=[
+                audio_output, provenance_label, generation_telemetry,
+                trajectory_id_display, trajectory_version,
+            ],
+        )
+
+        # --- Panel 6: Trajectory operations ---
+
+        def _inspect_trajectory(tid):
+            """Inspect a trajectory's full details."""
+            if not tid:
+                return {}, "No trajectory selected."
+            resp = _api_get(f"{WORKSHOP_API_PREFIX}/trajectories/{tid}")
+            if resp is None:
+                return {}, f"Error: Could not fetch trajectory {tid}."
+            return resp, f"Inspected trajectory {tid} (version {resp.get('version', '?')})."
+
+        inspect_btn.click(
+            fn=_inspect_trajectory,
+            inputs=[trajectory_id_display],
+            outputs=[trajectory_details, trajectory_status],
+        )
+
+        def _patch_trajectory(
+            tid, version, start_idx, end_idx,
+            # Use current panel values for the patch overrides
+            pitch_level, energy_level, breathiness, pressedness, spectral_tilt, vocal_effort,
+            adv_pr, adv_vi, adv_op, adv_ap, adv_fs, adv_ck,
+            intensity, instability, tenderness, tension,
+        ):
+            """Apply a local region patch to a trajectory."""
+            if not tid:
+                return None, "[patched replay]", None, "", 0, "No trajectory selected."
+            payload = {
+                "start_pointer_index": int(start_idx),
+                "end_pointer_index": int(end_idx),
+                "physical_overrides": {
+                    "pitch_level": pitch_level,
+                    "pitch_range": adv_pr,
+                    "energy_level": energy_level,
+                    "pressedness": pressedness,
+                    "spectral_tilt": spectral_tilt,
+                    "breathiness": breathiness,
+                    "voice_irregularity": adv_vi,
+                    "openness": adv_op,
+                    "aperiodicity": adv_ap,
+                    "formant_shift": adv_fs,
+                    "vocal_effort": vocal_effort,
+                    "creak": adv_ck,
+                },
+                "acting_macro_overrides": {
+                    "intensity": intensity,
+                    "instability": instability,
+                    "tenderness": tenderness,
+                    "tension": tension,
+                },
+                "expected_version": int(version),
+                "schema_version": "1.0",
+            }
+            resp = _api_post(
+                f"{WORKSHOP_API_PREFIX}/trajectories/{tid}/patch", payload,
+            )
+            if resp is None:
+                return None, "Error: API request failed", None, tid, int(version), "Patch failed."
+            prov = _fmt_provenance(resp.get("provenance", "patched_replay"))
+            new_version = resp.get("version", int(version) + 1)
+            audio = _decode_audio_response(resp)
+            status = (
+                f"Patched trajectory {tid} "
+                f"(pointer range [{int(start_idx)}, {int(end_idx)}], "
+                f"new version: {new_version})."
+            )
+            return audio, prov, None, tid, new_version, status
+
+        patch_btn.click(
+            fn=_patch_trajectory,
+            inputs=[
+                trajectory_id_display, trajectory_version,
+                patch_start, patch_end,
+                # Physical overrides from basic panel
+                basic_pitch_level, basic_energy_level, basic_breathiness,
+                basic_pressedness, basic_spectral_tilt, basic_vocal_effort,
+                # Advanced overrides
+                adv_pitch_range, adv_voice_irregularity, adv_openness,
+                adv_aperiodicity, adv_formant_shift, adv_creak,
+                # Acting macro overrides
+                macro_intensity, macro_instability, macro_tenderness, macro_tension,
+            ],
+            outputs=[
+                audio_output, provenance_label, generation_telemetry,
+                trajectory_id_display, trajectory_version, trajectory_status,
+            ],
+        )
+
+        def _replay(tid, speaker_id):
+            """Deterministic replay of a trajectory."""
+            if not tid:
+                return None, "(not yet generated)", None, "", 0, "No trajectory selected."
+            payload = {
+                "trajectory_id": tid,
+                "speaker_profile_id": speaker_id if speaker_id else None,
+                "schema_version": "1.0",
+            }
+            resp = _api_post(f"{WORKSHOP_API_PREFIX}/trajectories/{tid}/replay", payload)
+            if resp is None:
+                return None, "Error: API request failed", None, tid, 0, "Replay failed."
+            prov_raw = resp.get("provenance", "deterministic_replay")
+            prov = _fmt_provenance(prov_raw)
+            audio = _decode_audio_response(resp)
+            return audio, prov, None, tid, 1, f"Replayed trajectory {tid}."
+
+        replay_btn.click(
+            fn=_replay,
+            inputs=[trajectory_id_display, speaker_profile_id],
+            outputs=[
+                audio_output, provenance_label, generation_telemetry,
+                trajectory_id_display, trajectory_version, trajectory_status,
+            ],
+        )
+
+        def _transfer(tid, target_speaker_id):
+            """Cross-speaker acting transfer."""
+            if not tid or not target_speaker_id:
+                return (
+                    None, "(not yet generated)", None, tid or "", 0,
+                    "Select trajectory and target speaker.",
+                )
+            payload = {
+                "target_speaker_profile_id": target_speaker_id,
+                "schema_version": "1.0",
+            }
+            resp = _api_post(
+                f"{WORKSHOP_API_PREFIX}/trajectories/{tid}/transfer", payload,
+            )
+            if resp is None:
+                return None, "Error: API request failed", None, tid, 0, "Transfer failed."
+            prov_raw = resp.get("provenance", "cross_speaker_transfer")
+            prov = _fmt_provenance(prov_raw)
+            new_tid = resp.get("trajectory_id", tid)
+            audio = _decode_audio_response(resp)
+            return (
+                audio, prov, None, new_tid, 1,
+                f"Transferred trajectory {tid} to speaker {target_speaker_id}. "
+                f"New trajectory: {new_tid}.",
+            )
+
+        transfer_btn.click(
+            fn=_transfer,
+            inputs=[trajectory_id_display, transfer_speaker_id],
+            outputs=[
+                audio_output, provenance_label, generation_telemetry,
+                trajectory_id_display, trajectory_version, trajectory_status,
+            ],
+        )
+
+    # ===============================================================
+    # Prompt Mode Group
+    # ===============================================================
+    with gr.Group(visible=False) as prompt_group:
+        prompt_text = gr.Textbox(label="Text", lines=3)
+        prompt_acting = gr.Textbox(
+            label="Acting Prompt", lines=2,
+            placeholder="e.g. whispered with gentle sadness",
+        )
+        prompt_scene = gr.Textbox(
+            label="Scene Context", lines=2,
+            placeholder="e.g. late night confession scene",
+        )
+        prompt_speaker = gr.Dropdown(label="Speaker", choices=[], interactive=True)
+        prompt_generate_btn = gr.Button("Generate", variant="primary")
+        prompt_audio_out = gr.Audio(label="Output", type="numpy")
+
+        def _prompt_generate(text, acting_prompt, scene_context, speaker_id):
+            """Call /tts/prompt endpoint."""
+            if not text:
+                return None
+            payload = {
+                "text": text,
+                "acting_prompt": acting_prompt or "",
+                "scene_context": scene_context or "",
+                "speaker_profile_id": speaker_id if speaker_id else None,
+                "schema_version": "1.0",
+            }
+            resp = _api_post("/tts/prompt", payload)
+            return _decode_audio_response(resp)
+
+        prompt_generate_btn.click(
+            fn=_prompt_generate,
+            inputs=[prompt_text, prompt_acting, prompt_scene, prompt_speaker],
+            outputs=[prompt_audio_out],
+        )
+
+    # ===============================================================
+    # Mode Switching Handler
+    # ===============================================================
+    def _on_mode_change(mode):
+        return (
+            gr.update(visible=(mode == "Simple")),
+            gr.update(visible=(mode == "Physical Advanced")),
+            gr.update(visible=(mode == "Prompt")),
+        )
+
+    mode_selector.change(
+        fn=_on_mode_change,
+        inputs=[mode_selector],
+        outputs=[simple_group, advanced_group, prompt_group],
     )
 
 

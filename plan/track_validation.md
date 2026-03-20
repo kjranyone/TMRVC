@@ -3,9 +3,7 @@
 ## Scope
 
 This track owns the validation gates for the `v4` single-cutover program.
-This includes both repository-internal release gates and competitor-facing claim gates.
-
-This track is the only owner allowed to unblock "beats Fish Audio S2" language.
+This includes repository-internal release gates only.
 
 ## Primary Files
 
@@ -87,7 +85,6 @@ If parity fails, the release is blocked.
 Every evaluation report must declare which claim is being tested:
 
 - raw-audio bootstrap readiness
-- broad external-baseline TTS competitiveness
 - acting controllability
 - programmable expressive speech
 - cross-speaker acting transfer
@@ -95,29 +92,6 @@ Every evaluation report must declare which claim is being tested:
 - inline instruction following
 
 If a claim lacks its required evidence, it is blocked rather than softened in prose.
-
-### 6. Freeze the Fish S2 head-to-head protocol for `v4`
-
-This track must maintain the frozen Fish S2 competitor protocol.
-
-Mandatory axes for any "beats Fish Audio S2" language:
-
-- acting editability
-- trajectory replay fidelity
-- edit locality
-- transfer quality, if transfer is part of the claim
-
-Mandatory guardrail axes:
-
-- first-take naturalness or preference
-- few-shot speaker similarity
-- latency class disclosure
-
-Claim rule:
-
-- TMRVC may claim it beats Fish S2 only on the frozen declared axes
-- if TMRVC wins on editability but loses clearly on first-take quality, the claim must narrow to editability / programmability only
-- broad SOTA language remains blocked unless separately proven
 
 ## Required Tests And Reports
 
@@ -128,7 +102,6 @@ Claim rule:
 - acting-transfer report
 - runtime-parity report
 - claim matrix mapping each public claim to evidence
-- Fish S2 head-to-head report with frozen artifact/version, prompt rule, and subset definition
 - instruction-following report: tag compliance rate before and after RL, broken down by tag category
 - physical compliance under RL: monotonicity and calibration preserved after RL phase
 
@@ -139,6 +112,7 @@ Do not reopen:
 - preserving old `v3` claim wording
 - generic regression checks that are already covered elsewhere
 - using plan text itself as substitute for measured evidence
+- Fish S2 head-to-head comparison (descoped 2026-03-20)
 
 ## Exit Criteria
 
@@ -146,5 +120,4 @@ Do not reopen:
 - controllability metrics are implemented and meet thresholds defined in `docs/design/acceptance-thresholds.md` §V4-1
 - parity reports cover Python, ONNX, Rust, and streaming paths and meet thresholds defined in `docs/design/acceptance-thresholds.md` §V4-5
 - reports explicitly separate compile variance, replay variance, and transfer variance (no mixed buckets)
-- Fish S2 claim rules are frozen per `docs/design/acceptance-thresholds.md` §V4-9 with explicit axis definitions, subset sizes, and statistical significance requirements
 - each public claim maps to a specific report with measured evidence

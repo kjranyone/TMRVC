@@ -100,7 +100,7 @@ class TestModelExpressiveInputs:
             dialogue_context=torch.randn(B, 256),
         )
         assert out["logits_a"].shape[0] == B
-        assert out["pointer_logits"] is not None
+        assert out["advance_logit"] is not None
 
     def test_forward_tts_pointer_with_all_expressive_inputs(self):
         model = DisentangledUCLM(d_model=256, n_heads=4, n_layers=1, num_speakers=2)

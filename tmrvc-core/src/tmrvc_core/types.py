@@ -129,6 +129,7 @@ CFG_ZEROED_FIELDS = frozenset({
     "prompt_kv_cache",        # [B, T_prompt, d_model]
     "dialogue_context",       # [B, C_ctx, d_model] or [B, d_model]
     "acting_intent",          # [B, d_acting]
+    "acting_texture_latent",  # [B, d_acting_latent] (24-D)
     "local_prosody_latent",   # [B, d_prosody] or [B, T, d_prosody]
 })
 
@@ -210,10 +211,6 @@ class SpeakerProfile:
     prompt_kv_cache: Optional[torch.Tensor] = None
     # Compressed summary tokens from Prompt Resampler (Q-Former)
     prompt_summary_tokens: Optional[torch.Tensor] = None  # [n_prompt_summary_tokens, d_model]
-    # Deprecated compatibility placeholders.
-    adaptor_id: Optional[str] = None
-    adaptor_merged: bool = False
-    prompt_text_tokens: Optional[torch.Tensor] = None  # [L_prompt]
     prompt_encoder_fingerprint: str = ""
     display_name: str = ""
     language: str = "ja"

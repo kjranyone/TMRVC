@@ -481,20 +481,24 @@ def generate_report_template(
         fish_s2_version=fish_version,
     )
 
-    # Initialize axis results
+    # Initialize axis results.
+    # Scores start as None (template placeholders).  tmrvc_score is filled by
+    # automatic metrics in run_comparison(); fish_s2_score is filled externally
+    # from Fish S2 outputs or human evaluation.  tmrvc_wins / clear_deficit
+    # are resolved once both scores are available.
     for axis in VICTORY_AXES:
         report.victory_axes[axis] = {
-            "tmrvc_score": None,
-            "fish_s2_score": None,
-            "tmrvc_wins": None,  # determined after scoring
+            "tmrvc_score": None,       # filled by run_comparison() automatic metrics
+            "fish_s2_score": None,     # filled from external Fish S2 evaluation
+            "tmrvc_wins": None,        # determined after both scores are available
             "method": _axis_method(axis),
         }
 
     for axis in GUARDRAIL_AXES:
         report.guardrail_axes[axis] = {
-            "tmrvc_score": None,
-            "fish_s2_score": None,
-            "clear_deficit": None,
+            "tmrvc_score": None,       # filled by run_comparison() automatic metrics
+            "fish_s2_score": None,     # filled from external Fish S2 evaluation
+            "clear_deficit": None,     # True if TMRVC shows clear quality deficit
             "method": _axis_method(axis),
         }
 

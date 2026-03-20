@@ -331,16 +331,6 @@ def monotonic_alignment_search(log_probs: torch.Tensor) -> torch.Tensor:
     return path
 
 
-def alignment_loss_placeholder(
-    phoneme_features: torch.Tensor,
-    frame_features: torch.Tensor,
-    alignment_type: str = "none",
-) -> torch.Tensor:
-    """Placeholder for future MAS/CTC alignment loss."""
-    if alignment_type == "none":
-        return torch.tensor(0.0, device=phoneme_features.device)
-    raise NotImplementedError(f"Alignment loss type '{alignment_type}' not yet implemented.")
-
 
 def voice_state_supervision_loss(
     predicted_state: torch.Tensor,
@@ -426,20 +416,69 @@ def uclm_loss(
     prosody_speaker_embed: torch.Tensor | None = None,
     speaker_embeds: torch.Tensor | None = None,
     prosody_latents: torch.Tensor | None = None,
+    codec_condition: str = "A",
 ) -> dict[str, torch.Tensor]:
     """Compute the multi-task loss for Disentangled UCLM."""
     B, n_cb, T, vocab_a = logits_a.shape
     _, n_slots, _, vocab_b = logits_b.shape
 
-    # 1. Acoustic Loss (A_t)
-    loss_a = 0.0
-    for i in range(n_cb):
-        loss_a += F.cross_entropy(
-            logits_a[:, i, :, :].reshape(-1, vocab_a),
-            target_a[:, i, :].reshape(-1),
+    # Initialize components dict before acoustic loss (condition B adds to it)
+    components: dict[str, torch.Tensor] = {}
+
+    # 1. Acoustic Loss (A_t) -- codec condition aware
+    if codec_condition == "B":
+        # Condition B: separate AR (CB0) and NAR (CB1-7) losses
+        loss_a_ar = F.cross_entropy(
+            logits_a[:, 0, :, :].reshape(-1, vocab_a),
+            target_a[:, 0, :].reshape(-1),
             ignore_index=-1,
         )
-    loss_a = loss_a / n_cb
+        loss_a_nar = torch.tensor(0.0, device=logits_a.device)
+        for i in range(1, n_cb):
+            loss_a_nar = loss_a_nar + F.cross_entropy(
+                logits_a[:, i, :, :].reshape(-1, vocab_a),
+                target_a[:, i, :].reshape(-1),
+                ignore_index=-1,
+            )
+        loss_a_nar = loss_a_nar / max(1, n_cb - 1)
+        loss_a = loss_a_ar + loss_a_nar
+        components["loss_a_ar"] = loss_a_ar
+        components["loss_a_nar"] = loss_a_nar
+    elif codec_condition == "D":
+        # Condition D: single codebook, large vocab
+        vocab_d = logits_a.shape[-1]  # 8192
+        loss_a = F.cross_entropy(
+            logits_a[:, 0, :, :].reshape(-1, vocab_d),
+            target_a[:, 0, :].reshape(-1),
+            ignore_index=-1,
+        )
+    elif codec_condition == "C":
+        # Condition C: delay pattern — CB_k at position t predicts target_a[:, k, t-k]
+        # Positions where t < k are masked with ignore_index=-1
+        loss_a = 0.0
+        T_a = target_a.shape[2]
+        delayed_target = torch.full_like(target_a, -1)
+        for k in range(n_cb):
+            T_valid = T_a - k
+            if T_valid > 0:
+                delayed_target[:, k, k:] = target_a[:, k, :T_valid]
+        for i in range(n_cb):
+            loss_a += F.cross_entropy(
+                logits_a[:, i, :, :].reshape(-1, vocab_a),
+                delayed_target[:, i, :].reshape(-1),
+                ignore_index=-1,
+            )
+        loss_a = loss_a / n_cb
+    else:
+        # Condition A (default): standard 8CB cross-entropy average
+        loss_a = 0.0
+        for i in range(n_cb):
+            loss_a += F.cross_entropy(
+                logits_a[:, i, :, :].reshape(-1, vocab_a),
+                target_a[:, i, :].reshape(-1),
+                ignore_index=-1,
+            )
+        loss_a = loss_a / n_cb
 
     # 2. Control Loss (B_t)
     loss_b = 0.0
@@ -455,10 +494,8 @@ def uclm_loss(
     total_loss = loss_a + loss_b
 
     # 4. Optional Losses
-    components = {
-        "loss_a": loss_a,
-        "loss_b": loss_b,
-    }
+    components["loss_a"] = loss_a
+    components["loss_b"] = loss_b
 
     if vq_loss is not None:
         total_loss = total_loss + lambda_vq * vq_loss

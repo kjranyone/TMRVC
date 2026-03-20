@@ -141,6 +141,20 @@ def init_app(
         )
         _context_predictor = None
 
+    # Inject trained macro projector into Intent Compiler and UI module
+    if _engine is not None and _engine.uclm_core_model is not None:
+        if hasattr(_engine.uclm_core_model, "acting_macro_proj"):
+            if _context_predictor is not None:
+                _context_predictor.inject_projector(
+                    _engine.uclm_core_model.acting_macro_proj
+                )
+            # Also inject into the UI module's global intent compiler
+            import tmrvc_serve.routes.ui as ui_module
+            if ui_module._intent_compiler is not None:
+                ui_module._intent_compiler.inject_projector(
+                    _engine.uclm_core_model.acting_macro_proj
+                )
+
 
 # Include routers
 from tmrvc_serve.routes.health import router as health_router

@@ -3,8 +3,8 @@
 //! Token-based streaming voice conversion:
 //!   audio → codec_encoder → tokens → token_model → tokens → codec_decoder → audio
 //!
-//! Frame size: 480 samples (20ms @ 24kHz)
-//! Token rate: 50 Hz (200 tokens/sec with 4 codebooks)
+//! Frame size: 240 samples (10ms @ 24kHz)
+//! Token rate: 100 Hz (frame_rate = sample_rate / hop_length)
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,7 +27,7 @@ use crate::style::StyleFile;
 // ============================================================================
 
 /// Per-frame processing parameters.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FrameParams {
     /// Dry/wet mix: 0.0 = input only, 1.0 = processed only
     pub dry_wet: f32,
@@ -57,6 +57,45 @@ pub struct FrameParams {
     pub top_k_b: usize,
     /// Voice state parameters (12-D physical controls)
     pub voice_state: [f32; D_VOICE_STATE],
+    /// Acting texture latent (24-D)
+    pub acting_texture_latent: [f32; D_ACTING_LATENT],
+    /// Pace multiplier (1.0 = normal, >1.0 = faster, <1.0 = slower)
+    pub pace: f32,
+    /// Hold bias: slows advance probability and adds drag
+    pub hold_bias: f32,
+    /// Boundary bias: increases advance tendency at boundaries
+    pub boundary_bias: f32,
+    /// Phrase pressure: compresses phrasing timing
+    pub phrase_pressure: f32,
+    /// Breath tendency: reduces advance probability for breath-like pauses
+    pub breath_tendency: f32,
+}
+
+impl Default for FrameParams {
+    fn default() -> Self {
+        Self {
+            dry_wet: 0.0,
+            output_gain: 0.0,
+            alpha_timbre: 0.0,
+            beta_prosody: 0.0,
+            gamma_articulation: 0.0,
+            voice_source_alpha: 0.0,
+            latency_quality_q: 0.0,
+            pitch_shift: 0.0,
+            cfg_scale: 0.0,
+            temperature_a: 0.0,
+            temperature_b: 0.0,
+            top_k_a: 0,
+            top_k_b: 0,
+            voice_state: [0.0; D_VOICE_STATE],
+            acting_texture_latent: [0.0; D_ACTING_LATENT],
+            pace: 1.0,
+            hold_bias: 0.0,
+            boundary_bias: 0.0,
+            phrase_pressure: 0.0,
+            breath_tendency: 0.0,
+        }
+    }
 }
 
 /// Shared status for real-time monitoring (atomic values for thread-safe access).
@@ -198,14 +237,35 @@ impl Default for PointerState {
 }
 
 impl PointerState {
-    /// SOTA: Update pointer with continuous integration (GEMINI.md Mandate).
-    pub fn step(&mut self, advance_prob: f32, progress_delta: f32, boundary_confidence: f32, hold_bias: f32) -> bool {
+    /// SOTA: Update pointer with continuous integration + pacing modulation
+    /// (matches Python uclm_engine.py pacing formula).
+    pub fn step(
+        &mut self,
+        advance_logit: f32,
+        progress_delta: f32,
+        boundary_confidence: f32,
+        pace: f32,
+        hold_bias: f32,
+        boundary_bias: f32,
+        phrase_pressure: f32,
+        breath_tendency: f32,
+    ) -> bool {
         self.frames_on_current_unit += 1;
         self.frames_generated += 1;
 
-        // Integration with drag
+        // Pacing-modulated advance probability (matches Python uclm_engine.py:1208-1215)
+        let modulated_logit = advance_logit
+            - hold_bias
+            + boundary_bias
+            + (pace - 1.0) * 2.0
+            + phrase_pressure * 1.5
+            - breath_tendency * 0.5;
+        let advance_prob = 1.0 / (1.0 + (-modulated_logit).exp()); // sigmoid
+
+        // Pacing-modulated progress integration
+        let velocity = progress_delta * pace;
         let drag = (hold_bias * 0.02).max(0.0);
-        self.progress += (progress_delta - drag).max(0.0);
+        self.progress += (velocity - drag).max(0.0);
 
         let mut advanced = false;
         let mut forced = false;
@@ -588,6 +648,7 @@ impl StreamingEngine {
                 &vec![0.0f32; D_SPEAKER], // speaker embed (from loaded profile)
                 &[0.0f32; D_F0], // f0 condition (unused)
                 &params.voice_state.to_vec(), // voice state as conditioning
+                &params.acting_texture_latent, // acting texture latent
                 kv_in,
                 &mut logits_out,
                 kv_out,
@@ -605,12 +666,16 @@ impl StreamingEngine {
                 &mut boundary_conf,
             )?;
 
-            // SOTA: Update pointer with continuous integration
+            // SOTA: Update pointer with continuous integration + pacing
             self.ptr.step(
                 adv_logit[0],
                 progress_delta[0],
                 boundary_conf[0],
-                0.0, // hold_bias from params.voice_state or default
+                params.pace,
+                params.hold_bias,
+                params.boundary_bias,
+                params.phrase_pressure,
+                params.breath_tendency,
             );
 
             sample_tokens(&logits_out, top_k, temperature)
@@ -630,6 +695,7 @@ impl StreamingEngine {
                     &vec![0.0f32; D_SPEAKER], // speaker embed
                     &[0.0f32; D_F0], // f0 condition (unused)
                     &params.voice_state.to_vec(), // voice state conditioning
+                    &params.acting_texture_latent, // acting texture latent
                     kv_in,
                     &mut logits_out,
                     kv_out,
@@ -748,6 +814,12 @@ mod tests {
             top_k_a: 50,
             top_k_b: 20,
             voice_state: [0.5f32; D_VOICE_STATE],
+            acting_texture_latent: [0.0f32; D_ACTING_LATENT],
+            pace: 1.0,
+            hold_bias: 0.0,
+            boundary_bias: 0.0,
+            phrase_pressure: 0.0,
+            breath_tendency: 0.0,
         };
         assert_eq!(params.dry_wet, 0.8);
     }

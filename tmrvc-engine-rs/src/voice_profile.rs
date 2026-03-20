@@ -201,7 +201,6 @@ pub fn create_voice_profile(
         ssl_state: None,
         acting_latent: None,
         metadata,
-        version: 3,
     };
     speaker_file.save(output_path)?;
 

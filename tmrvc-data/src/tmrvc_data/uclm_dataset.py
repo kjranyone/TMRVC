@@ -74,13 +74,13 @@ class UCLMBatch:
     utterance_ids: list[str]  # [B]
     frame_lengths: torch.Tensor  # [B]
     phoneme_lengths: torch.Tensor  # [B]
-    # v3 expressive fields
+    # Expressive fields
     dialogue_context: Optional[torch.Tensor] = None
     acting_intent: Optional[torch.Tensor] = None
     prosody_targets: Optional[torch.Tensor] = None
     text_suprasegmentals: Optional[torch.Tensor] = None  # [B, L, 4]
     bootstrap_alignment: Optional[dict] = None  # Contains 'phoneme_indices'
-    # v3 voice state supervision (Worker 01/03)
+    # Voice state supervision
     voice_state_targets: Optional[torch.Tensor] = None       # [B, T, 8]
     voice_state_observed_mask: Optional[torch.Tensor] = None  # [B, T, 8] bool
     voice_state_confidence: Optional[torch.Tensor] = None     # [B, T, 8]
@@ -412,7 +412,7 @@ class UCLMDataset(Dataset):
         spk_embed_path = utt_path / "spk_embed.npy"
         spk_embed = torch.from_numpy(np.load(spk_embed_path)).float() if spk_embed_path.exists() else torch.zeros(192)
 
-        # Load v3 expressive fields
+        # Load expressive fields
         dialogue_context = None
         if (utt_path / "dialogue_context.npy").exists():
             dialogue_context = torch.from_numpy(np.load(utt_path / "dialogue_context.npy")).float()

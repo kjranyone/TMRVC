@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use tmrvc_engine_rs::constants::{D_VOICE_STATE, FRAME_SIZE, SAMPLE_RATE};
+use tmrvc_engine_rs::constants::{D_ACTING_LATENT, D_VOICE_STATE, FRAME_SIZE, SAMPLE_RATE};
 use tmrvc_engine_rs::processor::{FrameParams, SharedStatus, StreamingEngine};
 use tmrvc_engine_rs::resampler::PolyphaseResampler;
 use tmrvc_engine_rs::wav_reader::read_wav;
@@ -130,6 +130,12 @@ fn main() -> Result<()> {
         top_k_a,
         top_k_b,
         voice_state: [0.5; D_VOICE_STATE],
+        acting_texture_latent: [0.0; D_ACTING_LATENT],
+        pace: 1.0,
+        hold_bias: 0.0,
+        boundary_bias: 0.0,
+        phrase_pressure: 0.0,
+        breath_tendency: 0.0,
     };
 
     let mut out = Vec::with_capacity(input_24k.len() + FRAME_SIZE);

@@ -298,10 +298,10 @@ def _generate_rust(cfg: dict) -> str:
         "tts": "\n// --- TTS extension ---",
         "uclm": "\n// --- UCLM (Unified Codec Language Model) ---",
         "f0": "\n// --- F0 Conditioning ---",
-        "suprasegmental": "\n// --- Suprasegmental text features (v3) ---",
+        "suprasegmental": "\n// --- Suprasegmental text features ---",
         "cfg": "\n// --- CFG (Classifier-Free Guidance) ---",
-        "prompt_budget": "\n// --- Prompt budget limits (v3) ---",
-        "runtime_budget": "\n// --- Runtime budget limits (v3) ---",
+        "prompt_budget": "\n// --- Prompt budget limits ---",
+        "runtime_budget": "\n// --- Runtime budget limits ---",
         "server": "\n// --- Server ports ---",
         "v4_acting": "\n// --- v4 Acting & Biological Constraints ---",
     }

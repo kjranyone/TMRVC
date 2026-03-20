@@ -215,26 +215,41 @@ class UCLMEngine:
         logger.info("Initialized UCLMEngine with RANDOM weights on %s", self.device)
 
     def project_acting_macro(self, macro_controls: torch.Tensor) -> torch.Tensor:
-        """Project 6-D acting macro controls to 24-D acting latent.
+        """Project 6-D acting macro controls to 24-D acting texture latent.
+
+        Uses the ActingMacroProjector (6→24) which is part of the training
+        graph.  If no trained projector is available, falls back to a
+        zero-padded identity mapping.
 
         Args:
             macro_controls: [B, 6] macro control values
 
         Returns:
-            acting_intent: [B, 24] acting latent vector
+            acting_texture_latent: [B, 24]
         """
         self._require_loaded()
-        if hasattr(self.uclm_core_model, "acting_macro_proj"):
-            with torch.no_grad():
-                return self.uclm_core_model.acting_macro_proj(
-                    macro_controls.to(self.device)
-                )
-        # Fallback: zero-pad to 24-D if projector not available
         from tmrvc_core.constants import D_ACTING_LATENT
-        B = macro_controls.shape[0]
-        latent = torch.zeros(B, D_ACTING_LATENT, device=self.device)
-        latent[:, :macro_controls.shape[1]] = macro_controls.to(self.device)
-        return latent
+        from tmrvc_train.models.acting_latent import ActingMacroProjector
+
+        # Prefer the projector from the loaded checkpoint if available
+        if not hasattr(self, "_acting_macro_projector"):
+            self._acting_macro_projector = ActingMacroProjector().to(self.device).eval()
+            # Try to load weights from the UCLM checkpoint state_dict
+            if self.uclm_core_model is not None:
+                sd = {k: v for k, v in self.uclm_core_model.state_dict().items()
+                      if k.startswith("acting_macro_proj.")}
+                if sd:
+                    mapped = {k.replace("acting_macro_proj.", ""): v for k, v in sd.items()}
+                    self._acting_macro_projector.load_state_dict(mapped, strict=False)
+                    logger.info("Loaded ActingMacroProjector weights from UCLM checkpoint")
+                else:
+                    logger.warning(
+                        "ActingMacroProjector weights not found in checkpoint — "
+                        "using random init (macro→latent will be untrained)"
+                    )
+
+        with torch.no_grad():
+            return self._acting_macro_projector(macro_controls.to(self.device))
 
     def load_models(
         self,
@@ -259,7 +274,18 @@ class UCLMEngine:
             num_spk = uclm_state[key].shape[0]
 
         self.uclm_core_model = DisentangledUCLM(num_speakers=num_spk).to(self.device).eval()
-        self.uclm_core_model.load_state_dict(uclm_state, strict=False)
+        missing, unexpected = self.uclm_core_model.load_state_dict(uclm_state, strict=False)
+        # v4 modules (acting_latent_conditioner, physical_prediction_head) will
+        # be missing from v3 checkpoints — warn explicitly so users know.
+        v4_missing = [k for k in missing if k.startswith(("acting_latent_conditioner.", "physical_prediction_head."))]
+        if v4_missing:
+            logger.warning(
+                "v4 modules not found in checkpoint (random init): %s",
+                ", ".join(sorted(set(k.split(".")[0] for k in v4_missing))),
+            )
+        other_missing = [k for k in missing if k not in v4_missing]
+        if other_missing:
+            logger.warning("Missing keys in checkpoint: %d keys", len(other_missing))
 
         codec_ckpt = torch.load(
             codec_ckpt_path, map_location=self.device, weights_only=False
@@ -414,8 +440,6 @@ class UCLMEngine:
                 speaker_embed=embed,
                 prompt_codec_tokens=tokens,
                 prompt_summary_tokens=summary,
-                adaptor_id=meta.get("adaptor_id"),
-                adaptor_merged=meta.get("adaptor_merged", False)
             )
             
             # SOTA: Bake FiLM parameters immediately on load
@@ -778,6 +802,7 @@ class UCLMEngine:
         max_frames: int = 1500,
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
+        acting_texture_latent: torch.Tensor | None = None,
         phrase_pressure: float = 0.0,
         breath_tendency: float = 0.0,
         reference_audio_base64: str | None = None,
@@ -949,6 +974,7 @@ class UCLMEngine:
         # Move optional expressive inputs to device once
         _dlg_ctx = dialogue_context.to(self.device) if dialogue_context is not None else None
         _act_int = acting_intent.to(self.device) if acting_intent is not None else None
+        _act_tex = acting_texture_latent.to(self.device) if acting_texture_latent is not None else None
 
         a_tokens, b_tokens = [], []
         ctx_a = torch.zeros(1, 8, 1, dtype=torch.long, device=self.device)
@@ -1049,6 +1075,7 @@ class UCLMEngine:
                 kv_caches=kv_caches,
                 dialogue_context=_dlg_ctx,
                 acting_intent=_act_int,
+                acting_texture_latent=_act_tex,
                 prompt_summary_tokens=prompt_summary_tokens,
                 frame_index=ptr.text_index, # SOTA: Semantic position
                 frame_offsets=ptr.frames_on_current_unit, # SOTA: Temporal offset
@@ -1082,6 +1109,7 @@ class UCLMEngine:
                         kv_caches=None,
                         dialogue_context=_dlg_ctx,
                         acting_intent=_act_int,
+                        acting_texture_latent=_act_tex,
                         frame_index=ptr.text_index,
                         frame_offsets=ptr.frames_on_current_unit,
                         precomputed_film_params=baked_film,
@@ -1117,6 +1145,7 @@ class UCLMEngine:
                             speaker_embed=speaker_embed,
                             dialogue_context=_dlg_ctx,
                             acting_intent=_act_int,
+                            acting_texture_latent=_act_tex,
                         )
                         out_uncond = self.uclm_core_model.forward_streaming(
                             queries=content_features,
@@ -1129,6 +1158,7 @@ class UCLMEngine:
                             kv_caches=None,  # Don't share cache with unconditional
                             dialogue_context=masked["dialogue_context"],
                             acting_intent=masked["acting_intent"],
+                            acting_texture_latent=masked["acting_texture_latent"],
                             frame_index=ptr.text_index,
                             frame_offsets=ptr.frames_on_current_unit,
                             precomputed_film_params=baked_film_uncond,
@@ -1373,7 +1403,15 @@ class UCLMEngine:
         vs_trajectory = trajectory.physical_trajectory.to(device) if trajectory.physical_trajectory is not None else None
         # Bit-exact acoustic tokens if requested (Worker 01/04)
         a_trace = trajectory.acoustic_trace.to(device) if (use_exact_tokens and trajectory.acoustic_trace is not None) else None
-        
+
+        # v4: Restore acting latent from trajectory for replay fidelity
+        _act_tex_replay = None
+        if trajectory.acting_latent_trajectory is not None:
+            _act_tex_replay = trajectory.acting_latent_trajectory.to(device)
+            # Static latent: broadcast a single [1, 24] across all frames
+            if trajectory.acting_latent_is_static and _act_tex_replay.dim() == 2:
+                _act_tex_replay = _act_tex_replay[:1]  # ensure [1, d_latent]
+
         # SOTA: Bake FiLM parameters once before the forced loop if not already in cache
         if baked_film is None:
             baked_film = self.uclm_core_model.bake_film_params(speaker_embed)
@@ -1431,14 +1469,15 @@ class UCLMEngine:
                 cfg_scale=1.0,
                 kv_caches=kv_caches,
                 prompt_summary_tokens=prompt_summary_tokens,
+                acting_texture_latent=_act_tex_replay,
                 frame_index=text_idx,
                 frame_offsets=frames_on_unit,
                 precomputed_film_params=baked_film,
                 cross_attn_mask=ca_mask,
             )
-            
+
             logits_a, logits_b, kv_caches = out["logits_a"], out["logits_b"], out["kv_cache_out"]
-            
+
             if a_trace is not None and use_exact_tokens:
                 # a_trace is [B, 8, T]
                 at = a_trace[:, :, t] # [B, 8]
@@ -1507,7 +1546,7 @@ class UCLMEngine:
             metadata=metadata or {}
         )
 
-    def synthesize_sentences(self, text: str, language: str, spk_embed: np.ndarray, style: StyleParams | None, speed: float = 1.0, cancel=None, sentence_pause_ms: int = 120, auto_style: bool = True):
+    def synthesize_sentences(self, text: str, language: str, spk_embed: np.ndarray, style: StyleParams | None, speed: float = 1.0, cancel=None, sentence_pause_ms: int = 120, auto_style: bool = True, pace: float = 1.0, hold_bias: float = 0.0, boundary_bias: float = 0.0, phrase_pressure: float = 0.0, breath_tendency: float = 0.0):
         del auto_style
         if cancel is not None and cancel.is_set(): return
         from tmrvc_data.g2p import text_to_phonemes
@@ -1516,7 +1555,7 @@ class UCLMEngine:
         supra_t = g2p_result.text_suprasegmentals  # [L, 4] or None
         spk_t = torch.from_numpy(np.asarray(spk_embed)).float().to(self.device) if not isinstance(spk_embed, torch.Tensor) else spk_embed.to(self.device)
         if spk_t.dim() == 1: spk_t = spk_t.unsqueeze(0)
-        audio_t, _ = self.tts(phonemes=phonemes_t, speaker_embed=spk_t, style=style or StyleParams.neutral(), language_id=g2p_result.language_id, text_suprasegmentals=supra_t)
+        audio_t, _ = self.tts(phonemes=phonemes_t, speaker_embed=spk_t, style=style or StyleParams.neutral(), language_id=g2p_result.language_id, text_suprasegmentals=supra_t, pace=pace, hold_bias=hold_bias, boundary_bias=boundary_bias, phrase_pressure=phrase_pressure, breath_tendency=breath_tendency)
         audio = audio_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
         chunk_size = int(0.1 * SAMPLE_RATE)
         for i in range(0, audio.size, chunk_size):

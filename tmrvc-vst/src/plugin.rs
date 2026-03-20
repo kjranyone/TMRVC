@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
-use tmrvc_engine_rs::constants::D_VOICE_STATE;
+use tmrvc_engine_rs::constants::{D_ACTING_LATENT, D_VOICE_STATE};
 use tmrvc_engine_rs::constants::{FRAME_SIZE, SAMPLE_RATE};
 use tmrvc_engine_rs::nam::NamChain;
 use tmrvc_engine_rs::processor::{FrameParams, StreamingEngine};
@@ -257,6 +257,12 @@ impl Plugin for TmrvcPlugin {
                     top_k_a: 50,
                     top_k_b: 20,
                     voice_state: [0.5f32; D_VOICE_STATE],
+                    acting_texture_latent: [0.0f32; D_ACTING_LATENT],
+                    pace: 1.0,
+                    hold_bias: 0.0,
+                    boundary_bias: 0.0,
+                    phrase_pressure: 0.0,
+                    breath_tendency: 0.0,
                 };
 
                 proc.process_one_frame(

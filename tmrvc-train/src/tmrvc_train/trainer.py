@@ -155,6 +155,7 @@ class UCLMTrainer:
         disentanglement_weight: float = 0.1,
         use_enriched_transcript: bool = False,
         enriched_transcript_prob: float = 0.5,
+        codec_condition: str = "A",
     ):
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -202,6 +203,7 @@ class UCLMTrainer:
         self.disentanglement_weight = disentanglement_weight
         self.use_enriched_transcript = use_enriched_transcript
         self.enriched_transcript_prob = enriched_transcript_prob
+        self.codec_condition = codec_condition
 
         # Biological constraint regularizer (Task 3-2)
         self.bio_regularizer: BiologicalConstraintRegularizer | None = None
@@ -528,6 +530,11 @@ class UCLMTrainer:
         if can_do_tts and random.random() < tts_prob:
             mode = "tts"
 
+        # v4: Initialize acting latent cache vars (populated in TTS path)
+        teacher_acting_latent = None
+        cached_act_mu = None
+        cached_act_logvar = None
+
         if mode == "vc":
             source_a_t = batch["source_a_t"].to(self.device)
             source_mask = (target_a[:, 0, :] != -1)
@@ -548,7 +555,8 @@ class UCLMTrainer:
                 target_b=target_b,
                 vq_loss=out.get("vq_loss"),
                 adv_logits=out.get("adv_logits"),
-                speaker_labels=speaker_labels
+                speaker_labels=speaker_labels,
+                codec_condition=self.codec_condition,
             )
             # Add prompt VQ loss if present
             if prompt_vq_loss is not None:
@@ -604,6 +612,23 @@ class UCLMTrainer:
             if text_suprasegmentals is not None:
                 text_suprasegmentals = text_suprasegmentals.to(self.device)
 
+            # --- v4: Extract teacher acting latent BEFORE forward pass ---
+            # Encoder output is used as conditioning (detached from encoder graph)
+            # and separately for KL/usage loss (with encoder gradients).
+            teacher_acting_latent = None
+            cached_act_mu = None
+            cached_act_logvar = None
+            if self.enable_v4_losses and self.acting_latent_encoder is not None and ssl_state is not None:
+                ssl_for_acting = ssl_state
+                d_input = self.acting_latent_encoder.encoder[0].in_features
+                if ssl_for_acting.dim() == 3 and ssl_for_acting.shape[-1] != d_input:
+                    if ssl_for_acting.shape[1] == d_input:
+                        ssl_for_acting = ssl_for_acting.transpose(1, 2)
+                teacher_acting_latent, cached_act_mu, cached_act_logvar = self.acting_latent_encoder(ssl_for_acting)
+                # Detach latent for conditioning path — encoder gradients flow
+                # only via KL/usage loss, not through the main transformer.
+                teacher_acting_latent = teacher_acting_latent.detach()
+
             losses = self._tts_pointer_step(
                 phonemes=phonemes,
                 language_ids=language_ids,
@@ -624,6 +649,7 @@ class UCLMTrainer:
                 batch=batch,
                 current_step=current_step,
                 pointer_loss_weight=pointer_loss_weight,
+                acting_texture_latent=teacher_acting_latent,
             )
             # Add prompt VQ loss if present
             if prompt_vq_loss is not None:
@@ -638,7 +664,10 @@ class UCLMTrainer:
             physical_mask = batch.get("physical_observed_mask")
             if physical_targets is not None:
                 physical_targets = physical_targets.to(self.device)
-                physical_pred = explicit_state[:, :, :12] if explicit_state.shape[-1] >= 12 else explicit_state
+                # v4: Use dedicated physical prediction head output when available
+                physical_pred = losses.get("_physical_pred")
+                if physical_pred is None:
+                    physical_pred = explicit_state[:, :, :12] if explicit_state.shape[-1] >= 12 else explicit_state
                 # Align temporal dimensions
                 T_pred = physical_pred.shape[1]
                 T_tgt = physical_targets.shape[1]
@@ -720,10 +749,14 @@ class UCLMTrainer:
         if self.enable_v4_losses:
             losses = self._compute_v4_additional_losses(
                 losses, batch, explicit_state, ssl_state, speaker_embed,
+                cached_act_mu=cached_act_mu,
+                cached_act_logvar=cached_act_logvar,
+                cached_act_latent=teacher_acting_latent,
             )
 
         # Remove internal-only keys before backward
         losses.pop("_hidden_states", None)
+        losses.pop("_physical_pred", None)
 
         # Optimization
         losses["loss"].backward()
@@ -744,6 +777,9 @@ class UCLMTrainer:
         explicit_state: torch.Tensor,
         ssl_state: torch.Tensor,
         speaker_embed: torch.Tensor,
+        cached_act_mu: torch.Tensor | None = None,
+        cached_act_logvar: torch.Tensor | None = None,
+        cached_act_latent: torch.Tensor | None = None,
     ) -> dict:
         """Compute all 9 v4 loss terms (Task 3-3).
 
@@ -761,16 +797,22 @@ class UCLMTrainer:
         device = self.device
 
         # --- Loss 5: Acting latent regularization (KL) ---
-        if self.acting_latent_encoder is not None and ssl_state is not None:
-            # ssl_state should be [B, T, d_ssl=128]; ensure correct layout
+        # Use cached encoder output from train_step if available (v4 integration)
+        # ssl_for_acting is needed by semantic alignment loss below, so always prepare it.
+        ssl_for_acting = None
+        if ssl_state is not None:
             ssl_for_acting = ssl_state
-            d_input = self.acting_latent_encoder.encoder[0].in_features  # 128
-            if ssl_for_acting.dim() == 3 and ssl_for_acting.shape[-1] != d_input:
-                if ssl_for_acting.shape[1] == d_input:
-                    # [B, d_ssl, T] -> transpose to [B, T, d_ssl]
-                    ssl_for_acting = ssl_for_acting.transpose(1, 2)
+            if self.acting_latent_encoder is not None:
+                d_input = self.acting_latent_encoder.encoder[0].in_features
+                if ssl_for_acting.dim() == 3 and ssl_for_acting.shape[-1] != d_input:
+                    if ssl_for_acting.shape[1] == d_input:
+                        ssl_for_acting = ssl_for_acting.transpose(1, 2)
 
-            latent, mu, logvar = self.acting_latent_encoder(ssl_for_acting)
+        if self.acting_latent_encoder is not None and (cached_act_mu is not None or ssl_state is not None):
+            if cached_act_mu is not None and cached_act_logvar is not None and cached_act_latent is not None:
+                mu, logvar, latent = cached_act_mu, cached_act_logvar, cached_act_latent
+            else:
+                latent, mu, logvar = self.acting_latent_encoder(ssl_for_acting)
 
             # KL regularization
             kl_loss = acting_latent_kl_loss(mu, logvar)
@@ -783,10 +825,17 @@ class UCLMTrainer:
             losses["loss_acting_usage"] = usage_loss
 
             # --- Loss 6: Disentanglement loss ---
-            physical_pred = explicit_state
-            if physical_pred.dim() == 3 and physical_pred.shape[-1] >= 12:
-                physical_for_dis = physical_pred[:, :, :12]
+            # v4: Prefer dedicated physical_pred head output for gradient flow.
+            # disentanglement_loss expects [B, T, 12] — it pools internally.
+            physical_pred_for_dis = losses.get("_physical_pred")
+            if physical_pred_for_dis is not None:
+                dis_loss = disentanglement_loss(physical_pred_for_dis, latent)
+            elif explicit_state.dim() == 3 and explicit_state.shape[-1] >= 12:
+                physical_for_dis = explicit_state[:, :, :12]
                 dis_loss = disentanglement_loss(physical_for_dis, latent)
+            else:
+                dis_loss = None
+            if dis_loss is not None:
                 losses["loss"] = losses["loss"] + self.disentanglement_weight * dis_loss
                 losses["loss_disentanglement"] = dis_loss
 
@@ -853,6 +902,7 @@ class UCLMTrainer:
         batch: dict,
         current_step: int,
         pointer_loss_weight: float,
+        acting_texture_latent: torch.Tensor | None = None,
     ) -> dict:
         """Pointer-mode TTS training step with full annealing schedule."""
         B = phonemes.shape[0]
@@ -892,6 +942,7 @@ class UCLMTrainer:
             dialogue_context=dialogue_context,
             acting_intent=acting_intent,
             prosody_latent=prosody_targets,
+            acting_texture_latent=acting_texture_latent,
             delta_voice_state=delta_voice_state,
             prompt_kv_cache=prompt_kv_cache,
             bootstrap_alignment=bootstrap_data,
@@ -991,6 +1042,7 @@ class UCLMTrainer:
             dialogue_context=dialogue_context,
             acting_intent=acting_intent,
             prosody_latent=prosody_targets,
+            acting_texture_latent=acting_texture_latent,
             delta_voice_state=delta_voice_state,
             prompt_kv_cache=prompt_kv_cache,
             text_suprasegmentals=text_suprasegmentals,
@@ -1056,6 +1108,7 @@ class UCLMTrainer:
             prosody_dialogue_context=dialogue_context,
             prosody_speaker_embed=speaker_embed,
             lambda_prosody=self.prosody_loss_weight if prosody_targets is not None else 0.0,
+            codec_condition=self.codec_condition,
         )
 
         # Boundary confidence loss
@@ -1095,6 +1148,7 @@ class UCLMTrainer:
                 position_indices=pos_indices,
                 frame_offsets=frame_offsets,
                 cross_attn_mask=ca_mask,
+                acting_texture_latent=acting_texture_latent,
             )
 
         # Voice state supervision with observed_mask and confidence (Worker 02)
@@ -1103,9 +1157,11 @@ class UCLMTrainer:
             and vs_targets is not None
             and out.get("hidden_states") is not None
         ):
-            # Use hidden_states[:, :, :12] as proxy for voice state prediction
-            # (real implementation uses a dedicated head)
-            vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :12]
+            # v4: Use dedicated physical prediction head for gradient flow
+            if out.get("physical_pred") is not None:
+                vs_pred = out["physical_pred"][:, :vs_targets.shape[1], :]
+            else:
+                vs_pred = out["hidden_states"][:, :vs_targets.shape[1], :12]
             loss_vs = voice_state_supervision_loss(
                 vs_pred,
                 vs_targets,
@@ -1132,6 +1188,10 @@ class UCLMTrainer:
         if out.get("hidden_states") is not None:
             losses["_hidden_states"] = out["hidden_states"]
 
+        # v4: Pass physical_pred from dedicated head for physical supervision + disentanglement
+        if out.get("physical_pred") is not None:
+            losses["_physical_pred"] = out["physical_pred"]
+
         return losses
 
     def _apply_cfg_distillation(
@@ -1155,6 +1215,7 @@ class UCLMTrainer:
         position_indices: torch.Tensor,
         frame_offsets: torch.Tensor,
         cross_attn_mask: torch.Tensor, # New SOTA field
+        acting_texture_latent: torch.Tensor | None = None,
     ) -> None:
         """Apply CFG self-distillation loss (Stage 3 only)."""
         # Sample a random cfg_scale from the configured range
@@ -1176,6 +1237,7 @@ class UCLMTrainer:
                 acting_intent=acting_intent,
                 prosody_latent=prosody_targets,
                 delta_voice_state=delta_voice_state,
+                acting_texture_latent=acting_texture_latent,
             )
             out_uncond = self.model.forward_tts_pointer(
                 phoneme_ids=phonemes,
@@ -1191,6 +1253,7 @@ class UCLMTrainer:
                 dialogue_context=masked_distill["dialogue_context"],
                 acting_intent=masked_distill["acting_intent"],
                 prosody_latent=masked_distill["prosody_latent"],
+                acting_texture_latent=masked_distill["acting_texture_latent"],
                 delta_voice_state=masked_distill["delta_voice_state"],
                 position_indices=position_indices, # SOTA consistency
                 frame_offsets=frame_offsets,       # SOTA consistency
@@ -1218,6 +1281,7 @@ class UCLMTrainer:
             dialogue_context=dialogue_context,
             acting_intent=acting_intent,
             prosody_latent=prosody_targets,
+            acting_texture_latent=acting_texture_latent,
             delta_voice_state=delta_voice_state,
             text_suprasegmentals=text_suprasegmentals,
             position_indices=position_indices,
@@ -1324,6 +1388,7 @@ class UCLMTrainer:
             progress_targets=prog_targets,
             lambda_pointer=self.pointer_loss_weight,
             lambda_progress=self.progress_loss_weight,
+            codec_condition=self.codec_condition,
         )
         
         metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}

@@ -46,8 +46,8 @@ def _make_model(**overrides):
         rvq_vocab_size=128,
         n_codebooks=8,
         control_vocab_size=32,
-        d_explicit=_D_EXPLICIT,
-        d_ssl=32,
+        d_voice_state_explicit=_D_EXPLICIT,
+        d_voice_state_ssl=32,
         d_speaker=_D_SPEAKER,
         vq_bins=32,
         vocab_size=64,
@@ -73,8 +73,8 @@ def test_uclm_vc_forward():
         rvq_vocab_size=1024,
         n_codebooks=8,
         control_vocab_size=64,
-        d_explicit=_D_EXPLICIT,
-        d_ssl=128,
+        d_voice_state_explicit=_D_EXPLICIT,
+        d_voice_state_ssl=128,
         d_speaker=192,
         vq_bins=64,
     )
@@ -105,8 +105,8 @@ def test_uclm_tts_pointer_forward():
         rvq_vocab_size=1024,
         n_codebooks=8,
         control_vocab_size=64,
-        d_explicit=_D_EXPLICIT,
-        d_ssl=128,
+        d_voice_state_explicit=_D_EXPLICIT,
+        d_voice_state_ssl=128,
         d_speaker=192,
         vq_bins=64,
         vocab_size=256,
@@ -135,7 +135,7 @@ def test_uclm_tts_pointer_forward():
 
     assert "logits_a" in out
     assert "logits_b" in out
-    assert "pointer_logits" in out
+    assert "advance_logit" in out
 
     assert out["logits_a"].shape == (B, 8, T, 1024)
     assert out["logits_b"].shape == (B, 4, T, 64)

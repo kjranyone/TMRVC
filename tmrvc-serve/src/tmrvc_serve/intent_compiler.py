@@ -26,6 +26,7 @@ from tmrvc_core.types import (
     PacingControls,
 )
 from tmrvc_serve.llm_backend import LLMBackend
+from tmrvc_train.models.acting_latent import ActingMacroProjector
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,22 @@ class IntentCompiler:
             seed=seed,
         )
         self._initialized = False
+        # v4: Project acting macro controls to 24-D acting latent prior.
+        # TODO: Load trained weights from checkpoint — currently random init.
+        # Until trained, the latent prior is a deterministic but untrained
+        # projection (consistent within a process lifetime).
+        self._macro_projector = ActingMacroProjector()
+        self._macro_projector.eval()
+
+    def inject_projector(self, projector: ActingMacroProjector) -> None:
+        """Inject a trained ActingMacroProjector from a loaded checkpoint.
+
+        Until this is called, the projector uses random init and the
+        24-D latent prior will be arbitrary.
+        """
+        self._macro_projector = projector
+        self._macro_projector.eval()
+        logger.info("IntentCompiler: injected trained ActingMacroProjector weights")
 
     def ensure_loaded(self) -> None:
         """Load the LLM backend if not already loaded."""
@@ -116,6 +133,20 @@ class IntentCompiler:
         inline_tags = parsed.get("inline_tags", [])
         warnings = parsed.get("warnings", [])
 
+        # v4: Project acting macro to 24-D acting latent prior
+        macro_tensor = torch.tensor([[
+            acting_macro.intensity,
+            acting_macro.instability,
+            acting_macro.tenderness,
+            acting_macro.tension,
+            acting_macro.spontaneity,
+            acting_macro.reference_mix,
+        ]], dtype=torch.float32)
+        # Move to projector's device to avoid CPU/CUDA mismatch
+        proj_device = next(self._macro_projector.parameters()).device
+        with torch.no_grad():
+            acting_latent_prior = self._macro_projector(macro_tensor.to(proj_device)).cpu()  # [1, 24]
+
         logger.info(
             "Compiled prompt [%s] -> ID: %s (backend=%s)",
             prompt[:80],
@@ -129,6 +160,7 @@ class IntentCompiler:
             inline_tags=inline_tags,
             physical_targets=physical_targets,
             acting_macro=acting_macro,
+            acting_latent_prior=acting_latent_prior,
             pacing=pacing,
             warnings=warnings,
             provenance=self._llm.provenance,

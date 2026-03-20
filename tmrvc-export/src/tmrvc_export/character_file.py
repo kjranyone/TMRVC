@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from tmrvc_core.constants import (
+    D_ACTING_LATENT,
     D_SPEAKER,
     D_STYLE,
     LORA_DELTA_SIZE,
@@ -38,13 +39,16 @@ from tmrvc_core.constants import (
 logger = logging.getLogger(__name__)
 
 MAGIC = b"TMCH"
-VERSION = 1
+VERSION = 2
+# v1 backward compat: accept v1 files on read
+_SUPPORTED_VERSIONS = {1, 2}
 
 HEADER_SIZE = 28  # magic(4) + ver(4) + spk(4) + lora(4) + vs(4) + style(4) + prof(4)
 SPK_EMBED_BYTES = D_SPEAKER * 4
 LORA_DELTA_BYTES = LORA_DELTA_SIZE * 4
 VOICE_SOURCE_BYTES = N_VOICE_SOURCE_PARAMS * 4
 STYLE_BYTES = D_STYLE * 4
+ACTING_LATENT_PRIOR_BYTES = D_ACTING_LATENT * 4
 CHECKSUM_SIZE = 32
 
 
@@ -55,8 +59,11 @@ def write_character_file(
     voice_source_preset: np.ndarray | None = None,
     default_style: np.ndarray | None = None,
     profile: dict | None = None,
+    acting_latent_prior: np.ndarray | None = None,
+    compiler_fingerprint: str = "",
+    linked_speaker_profile_id: str = "",
 ) -> Path:
-    """Write a .tmrvc_character binary file.
+    """Write a .tmrvc_character v2 binary file.
 
     Args:
         output_path: Output file path.
@@ -66,6 +73,9 @@ def write_character_file(
         default_style: Default emotion style, shape (32,), float32. Zeros if None.
         profile: Character profile dict with keys: name, personality,
             voice_description, language. Missing keys use empty defaults.
+        acting_latent_prior: v2: 24-D acting texture latent prior, float32. Zeros if None.
+        compiler_fingerprint: v2: intent compiler fingerprint string.
+        linked_speaker_profile_id: v2: linked speaker profile ID.
 
     Returns:
         Path to the written file.
@@ -89,12 +99,18 @@ def write_character_file(
         default_style = np.zeros(D_STYLE, dtype=np.float32)
     assert default_style.shape == (D_STYLE,)
 
+    if acting_latent_prior is None:
+        acting_latent_prior = np.zeros(D_ACTING_LATENT, dtype=np.float32)
+    assert acting_latent_prior.shape == (D_ACTING_LATENT,)
+
     profile = profile or {}
     profile_dict = {
         "name": profile.get("name", ""),
         "personality": profile.get("personality", ""),
         "voice_description": profile.get("voice_description", ""),
         "language": profile.get("language", "ja"),
+        "compiler_fingerprint": compiler_fingerprint,
+        "linked_speaker_profile_id": linked_speaker_profile_id,
     }
     profile_bytes = json.dumps(profile_dict, ensure_ascii=False).encode("utf-8")
 
@@ -110,6 +126,8 @@ def write_character_file(
     data += lora_delta.tobytes()
     data += voice_source_preset.astype(np.float32).tobytes()
     data += default_style.astype(np.float32).tobytes()
+    # v2: acting latent prior (24-D) written BEFORE profile JSON
+    data += acting_latent_prior.astype(np.float32).tobytes()
     data += profile_bytes
 
     checksum = hashlib.sha256(bytes(data)).digest()
@@ -117,25 +135,28 @@ def write_character_file(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(bytes(data))
-    logger.info("Wrote character file to %s (%d bytes)", output_path, len(data))
+    logger.info("Wrote character file v2 to %s (%d bytes)", output_path, len(data))
     return output_path
 
 
 def read_character_file(
     path: str | Path,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
-    """Read and validate a .tmrvc_character binary file.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, np.ndarray]:
+    """Read and validate a .tmrvc_character v1/v2 binary file.
 
     Args:
         path: Path to the character file.
 
     Returns:
-        Tuple of (spk_embed, lora_delta, voice_source_preset, default_style, profile).
+        Tuple of (spk_embed, lora_delta, voice_source_preset, default_style,
+                  profile, acting_latent_prior).
         - spk_embed: shape (192,) float32
         - lora_delta: shape (15872,) float32
         - voice_source_preset: shape (8,) float32
         - default_style: shape (32,) float32
-        - profile: dict with name, personality, voice_description, language
+        - profile: dict with name, personality, voice_description, language,
+                   compiler_fingerprint, linked_speaker_profile_id
+        - acting_latent_prior: shape (24,) float32 (zeros for v1 files)
 
     Raises:
         ValueError: If the file is invalid or corrupted.
@@ -161,7 +182,7 @@ def read_character_file(
         raise ValueError(f"Invalid magic: expected {MAGIC!r}, got {magic!r}")
 
     version = struct.unpack("<I", data[4:8])[0]
-    if version != VERSION:
+    if version not in _SUPPORTED_VERSIONS:
         raise ValueError(f"Unsupported version: {version}")
 
     spk_size = struct.unpack("<I", data[8:12])[0]
@@ -179,12 +200,15 @@ def read_character_file(
             f"Invalid lora_delta_size: expected {LORA_DELTA_SIZE}, got {lora_size}"
         )
 
+    # v2 files include acting_latent_prior (24 floats) between style and profile
+    acting_latent_size = D_ACTING_LATENT if version >= 2 else 0
     expected_size = (
         HEADER_SIZE
         + spk_size * 4
         + lora_size * 4
         + vs_size * 4
         + style_size * 4
+        + acting_latent_size * 4
         + profile_size
         + CHECKSUM_SIZE
     )
@@ -220,6 +244,16 @@ def read_character_file(
     ).copy()
     offset += STYLE_BYTES
 
+    # v2: acting latent prior
+    if version >= 2:
+        acting_latent_prior = np.frombuffer(
+            data[offset : offset + ACTING_LATENT_PRIOR_BYTES], dtype=np.float32
+        ).copy()
+        offset += ACTING_LATENT_PRIOR_BYTES
+    else:
+        # v1 backward compat: default zeros
+        acting_latent_prior = np.zeros(D_ACTING_LATENT, dtype=np.float32)
+
     if profile_size > 0:
         profile = json.loads(data[offset : offset + profile_size])
     else:
@@ -229,8 +263,11 @@ def read_character_file(
             "voice_description": "",
             "language": "ja",
         }
+    # Ensure v2 profile keys exist
+    profile.setdefault("compiler_fingerprint", "")
+    profile.setdefault("linked_speaker_profile_id", "")
 
-    return spk_embed, lora_delta, voice_source_preset, default_style_arr, profile
+    return spk_embed, lora_delta, voice_source_preset, default_style_arr, profile, acting_latent_prior
 
 
 def from_speaker_file(

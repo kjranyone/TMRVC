@@ -142,8 +142,8 @@ class TestBatchVsStreamingPointerConsistency:
         with torch.no_grad():
             batch_out = model.forward_tts_pointer(**inputs)
 
-        # Verify batch output contains pointer logits
-        assert "pointer_logits" in batch_out, "Batch output missing pointer_logits"
+        # Verify batch output contains advance_logit
+        assert "advance_logit" in batch_out, "Batch output missing advance_logit"
         assert "hidden_states" in batch_out, "Batch output missing hidden_states"
 
         # Simulate streaming: run forward_streaming with full context
@@ -155,9 +155,9 @@ class TestBatchVsStreamingPointerConsistency:
         with torch.no_grad():
             ptr_logits_2, prog_delta_2, _bc_2 = model.pointer_head(hidden_batch)
 
-        # Must match the batch pointer_logits exactly (same hidden states)
+        # Must match the batch advance_logit exactly (same hidden states)
         assert torch.allclose(
-            batch_out["pointer_logits"], ptr_logits_2, atol=1e-5
+            batch_out["advance_logit"], ptr_logits_2, atol=1e-5
         ), "Pointer logits differ when re-running pointer_head on same hidden_states"
         assert torch.allclose(
             batch_out["progress_delta"], prog_delta_2, atol=1e-5
@@ -173,7 +173,7 @@ class TestPytorchOnnxContractFields:
     ONNX_CONTRACT_KEYS = {
         "logits_a",
         "logits_b",
-        "pointer_logits",   # maps to advance_logit in ONNX
+        "advance_logit",
         "progress_delta",
         "hidden_states",
     }
@@ -191,9 +191,9 @@ class TestPytorchOnnxContractFields:
         missing = self.ONNX_CONTRACT_KEYS - set(out.keys())
         assert not missing, f"Missing ONNX contract keys in model output: {missing}"
 
-    def test_advance_logit_alias_present(self):
-        """forward_tts_pointer must include 'advance_logit' as an alias for
-        'pointer_logits', matching the ONNX output name."""
+    def test_advance_logit_present(self):
+        """forward_tts_pointer must include 'advance_logit' matching the ONNX
+        contract output name."""
         model = DisentangledUCLM()
         model.eval()
 
@@ -276,7 +276,7 @@ class TestBatchVsStreamingNumericalParity:
             ptr2, prog2, bc2 = model.pointer_head(hidden)
 
         assert torch.allclose(
-            batch_out["pointer_logits"], ptr2, atol=1e-5
+            batch_out["advance_logit"], ptr2, atol=1e-5
         ), "Pointer logits differ on same hidden_states"
         assert torch.allclose(
             batch_out["progress_delta"], prog2, atol=1e-5
@@ -294,7 +294,7 @@ class TestBatchVsStreamingNumericalParity:
             out2 = model.forward_tts_pointer(**inputs)
 
         assert torch.allclose(
-            out1["pointer_logits"], out2["pointer_logits"], atol=1e-6
+            out1["advance_logit"], out2["advance_logit"], atol=1e-6
         ), "Non-deterministic pointer logits on CPU"
         assert torch.allclose(
             out1["hidden_states"], out2["hidden_states"], atol=1e-6
@@ -491,14 +491,14 @@ def _export_all_components(
         core_wrapper,
         (dummy_content, dummy_b_ctx, dummy_spk, dummy_state_cond, dummy_acting, dummy_cfg, dummy_kv),
         core_path,
-        input_names=["content_features", "b_ctx", "spk_embed", "state_cond", "acting_intent", "cfg_scale", "kv_cache_in"],
+        input_names=["content_features", "b_ctx", "spk_embed", "state_cond", "acting_texture_latent", "cfg_scale", "kv_cache_in"],
         output_names=["logits_a", "logits_b", "kv_cache_out"],
         dynamic_axes={
             "content_features": {0: "batch", 2: "L"},
             "b_ctx": {0: "batch", 2: "L"},
             "spk_embed": {0: "batch"},
             "state_cond": {0: "batch"},
-            "acting_intent": {0: "batch"},
+            "acting_texture_latent": {0: "batch"},
             "cfg_scale": {},
             "kv_cache_in": {0: "batch"},
             "logits_a": {0: "batch"},
@@ -638,7 +638,7 @@ class TestPythonOnnxNumericalParity:
                 "b_ctx": b_ctx.numpy(),
                 "spk_embed": spk.numpy(),
                 "state_cond": state_cond.numpy(),
-                "acting_intent": acting.numpy(),
+                "acting_texture_latent": acting.numpy(),
                 "cfg_scale": cfg_scale.numpy(),
                 "kv_cache_in": kv_cache.numpy(),
             },
@@ -714,7 +714,7 @@ class TestPythonOnnxNumericalParity:
                 "b_ctx": np.zeros((1, 4, _CONTEXT_FRAMES), dtype=np.int64),
                 "spk_embed": spk.numpy(),
                 "state_cond": onnx_state_cond,
-                "acting_intent": acting.numpy(),
+                "acting_texture_latent": acting.numpy(),
                 "cfg_scale": cfg_scale.numpy(),
                 "kv_cache_in": kv_cache.numpy(),
             },
@@ -848,7 +848,7 @@ class TestActingLatentOrderingParity:
                 path,
                 input_names=[
                     "content_features", "b_ctx", "spk_embed", "state_cond",
-                    "acting_intent", "cfg_scale", "kv_cache_in",
+                    "acting_texture_latent", "cfg_scale", "kv_cache_in",
                 ],
                 output_names=["logits_a", "logits_b", "kv_cache_out"],
                 dynamic_axes={
@@ -856,7 +856,7 @@ class TestActingLatentOrderingParity:
                     "b_ctx": {0: "batch", 2: "L"},
                     "spk_embed": {0: "batch"},
                     "state_cond": {0: "batch"},
-                    "acting_intent": {0: "batch"},
+                    "acting_texture_latent": {0: "batch"},
                     "cfg_scale": {},
                     "kv_cache_in": {0: "batch"},
                     "logits_a": {0: "batch"},
@@ -869,24 +869,24 @@ class TestActingLatentOrderingParity:
             sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
             yield sess
 
-    def test_acting_intent_shape_is_24d(self, core_session):
-        """ONNX uclm_core input acting_intent must have shape [B, 24]."""
+    def test_acting_texture_latent_shape_is_24d(self, core_session):
+        """ONNX uclm_core input acting_texture_latent must have shape [B, 24]."""
         inp = next(
-            i for i in core_session.get_inputs() if i.name == "acting_intent"
+            i for i in core_session.get_inputs() if i.name == "acting_texture_latent"
         )
         assert inp.shape[-1] == D_ACTING_LATENT, (
-            f"acting_intent last dim is {inp.shape[-1]}, expected {D_ACTING_LATENT} (={D_ACTING_LATENT})"
+            f"acting_texture_latent last dim is {inp.shape[-1]}, expected {D_ACTING_LATENT}"
         )
 
-    def test_acting_intent_is_24_constant(self):
+    def test_acting_latent_is_24_constant(self):
         """D_ACTING_LATENT must equal 24 per the architecture spec."""
         assert D_ACTING_LATENT == 24, (
             f"D_ACTING_LATENT changed from 24 to {D_ACTING_LATENT} -- "
             "update ONNX contract and Rust engine if intentional"
         )
 
-    def test_zero_acting_intent_is_noop(self, core_session):
-        """Passing all-zero acting_intent must not crash and must produce
+    def test_zero_acting_texture_latent_is_noop(self, core_session):
+        """Passing all-zero acting_texture_latent must not crash and must produce
         valid logits (zeros = no acting control)."""
         from tmrvc_export.export_uclm import UCLMCoreExportWrapper
 
@@ -902,7 +902,7 @@ class TestActingLatentOrderingParity:
                 "b_ctx": np.zeros((1, 4, _CONTEXT_FRAMES), dtype=np.int64),
                 "spk_embed": np.zeros((1, D_SPEAKER), dtype=np.float32),
                 "state_cond": np.zeros((1, D_MODEL), dtype=np.float32),
-                "acting_intent": np.zeros((1, D_ACTING_LATENT), dtype=np.float32),
+                "acting_texture_latent": np.zeros((1, D_ACTING_LATENT), dtype=np.float32),
                 "cfg_scale": np.array([1.5], dtype=np.float32),
                 "kv_cache_in": np.zeros((1, kv_cache_size), dtype=np.float32),
             },

@@ -1,4 +1,4 @@
-"""Tests for .tmrvc_speaker v3 binary file format."""
+"""Tests for .tmrvc_speaker v4 binary file format."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import struct
 import numpy as np
 import pytest
 
-from tmrvc_core.constants import D_SPEAKER, LORA_DELTA_SIZE
+from tmrvc_core.constants import D_ACTING_LATENT, D_SPEAKER, D_VOICE_STATE_SSL, LORA_DELTA_SIZE
 from tmrvc_export.speaker_file import (
     CHECKSUM_SIZE,
     HEADER_SIZE,
@@ -27,6 +27,8 @@ def sample_arrays():
         "spk_embed": rng.standard_normal(D_SPEAKER).astype(np.float32),
         "style_embed": rng.standard_normal(D_STYLE).astype(np.float32),
         "lora_delta": rng.standard_normal(LORA_DELTA_SIZE).astype(np.float32),
+        "acting_latent": rng.standard_normal(D_ACTING_LATENT).astype(np.float32),
+        "ssl_state": rng.standard_normal(D_VOICE_STATE_SSL).astype(np.float32),
     }
 
 
@@ -102,6 +104,72 @@ class TestWriteRead:
         data = path.read_bytes()
         assert data[:4] == MAGIC
         assert struct.unpack("<I", data[4:8])[0] == VERSION
+        assert VERSION == 4
+
+    def test_header_size_is_40(self, tmp_path, sample_arrays):
+        assert HEADER_SIZE == 40
+        path = write_speaker_file(
+            tmp_path / "hdr.tmrvc_speaker",
+            sample_arrays["spk_embed"],
+        )
+        data = path.read_bytes()
+        # acting_latent_size at bytes 32..36 should be 0 (no acting_latent)
+        assert struct.unpack("<I", data[32:36])[0] == 0
+        # reserved/pad at bytes 36..40 should be 0
+        assert struct.unpack("<I", data[36:40])[0] == 0
+
+    def test_roundtrip_with_acting_latent(self, tmp_path, sample_arrays):
+        path = write_speaker_file(
+            tmp_path / "acting.tmrvc_speaker",
+            sample_arrays["spk_embed"],
+            acting_latent=sample_arrays["acting_latent"],
+        )
+        result = read_speaker_file(path)
+        assert result.acting_latent is not None
+        np.testing.assert_array_almost_equal(
+            result.acting_latent, sample_arrays["acting_latent"]
+        )
+
+    def test_roundtrip_with_acting_latent_and_ssl_state(self, tmp_path, sample_arrays):
+        path = write_speaker_file(
+            tmp_path / "full_v4.tmrvc_speaker",
+            sample_arrays["spk_embed"],
+            style_embed=sample_arrays["style_embed"],
+            lora_delta=sample_arrays["lora_delta"],
+            ssl_state=sample_arrays["ssl_state"],
+            acting_latent=sample_arrays["acting_latent"],
+            metadata={"profile_name": "FullV4"},
+        )
+        result = read_speaker_file(path)
+        np.testing.assert_array_almost_equal(
+            result.spk_embed, sample_arrays["spk_embed"]
+        )
+        np.testing.assert_array_almost_equal(
+            result.style_embed, sample_arrays["style_embed"]
+        )
+        np.testing.assert_array_almost_equal(
+            result.lora_delta, sample_arrays["lora_delta"]
+        )
+        np.testing.assert_array_almost_equal(
+            result.acting_latent, sample_arrays["acting_latent"]
+        )
+        assert result.ssl_state is not None
+        np.testing.assert_array_almost_equal(
+            result.ssl_state, sample_arrays["ssl_state"]
+        )
+        assert result.metadata["profile_name"] == "FullV4"
+
+    def test_acting_latent_flag_in_header(self, tmp_path, sample_arrays):
+        path = write_speaker_file(
+            tmp_path / "flag.tmrvc_speaker",
+            sample_arrays["spk_embed"],
+            acting_latent=sample_arrays["acting_latent"],
+        )
+        data = path.read_bytes()
+        flags = struct.unpack("<I", data[8:12])[0]
+        assert flags & (1 << 3)  # FLAG_HAS_ACTING_LATENT
+        acting_latent_size = struct.unpack("<I", data[32:36])[0]
+        assert acting_latent_size == D_ACTING_LATENT
 
 
 class TestValidation:

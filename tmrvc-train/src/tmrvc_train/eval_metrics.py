@@ -1,4 +1,4 @@
-"""Evaluation metrics for TMRVC v3 validation (Worker 06).
+"""Evaluation metrics for TMRVC v4 validation (Worker 06).
 
 Core metrics: SECS, UTMOS proxy, F0 correlation.
 Extended metrics: acting alignment, CFG responsiveness, disentanglement,
@@ -322,6 +322,124 @@ def external_baseline_delta(
         Signed delta: positive means TMRVC is better.
     """
     return tmrvc_score - baseline_score
+
+
+# ---------------------------------------------------------------------------
+# Codec comparison metrics (track_codec_strategy 5-axis evaluation)
+# ---------------------------------------------------------------------------
+
+
+def physical_control_monotonicity(
+    requested: torch.Tensor,
+    measured: torch.Tensor,
+) -> float:
+    """Spearman rank correlation between requested and measured physical control values.
+
+    Measures whether increasing the requested control value leads to a
+    monotonic increase in the measured output.
+
+    Args:
+        requested: ``[N]`` requested control values (sweep).
+        measured: ``[N]`` corresponding measured values in generated audio.
+
+    Returns:
+        Spearman rank correlation in ``[-1, 1]`` (higher = more monotonic).
+    """
+    if requested.numel() < 3:
+        return 0.0
+    # Spearman = Pearson on ranks
+    r_rank = requested.float().argsort().argsort().float()
+    m_rank = measured.float().argsort().argsort().float()
+    return _pearson(r_rank, m_rank)
+
+
+def physical_calibration_error(
+    requested: torch.Tensor,
+    measured: torch.Tensor,
+) -> float:
+    """RMSE between requested and measured physical control values.
+
+    Both tensors should be in the same normalized scale (e.g. [0, 1]).
+
+    Args:
+        requested: ``[N]`` or ``[N, D]`` requested values.
+        measured: ``[N]`` or ``[N, D]`` measured values.
+
+    Returns:
+        RMSE (lower is better).
+    """
+    diff = requested.float() - measured.float()
+    return diff.pow(2).mean().sqrt().item()
+
+
+def replay_fidelity(
+    tokens_a: torch.Tensor,
+    tokens_b: torch.Tensor,
+) -> float:
+    """Fraction of codec tokens that match exactly between two runs.
+
+    Used to verify deterministic replay from frozen artifacts.
+
+    Args:
+        tokens_a: ``[K, T]`` or ``[B, K, T]`` codec tokens from run 1.
+        tokens_b: ``[K, T]`` or ``[B, K, T]`` codec tokens from run 2.
+
+    Returns:
+        Match rate in ``[0, 1]`` (1.0 = bit-exact replay).
+    """
+    a = tokens_a.flatten().long()
+    b = tokens_b.flatten().long()
+    T = min(a.numel(), b.numel())
+    if T == 0:
+        return 0.0
+    return (a[:T] == b[:T]).float().mean().item()
+
+
+def edit_locality(
+    original: torch.Tensor,
+    edited: torch.Tensor,
+    edit_start: int,
+    edit_end: int,
+) -> dict[str, float]:
+    """Measure change outside the edited region.
+
+    Verifies that patching a local region does not cause unintended changes
+    to the rest of the output.
+
+    Args:
+        original: ``[K, T]`` or ``[T, D]`` original output.
+        edited: ``[K, T]`` or ``[T, D]`` output after local edit.
+        edit_start: Start frame of the edit region.
+        edit_end: End frame of the edit region (exclusive).
+
+    Returns:
+        Dict with ``max_diff``, ``mean_diff``, and ``is_local`` (True if
+        max_diff < 1e-5 outside the edit region).
+    """
+    orig = original.float()
+    edit = edited.float()
+    if orig.dim() == 1:
+        orig = orig.unsqueeze(0)
+        edit = edit.unsqueeze(0)
+
+    # Mask the edit region
+    if orig.dim() == 2:
+        # [K, T] or [T, D]
+        outside = torch.cat([orig[:, :edit_start], orig[:, edit_end:]], dim=-1)
+        outside_edit = torch.cat([edit[:, :edit_start], edit[:, edit_end:]], dim=-1)
+    else:
+        outside = torch.cat([orig[..., :edit_start], orig[..., edit_end:]], dim=-1)
+        outside_edit = torch.cat([edit[..., :edit_start], edit[..., edit_end:]], dim=-1)
+
+    diff = (outside - outside_edit).abs()
+    max_diff = diff.max().item() if diff.numel() > 0 else 0.0
+    mean_diff = diff.mean().item() if diff.numel() > 0 else 0.0
+
+    return {
+        "max_diff": max_diff,
+        "mean_diff": mean_diff,
+        "is_local": max_diff < 1e-5,
+    }
 
 
 # ---------------------------------------------------------------------------

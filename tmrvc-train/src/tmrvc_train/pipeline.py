@@ -1,4 +1,4 @@
-"""Reproducible training pipeline for UCLM v3."""
+"""Reproducible training pipeline for UCLM v4."""
 
 from __future__ import annotations
 
@@ -369,6 +369,10 @@ class TrainingPipeline:
             train_args.extend(["--voice-state-loss-weight", str(self.config["voice_state_loss_weight"])])
         if "delta_voice_state_loss_weight" in self.config:
             train_args.extend(["--delta-voice-state-loss-weight", str(self.config["delta_voice_state_loss_weight"])])
+        # v4 codec condition routing
+        codec_condition = self.config.get("codec_condition", "A")
+        if codec_condition != "A":
+            train_args.extend(["--codec-condition", codec_condition])
 
         try:
             train_uclm_main(train_args)

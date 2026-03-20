@@ -735,8 +735,6 @@ class CurationExporter:
         profile_meta = {
             "speaker_profile_id": profile_id,
             "base_model_id": base_model_id,
-            "adaptor_id": f"{profile_id}_lora",
-            "adaptor_merged": merge_to_onnx,
         }
         with open(out / "profile.json", "w", encoding="utf-8") as f:
             json.dump(profile_meta, f, ensure_ascii=False, indent=2)

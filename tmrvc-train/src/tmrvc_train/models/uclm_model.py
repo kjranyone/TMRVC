@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from tmrvc_core.constants import D_MODEL, UCLM_N_HEADS, UCLM_N_LAYERS
 from tmrvc_core.types import PointerState
 
+from .acting_latent import ActingLatentConditioner, ActingMacroProjector
 from .text_encoder import TextEncoder
 from .voice_state_encoder import VoiceStateEncoder
 from .uclm_transformer import CodecTransformer
@@ -387,6 +388,10 @@ class DialogueContextProjector(nn.Module):
     Inputs (all optional):
         dialogue_context: [B, D_ctx] or [B, C_ctx, D_ctx] — scene/dialogue embedding.
         acting_intent: [B, D_act] — utterance-level acting intent vector.
+            **Deprecated in v4**: superseded by ActingLatentConditioner (24-D).
+            Retained for backward compat with v3 checkpoints and datasets.
+            When both acting_intent and acting_texture_latent are provided,
+            the caller must suppress acting_intent (set to None).
         prosody_latent: [B, D_pro] or [B, T, D_pro] — local prosody planning signal.
     """
 
@@ -437,7 +442,7 @@ class DialogueContextProjector(nn.Module):
 
 
 class DisentangledUCLM(nn.Module):
-    """The complete SOTA Disentangled UCLM model tying all components together (v3)."""
+    """The complete SOTA Disentangled UCLM model tying all components together."""
 
     def __init__(
         self,
@@ -447,8 +452,8 @@ class DisentangledUCLM(nn.Module):
         rvq_vocab_size: int = 1024,
         n_codebooks: int = 8,
         control_vocab_size: int = 64,
-        d_explicit: int = 12,
-        d_ssl: int = 128,
+        d_voice_state_explicit: int = 12,
+        d_voice_state_ssl: int = 128,
         d_speaker: int = 192,
         vq_bins: int = 128,
         vocab_size: int = 256,
@@ -457,6 +462,7 @@ class DisentangledUCLM(nn.Module):
         d_acting: int = 64,
         d_prosody: int = 128,
         acting_tag_vocab_size: int = 0,
+        codec_condition: str = "A",
     ):
         super().__init__()
         self.d_model = d_model
@@ -477,7 +483,7 @@ class DisentangledUCLM(nn.Module):
         )
 
         self.voice_state_enc = VoiceStateEncoder(
-            d_explicit=d_explicit, d_ssl=d_ssl, d_model=d_model, num_speakers=num_speakers
+            d_voice_state_explicit=d_voice_state_explicit, d_voice_state_ssl=d_voice_state_ssl, d_model=d_model, num_speakers=num_speakers
         )
 
         self.f0_proj = nn.Linear(2, d_model)  # F0 condition: [norm_f0, shift]
@@ -492,10 +498,10 @@ class DisentangledUCLM(nn.Module):
             d_speaker=d_speaker,
         )
 
-        # Pointer-based TTS head (primary v3 text progression mechanism).
+        # Pointer-based TTS head (primary text progression mechanism).
         self.pointer_head = PointerHead(d_model=d_model)
 
-        # Dialogue/acting conditioning projector (v3 expressive path).
+        # Dialogue/acting conditioning projector (expressive path).
         self.context_projector = DialogueContextProjector(
             d_model=d_model,
             d_dialogue=d_dialogue,
@@ -503,18 +509,45 @@ class DisentangledUCLM(nn.Module):
             d_prosody=d_prosody,
         )
 
-        # Speaker prompt encoder for few-shot adaptation (v3).
+        # Speaker prompt encoder for few-shot adaptation.
         self.speaker_prompt_encoder = SpeakerPromptEncoder(d_model=d_model, d_speaker=d_speaker)
 
-        # Prosody predictor for inference-time prosody generation (v3).
+        # Prosody predictor for inference-time prosody generation.
         self.prosody_predictor = ProsodyPredictor(d_model=d_model, d_prosody=d_prosody)
 
-        # Delta voice state projection (v3).
-        self.delta_voice_state_proj = nn.Linear(d_explicit, d_model)
+        # Delta voice state projection.
+        self.delta_voice_state_proj = nn.Linear(d_voice_state_explicit, d_model)
 
-        # CFG scale embedding for distilled mode (v3).
-        # Projects to d_speaker so it can be added to speaker_embed directly.
-        self.cfg_scale_embed = nn.Linear(1, d_speaker)
+        # CFG scale embedding for distilled mode.
+        # Projects to d_model as an independent conditioning signal,
+        # separate from speaker_embed (v4 conditioning separation).
+        self.cfg_scale_embed = nn.Linear(1, d_model)
+
+        # v4: Acting texture latent conditioner (24-D -> d_model)
+        self.acting_latent_conditioner = ActingLatentConditioner()
+
+        # v4: Acting macro projector (6-D user-facing -> 24-D latent)
+        # Registered as a submodule so weights are checkpointed and loaded.
+        self.acting_macro_proj = ActingMacroProjector()
+
+        # v4: Dedicated physical prediction head from hidden states (d_model -> 12)
+        self.physical_prediction_head = nn.Linear(d_model, 12)
+
+        # v4 codec condition routing
+        self.codec_condition = codec_condition
+
+        # Condition-specific modules (v4 codec strategy)
+        if codec_condition == "B":
+            self.nar_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, (n_codebooks - 1) * rvq_vocab_size),
+            )
+        elif codec_condition == "C":
+            self.delay_offset = n_codebooks  # delay pattern: CB_i delayed by i frames
+        elif codec_condition == "D":
+            self.single_cb_embed = nn.Embedding(8192, d_model)
+            self.single_cb_head = nn.Linear(d_model, 8192)
 
     @staticmethod
     def apply_cfg_unconditional_mask(
@@ -526,6 +559,7 @@ class DisentangledUCLM(nn.Module):
         prosody_latent: torch.Tensor | None = None,
         delta_voice_state: torch.Tensor | None = None,
         prompt_kv_cache: torch.Tensor | None = None,
+        acting_texture_latent: torch.Tensor | None = None,
     ) -> dict:
         """Apply CFG unconditional mask: zero all conditioning fields.
 
@@ -541,6 +575,10 @@ class DisentangledUCLM(nn.Module):
             "prosody_latent": torch.zeros_like(prosody_latent) if prosody_latent is not None else None,
             "delta_voice_state": torch.zeros_like(delta_voice_state) if delta_voice_state is not None else None,
             "prompt_kv_cache": torch.zeros_like(prompt_kv_cache) if prompt_kv_cache is not None else None,
+            # Use None (not zeros) so the conditioner MLP is fully bypassed.
+            # zeros would still inject the MLP's bias vector, breaking the
+            # unconditional semantics required by CFG.
+            "acting_texture_latent": None,
         }
 
     def encode_speaker_prompt(
@@ -728,6 +766,7 @@ class DisentangledUCLM(nn.Module):
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
         prosody_latent: torch.Tensor | None = None,
+        acting_texture_latent: torch.Tensor | None = None,
         delta_voice_state: torch.Tensor | None = None,
         prompt_kv_cache: torch.Tensor | None = None,
         acoustic_history: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -736,8 +775,9 @@ class DisentangledUCLM(nn.Module):
         position_indices: torch.Tensor | None = None,
         frame_offsets: torch.Tensor | None = None,
         cross_attn_mask: torch.Tensor | None = None,
+        distilled_cfg_cond: torch.Tensor | None = None,
     ) -> dict:
-        """Pointer-based TTS forward pass (UCLM v3).
+        """Pointer-based TTS forward pass.
 
         Args:
             phoneme_ids: [B, L] phoneme token ids.
@@ -820,12 +860,27 @@ class DisentangledUCLM(nn.Module):
             content_features = content_features + self.f0_proj(f0_condition)
 
         # 3b. Apply dialogue/acting/prosody conditioning
+        # v4 topology: acting_texture_latent (24-D) supersedes acting_intent (64-D).
+        # When both are provided, acting_intent is suppressed to prevent
+        # double-conditioning on the same semantic axis.
+        effective_acting_intent = acting_intent
+        if acting_texture_latent is not None and acting_intent is not None:
+            effective_acting_intent = None  # suppressed: 24-D latent takes over
         content_features = self.context_projector(
             content_features,
             dialogue_context=dialogue_context,
-            acting_intent=acting_intent,
+            acting_intent=effective_acting_intent,
             prosody_latent=prosody_latent,
         )
+
+        # 3c. v4: Apply acting texture latent conditioning (24-D -> d_model)
+        if acting_texture_latent is not None:
+            act_cond = self.acting_latent_conditioner(acting_texture_latent)  # [B, d_model]
+            content_features = content_features + act_cond.unsqueeze(1)
+
+        # 3d. Distilled CFG conditioning (independent of speaker_embed)
+        if distilled_cfg_cond is not None:
+            content_features = content_features + distilled_cfg_cond.unsqueeze(1)
 
         # 4. Voice state conditioning
         v_out = self.voice_state_enc(explicit_state, ssl_state)
@@ -840,9 +895,19 @@ class DisentangledUCLM(nn.Module):
         if acoustic_history is not None:
             a_ctx, b_ctx = acoustic_history
         elif target_a is not None and target_b is not None:
-            a_ctx = torch.zeros_like(target_a)
-            a_ctx[:, :, 1:] = target_a[:, :, :-1]
-            a_ctx = a_ctx.clamp_min(0)
+            if hasattr(self, 'codec_condition') and self.codec_condition == "C":
+                # Delay pattern: CB_k context at position t is target_a[:, k, t-k-1]
+                a_ctx = torch.zeros_like(target_a)
+                T_a = target_a.shape[2]
+                for k in range(self.n_codebooks):
+                    shift = k + 1
+                    if shift < T_a:
+                        a_ctx[:, k, shift:] = target_a[:, k, : T_a - shift]
+                a_ctx = a_ctx.clamp_min(0)
+            else:
+                a_ctx = torch.zeros_like(target_a)
+                a_ctx[:, :, 1:] = target_a[:, :, :-1]
+                a_ctx = a_ctx.clamp_min(0)
 
             b_ctx = torch.zeros_like(target_b)
             b_ctx[:, :, 1:] = target_b[:, :, :-1]
@@ -878,6 +943,20 @@ class DisentangledUCLM(nn.Module):
         # 7. Pointer head
         advance_logit, progress_delta, boundary_confidence = self.pointer_head(x_out)
 
+        # 8. Codec condition routing (v4)
+        if hasattr(self, 'codec_condition') and self.codec_condition == "B":
+            # CB0: standard AR head, CB1-7: NAR refinement
+            nar_logits = self.nar_head(x_out)
+            B_sz, T_sz, _ = nar_logits.shape
+            nar_logits = nar_logits.view(B_sz, T_sz, self.n_codebooks - 1, self.rvq_vocab_size)
+            nar_logits = nar_logits.permute(0, 2, 1, 3)  # [B, 7, T, V]
+            # Replace CB1-7 in logits_a
+            logits_a[:, 1:, :, :] = nar_logits
+        elif hasattr(self, 'codec_condition') and self.codec_condition == "D":
+            # Single codebook: project hidden states to 8192-vocab
+            single_logits = self.single_cb_head(x_out)  # [B, T, 8192]
+            logits_a = single_logits.unsqueeze(1)  # [B, 1, T, 8192]
+
         return {
             "logits_a": logits_a,
             "logits_b": logits_b,
@@ -886,7 +965,7 @@ class DisentangledUCLM(nn.Module):
             "boundary_confidence": boundary_confidence,
             "adv_logits": v_out[1] if isinstance(v_out, tuple) else None,
             "hidden_states": x_out,
-            "pointer_logits": advance_logit,  # backward-compat alias
+            "physical_pred": self.physical_prediction_head(x_out),  # [B, T, 12]
             "next_pointer_state": None,  # populated at inference time
         }
 
@@ -896,6 +975,7 @@ class DisentangledUCLM(nn.Module):
         text_ids: torch.Tensor,
         speaker_embed: torch.Tensor | None = None,
         max_frames: int = 1000,
+        acting_texture_latent: torch.Tensor | None = None,
         **kw,
     ) -> dict:
         """RL rollout generation — autoregressive codec token sampling.
@@ -939,6 +1019,7 @@ class DisentangledUCLM(nn.Module):
             target_a=target_a,
             target_b=target_b,
             target_length=max_frames,
+            acting_texture_latent=acting_texture_latent,
         )
 
         logits_a = out["logits_a"]  # [B, n_codebooks, T, V]
@@ -979,39 +1060,43 @@ class DisentangledUCLM(nn.Module):
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
         prosody_latent: torch.Tensor | None = None,
+        acting_texture_latent: torch.Tensor | None = None,
         delta_voice_state: torch.Tensor | None = None,
         text_suprasegmentals: torch.Tensor | None = None,
         position_indices: torch.Tensor | None = None,
         frame_offsets: torch.Tensor | None = None,
         cross_attn_mask: torch.Tensor | None = None, # New SOTA field
     ) -> dict:
-        """Single-pass forward with cfg_scale injected for distillation training."""
-        # Project cfg_scale to model dimension and add to global speaker/style conditioning
+        """Single-pass forward with cfg_scale injected for distillation training.
+
+        The cfg_scale is projected to d_model and injected as an independent
+        conditioning signal on content_features, separate from speaker_embed
+        (v4 conditioning separation: speaker identity must remain timbre-only).
+        """
         cfg_tensor = torch.tensor([[cfg_scale]], device=speaker_embed.device, dtype=torch.float32)
-        cfg_emb = self.cfg_scale_embed(cfg_tensor)
-        
-        # Add cfg_emb to speaker_embed for distillation (simple injection hack)
-        speaker_embed_with_cfg = speaker_embed + cfg_emb.squeeze(1)
-        
+        cfg_cond = self.cfg_scale_embed(cfg_tensor)  # [1, d_model]
+
         return self.forward_tts_pointer(
             phoneme_ids=phoneme_ids,
             language_ids=language_ids,
             pointer_state=None,  # distillation uses teacher-forced alignment
-            speaker_embed=speaker_embed_with_cfg,
+            speaker_embed=speaker_embed,
             explicit_state=explicit_state,
             ssl_state=ssl_state,
             target_a=target_a,
             target_b=target_b,
             target_length=target_length,
             f0_condition=f0_condition,
-            cfg_scale=1.0, # scale is already baked into speaker_embed_with_cfg
+            cfg_scale=1.0,
             dialogue_context=dialogue_context,
             acting_intent=acting_intent,
             prosody_latent=prosody_latent,
+            acting_texture_latent=acting_texture_latent,
             delta_voice_state=delta_voice_state,
             position_indices=position_indices,
             frame_offsets=frame_offsets,
             cross_attn_mask=cross_attn_mask,
+            distilled_cfg_cond=cfg_cond,
         )
 
     @staticmethod
@@ -1057,20 +1142,17 @@ class DisentangledUCLM(nn.Module):
         dialogue_context: torch.Tensor | None = None,
         acting_intent: torch.Tensor | None = None,
         prosody_latent: torch.Tensor | None = None,
+        acting_texture_latent: torch.Tensor | None = None,
         f0_condition: torch.Tensor | None = None,
         prompt_summary_tokens: torch.Tensor | None = None,
-        content_features: torch.Tensor | None = None,
         frame_index: int = 0,
         precomputed_film_params: torch.Tensor | None = None,
         cross_attn_mask: torch.Tensor | None = None,
         frame_offsets: int | torch.Tensor | None = None, # New SOTA field
     ) -> dict:
         """Forward pass for streaming inference with internal voice state encoding."""
-        # Backward-compatible alias: content_features -> queries
-        if queries is None and content_features is not None:
-            queries = content_features
         if queries is None:
-            raise ValueError("Either 'queries' or 'content_features' must be provided")
+            raise ValueError("'queries' must be provided")
 
         # Default memory to queries if not provided
         if memory is None:
@@ -1093,12 +1175,21 @@ class DisentangledUCLM(nn.Module):
             state_cond = torch.zeros(queries.shape[0], queries.shape[1], self.d_model, device=queries.device)
 
         # 2. Apply dialogue/acting/prosody conditioning
+        # v4 topology: suppress legacy acting_intent when acting_texture_latent is present
+        effective_acting_intent = acting_intent
+        if acting_texture_latent is not None and acting_intent is not None:
+            effective_acting_intent = None
         queries = self.context_projector(
             queries,
             dialogue_context=dialogue_context,
-            acting_intent=acting_intent,
+            acting_intent=effective_acting_intent,
             prosody_latent=prosody_latent,
         )
+
+        # 2b. v4: Apply acting texture latent conditioning
+        if acting_texture_latent is not None:
+            act_cond = self.acting_latent_conditioner(acting_texture_latent)  # [B, d_model]
+            queries = queries + act_cond.unsqueeze(1)
 
         cfg_tensor = torch.tensor([cfg_scale], device=queries.device)
         

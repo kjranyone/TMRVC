@@ -1,9 +1,8 @@
 """Dialogue and character types for context-aware TTS.
 
-`StyleParams` in this module is a legacy convenience layer used by existing
-heuristics, script parsing, and context predictors. It is not the canonical
-v3 `voice_state` registry; the canonical 8-D physical contract lives in
-`tmrvc_core.voice_state`.
+`StyleParams` mirrors the canonical 12-D physical control contract defined
+in `tmrvc_core.voice_state`. Its `to_vector()` returns the 12-D physical
+voice-state vector in canonical index order.
 """
 
 from __future__ import annotations
@@ -32,60 +31,95 @@ SUPPORTED_LANGUAGES: tuple[str, ...] = ("ja", "en", "zh", "ko")
 
 @dataclass
 class StyleParams:
-    """Legacy convenience style parameters for compatibility paths.
+    """Style parameters for script parsing and context prediction.
 
-    `to_vector()` returns the legacy 8-D style vector used by older style
-    predictors and script tooling. It should not be treated as the canonical
-    v3 physical `voice_state` registry for sign-off purposes.
+    Fields mirror the canonical 12-D physical voice-state registry
+    (``tmrvc_core.voice_state``).  ``to_vector()`` returns the 12-D
+    physical vector in canonical index order.
+
+    Non-physical metadata (``emotion``, ``reasoning``) are kept for
+    script-level semantics but are *not* part of the numeric vector.
     """
 
     emotion: str = "neutral"
-    breathiness: float = 0.0
-    tension: float = 0.0
+
+    # -- 12-D physical controls (canonical index order) --
+    # idx 0: pitch_level
+    pitch_level: float = 0.5
+    # idx 1: pitch_range
+    pitch_range: float = 0.3
+    # idx 2: energy_level  (legacy alias: energy)
+    energy: float = 0.5
+    # idx 3: pressedness  (legacy alias: tension)
+    tension: float = 0.35
+    # idx 4: spectral_tilt
+    spectral_tilt: float = 0.5
+    # idx 5: breathiness
+    breathiness: float = 0.2
+    # idx 6: voice_irregularity  (legacy alias: roughness)
+    roughness: float = 0.15
+    # idx 7: openness
+    openness: float = 0.5
+    # idx 8: aperiodicity
+    aperiodicity: float = 0.2
+    # idx 9: formant_shift
+    formant_shift: float = 0.5
+    # idx 10: vocal_effort
+    vocal_effort: float = 0.4
+    # idx 11: creak
+    creak: float = 0.1
+
+    # -- Non-physical semantic/control fields --
     arousal: float = 0.0
     valence: float = 0.0
-    roughness: float = 0.0
     voicing: float = 1.0
-    energy: float = 0.0
     speech_rate: float = 1.0
-    pitch_range: float = 0.0  # Kept for backward compatibility, mapped to arousal/energy
     reasoning: str = ""
 
     def to_vector(self) -> list[float]:
-        """Convert to the legacy 8-dim style vector."""
-        vec = [0.0] * 8
-
-        vec[0] = _clamp(self.breathiness, 0.0, 1.0)
-        vec[1] = _clamp(self.tension, 0.0, 1.0)
-        vec[2] = _clamp(self.arousal, 0.0, 1.0)
-        vec[3] = _clamp(self.valence, -1.0, 1.0)
-        vec[4] = _clamp(self.roughness, 0.0, 1.0)
-        vec[5] = _clamp(self.voicing, 0.0, 1.0)
-        vec[6] = _clamp(self.energy, 0.0, 1.0)
-        vec[7] = _clamp(self.speech_rate, 0.5, 2.0)
-
-        return vec
+        """Return the 12-D physical voice-state vector (canonical order)."""
+        return [
+            _clamp(self.pitch_level, 0.0, 1.0),       # 0  pitch_level
+            _clamp(self.pitch_range, 0.0, 1.0),        # 1  pitch_range
+            _clamp(self.energy, 0.0, 1.0),             # 2  energy_level
+            _clamp(self.tension, 0.0, 1.0),            # 3  pressedness
+            _clamp(self.spectral_tilt, 0.0, 1.0),      # 4  spectral_tilt
+            _clamp(self.breathiness, 0.0, 1.0),        # 5  breathiness
+            _clamp(self.roughness, 0.0, 1.0),          # 6  voice_irregularity
+            _clamp(self.openness, 0.0, 1.0),           # 7  openness
+            _clamp(self.aperiodicity, 0.0, 1.0),       # 8  aperiodicity
+            _clamp(self.formant_shift, 0.0, 1.0),      # 9  formant_shift
+            _clamp(self.vocal_effort, 0.0, 1.0),       # 10 vocal_effort
+            _clamp(self.creak, 0.0, 1.0),              # 11 creak
+        ]
 
     @classmethod
     def from_dict(cls, d: dict) -> StyleParams:
         """Create from a dict (e.g. JSON response from LLM)."""
         return cls(
             emotion=d.get("emotion", "neutral"),
-            breathiness=d.get("breathiness", 0.0),
-            tension=d.get("tension", 0.0),
+            pitch_level=d.get("pitch_level", 0.5),
+            pitch_range=d.get("pitch_range", 0.3),
+            energy=d.get("energy", 0.5),
+            tension=d.get("tension", 0.35),
+            spectral_tilt=d.get("spectral_tilt", 0.5),
+            breathiness=d.get("breathiness", 0.2),
+            roughness=d.get("roughness", 0.15),
+            openness=d.get("openness", 0.5),
+            aperiodicity=d.get("aperiodicity", 0.2),
+            formant_shift=d.get("formant_shift", 0.5),
+            vocal_effort=d.get("vocal_effort", 0.4),
+            creak=d.get("creak", 0.1),
             arousal=d.get("arousal", 0.0),
             valence=d.get("valence", 0.0),
-            roughness=d.get("roughness", 0.0),
             voicing=d.get("voicing", 1.0),
-            energy=d.get("energy", 0.0),
             speech_rate=d.get("speech_rate", 1.0),
-            pitch_range=d.get("pitch_range", 0.0),
             reasoning=d.get("reasoning", ""),
         )
 
     @classmethod
     def neutral(cls) -> StyleParams:
-        """Return default neutral style for compatibility paths."""
+        """Return default neutral style (all physical dims at registry defaults)."""
         return cls()
 
 

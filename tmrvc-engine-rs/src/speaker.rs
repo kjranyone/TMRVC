@@ -11,10 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::constants::*;
 
 const MAGIC: &[u8; 4] = b"TMSP";
-const VERSION_V3: u32 = 3;
 const VERSION_V4: u32 = 4;
-const HEADER_SIZE: usize = 32;
-const HEADER_SIZE_V4: usize = 40;
+const HEADER_SIZE: usize = 40;
 const CHECKSUM_SIZE: usize = 32;
 
 // Flags
@@ -62,7 +60,7 @@ fn default_f0_mean() -> f32 {
     220.0
 }
 
-/// Parsed .tmrvc_speaker v3/v4 file.
+/// Parsed .tmrvc_speaker v4 file.
 pub struct SpeakerFile {
     pub spk_embed: [f32; D_SPEAKER],
     pub f0_mean: f32,
@@ -72,7 +70,6 @@ pub struct SpeakerFile {
     pub ssl_state: Option<Vec<f32>>,
     pub acting_latent: Option<Vec<f32>>,
     pub metadata: SpeakerMetadata,
-    pub version: u32,
 }
 
 impl SpeakerFile {
@@ -108,7 +105,7 @@ impl SpeakerFile {
         Some(arr)
     }
 
-    /// Load and validate a .tmrvc_speaker v3 file.
+    /// Load and validate a .tmrvc_speaker v4 file.
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read(path).context("Failed to read speaker file")?;
 
@@ -129,24 +126,18 @@ impl SpeakerFile {
 
         // Version
         let version = u32::from_le_bytes(data[4..8].try_into().expect("version field is 4 bytes"));
-        if version != VERSION_V3 && version != VERSION_V4 {
-            bail!("Unsupported version: {} (expected {} or {})", version, VERSION_V3, VERSION_V4);
+        if version != VERSION_V4 {
+            bail!("Unsupported version: {} (expected {})", version, VERSION_V4);
         }
 
-        // Parse v3 header
+        // Parse header
         let flags = u32::from_le_bytes(data[8..12].try_into().unwrap());
         let spk_embed_size = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
         let style_embed_size = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         let ref_tokens_frames = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
         let lora_size = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
         let metadata_size = u32::from_le_bytes(data[28..32].try_into().unwrap()) as usize;
-
-        // V4 extended header: acting_latent_size at bytes 32..36
-        let acting_latent_size = if version == VERSION_V4 {
-            u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize
-        } else {
-            0
-        };
+        let acting_latent_size = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
 
         if spk_embed_size != D_SPEAKER {
             bail!(
@@ -164,8 +155,7 @@ impl SpeakerFile {
         }
 
         // Calculate expected size
-        let header_sz = if version == VERSION_V4 { HEADER_SIZE_V4 } else { HEADER_SIZE };
-        let mut expected_size = header_sz;
+        let mut expected_size = HEADER_SIZE;
         expected_size += D_SPEAKER * 4; // spk_embed
         expected_size += 4; // f0_mean
         if flags & FLAG_HAS_STYLE != 0 {
@@ -199,7 +189,7 @@ impl SpeakerFile {
             bail!("SHA-256 checksum mismatch");
         }
 
-        let mut offset = header_sz;
+        let mut offset = HEADER_SIZE;
 
         // Parse spk_embed
         let mut spk_embed = [0.0f32; D_SPEAKER];
@@ -263,7 +253,7 @@ impl SpeakerFile {
             None
         };
 
-        // Parse acting_latent (optional, V4 only)
+        // Parse acting_latent (optional)
         let acting_latent = if flags & FLAG_HAS_ACTING_LATENT != 0 && acting_latent_size > 0 {
             let mut al = vec![0.0f32; acting_latent_size];
             for (i, chunk) in data[offset..offset + acting_latent_size * 4]
@@ -291,9 +281,6 @@ impl SpeakerFile {
         // Extract ssl_state from metadata if present
         let ssl_state = metadata.ssl_state.clone();
 
-        // For V3 files, also check metadata for acting_latent
-        let acting_latent = acting_latent.or_else(|| metadata.acting_latent.clone());
-
         Ok(Self {
             spk_embed,
             f0_mean,
@@ -303,11 +290,10 @@ impl SpeakerFile {
             ssl_state,
             acting_latent,
             metadata,
-            version,
         })
     }
 
-    /// Save as .tmrvc_speaker file (V3 or V4 depending on content).
+    /// Save as .tmrvc_speaker v4 file.
     pub fn save(&self, path: &Path) -> Result<()> {
         // Include ssl_state and acting_latent in metadata for serialization
         let mut metadata = self.metadata.clone();
@@ -316,10 +302,6 @@ impl SpeakerFile {
         let metadata_json =
             serde_json::to_vec(&metadata).context("Failed to serialize metadata")?;
         let metadata_size = metadata_json.len();
-
-        // Determine version: use V4 if acting_latent is present
-        let use_v4 = self.acting_latent.is_some() || self.version == VERSION_V4;
-        let version = if use_v4 { VERSION_V4 } else { VERSION_V3 };
 
         // Calculate flags and sizes
         let mut flags: u32 = 0;
@@ -361,22 +343,18 @@ impl SpeakerFile {
         // Build payload
         let mut buf = Vec::new();
 
-        // Header (32 bytes for V3, 40 bytes for V4)
+        // Header (40 bytes)
         buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&version.to_le_bytes());
+        buf.extend_from_slice(&VERSION_V4.to_le_bytes());
         buf.extend_from_slice(&flags.to_le_bytes());
         buf.extend_from_slice(&(D_SPEAKER as u32).to_le_bytes());
         buf.extend_from_slice(&style_embed_size.to_le_bytes());
         buf.extend_from_slice(&ref_tokens_frames.to_le_bytes());
         buf.extend_from_slice(&lora_size.to_le_bytes());
         buf.extend_from_slice(&(metadata_size as u32).to_le_bytes());
-
-        // V4 extended header field
-        if use_v4 {
-            buf.extend_from_slice(&acting_latent_size.to_le_bytes());
-            // Pad to 40 bytes
-            buf.extend_from_slice(&[0u8; 4]);
-        }
+        buf.extend_from_slice(&acting_latent_size.to_le_bytes());
+        // Pad to 40 bytes
+        buf.extend_from_slice(&[0u8; 4]);
 
         // spk_embed
         for &v in &self.spk_embed {
@@ -407,7 +385,7 @@ impl SpeakerFile {
             }
         }
 
-        // acting_latent (V4)
+        // acting_latent
         if let Some(ref al) = self.acting_latent {
             for &v in al {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -453,11 +431,10 @@ mod tests {
             ssl_state: None,
             acting_latent: None,
             metadata: default_metadata(),
-            version: VERSION_V3,
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v3_light.tmrvc_speaker");
+        let path = dir.join("test_light.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
@@ -485,11 +462,10 @@ mod tests {
             ssl_state: None,
             acting_latent: None,
             metadata: default_metadata(),
-            version: VERSION_V3,
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v3_standard.tmrvc_speaker");
+        let path = dir.join("test_standard.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
@@ -517,11 +493,10 @@ mod tests {
             ssl_state: None,
             acting_latent: None,
             metadata: default_metadata(),
-            version: VERSION_V3,
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v3_full.tmrvc_speaker");
+        let path = dir.join("test_full.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
@@ -547,10 +522,9 @@ mod tests {
             ssl_state: None,
             acting_latent: None,
             metadata: default_metadata(),
-            version: VERSION_V3,
         };
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v3_corrupt.tmrvc_speaker");
+        let path = dir.join("test_corrupt.tmrvc_speaker");
         spk.save(&path).expect("save failed");
 
         // Corrupt one byte
@@ -573,7 +547,6 @@ mod tests {
             ssl_state: None,
             acting_latent: None,
             metadata: default_metadata(),
-            version: VERSION_V3,
         };
         let zeros = sf.lora_delta_or_zeros();
         assert_eq!(zeros.len(), LORA_DELTA_SIZE);
@@ -594,11 +567,10 @@ mod tests {
             ssl_state,
             acting_latent: None,
             metadata: default_metadata(),
-            version: VERSION_V3,
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v3_ssl_state.tmrvc_speaker");
+        let path = dir.join("test_ssl_state.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
@@ -674,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn save_load_roundtrip_v4_with_acting_latent() {
+    fn save_load_roundtrip_with_acting_latent() {
         let spk_embed = [0.5f32; D_SPEAKER];
         let acting_latent = Some(vec![0.42f32; D_ACTING_LATENT]);
 
@@ -687,15 +659,13 @@ mod tests {
             ssl_state: Some(vec![0.1f32; D_VOICE_STATE_SSL]),
             acting_latent,
             metadata: default_metadata(),
-            version: VERSION_V4,
         };
 
         let dir = std::env::temp_dir();
-        let path = dir.join("test_v4_acting.tmrvc_speaker");
+        let path = dir.join("test_acting.tmrvc_speaker");
         original.save(&path).expect("save failed");
 
         let loaded = SpeakerFile::load(&path).expect("load failed");
-        assert_eq!(loaded.version, VERSION_V4);
         assert_eq!(original.spk_embed, loaded.spk_embed);
         assert!((loaded.f0_mean - 200.0).abs() < 0.1);
         assert_eq!(

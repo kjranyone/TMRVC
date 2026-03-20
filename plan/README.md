@@ -8,14 +8,13 @@ Rules:
 
 - if a file remains in `plan/`, it is still open
 - implemented contracts belong in `docs/design/`, code, or tests
-- no public "beats Fish Audio S2" language is allowed until track_validation sign-off
 
 ## Remaining Open Tracks
 
 - `track_codec_strategy.md`
-  - codec selection: EnCodec baseline vs Mimi AR/NAR vs single-codebook (experiments pending)
+  - codec selection: EnCodec baseline vs Mimi AR/NAR vs single-codebook (code ready, experiments pending)
 - `track_validation.md`
-  - bootstrap QC, controllability, parity, and Fish S2 claim gates (sign-off pending)
+  - bootstrap QC, controllability, parity gates (sign-off pending; Fish S2 comparison descoped)
 
 ## Completed (removed from plan/)
 
@@ -28,4 +27,5 @@ Rules:
 - `track_survey.md` — competitive analysis in docs/design/ and eval scripts
 - `strategy_competitive.md` — strategy realized in architecture
 - `strategy_acting_claims.md` — all 6 blockers implemented, sign-off via track_validation
+- `track_character_intent.md` — conditioning split realized end-to-end (model, trainer, export, Rust, UI)
 - `IMPLEMENTATION_INSTRUCTIONS.md` — all phases consumed

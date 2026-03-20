@@ -84,8 +84,11 @@ def disentanglement_loss(
     Returns:
         Scalar disentanglement loss
     """
-    # Pool physical over time
-    physical_pooled = physical_pred.mean(dim=1)  # [B, d_physical]
+    # Pool physical over time — handle both [B, T, 12] and [B, 12]
+    if physical_pred.ndim == 2:
+        physical_pooled = physical_pred  # already [B, d_physical]
+    else:
+        physical_pooled = physical_pred.mean(dim=1)  # [B, d_physical]
 
     # Cross-correlation matrix
     # Normalize both

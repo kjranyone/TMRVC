@@ -134,8 +134,6 @@ async def workshop_compile(req: CompileRequest):
 
     Creator-facing: may accept prompts, tags, and context.
     """
-    compile_id = str(uuid.uuid4())
-
     # Use intent compiler if available, else return defaults
     if _intent_compiler is not None:
         context = {"scene": req.scene_context} if req.scene_context else None
@@ -143,6 +141,8 @@ async def workshop_compile(req: CompileRequest):
             prompt=req.acting_prompt or req.text,
             context=context,
         )
+        # Use the compiler's own compile_id for provenance continuity
+        compile_id = compiled.compile_id
         physical_targets = compiled.physical_targets.squeeze(0).tolist()
         physical_confidence = [0.5] * 12  # default confidence
         acting_macro = ActingMacroControls(
@@ -162,17 +162,25 @@ async def workshop_compile(req: CompileRequest):
         )
         warnings = compiled.warnings
     else:
+        compile_id = str(uuid.uuid4())
         physical_targets = [0.5] * 12  # 12-D defaults
         physical_confidence = [0.5] * 12
         acting_macro = ActingMacroControls()
         pacing = PacingControlsSchema()
         warnings = []
 
+    # v4: Extract acting texture latent prior from compiled intent.
+    # `compiled` is only defined when `_intent_compiler is not None`.
+    acting_latent_prior = [0.0] * 24
+    if _intent_compiler is not None and compiled.acting_latent_prior is not None:
+        acting_latent_prior = compiled.acting_latent_prior.squeeze(0).tolist()
+
     return CompileResponse(
         compile_id=compile_id,
         physical_targets=physical_targets,
         physical_confidence=physical_confidence,
         acting_macro=acting_macro,
+        acting_texture_latent_prior=acting_latent_prior,
         pacing=pacing,
         warnings=warnings,
     )
@@ -214,9 +222,13 @@ async def workshop_generate(req: TTSRequestAdvanced):
     # 4. CFG mode
     cfg_mode_str = req.cfg_mode if req.cfg_mode else "full"
 
-    # 5. Acting macro -> 24-D acting intent
-    acting_intent = None
-    if req.acting_controls is not None:
+    # 5. Acting controls -> 24-D acting texture latent
+    # v4: Direct acting_texture_latent takes priority over macro projection.
+    # Both paths produce acting_texture_latent; acting_intent (legacy 64-D) is never used.
+    acting_tex_t = None
+    if req.acting_texture_latent is not None:
+        acting_tex_t = torch.tensor([req.acting_texture_latent], dtype=torch.float32)
+    elif req.acting_controls is not None:
         macro_vec = torch.tensor([
             req.acting_controls.intensity,
             req.acting_controls.instability,
@@ -226,7 +238,7 @@ async def workshop_generate(req: TTSRequestAdvanced):
             req.acting_controls.reference_mix,
         ], dtype=torch.float32).unsqueeze(0)  # [1, 6]
         if macro_vec.abs().sum() > 0:
-            acting_intent = engine.project_acting_macro(macro_vec)
+            acting_tex_t = engine.project_acting_macro(macro_vec)
 
     # 6. Generate via engine
     t0 = time.time()
@@ -237,7 +249,7 @@ async def workshop_generate(req: TTSRequestAdvanced):
         delta_voice_state=delta_vs,
         cfg_scale=req.cfg_scale,
         cfg_mode=cfg_mode_str,
-        acting_intent=acting_intent,
+        acting_texture_latent=acting_tex_t,
         pace=req.pacing.pace,
         hold_bias=req.pacing.hold_bias,
         boundary_bias=req.pacing.boundary_bias,
@@ -248,13 +260,23 @@ async def workshop_generate(req: TTSRequestAdvanced):
     gen_time_ms = (time.time() - t0) * 1000.0
 
     # 6. Build TrajectoryRecord
+    # Resolve acting latent for trajectory storage:
+    # acting_tex_t (direct 24-D) takes priority, then macro-projected intent
+    _stored_acting_latent = None
+    if acting_tex_t is not None:
+        _stored_acting_latent = acting_tex_t.detach().cpu()
+    elif acting_intent is not None:
+        _stored_acting_latent = acting_intent.detach().cpu()
+
     record = TrajectoryRecord(
         trajectory_id=trajectory_id,
-        source_compile_id="",
+        source_compile_id=req.source_compile_id if hasattr(req, "source_compile_id") and req.source_compile_id else "",
         phoneme_ids=meta.get("phoneme_ids", phonemes),
         text_suprasegmentals=g2p_result.text_suprasegmentals.unsqueeze(0) if g2p_result.text_suprasegmentals is not None else None,
         pointer_trace=meta.get("pointer_trace", []),
         physical_trajectory=meta.get("physical_trajectory"),
+        acting_latent_trajectory=_stored_acting_latent,
+        acting_latent_is_static=True,
         acoustic_trace=meta.get("acoustic_trace"),
         control_trace=meta.get("control_trace"),
         applied_pacing=PacingControls(

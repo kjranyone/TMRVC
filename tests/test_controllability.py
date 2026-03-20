@@ -280,3 +280,63 @@ class TestVarianceSeparation:
 
         variance = float((trace_1.float() - trace_2.float()).var())
         assert variance == 0.0
+
+
+class TestVarianceSeparationHarness:
+    """Tests for the variance separation measurement harness (Phase 6-1)."""
+
+    def test_compile_variance_report_structure(self):
+        """Compile variance report must have expected keys."""
+        from scripts.eval.variance_separation import measure_compile_variance
+
+        result = measure_compile_variance(n=3, device="cpu")
+        assert result.bucket == "compile"
+        assert "physical_targets_std" in result.metrics
+        assert "acting_latent_prior_std" in result.metrics
+        assert "pace_std" in result.metrics
+        assert result.n_trials == 3
+
+    def test_replay_variance_is_zero_on_deterministic(self):
+        """Deterministic replay must have zero audio diff."""
+        from scripts.eval.variance_separation import measure_replay_variance
+
+        result = measure_replay_variance(m=3, device="cpu")
+        assert result.bucket == "replay"
+        assert result.metrics["max_audio_diff"] < 1e-6
+        assert result.passed
+
+    def test_transfer_variance_has_distinct_bucket(self):
+        """Transfer variance must report per-speaker correlations."""
+        from scripts.eval.variance_separation import measure_transfer_variance
+
+        result = measure_transfer_variance(k=3, device="cpu")
+        assert result.bucket == "transfer"
+        assert "mean_trajectory_correlation" in result.metrics
+        assert "per_speaker_correlations" in result.metrics
+        assert len(result.metrics["per_speaker_correlations"]) == 3
+
+    def test_mixed_bucket_rejection(self):
+        """Validate that mixed bucket detection works."""
+        from scripts.eval.variance_separation import (
+            VarianceSeparationReport,
+            BucketResult,
+            validate_no_mixed_buckets,
+        )
+
+        # Good report: no violations
+        good_report = VarianceSeparationReport(
+            compile=BucketResult(bucket="compile", metrics={"physical_targets_std": 0.1}, n_trials=10),
+            replay=BucketResult(bucket="replay", metrics={"max_audio_diff": 0.0}, n_trials=5),
+            transfer=BucketResult(bucket="transfer", metrics={"min_trajectory_correlation": 0.95}, n_trials=5),
+        )
+        assert validate_no_mixed_buckets(good_report)
+        assert not good_report.mixed_bucket_violation
+
+        # Bad report: replay has non-zero variance
+        bad_report = VarianceSeparationReport(
+            compile=BucketResult(bucket="compile", metrics={"physical_targets_std": 0.1}, n_trials=10),
+            replay=BucketResult(bucket="replay", metrics={"max_audio_diff": 0.5}, n_trials=5),
+            transfer=BucketResult(bucket="transfer", metrics={"min_trajectory_correlation": 0.95}, n_trials=5),
+        )
+        assert not validate_no_mixed_buckets(bad_report)
+        assert bad_report.mixed_bucket_violation

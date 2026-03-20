@@ -58,6 +58,11 @@ class SpeakItem:
     hint: str | None = None
     situation: str | None = None
     speed: float | None = None
+    pace: float = 1.0
+    hold_bias: float = 0.0
+    boundary_bias: float = 0.0
+    phrase_pressure: float = 0.0
+    breath_tendency: float = 0.0
 
     def __lt__(self, other: SpeakItem) -> bool:
         """Lower priority value = higher priority; break ties by timestamp."""
@@ -93,6 +98,11 @@ async def chat_websocket(ws: WebSocket) -> None:
     session_speed: float = 1.0
     session_style_preset: StylePreset = "default"
     session_situation: str | None = None
+    session_pace: float = 1.0
+    session_hold_bias: float = 0.0
+    session_boundary_bias: float = 0.0
+    session_phrase_pressure: float = 0.0
+    session_breath_tendency: float = 0.0
     dialogue_history: list[DialogueTurn] = []
 
     # Scene state (SSL): persists across speak requests, reset on scene_reset
@@ -120,6 +130,8 @@ async def chat_websocket(ws: WebSocket) -> None:
         nonlocal seq_counter, session_character_id, session_speed
         nonlocal session_style_preset, session_situation
         nonlocal session_scene_state
+        nonlocal session_pace, session_hold_bias, session_boundary_bias
+        nonlocal session_phrase_pressure, session_breath_tendency
         try:
             while True:
                 data = await ws.receive_text()
@@ -182,6 +194,11 @@ async def chat_websocket(ws: WebSocket) -> None:
                         hint=msg.get("hint"),
                         situation=speak_situation,
                         speed=speak_speed,
+                        pace=msg.get("pace", session_pace),
+                        hold_bias=msg.get("hold_bias", session_hold_bias),
+                        boundary_bias=msg.get("boundary_bias", session_boundary_bias),
+                        phrase_pressure=msg.get("phrase_pressure", session_phrase_pressure),
+                        breath_tendency=msg.get("breath_tendency", session_breath_tendency),
                     )
                     if queue.full():
                         await _send(WSSkipped(
@@ -221,6 +238,17 @@ async def chat_websocket(ws: WebSocket) -> None:
                             )
                             continue
                         session_style_preset = style_preset
+                    if "pace" in msg and msg["pace"] is not None:
+                        session_pace = max(0.3, min(3.0, float(msg["pace"])))
+                    if "hold_bias" in msg and msg["hold_bias"] is not None:
+                        session_hold_bias = max(-1.0, min(1.0, float(msg["hold_bias"])))
+                    if "boundary_bias" in msg and msg["boundary_bias"] is not None:
+                        session_boundary_bias = max(-1.0, min(1.0, float(msg["boundary_bias"])))
+                    if "phrase_pressure" in msg and msg["phrase_pressure"] is not None:
+                        session_phrase_pressure = max(-1.0, min(1.0, float(msg["phrase_pressure"])))
+                    if "breath_tendency" in msg and msg["breath_tendency"] is not None:
+                        session_breath_tendency = max(-1.0, min(1.0, float(msg["breath_tendency"])))
+
                     if msg.get("scene_reset"):
                         session_scene_state = None
                         dialogue_history.clear()
@@ -335,6 +363,11 @@ async def chat_websocket(ws: WebSocket) -> None:
                             cancel=cancel_event,
                             sentence_pause_ms=effective_sentence_pause_ms,
                             auto_style=preset_cfg.auto_style,
+                            pace=item.pace,
+                            hold_bias=item.hold_bias,
+                            boundary_bias=item.boundary_bias,
+                            phrase_pressure=item.phrase_pressure,
+                            breath_tendency=item.breath_tendency,
                         ):
                             # Use timeout to avoid deadlock when consumer
                             # stops reading (interrupt).  Check cancel between
