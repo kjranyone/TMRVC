@@ -65,8 +65,10 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--output-dir", default=str(ROOT / "checkpoints" / "v4_full"))
     p.add_argument("--log-every", type=int, default=10)
-    p.add_argument("--save-every", type=int, default=100)
+    p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--skip-cache", action="store_true")
+    p.add_argument("--resume-from", type=int, default=None,
+                   help="Resume from checkpoint step (e.g. 9500)")
     p.add_argument("--annotation-model", default="Qwen/Qwen3.5-35B-A3B",
                    help="LLM for semantic annotation + enriched transcripts")
     p.add_argument("--codec-condition", default="A", choices=["A", "B", "C", "D"],
@@ -400,7 +402,14 @@ class FullBootstrapCacheBuilder:
 
 def main():
     args = parse_args()
-    cache_dir = ROOT / "data" / "cache"
+    # v4 cache: prefer new managed path, fall back to legacy
+    cache_dir = ROOT / "data" / "cache" / "v4"
+    if not cache_dir.exists():
+        legacy = ROOT / "data" / "cache"
+        if (legacy / "v4full").exists():
+            cache_dir = legacy
+        elif legacy.exists():
+            cache_dir = legacy
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -447,20 +456,78 @@ def main():
     codec_cond = args.codec_condition
     logger.info("Codec condition: %s", codec_cond)
 
-    model = DisentangledUCLM(
-        d_model=D_MODEL, d_explicit=D_VOICE_STATE, d_ssl=D_VOICE_STATE_SSL,
+    # Infer d_model/n_layers from checkpoint when resuming (checkpoint may differ from constants.yaml)
+    eff_d_model = D_MODEL
+    eff_n_layers = None  # use default from constants
+    eff_n_heads = None
+    resume_step = 0
+
+    if args.resume_from is not None:
+        resume_path = output_dir / f"v4_step_{args.resume_from}.pt"
+        if not resume_path.exists():
+            logger.error("Checkpoint not found: %s", resume_path)
+            sys.exit(1)
+        _ckpt_sd = torch.load(resume_path, map_location="cpu", weights_only=False)["model"]
+        eff_d_model = _ckpt_sd["uclm_core.layers.0.norm1.weight"].shape[0]
+        eff_n_layers = max(int(k.split(".")[2]) for k in _ckpt_sd if k.startswith("uclm_core.layers.")) + 1
+        q_dim = _ckpt_sd["uclm_core.layers.0.attn.q_proj.weight"].shape[0]
+        k_dim = _ckpt_sd["uclm_core.layers.0.attn.k_proj.weight"].shape[0]
+        for nh in [8, 12, 16, 4]:
+            hd = eff_d_model // nh
+            if hd * nh == eff_d_model and k_dim % hd == 0:
+                eff_n_heads = nh
+                break
+        del _ckpt_sd
+        logger.info("Resume: d_model=%d, n_layers=%d, n_heads=%s (from checkpoint)",
+                     eff_d_model, eff_n_layers, eff_n_heads)
+
+    init_kwargs = dict(
+        d_model=eff_d_model,
+        d_voice_state_explicit=D_VOICE_STATE, d_voice_state_ssl=D_VOICE_STATE_SSL,
         d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
         rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
         vocab_size=PHONEME_VOCAB_SIZE, num_speakers=100,
         acting_tag_vocab_size=N_ACTING_TAGS,
         codec_condition=codec_cond,
-    ).to(device)
+    )
+    if eff_n_layers is not None:
+        init_kwargs["n_layers"] = eff_n_layers
+    if eff_n_heads is not None:
+        init_kwargs["n_heads"] = eff_n_heads
+
+    model = DisentangledUCLM(**init_kwargs).to(device)
 
     acting_enc = ActingLatentEncoder().to(device)
-    acting_pred = ActingLatentPredictor().to(device)
+    acting_pred = ActingLatentPredictor(d_text=eff_d_model, d_context=eff_d_model).to(device)
 
     # Only model params here — trainer will add acting_enc/pred/bio params via add_param_group
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+
+    # Resume from checkpoint
+    if args.resume_from is not None:
+        resume_path = output_dir / f"v4_step_{args.resume_from}.pt"
+        logger.info("Loading checkpoint: %s", resume_path)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        # Filter out keys with shape mismatch (code may have evolved since checkpoint)
+        model_sd = model.state_dict()
+        ckpt_sd = ckpt["model"]
+        filtered = {k: v for k, v in ckpt_sd.items() if k in model_sd and model_sd[k].shape == v.shape}
+        skipped = [k for k in ckpt_sd if k in model_sd and model_sd[k].shape != ckpt_sd[k].shape]
+        model.load_state_dict(filtered, strict=False)
+        if skipped:
+            logger.warning("Skipped %d keys with shape mismatch: %s", len(skipped), skipped)
+        acting_enc.load_state_dict(ckpt["acting_encoder"])
+        acting_pred.load_state_dict(ckpt["acting_predictor"])
+        # Optimizer state may have mismatched param groups due to model changes;
+        # load with best-effort
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except (ValueError, RuntimeError) as e:
+            logger.warning("Optimizer state load failed (%s), starting fresh optimizer", e)
+        resume_step = ckpt["step"]
+        del ckpt
+        logger.info("Resumed from step %d (%d/%d model keys loaded)",
+                     resume_step, len(filtered), len(ckpt_sd))
 
     trainer = UCLMTrainer(
         model=model, optimizer=optimizer, device=device,
@@ -573,7 +640,7 @@ def main():
     logger.info("  All v4 losses ✓")
     logger.info("=" * 60)
 
-    step = 0
+    step = resume_step
     epoch = 0
     running = {}
     best_loss = float("inf")
@@ -584,7 +651,13 @@ def main():
         for batch in dataloader:
             if step >= args.steps:
                 break
-            metrics = trainer.train_step(batch)
+            try:
+                metrics = trainer.train_step(batch)
+            except RuntimeError as e:
+                if "shape" in str(e) or "size" in str(e):
+                    logger.warning("Skipping bad batch at step %d: %s", step, e)
+                    continue
+                raise
             step += 1
 
             for k, v in metrics.items():

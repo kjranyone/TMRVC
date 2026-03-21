@@ -8,6 +8,7 @@ Implements the full pointer protocol from UCLMEngine.tts():
 - forward_streaming for causal frame-by-frame generation
 - Automatic stop when pointer reaches end of text
 - EnCodec decode for waveform
+- v4: acting_texture_latent conditioning via ActingMacroProjector
 
 Usage:
     .venv/bin/python scripts/generate_v4_sample.py
@@ -36,23 +37,52 @@ logger = logging.getLogger("gen_v4")
 
 from tmrvc_core.constants import (
     D_MODEL, D_SPEAKER, D_VOICE_STATE, D_VOICE_STATE_SSL,
+    D_ACTING_LATENT, D_ACTING_MACRO,
     N_CODEBOOKS, CONTROL_SLOTS, RVQ_VOCAB_SIZE, CONTROL_VOCAB_SIZE,
     PHONEME_VOCAB_SIZE, SAMPLE_RATE,
 )
 
 
+def _infer_hparams(state_dict: dict) -> dict:
+    """Infer model hyperparameters from checkpoint weight shapes."""
+    d_model = state_dict["uclm_core.layers.0.norm1.weight"].shape[0]
+    n_layers = max(int(k.split(".")[2]) for k in state_dict if k.startswith("uclm_core.layers.")) + 1
+    q_dim = state_dict["uclm_core.layers.0.attn.q_proj.weight"].shape[0]
+    k_dim = state_dict["uclm_core.layers.0.attn.k_proj.weight"].shape[0]
+    for n_h in [8, 12, 16, 4]:
+        hd = d_model // n_h
+        if hd * n_h == d_model and k_dim % hd == 0:
+            n_heads = n_h
+            break
+    else:
+        n_heads = 8
+    return {"d_model": d_model, "n_layers": n_layers, "n_heads": n_heads}
+
+
 def load_model(ckpt_path: str, device: str):
     from tmrvc_train.models.uclm_model import DisentangledUCLM
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    hp = _infer_hparams(ckpt["model"])
+    logger.info("Checkpoint hparams: d_model=%d, n_layers=%d, n_heads=%d",
+                hp["d_model"], hp["n_layers"], hp["n_heads"])
     model = DisentangledUCLM(
-        d_model=D_MODEL, d_explicit=D_VOICE_STATE, d_ssl=D_VOICE_STATE_SSL,
+        d_model=hp["d_model"], n_heads=hp["n_heads"], n_layers=hp["n_layers"],
+        d_voice_state_explicit=D_VOICE_STATE,
+        d_voice_state_ssl=D_VOICE_STATE_SSL,
         d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
         rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
         vocab_size=PHONEME_VOCAB_SIZE, num_speakers=100,
     ).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"], strict=False)
+    model_sd = model.state_dict()
+    ckpt_sd = ckpt["model"]
+    filtered = {k: v for k, v in ckpt_sd.items() if k in model_sd and model_sd[k].shape == v.shape}
+    skipped = [k for k in ckpt_sd if k in model_sd and model_sd[k].shape != ckpt_sd[k].shape]
+    model.load_state_dict(filtered, strict=False)
+    if skipped:
+        logger.warning("Skipped %d keys with shape mismatch: %s", len(skipped), skipped[:5])
     model.eval()
-    logger.info("Model loaded (step %d, loss %.4f)", ckpt.get("step", 0), ckpt.get("best_loss", 0))
+    logger.info("Model loaded (step %d, loss %.4f, %d/%d keys)",
+                ckpt.get("step", 0), ckpt.get("best_loss", 0), len(filtered), len(ckpt_sd))
     return model
 
 
@@ -60,10 +90,11 @@ def load_model(ckpt_path: str, device: str):
 def generate_speech(
     model, phoneme_ids: torch.Tensor, speaker_embed: torch.Tensor,
     voice_state: torch.Tensor, device: str,
+    acting_texture_latent: torch.Tensor | None = None,
     max_frames: int = 1500, temperature: float = 0.8,
     pace: float = 1.0, max_frames_per_unit: int = 50,
 ) -> tuple[np.ndarray, dict]:
-    """Proper pointer-based causal TTS generation."""
+    """Proper pointer-based causal TTS generation with v4 acting latent."""
 
     B = 1
     phoneme_ids = phoneme_ids.unsqueeze(0).to(device) if phoneme_ids.dim() == 1 else phoneme_ids.to(device)
@@ -73,6 +104,11 @@ def generate_speech(
     vs = voice_state.view(1, 1, -1).to(device)
     ssl_zeros = torch.zeros(1, 1, D_VOICE_STATE_SSL, device=device)
     lang_ids = torch.zeros(B, dtype=torch.long, device=device)
+
+    # Acting texture latent [B, D_ACTING_LATENT]
+    act_latent = None
+    if acting_texture_latent is not None:
+        act_latent = acting_texture_latent.view(1, D_ACTING_LATENT).to(device)
 
     # Pre-compute text features
     text_features = model.text_encoder(phoneme_ids, lang_ids).transpose(1, 2)  # [B, L, D]
@@ -101,31 +137,31 @@ def generate_speech(
         safe_idx = min(text_index, L - 1)
         content_features = text_features[:, safe_idx:safe_idx+1, :]  # [B, 1, D]
 
-        # Voice state encoding for this frame
-        state_cond = model.voice_state_enc(
-            explicit_state=vs, ssl_state=ssl_zeros,
-            delta_state=torch.zeros(1, 1, D_VOICE_STATE, device=device),
-        )
-        if isinstance(state_cond, tuple):
-            state_cond = state_cond[0]
-
-        # Forward streaming (single frame)
+        # Forward streaming (single frame) — v4 handles voice state + acting latent internally
         try:
             out = model.forward_streaming(
-                queries=content_features + state_cond,
+                queries=content_features,
                 memory=text_features,
                 a_ctx=ctx_a, b_ctx=ctx_b,
                 speaker_embed=speaker_embed,
                 explicit_state=vs,
+                ssl_state=ssl_zeros,
+                acting_texture_latent=act_latent,
                 cfg_scale=1.0,
                 kv_caches=kv_caches,
+                frame_index=t,
             )
             logits_a = out["logits_a"]  # [B, 8, 1, 1024]
             logits_b = out["logits_b"]
             kv_caches = out.get("kv_cache_out", None)
             hidden = out.get("hidden_states", None)
         except Exception as e:
-            # Fallback: use uclm_core directly
+            # Fallback: manual voice state encoding + uclm_core
+            state_cond = model.voice_state_enc(
+                explicit_state=vs, ssl_state=ssl_zeros,
+            )
+            if isinstance(state_cond, tuple):
+                state_cond = state_cond[0]
             result = model.uclm_core(
                 queries=content_features + state_cond,
                 memory=text_features,
@@ -260,28 +296,69 @@ def main():
         except Exception:
             return torch.randint(1, PHONEME_VOCAB_SIZE, (len(text)*2,))
 
+    # v4: Load acting macro projector from checkpoint for latent computation
+    from tmrvc_train.models.acting_latent import ActingMacroProjector
+    macro_proj = ActingMacroProjector()
+    if hasattr(model, "acting_macro_proj"):
+        macro_proj.load_state_dict(model.acting_macro_proj.state_dict())
+    macro_proj.to(device).eval()
+
+    def macro_to_latent(intensity=0.5, instability=0.2, tenderness=0.3,
+                        tension=0.3, spontaneity=0.5, reference_mix=0.0):
+        """Convert 6-D acting macro to 24-D acting texture latent."""
+        macro = torch.tensor([[intensity, instability, tenderness,
+                               tension, spontaneity, reference_mix]],
+                             dtype=torch.float32, device=device)
+        return macro_proj(macro).squeeze(0)  # [24]
+
+    # Style dict: (text, 12-D voice_state, 6-D acting_macro or None)
+    #   voice_state order: pitch_level, pitch_range, energy_level, pressedness,
+    #     spectral_tilt, breathiness, voice_irregularity, openness,
+    #     aperiodicity, formant_shift, vocal_effort, creak
     styles = {
-        "neutral":          ("本当にありがとうございます。",     [0.5,0.3,0.5,0.35,0.5,0.2,0.15,0.5,0.2,0.5,0.4,0.1]),
-        "angry":            ("いい加減にしてよ！",               [0.7,0.6,0.85,0.7,0.7,0.1,0.3,0.6,0.3,0.5,0.8,0.2]),
-        "whisper":          ("ねえ、ちょっと聞いて。",           [0.4,0.15,0.15,0.1,0.3,0.8,0.1,0.3,0.4,0.5,0.15,0.05]),
-        "sad":              ("もう会えないのかな。",             [0.35,0.15,0.25,0.2,0.35,0.3,0.25,0.4,0.15,0.5,0.25,0.15]),
-        "excited":          ("すごい！信じられない！",           [0.7,0.7,0.8,0.5,0.6,0.15,0.2,0.7,0.2,0.5,0.7,0.1]),
-        "tender":           ("大丈夫だよ、心配しないで。",       [0.45,0.2,0.3,0.15,0.4,0.35,0.1,0.45,0.1,0.5,0.25,0.05]),
-        "professional":     ("本日の会議を始めさせていただきます。", [0.5,0.25,0.5,0.4,0.5,0.1,0.05,0.5,0.1,0.5,0.5,0.05]),
-        "creaky_dramatic":  ("それは...嘘でしょう。",             [0.3,0.4,0.35,0.6,0.4,0.2,0.4,0.35,0.3,0.5,0.3,0.6]),
+        "neutral":          ("本当にありがとうございます。",
+                             [0.5,0.3,0.5,0.35,0.5,0.2,0.15,0.5,0.2,0.5,0.4,0.1], None),
+        "angry":            ("いい加減にしてよ！",
+                             [0.7,0.6,0.85,0.7,0.7,0.1,0.3,0.6,0.3,0.5,0.8,0.2], None),
+        "whisper":          ("ねえ、ちょっと聞いて。",
+                             [0.4,0.15,0.15,0.1,0.3,0.8,0.1,0.3,0.4,0.5,0.15,0.05], None),
+        "sad":              ("もう会えないのかな。",
+                             [0.35,0.15,0.25,0.2,0.35,0.3,0.25,0.4,0.15,0.5,0.25,0.15], None),
+        "excited":          ("すごい！信じられない！",
+                             [0.7,0.7,0.8,0.5,0.6,0.15,0.2,0.7,0.2,0.5,0.7,0.1], None),
+        "tender":           ("大丈夫だよ、心配しないで。",
+                             [0.45,0.2,0.3,0.15,0.4,0.35,0.1,0.45,0.1,0.5,0.25,0.05], None),
+        "professional":     ("本日の会議を始めさせていただきます。",
+                             [0.5,0.25,0.5,0.4,0.5,0.1,0.05,0.5,0.1,0.5,0.5,0.05], None),
+        "creaky_dramatic":  ("それは...嘘でしょう。",
+                             [0.3,0.4,0.35,0.6,0.4,0.2,0.4,0.35,0.3,0.5,0.3,0.6], None),
+        # v4: character archetypes with acting texture latent
+        "mesugaki":         ("ざぁ〜こ♡ ざぁ〜こ♡ お兄さん弱すぎじゃない？",
+                             [0.75,0.6,0.65,0.25,0.7,0.15,0.1,0.6,0.1,0.75,0.55,0.05],
+                             {"intensity": 0.8, "instability": 0.35, "tenderness": 0.1,
+                              "tension": 0.15, "spontaneity": 0.85, "reference_mix": 0.0}),
     }
 
     logger.info("=" * 60)
-    logger.info("Generating %d samples with POINTER PROTOCOL", len(styles))
+    logger.info("Generating %d samples with POINTER PROTOCOL + ACTING LATENT", len(styles))
     logger.info("=" * 60)
 
     results = []
-    for name, (text, vs_list) in styles.items():
+    for name, (text, vs_list, macro_params) in styles.items():
         phonemes = g2p(text)
         vs = torch.tensor(vs_list, dtype=torch.float32)
-        logger.info("--- %s: %s → %d phonemes ---", name, text, len(phonemes))
 
-        audio, meta = generate_speech(model, phonemes, speaker_embed, vs, device)
+        act_latent = None
+        if macro_params is not None:
+            act_latent = macro_to_latent(**macro_params)
+
+        logger.info("--- %s: %s → %d phonemes (latent=%s) ---",
+                     name, text, len(phonemes), "yes" if act_latent is not None else "no")
+
+        audio, meta = generate_speech(
+            model, phonemes, speaker_embed, vs, device,
+            acting_texture_latent=act_latent,
+        )
         wav_path = output_dir / f"{name}.wav"
         sf.write(str(wav_path), audio, SAMPLE_RATE)
 

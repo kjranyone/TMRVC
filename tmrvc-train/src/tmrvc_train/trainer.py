@@ -210,9 +210,9 @@ class UCLMTrainer:
         self.bio_physical_head: nn.Linear | None = None
         if self.enable_v4_losses:
             self.bio_regularizer = BiologicalConstraintRegularizer().to(device)
-            # Projection head: hidden_states [B, T, D_MODEL] -> [B, T, 12]
-            from tmrvc_core.constants import D_MODEL as _D_MODEL
-            self.bio_physical_head = nn.Linear(_D_MODEL, 12).to(device)
+            # Projection head: hidden_states [B, T, d_model] -> [B, T, 12]
+            _d_model = model.d_model if hasattr(model, 'd_model') else 768
+            self.bio_physical_head = nn.Linear(_d_model, 12).to(device)
 
         # Acting latent encoder/predictor (Task 3-3)
         self.acting_latent_encoder = acting_latent_encoder

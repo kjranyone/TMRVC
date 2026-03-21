@@ -1,202 +1,261 @@
-# TMRVC Training Guide
+# TMRVC v4 Training Guide
 
-この文書は、現行 mainline である `UCLM v3` の学習フローをまとめたものです。前提は次のとおりです。
+UCLMv4 の学習フローをまとめた文書。全操作は冪等に設計されている。
 
-- TTS / VC は単一の UCLM backbone で学習する
-- TTS の主経路は `pointer-based internal alignment` (MFA 不要)
-- dual-stream token contract (`A_t / B_t`) は維持する
+## 原則
 
-## 1. 学習成果物
+1. **冪等性**: どのコマンドも何度実行しても同じ結果を返す。途中で止まっても再実行で続きから動く
+2. **増分処理**: データ追加は append-only。cache 構築は未処理分だけ実行される
+3. **単一台帳**: `data/manifest.jsonl` が全 utterance の source of truth
+4. **checkpoint 再開**: 学習は任意の step から再開可能。optimizer state も復元される
+5. **アノテーション不要**: raw wav を投入すれば ASR・G2P・話者・声質が自動推定される
 
-運用に必要な主成果物は次の 2 つです。
+## 成果物
 
-- `checkpoints/uclm/uclm_latest.pt`
-- `checkpoints/codec/codec_latest.pt`
+| ファイル | 役割 |
+|---|---|
+| `checkpoints/v4_full/v4_step_*.pt` | UCLM 本体 + acting encoder/predictor + optimizer |
+| `checkpoints/codec/codec_latest.pt` | EnCodec (condition A baseline) |
+| `data/manifest.jsonl` | データ台帳 (corpus, speaker, wav_path, cached) |
+| `data/cache/v4/train/` | 学習 cache (codec tokens, voice state, phonemes 等) |
 
-`UCLM` は token 予測器、`codec` は波形と token の相互変換器です。片方だけでは実運用できません。
-
-## 2. データ要件
-
-### 2.1 データセット単位の原則
-
-- 1 dataset = 1 language
-- dataset ごとに `raw_dir` を分ける
-- 話者別フォルダでも単一フォルダでもよい
-- テキストがある方が TTS 学習は安定する
-
-### 2.2 TTS 監督
-
-mainline の TTS 監督は次を使います。
-
-- `text`: 発話テキスト
-- `phoneme_ids.npy` または同等の text units
-- 音声側の `codec_tokens.npy`, `control_tokens.npy`, `voice_state.npy`, `ssl_state.npy`
-
-使わないもの:
-
-- `MFA` 前提の forced alignment
-- `durations.npy` 必須設計
-- TextGrid を品質の中心に置く運用
-
-`phoneme_ids.npy` は言語別 G2P または grapheme backend から作ります。英語系は `phonemizer + espeak-ng`、日本語は `pyopenjtalk` を使います。
-
-## 3. cache スキーマ
-
-標準 cache は以下を持ちます。
-
-| ファイル | 必須 | 役割 |
-|---|---|---|
-| `codec_tokens.npy` | yes | acoustic tokens `[8, T]` |
-| `control_tokens.npy` | yes | control tokens `[4, T]` |
-| `voice_state.npy` | optional | canonical physical-control supervision `[T, 8]` |
-| `ssl_state.npy` | yes | frame-level latent state `[T, D]` |
-| `spk_embed.npy` | yes | speaker embedding |
-| `meta.json` | yes | text, language, frame stats |
-| `phoneme_ids.npy` | tts | text unit ids |
-
-互換 alias:
-
-- `explicit_state.npy` (`voice_state.npy` の alias)
-
-## 4. dev.py ベースの標準フロー
-
-### 4.1 初回セットアップ
+## Phase 0: 環境
 
 ```bash
 uv sync --extra-index-url https://download.pytorch.org/whl/cu128
 sudo apt-get update && sudo apt-get install -y espeak-ng
-uv run python dev.py
 ```
 
-### 4.2 推奨順序
+## Phase 1: データ登録
 
-1. `6` 設定初期化
-2. `4` データセット追加 (raw_dir, language 設定)
-3. `1` フル学習 (前処理 + 学習)
-4. `8` Codec 学習
-5. `7` 学習成果物を確定
-6. `11` 推論サーバー起動
-
-`1` が推奨フローです。前処理→学習を一括実行します。
-
-### 4.3 再学習
-
-前処理済み cache を再利用する場合:
-
-1. `2` 既存キャッシュで学習のみ
-2. `7` 成果物を確定
-3. `11` 推論サーバー起動
-
-### 4.4 キュレーション経由のデータ準備
-
-raw音声から学習データを準備する場合:
-
-1. `13` キュレーション: 音声ファイル取込 (ingest)
-2. `14` キュレーション: スコアリング & 昇格判定 (run)
-3. `16` キュレーション: エクスポート (promoted → cache)
-4. `1` フル学習
-
-## 5. CLI ベースの実行
-
-### 5.1 前処理のみ
+`manage_data.py add` で raw 音声を台帳に登録する。ファイルは移動されない。
 
 ```bash
-uv run tmrvc-preprocess \
-  --raw-dir /path/to/raw \
-  --cache-dir experiments/cache \
-  --dataset mydata \
-  --language ja \
-  --workers 2
+# 話者がディレクトリで分かれている場合
+.venv/bin/python scripts/manage_data.py add <name> <path> --speaker-from-dir
+
+# 1 話者 or 話者不明の場合
+.venv/bin/python scripts/manage_data.py add <name> <path> --speaker single
+
+# flac など wav 以外
+.venv/bin/python scripts/manage_data.py add <name> <path> --speaker-from-dir --ext flac
 ```
 
-### 5.2 統合パイプライン (推奨)
+**冪等性**: 同じ wav は二重登録されない。`--force` で再登録。
 
 ```bash
-uv run tmrvc-train-pipeline \
-  --output-dir experiments \
-  --workers 2 \
-  --train-device cuda \
-  --seed 42
+# 例: 初回セットアップ
+.venv/bin/python scripts/manage_data.py add jvs data/raw/jvs --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add moe data/raw/moe_voices --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add tsukuyomi data/raw/tsukuyomi --speaker single
+.venv/bin/python scripts/manage_data.py add vctk data/raw/vctk --speaker-from-dir --ext flac
+
+# 例: 後から追加
+.venv/bin/python scripts/manage_data.py add my_voice ~/recordings --speaker single
+.venv/bin/python scripts/manage_data.py add drama ~/drama_corpus --speaker-from-dir
 ```
 
-### 5.3 既存 cache で学習のみ
+確認:
 
 ```bash
-uv run tmrvc-train-pipeline \
-  --output-dir experiments \
-  --cache-dir experiments/<exp_id>/cache \
-  --skip-preprocess \
-  --train-device cuda \
-  --seed 42
+.venv/bin/python scripts/manage_data.py status
 ```
 
-### 5.4 codec 学習
+## Phase 2: Cache 構築
+
+`manage_data.py build` で manifest の未処理 entry を cache に変換する。
 
 ```bash
-uv run tmrvc-train-codec \
-  --cache-dir experiments/<exp_id>/cache \
-  --output-dir checkpoints/codec \
-  --device cuda
+# 全量
+.venv/bin/python scripts/manage_data.py build
+
+# 上限指定 (時間を区切りたいとき)
+.venv/bin/python scripts/manage_data.py build --max 10000
 ```
 
-### 5.5 UCLM 単体学習 (cache 既存)
+**冪等性**: 処理済み entry はスキップされる。中断しても再実行で続きから。
 
-```bash
-uv run tmrvc-train-uclm \
-  --cache-dir experiments/<exp_id>/cache \
-  --output-dir checkpoints/uclm \
-  --batch-size 16 \
-  --max-steps 10000 \
-  --device cuda
-```
+内部で実行されるパイプライン:
 
-## 6. 利用可能な CLI コマンド一覧
-
-| コマンド | パッケージ | 説明 |
+| ステップ | モデル | 出力 |
 |---|---|---|
-| `tmrvc-preprocess` | tmrvc-data | 音声の前処理・特徴量抽出 |
-| `tmrvc-extract-features` | tmrvc-data | 特徴量抽出のみ |
-| `tmrvc-verify-cache` | tmrvc-data | cache 整合性検証 |
-| `tmrvc-prepare-uclm` | tmrvc-data | UCLM 用データ準備 |
-| `tmrvc-curate` / `tmrvc-curation` | tmrvc-data | キュレーション CLI |
-| `tmrvc-train-pipeline` | tmrvc-train | 統合学習パイプライン (推奨) |
-| `tmrvc-train-uclm` | tmrvc-train | UCLM 単体学習 |
-| `tmrvc-train-codec` | tmrvc-train | Codec 学習 |
-| `tmrvc-finetune-encodec` | tmrvc-train | EnCodec fine-tuning |
-| `tmrvc-serve` | tmrvc-serve | 推論サーバー起動 |
+| ASR | Whisper large-v3 | transcript, language, confidence |
+| G2P | pyopenjtalk / phonemizer | `phoneme_ids.npy` |
+| Voice State | DSP 12-D estimator | `voice_state.npy` [T, 12] |
+| Speaker | ECAPA-TDNN | `spk_embed.npy` [192] |
+| Codec | EnCodec 24kHz | `codec_tokens.npy` [8, T] |
 
-## 7. Quality Gate
+### Cache スキーマ (v4)
 
-学習前に cache 品質を検査します。主な検査対象は次のとおりです。
+| ファイル | shape | 役割 |
+|---|---|---|
+| `codec_tokens.npy` | `[8, T]` | acoustic tokens (RVQ 8 codebooks × 1024 vocab) |
+| `voice_state.npy` | `[T, 12]` | 12-D physical voice state |
+| `voice_state_targets.npy` | `[T, 12]` | supervision target |
+| `voice_state_observed_mask.npy` | `[T, 12]` | 観測マスク (dim 8-11 は低信頼) |
+| `voice_state_confidence.npy` | `[T, 12]` | フレーム別信頼度 |
+| `spk_embed.npy` | `[192]` | speaker embedding |
+| `phoneme_ids.npy` | `[L]` | 音素 ID 列 |
+| `text_suprasegmentals.npy` | `[L, 4]` | 韻律素性 |
+| `meta.json` | — | text, language, duration, tier, corpus |
 
-- 必須 artifact の欠損率
-- token range 異常
-- dataset ごとの最小 utterance / speaker 数
-- waveform length と `n_frames * hop_length` の整合
-- TTS text coverage
+## Phase 3: 学習
 
-legacy alignment coverage は mainline fail 条件ではなく、別指標として扱います。
+```bash
+# 新規学習
+.venv/bin/python scripts/train_v4_full.py \
+  --steps 100000 \
+  --batch-size 4 \
+  --lr 3e-4 \
+  --skip-cache \
+  --save-every 5000
 
-## 8. G2P と言語依存
+# checkpoint から再開
+.venv/bin/python scripts/train_v4_full.py \
+  --resume-from <step> \
+  --steps 100000 \
+  --batch-size 4 \
+  --lr 3e-4 \
+  --skip-cache \
+  --save-every 5000
+```
 
-### 8.1 日本語
+**冪等性**: `--resume-from` は checkpoint から model + optimizer state を復元する。d_model 等のハイパーパラメータは checkpoint から自動推定される。
 
-- backend: `pyopenjtalk`
-- dataset `language: ja`
+### 学習フェーズ (curriculum)
 
-### 8.2 英語
+| Phase | Steps | 内容 |
+|---|---|---|
+| Stage 1 | 0–2,000 | Base LM, codec token 予測 |
+| Stage 2 | 2,000–15,000 | Pointer alignment + text progression |
+| Stage 3 | 15,000– | Drama/dialogue, CFG, acting latent |
 
-- backend: `phonemizer`
-- system dependency: `espeak-ng`
-- dataset `language: en`
+### Loss 構成 (9 項)
 
-### 8.3 多言語運用
+| Loss | 対象 |
+|---|---|
+| loss_a | Stream A codec token prediction |
+| loss_b | Stream B control token prediction |
+| loss_adv | Pointer advance/hold decision |
+| loss_progress | Pointer progress delta |
+| loss_boundary_confidence | 音素境界信頼度 |
+| loss_voice_state | 12-D physical supervision |
+| loss_bio_* | 生物学的制約 (covariance, transition, implausibility) |
+| loss_acting_kl | Acting latent KL 正則化 |
+| loss_disentangle | Physical / latent 直交性 |
 
-多言語コーパスであっても、`datasets.yaml` の 1 entry は単一言語に分割してください。language ごとに backend と text normalization が異なるため、混在運用は mainline 品質を崩します。
+## Phase 4: 検証
 
-## 9. 次に参照すべき文書
+```bash
+# サンプル生成
+.venv/bin/python scripts/generate_v4_sample.py
 
-- 設計入口: `docs/design/architecture.md`
-- モデル仕様: `docs/design/unified-codec-lm.md`
-- データ準備: `docs/design/dataset-preparation-flow.md`
-- 実装計画: `plan/README.md`
+# メスガキ検証
+.venv/bin/python scripts/verify_mesugaki.py --checkpoint checkpoints/v4_full/v4_step_50000.pt
+```
+
+## Phase 5: サーブ
+
+```bash
+.venv/bin/python -m tmrvc_serve --checkpoint checkpoints/v4_full/v4_full_final.pt
+```
+
+## データ追加ワークフロー (学習途中でも可能)
+
+```bash
+# 1. データ登録
+.venv/bin/python scripts/manage_data.py add new_corpus /path/to/wavs --speaker-from-dir
+
+# 2. cache 構築 (増分)
+.venv/bin/python scripts/manage_data.py build
+
+# 3. 学習再開 (新しい cache を含む)
+.venv/bin/python scripts/train_v4_full.py --resume-from <last_step> --steps 200000 --skip-cache
+```
+
+全ステップが冪等。途中で止まっても同じコマンドを再実行すればよい。
+
+## データ管理コマンド一覧
+
+```bash
+# 登録
+manage_data.py add <name> <path> [--speaker-from-dir] [--speaker single] [--ext wav] [--force]
+
+# cache 構築
+manage_data.py build [--max N] [--device auto]
+
+# 状態確認
+manage_data.py status
+
+# コーパス除外
+manage_data.py remove <name>
+```
+
+## ディレクトリ構成
+
+```
+data/
+├── manifest.jsonl              # 全 utterance の台帳 (source of truth)
+├── raw/                        # 元音声 (読み取り専用)
+│   ├── jvs/                    #   JVS corpus (ja)
+│   ├── moe_voices/             #   MOE voices (ja, 5 speakers)
+│   ├── tsukuyomi/              #   つくよみちゃん (ja)
+│   ├── vctk/                   #   VCTK corpus (en, 110 speakers)
+│   └── <your_corpus>/          #   任意のコーパスを追加
+├── cache/
+│   └── v4/
+│       └── train/
+│           └── <speaker_id>/
+│               └── <utt_id>/
+│                   ├── codec_tokens.npy
+│                   ├── voice_state.npy
+│                   ├── spk_embed.npy
+│                   ├── phoneme_ids.npy
+│                   └── meta.json
+├── curated_export/             # キュレーション出力
+└── curation/                   # キュレーション DB
+```
+
+## G2P
+
+| 言語 | Backend | 依存 |
+|---|---|---|
+| ja | pyopenjtalk | pip install |
+| en | phonemizer + espeak-ng | apt install espeak-ng |
+
+言語は Whisper が自動判定する。G2P backend は言語に応じて自動選択される。
+
+## dev.py との関係
+
+`dev.py` は対話メニュー型のエントリポイントとして残っている。
+
+| dev.py menu | 新体制での推奨 |
+|---|---|
+| 1. Bootstrap | `manage_data.py add` + `build` |
+| 2. Training | `train_v4_full.py --resume-from` |
+| 3. RL fine-tuning | dev.py menu 3 をそのまま使う |
+| 4. Dataset management | `manage_data.py add/status/remove` |
+| 5. Curation | dev.py menu 5 をそのまま使う |
+| 6. Finalize | dev.py menu 6 をそのまま使う |
+| 7. Characters | dev.py menu 7 をそのまま使う |
+| 8. Serve | dev.py menu 8 をそのまま使う |
+| 9. Integrity check | dev.py menu 9 をそのまま使う |
+
+v4 の学習ループ (add → build → train) は CLI 直接実行を推奨する。dev.py はキャラクター管理・キュレーション・RL 等の補助操作に使う。
+
+## FAQ
+
+**Q: アノテーション無しの wav を入れてよいか？**
+A: よい。Whisper ASR → G2P → DSP voice state → speaker embed が全自動で実行される。
+
+**Q: 1 ファイルが長い (30 秒超) 場合は？**
+A: bootstrap pipeline は VAD で無音区間を除外する。長すぎるファイルは学習時に truncate される。
+
+**Q: 途中で新しいデータを足したい**
+A: `manage_data.py add` → `build` → `train --resume-from`。既存 cache は壊れない。
+
+**Q: 学習が途中で死んだ**
+A: 同じコマンドに `--resume-from <last_saved_step>` を付けて再実行。
+
+**Q: cache を作り直したい**
+A: `data/cache/v4/` を削除して `manage_data.py build` を再実行。manifest の `cached` フラグは自動更新される。

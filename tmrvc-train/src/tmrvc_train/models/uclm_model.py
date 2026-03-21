@@ -524,7 +524,7 @@ class DisentangledUCLM(nn.Module):
         self.cfg_scale_embed = nn.Linear(1, d_model)
 
         # v4: Acting texture latent conditioner (24-D -> d_model)
-        self.acting_latent_conditioner = ActingLatentConditioner()
+        self.acting_latent_conditioner = ActingLatentConditioner(d_model=d_model)
 
         # v4: Acting macro projector (6-D user-facing -> 24-D latent)
         # Registered as a submodule so weights are checkpointed and loaded.

@@ -6,5 +6,35 @@
     "personality": "",
     "voice_description": "",
     "language": "ja"
+  },
+  "mesugaki": {
+    "name": "mesugaki",
+    "speaker_file": "models/characters/mesugaki.tmrvc_speaker",
+    "adaptation_level": "standard",
+    "personality": "小悪魔的で生意気、挑発的だがどこか愛嬌がある",
+    "voice_description": "高めのピッチ、明るく鋭い声質、広い抑揚、元気で自信のある発声",
+    "language": "ja",
+    "voice_state_preset": {
+      "pitch_level": 0.75,
+      "pitch_range": 0.6,
+      "energy_level": 0.65,
+      "pressedness": 0.25,
+      "spectral_tilt": 0.7,
+      "breathiness": 0.15,
+      "voice_irregularity": 0.1,
+      "openness": 0.6,
+      "aperiodicity": 0.1,
+      "formant_shift": 0.75,
+      "vocal_effort": 0.55,
+      "creak": 0.05
+    },
+    "acting_macro_preset": {
+      "intensity": 0.8,
+      "instability": 0.35,
+      "tenderness": 0.1,
+      "tension": 0.15,
+      "spontaneity": 0.85,
+      "reference_mix": 0.0
+    }
   }
 }
