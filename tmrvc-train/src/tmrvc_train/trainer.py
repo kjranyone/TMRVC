@@ -440,12 +440,13 @@ class UCLMTrainer:
                 diagnostics["voice_state_between_utt_variance"] = 0.0
         return diagnostics
 
-    def train_step(self, batch: dict) -> dict:
+    def train_step(self, batch: dict, accumulate: bool = False, accum_steps: int = 1) -> dict:
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
+        # When accumulating, caller handles zero_grad. For single-step compat:
+        if accum_steps == 1:
+            self.optimizer.zero_grad(set_to_none=True)
 
         current_step = self._global_step
-        self._global_step += 1
 
         # Stage 3 anti-forgetting replay: override drama config with
         # Stage 1/2 stability settings when the scheduler says so.
@@ -583,7 +584,9 @@ class UCLMTrainer:
                 phonemes = torch.where(mask.unsqueeze(1).expand_as(phonemes), enriched, phonemes)
             language_ids = batch["language_id"].to(self.device)
             B = phonemes.shape[0]
-            target_length = target_a.shape[-1]
+            # Use actual (pre-padding) frame count, not padded tensor length
+            frame_mask = (target_a[:, 0, :] != -1)  # [B, T] True=real, False=pad
+            target_length = frame_mask.sum(dim=1).max().item()
 
             # --- Replay Mix (Worker 02 Task 15) ---
             if is_replay:
@@ -618,7 +621,8 @@ class UCLMTrainer:
             teacher_acting_latent = None
             cached_act_mu = None
             cached_act_logvar = None
-            if self.enable_v4_losses and self.acting_latent_encoder is not None and ssl_state is not None:
+            ssl_is_real = ssl_state is not None and ssl_state.abs().sum() > 0
+            if self.enable_v4_losses and self.acting_latent_encoder is not None and ssl_is_real:
                 ssl_for_acting = ssl_state
                 d_input = self.acting_latent_encoder.encoder[0].in_features
                 if ssl_for_acting.dim() == 3 and ssl_for_acting.shape[-1] != d_input:
@@ -650,6 +654,7 @@ class UCLMTrainer:
                 current_step=current_step,
                 pointer_loss_weight=pointer_loss_weight,
                 acting_texture_latent=teacher_acting_latent,
+                frame_mask=frame_mask,
             )
             # Add prompt VQ loss if present
             if prompt_vq_loss is not None:
@@ -758,11 +763,12 @@ class UCLMTrainer:
         losses.pop("_hidden_states", None)
         losses.pop("_physical_pred", None)
 
-        # Optimization
-        losses["loss"].backward()
-        # SOTA: Strict gradient clipping to prevent catastrophic loss spikes
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        # Optimization — scale loss for gradient accumulation
+        (losses["loss"] / accum_steps).backward()
+        if not accumulate:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            self._global_step += 1
 
         res = {k: v.item() for k, v in losses.items() if isinstance(v, torch.Tensor)}
         res["mode"] = 1 if mode == "tts" else 0
@@ -839,8 +845,8 @@ class UCLMTrainer:
                 losses["loss"] = losses["loss"] + self.disentanglement_weight * dis_loss
                 losses["loss_disentanglement"] = dis_loss
 
-            # --- Loss 9: Semantic alignment loss ---
-            if self.acting_latent_predictor is not None:
+            # --- Loss 9: Semantic alignment loss (skip when ssl_state is zeros) ---
+            if self.acting_latent_predictor is not None and ssl_is_real:
                 # Use text features if available, otherwise use a pooled ssl_state proxy
                 text_features = batch.get("text_features")
                 if text_features is not None:
@@ -903,6 +909,7 @@ class UCLMTrainer:
         current_step: int,
         pointer_loss_weight: float,
         acting_texture_latent: torch.Tensor | None = None,
+        frame_mask: torch.Tensor | None = None,
     ) -> dict:
         """Pointer-mode TTS training step with full annealing schedule."""
         B = phonemes.shape[0]
@@ -920,114 +927,76 @@ class UCLMTrainer:
             if bootstrap_data is not None and "phoneme_indices" in bootstrap_data:
                 pos_indices_init = bootstrap_data["phoneme_indices"]
             else:
-                # Fallback to heuristic durations if curated bootstrap is missing
-                # but we are in the hard bootstrap phase.
+                # Heuristic fallback — skip all timing losses (uniform durations are misleading)
                 indices = torch.arange(target_length, device=self.device).float() * L / target_length
                 pos_indices_init = indices.long().clamp(max=L - 1).unsqueeze(0).expand(B, -1)
-                bootstrap_data = {"phoneme_indices": pos_indices_init}
+                bootstrap_data = {"phoneme_indices": pos_indices_init, "_heuristic": True}
 
-        # First pass: use initial pos_indices (if bootstrap) or uniform (if latent)
-        # to get hidden states for MAS.
-        out = self.model.forward_tts_pointer(
-            phoneme_ids=phonemes,
-            language_ids=language_ids,
-            pointer_state=None,
-            speaker_embed=speaker_embed,
-            explicit_state=explicit_state,
-            ssl_state=ssl_state,
-            target_a=target_a,
-            target_b=target_b,
-            target_length=target_length,
-            f0_condition=f0_condition,
-            dialogue_context=dialogue_context,
-            acting_intent=acting_intent,
-            prosody_latent=prosody_targets,
-            acting_texture_latent=acting_texture_latent,
-            delta_voice_state=delta_voice_state,
-            prompt_kv_cache=prompt_kv_cache,
-            bootstrap_alignment=bootstrap_data,
-            text_suprasegmentals=text_suprasegmentals,
-            position_indices=pos_indices_init,
-        )
-
-        # --- Alignment Target Generation (Stage 2 Annealing Logic) ---
+        # --- Alignment Target Generation (single-pass: no full forward needed) ---
+        skip_timing_losses = False  # set True when alignment is unreliable
         if annealing_phase == "hard_bootstrap":
-            # Phase 1: Use Bootstrap Alignment as ground truth
-            if pos_indices_init is not None:
-                indices = pos_indices_init  # [B, T]
+            has_real_bootstrap = (bootstrap_data is not None
+                                 and "phoneme_indices" in bootstrap_data
+                                 and not bootstrap_data.get("_heuristic", False))
+            if has_real_bootstrap:
+                indices = pos_indices_init
                 pseudo_durations = torch.zeros(B, L, device=self.device)
                 for b in range(B):
                     counts = torch.bincount(indices[b].clamp(min=0, max=L-1), minlength=L)
                     pseudo_durations[b] = counts[:L].float()
                 adv_targets, prog_targets, frame_offsets, pos_indices = self._generate_pointer_targets(pseudo_durations, target_length)
             else:
-                # Heuristic fallback
+                # No real bootstrap — use uniform alignment for content, skip timing losses
                 dummy_durations = torch.full((B, L), target_length / max(L, 1), device=self.device)
                 adv_targets, prog_targets, frame_offsets, pos_indices = self._generate_pointer_targets(dummy_durations, target_length)
-        elif annealing_phase == "soft_transition":
-            # Phase 2: Mix bootstrap with MAS-derived targets
-            mix_ratio = self._get_bootstrap_mix_ratio(current_step)
-
-            # MAS targets
+                skip_timing_losses = True
+        else:
+            # MAS from text encoder + lightweight acoustic features (no full forward pass)
             with torch.no_grad():
                 phoneme_lens = (phonemes != 0).sum(dim=1)
                 x_text = F.normalize(self.model.text_encoder(
                     phonemes, language_ids, phoneme_lens,
                     text_suprasegmentals=text_suprasegmentals,
-                ).transpose(1, 2), dim=-1)
-                x_acoustic = F.normalize(out["hidden_states"], dim=-1)
-                dist = torch.cdist(x_text, x_acoustic)
+                ).transpose(1, 2), dim=-1)  # [B, L, D]
+
+                # Lightweight acoustic features from target codec tokens
+                a_embed_list = [
+                    self.model.uclm_core.a_ctx_embeds[i](target_a[:, i, :target_length].clamp(min=0))
+                    for i in range(self.model.n_codebooks)
+                ]
+                x_acoustic_raw = torch.cat(a_embed_list, dim=-1)
+                x_acoustic = F.normalize(self.model.uclm_core.a_ctx_fusion(x_acoustic_raw), dim=-1)
+
+                dist = torch.cdist(x_text, x_acoustic[:, :target_length, :])
                 log_probs = -0.5 * (dist ** 2)
                 path = monotonic_alignment_search(log_probs)
-                mas_adv, mas_prog, mas_offs, mas_indices = self._generate_pointer_targets_from_path(path)
 
-            if mix_ratio > 0 and pos_indices_init is not None:
-                indices = pos_indices_init
-                pseudo_durations = torch.zeros(B, L, device=self.device)
-                for b in range(B):
-                    counts = torch.bincount(indices[b].clamp(min=0, max=L-1), minlength=L)
-                    pseudo_durations[b] = counts[:L].float()
-                boot_adv, boot_prog, boot_offs, boot_indices = self._generate_pointer_targets(pseudo_durations, target_length)
-                # Blend
-                adv_targets = mix_ratio * boot_adv + (1 - mix_ratio) * mas_adv
-                prog_targets = mix_ratio * boot_prog + (1 - mix_ratio) * mas_prog
-                frame_offsets = mix_ratio * boot_offs + (1 - mix_ratio) * mas_offs
-                # SOTA: Use bootstrap indices if mix_ratio is high for RoPE stability
-                pos_indices = boot_indices if mix_ratio > 0.5 else mas_indices
+            mas_adv, mas_prog, mas_offs, mas_indices = self._generate_pointer_targets_from_path(path)
+
+            if annealing_phase == "soft_transition":
+                mix_ratio = self._get_bootstrap_mix_ratio(current_step)
+                if mix_ratio > 0 and pos_indices_init is not None:
+                    indices = pos_indices_init
+                    pseudo_durations = torch.zeros(B, L, device=self.device)
+                    for b in range(B):
+                        counts = torch.bincount(indices[b].clamp(min=0, max=L-1), minlength=L)
+                        pseudo_durations[b] = counts[:L].float()
+                    boot_adv, boot_prog, boot_offs, boot_indices = self._generate_pointer_targets(pseudo_durations, target_length)
+                    adv_targets = mix_ratio * boot_adv + (1 - mix_ratio) * mas_adv
+                    prog_targets = mix_ratio * boot_prog + (1 - mix_ratio) * mas_prog
+                    frame_offsets = mix_ratio * boot_offs + (1 - mix_ratio) * mas_offs
+                    pos_indices = boot_indices if mix_ratio > 0.5 else mas_indices
+                else:
+                    adv_targets, prog_targets, frame_offsets, pos_indices = mas_adv, mas_prog, mas_offs, mas_indices
             else:
                 adv_targets, prog_targets, frame_offsets, pos_indices = mas_adv, mas_prog, mas_offs, mas_indices
-        else:
-            # Phase 3: Pure Latent-Only (MAS from internal attention)
-            with torch.no_grad():
-                phoneme_lens = (phonemes != 0).sum(dim=1)
-                x_text = F.normalize(self.model.text_encoder(
-                    phonemes, language_ids, phoneme_lens,
-                    text_suprasegmentals=text_suprasegmentals,
-                ).transpose(1, 2), dim=-1)
-                x_acoustic = F.normalize(out["hidden_states"], dim=-1)
-                dist = torch.cdist(x_text, x_acoustic)
-                log_probs = -0.5 * (dist ** 2)
-                path = monotonic_alignment_search(log_probs)
-                adv_targets, prog_targets, frame_offsets, pos_indices = self._generate_pointer_targets_from_path(path)
 
-        # SOTA: Generate Dynamic Cross-Attention Window Mask for training
-        # This ensures the model learns to focus only on relevant phonemes.
-        # Window: current_phoneme +/- 1.
-        with torch.no_grad():
-            B, T = pos_indices.shape
-            S = phonemes.shape[1]
-            # Create mask: [B, 1, T, S]
-            ca_mask = torch.full((B, 1, T, S), float("-inf"), device=self.device)
-            # Efficiently fill the window using scatter or loop
-            # For training simplicity, we can use a loop over B or a vectorized approach
-            for b in range(B):
-                for t_idx in range(T):
-                    p_idx = pos_indices[b, t_idx]
-                    w_start = max(0, p_idx - 1)
-                    w_end = min(S, p_idx + 2)
-                    ca_mask[b, 0, t_idx, w_start:w_end] = 0.0
+        # Effective pointer/progress/boundary loss weight (zero when timing is unreliable)
+        eff_pointer_weight = 0.0 if skip_timing_losses else pointer_loss_weight
+        eff_progress_weight = 0.0 if skip_timing_losses else self.progress_loss_weight
+        eff_boundary_weight = 0.0 if skip_timing_losses else self.boundary_confidence_loss_weight
 
-        # Worker 01/02: Second forward pass with correct position_indices AND frame_offsets for RoPE
+        # Single forward pass with MAS-derived alignment, no cross-attention mask
         out = self.model.forward_tts_pointer(
             phoneme_ids=phonemes,
             language_ids=language_ids,
@@ -1048,7 +1017,7 @@ class UCLMTrainer:
             text_suprasegmentals=text_suprasegmentals,
             position_indices=pos_indices,
             frame_offsets=frame_offsets,
-            cross_attn_mask=ca_mask,
+            cross_attn_mask=None,
         )
 
         # Generate boundary confidence targets
@@ -1086,6 +1055,9 @@ class UCLMTrainer:
             text_suprasegmentals=text_suprasegmentals,
         ).transpose(1, 2)
 
+        # Invert frame_mask for loss functions (True=ignore for pointer/progress/boundary)
+        loss_frame_mask = ~frame_mask[:, :target_length] if frame_mask is not None else None
+
         losses = uclm_loss(
             logits_a=out["logits_a"],
             logits_b=out["logits_b"],
@@ -1097,10 +1069,11 @@ class UCLMTrainer:
             advance_targets=adv_targets,
             progress_delta=out.get("progress_delta"),
             progress_targets=prog_targets,
+            frame_mask=loss_frame_mask,
             hidden_states=out.get("hidden_states"),
             context_groups=context_groups,
-            lambda_pointer=pointer_loss_weight,
-            lambda_progress=self.progress_loss_weight,
+            lambda_pointer=eff_pointer_weight,
+            lambda_progress=eff_progress_weight,
             # Flow-matching loss for ProsodyPredictor
             prosody_predictor=self.model.prosody_predictor,
             phoneme_features=phoneme_features,
@@ -1111,15 +1084,15 @@ class UCLMTrainer:
             codec_condition=self.codec_condition,
         )
 
-        # Boundary confidence loss
+        # Boundary confidence loss (with frame mask)
         if (
-            self.boundary_confidence_loss_weight > 0
+            eff_boundary_weight > 0
             and out.get("boundary_confidence") is not None
         ):
             loss_boundary = boundary_confidence_loss(
-                out["boundary_confidence"], boundary_targets
+                out["boundary_confidence"], boundary_targets, mask=loss_frame_mask
             )
-            losses["loss"] = losses["loss"] + self.boundary_confidence_loss_weight * loss_boundary
+            losses["loss"] = losses["loss"] + eff_boundary_weight * loss_boundary
             losses["loss_boundary_confidence"] = loss_boundary
 
         # CFG distillation loss (Stage 3 only)

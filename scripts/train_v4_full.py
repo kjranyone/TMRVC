@@ -34,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tmrvc-core" / "src"))
@@ -60,6 +61,8 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--grad-accum", type=int, default=8,
+                   help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     p.add_argument("--sample-pct", type=float, default=1.0, help="% of raw audio")
     p.add_argument("--max-frames", type=int, default=400)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -550,6 +553,16 @@ def main():
         codec_condition=codec_cond,
     )
 
+    # LR scheduler: linear warmup + cosine decay (after trainer adds param groups)
+    import math
+    warmup_steps = min(5000, args.steps // 10)
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, args.steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("Model: %.2fM trainable params", n_params / 1e6)
 
@@ -575,10 +588,14 @@ def main():
 
         d = {
             "target_a": raw["codec_tokens_a"],
-            "target_b": raw["codec_tokens_b"] if raw.get("codec_tokens_b") is not None else torch.zeros(B, CONTROL_SLOTS, T, dtype=torch.long),
+            "target_b": raw["codec_tokens_b"] if raw.get("codec_tokens_b") is not None else torch.full((B, CONTROL_SLOTS, T), -1, dtype=torch.long),
             "speaker_embed": raw.get("speaker_embed", torch.zeros(B, D_SPEAKER)),
             "phoneme_ids": raw.get("phoneme_ids", torch.zeros(B, 1, dtype=torch.long)),
             "phoneme_lens": raw.get("phoneme_ids_lengths", torch.ones(B, dtype=torch.long)),
+            # Keys matching trainer expectations
+            "physical_targets": raw.get("physical_targets"),
+            "physical_observed_mask": raw.get("physical_observed_mask"),
+            "physical_confidence": raw.get("physical_confidence"),
             "voice_state_targets": raw.get("physical_targets"),
             "voice_state_observed_mask": raw.get("physical_observed_mask"),
             "voice_state_confidence": raw.get("physical_confidence"),
@@ -586,10 +603,13 @@ def main():
             "enriched_phoneme_ids": raw.get("enriched_phoneme_ids"),
             "use_enriched": raw.get("use_enriched"),
             "supervision_tier": raw.get("supervision_tier"),
-            # Generate missing keys
-            "ssl_state": torch.zeros(B, T, D_VOICE_STATE_SSL),
-            "speaker_id": torch.zeros(B, dtype=torch.long),
-            "language_id": torch.zeros(B, dtype=torch.long),
+            # Generate missing keys — use real data where possible
+            "ssl_state": raw.get("ssl_state", torch.zeros(B, T, D_VOICE_STATE_SSL)),
+            "speaker_id": torch.tensor(
+                [hash(s) % 100 for s in (raw.get("speaker_id") or [""] * B)],
+                dtype=torch.long,
+            ),
+            "language_id": raw.get("language_id", torch.zeros(B, dtype=torch.long)),
             "utterance_ids": raw.get("utterance_id", [f"unk_{i}" for i in range(B)]),
         }
 
@@ -608,11 +628,19 @@ def main():
             d["explicit_state"] = raw["physical_targets"][:, :T_aligned, :]
         else:
             d["explicit_state"] = torch.zeros(B, T_aligned, D_VOICE_STATE)
-        d["ssl_state"] = torch.zeros(B, T_aligned, D_VOICE_STATE_SSL)
+        # Align ssl_state (keep real data if available)
+        if d.get("ssl_state") is not None and isinstance(d["ssl_state"], torch.Tensor) and d["ssl_state"].shape[1] >= T_aligned:
+            d["ssl_state"] = d["ssl_state"][:, :T_aligned, :]
+        else:
+            d["ssl_state"] = torch.zeros(B, T_aligned, D_VOICE_STATE_SSL)
 
-        for vs_key in ("voice_state_targets", "voice_state_observed_mask", "voice_state_confidence"):
-            if d.get(vs_key) is not None and isinstance(d[vs_key], torch.Tensor):
-                d[vs_key] = d[vs_key][:, :T_aligned, :]
+        # Interpolate voice-state tensors to match codec frame count
+        for vs_key in ("voice_state_targets", "voice_state_observed_mask", "voice_state_confidence",
+                       "physical_targets", "physical_observed_mask", "physical_confidence"):
+            if d.get(vs_key) is not None and isinstance(d[vs_key], torch.Tensor) and d[vs_key].dim() == 3:
+                vs_t = d[vs_key].permute(0, 2, 1).float()  # [B, D, T_vs]
+                vs_t = F.interpolate(vs_t, size=T_aligned, mode='nearest')
+                d[vs_key] = vs_t.permute(0, 2, 1).to(d[vs_key].dtype)
 
         d["lengths"] = torch.full((B,), T_aligned, dtype=torch.long)
 
@@ -646,19 +674,38 @@ def main():
     best_loss = float("inf")
     t0 = time.time()
 
+    accum_steps = args.grad_accum
+    micro_step = 0
+
     while step < args.steps:
         epoch += 1
         for batch in dataloader:
             if step >= args.steps:
                 break
+            is_first_micro = (micro_step % accum_steps == 0)
+            is_last_micro = (micro_step % accum_steps == accum_steps - 1)
+
+            # Zero grad only at the start of each accumulation cycle
+            if is_first_micro:
+                trainer.optimizer.zero_grad(set_to_none=True)
+
             try:
-                metrics = trainer.train_step(batch)
+                metrics = trainer.train_step(
+                    batch,
+                    accumulate=not is_last_micro,
+                    accum_steps=accum_steps,
+                )
             except RuntimeError as e:
                 if "shape" in str(e) or "size" in str(e):
                     logger.warning("Skipping bad batch at step %d: %s", step, e)
+                    micro_step += 1
                     continue
                 raise
+            micro_step += 1
+            if not is_last_micro:
+                continue  # accumulating — don't count as a step
             step += 1
+            scheduler.step()
 
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):

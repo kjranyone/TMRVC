@@ -643,8 +643,7 @@ class DisentangledUCLM(nn.Module):
         v_out = self.voice_state_enc(explicit_state, ssl_state)
         state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
 
-        if f0_condition is not None:
-            content_features = content_features + self.f0_proj(f0_condition)
+        # F0 conditioning is applied inside uclm_core only (avoid double injection)
 
         # Shift target_a and target_b to use as context A_{t-1}, B_{t-1}.
         # VC uses source_a_t as content, but still needs self-history for Stream A continuity.
@@ -699,25 +698,21 @@ class DisentangledUCLM(nn.Module):
         prosody_latent: Optional[torch.Tensor] = None,
         position_indices: Optional[torch.Tensor] = None,
         precomputed_film_params: Optional[torch.Tensor] = None,
-        state_cond: Optional[torch.Tensor] = None, # Explicitly named for older tests
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-        """Incremental forward pass for low-latency streaming (Worker 04)."""
-        
-        # SOTA: Prioritize explicit_state but fallback to state_cond if provided
+        state_cond: Optional[torch.Tensor] = None,
+        acting_texture_latent: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Incremental forward pass for low-latency streaming."""
         eff_explicit = explicit_state if explicit_state is not None else state_cond
-        
+
         if eff_explicit is None:
             eff_explicit = torch.zeros((queries.shape[0], queries.shape[1], 8), device=queries.device)
         if ssl_state is None:
             d_ssl = self.voice_state_enc.ssl_proj[0].in_features
             ssl_state = torch.zeros((queries.shape[0], queries.shape[1], d_ssl), device=queries.device)
 
-        # 1. Apply F0 conditioning to queries
-        if f0_condition is not None:
-            queries = queries + self.f0_proj(f0_condition)
+        # F0 conditioning applied inside uclm_core only
 
-        # 2. Apply dialogue/acting/prosody
+        # Apply dialogue/acting/prosody
         queries = self.context_projector(
             queries,
             dialogue_context=dialogue_context,
@@ -725,22 +720,33 @@ class DisentangledUCLM(nn.Module):
             prosody_latent=prosody_latent,
         )
 
-        # 3. Voice state conditioning
-        v_out = self.voice_state_enc(explicit_state, ssl_state)
-        state_cond = v_out[0] if isinstance(v_out, tuple) else v_out
+        # Apply acting texture latent if provided
+        if acting_texture_latent is not None:
+            act_cond = self.acting_latent_conditioner(acting_texture_latent)
+            queries = queries + act_cond.unsqueeze(1)
 
-        # 4. Core transformer with KV cache
-        return self.uclm_core(
+        # Voice state conditioning
+        v_out = self.voice_state_enc(eff_explicit, ssl_state)
+        state_cond_out = v_out[0] if isinstance(v_out, tuple) else v_out
+
+        # Core transformer with KV cache
+        logits_a, logits_b, kv_out, x = self.uclm_core(
             queries=queries,
             memory=memory,
             a_ctx=a_ctx,
             b_ctx=b_ctx,
             speaker_embed=speaker_embed,
-            state_cond=state_cond,
+            state_cond=state_cond_out,
             cfg_scale=cfg_scale,
             kv_caches=kv_caches,
             position_indices=position_indices,
         )
+        return {
+            "logits_a": logits_a,
+            "logits_b": logits_b,
+            "kv_cache_out": kv_out,
+            "hidden_states": x,
+        }
 
     @torch.no_grad()
     def bake_film_params(self, speaker_embed: torch.Tensor) -> torch.Tensor:
@@ -855,9 +861,7 @@ class DisentangledUCLM(nn.Module):
             idx = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
             content_features = phoneme_features[:, idx, :]
 
-        # 3. Apply F0 conditioning
-        if f0_condition is not None:
-            content_features = content_features + self.f0_proj(f0_condition)
+        # 3. F0 conditioning is applied inside uclm_core only (avoid double injection)
 
         # 3b. Apply dialogue/acting/prosody conditioning
         # v4 topology: acting_texture_latent (24-D) supersedes acting_intent (64-D).
