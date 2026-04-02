@@ -132,8 +132,8 @@ class UCLMTrainer:
         prosody_loss_weight: float = 1.0,
         curriculum: CurriculumScheduler | None = None,
         prompt_sampling_prob: float = 0.0,
-        pointer_aux_alignment_warmup_steps: int = 2000,
-        pointer_aux_alignment_anneal_steps: int = 5000,
+        pointer_aux_alignment_warmup_steps: int = 0,  # No hard phase without real bootstrap
+        pointer_aux_alignment_anneal_steps: int = 2000,
         pointer_hardening_start_step: int = 10000,
         pointer_hardening_ramp_steps: int = 5000,
         cfg_distillation_weight: float = 0.0,
@@ -705,35 +705,37 @@ class UCLMTrainer:
                 losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_physical * phys_loss_scalar
                 losses["loss_physical_12d"] = phys_loss_scalar
 
-        # --- v4 Phase 3: Tier-aware sample weighting (Task 3-1) ---
-        # Currently: codec_loss excluded, other supervision-dependent terms scaled
-        # by single sample_weight. TODO: implement per-loss tier weights using
-        # v4_loss.py TierWeightConfig for finer control (physical=0.5, prosody=0.8, etc).
-        # Apply tier weighting to supervision-dependent terms only.  Supervision-
-        # independent terms (biological constraints, acting latent KL,
-        # disentanglement, semantic alignment) are added AFTER this block and
-        # remain at full weight regardless of tier.
+        # --- v4 Phase 3: Per-loss tier weighting (Task 3-1) ---
+        # Uses get_tier_loss_weights() to scale each loss component independently.
+        # Biological constraints and acting regularization are added AFTER this block.
         if self.enable_v4_losses:
+            from tmrvc_data.v4_dataset import get_tier_loss_weights
             supervision_tier = batch.get("supervision_tier")
             if supervision_tier is not None:
-                # supervision_tier can be a string or list of strings
-                if isinstance(supervision_tier, str):
-                    tier_key = _TIER_KEY_MAP.get(supervision_tier, "D")
-                    sample_weight = TIER_WEIGHTS[tier_key]
-                elif isinstance(supervision_tier, (list, tuple)):
-                    # Per-sample tier: average the weights across batch
-                    sample_weight = sum(
-                        TIER_WEIGHTS.get(_TIER_KEY_MAP.get(t, "D"), 0.1)
-                        for t in supervision_tier
-                    ) / len(supervision_tier)
+                # Get per-loss weights for this tier
+                if isinstance(supervision_tier, (list, tuple)):
+                    # Mixed batch: average tier weights
+                    tier_list = [get_tier_loss_weights(t) for t in supervision_tier]
+                    tw = {k: sum(d.get(k, 1.0) for d in tier_list) / len(tier_list)
+                          for k in tier_list[0]}
                 else:
-                    sample_weight = 1.0
-                # Tier weight applies to supervision-dependent terms only.
-                # Codec loss (loss_a) is supervision-independent — always valid.
-                codec_loss = losses.get("loss_a", torch.tensor(0.0))
-                supervision_loss = losses["loss"] - codec_loss
-                losses["loss"] = codec_loss + supervision_loss * sample_weight
-                losses["tier_sample_weight"] = torch.tensor(sample_weight)
+                    tw = get_tier_loss_weights(supervision_tier)
+
+                # Rebuild loss with per-loss tier weights
+                total = torch.tensor(0.0, device=losses["loss"].device)
+                loss_key_map = {
+                    "loss_a": "codec_loss", "loss_b": "control_loss",
+                    "loss_pointer": "pointer_loss", "loss_progress": "pointer_loss",
+                    "loss_physical_12d": "physical_loss",
+                    "loss_adv": "speaker_loss",
+                }
+                for k, v in losses.items():
+                    if k == "loss" or not isinstance(v, torch.Tensor):
+                        continue
+                    tier_key = loss_key_map.get(k)
+                    w = tw.get(tier_key, 1.0) if tier_key else 1.0
+                    total = total + v * w
+                losses["loss"] = total
 
         # --- v4 Phase 3: Biological constraint regularization (Task 3-2) ---
         # Supervision-independent: NOT tier-weighted.
