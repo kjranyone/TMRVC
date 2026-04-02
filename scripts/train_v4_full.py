@@ -64,341 +64,20 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--grad-accum", type=int, default=8,
                    help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
-    p.add_argument("--sample-pct", type=float, default=1.0, help="% of raw audio")
     p.add_argument("--max-frames", type=int, default=400)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--output-dir", default=str(ROOT / "checkpoints" / "v4_full"))
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save-every", type=int, default=500)
-    p.add_argument("--skip-cache", action="store_true")
     p.add_argument("--resume-from", type=int, default=None,
                    help="Resume from checkpoint step (e.g. 9500)")
-    p.add_argument("--annotation-model", default="Qwen/Qwen3.5-35B-A3B",
-                   help="LLM for semantic annotation + enriched transcripts")
     p.add_argument("--codec-condition", default="A", choices=["A", "B", "C", "D"],
                    help="Codec experiment condition (track_codec_strategy.md)")
     return p.parse_args()
 
 
-# =========================================================================
-# Phase 1: Real bootstrap cache generation
-# =========================================================================
-
-class FullBootstrapCacheBuilder:
-    """Builds training cache using ALL real models."""
-
-    ANNOTATION_PROMPT = (
-        "You are a speech acting annotator. Analyze this transcript and respond with JSON:\n"
-        '{"scene_summary":"...","dialogue_intent":"...","emotion_description":"...","acting_hint":"...",'
-        '"enriched_transcript":"...(original text with inline acting tags like [angry], [whisper], '
-        '[emphasis], [pause], [laugh], [sigh] inserted at appropriate positions)..."}\n\n'
-        "Language: {lang}\nTranscript: {text}\n\nJSON:"
-    )
-
-    def __init__(self, device: str, annotation_model: str, max_frames: int):
-        self.device = device
-        self.annotation_model_name = annotation_model
-        self.max_frames = max_frames
-
-        # Real models — lazy loaded
-        self._whisper = None
-        self._spk_encoder = None
-        self._vs_estimator = None
-        self._mimi_codec = None
-        self._annotation_model = None
-        self._annotation_tokenizer = None
-
-    def _load_whisper(self):
-        if self._whisper is not None:
-            return
-        from faster_whisper import WhisperModel
-        compute = "float16" if self.device == "cuda" else "int8"
-        self._whisper = WhisperModel("large-v3", device=self.device, compute_type=compute)
-        logger.info("Loaded Whisper large-v3 on %s", self.device)
-
-    def _load_spk_encoder(self):
-        if self._spk_encoder is not None:
-            return
-        from tmrvc_data.speaker import SpeakerEncoder
-        self._spk_encoder = SpeakerEncoder(device=self.device)
-        logger.info("Loaded ECAPA-TDNN speaker encoder")
-
-    def _load_vs_estimator(self):
-        if self._vs_estimator is not None:
-            return
-        from tmrvc_data.voice_state import VoiceStateEstimator
-        self._vs_estimator = VoiceStateEstimator(device=self.device)
-        logger.info("Loaded VoiceStateEstimator")
-
-    def _load_codec(self):
-        if self._mimi_codec is not None:
-            return
-        # Use EnCodec for condition A baseline (track_codec_strategy.md)
-        from tmrvc_data.encodec_codec import EnCodecWrapper
-        self._mimi_codec = EnCodecWrapper(device=self.device)
-        logger.info("Loaded EnCodec 24kHz on %s", self.device)
-
-    def _load_annotation_llm(self):
-        if self._annotation_model is not None:
-            return
-        logger.info("Loading annotation LLM %s (4-bit quantized)...", self.annotation_model_name)
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-        self._annotation_tokenizer = AutoTokenizer.from_pretrained(
-            self.annotation_model_name, trust_remote_code=True,
-        )
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-        self._annotation_model = AutoModelForCausalLM.from_pretrained(
-            self.annotation_model_name, trust_remote_code=True,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-        self._annotation_model.eval()
-        logger.info("Loaded %s (4-bit, ~%.1f GB VRAM)",
-                     self.annotation_model_name,
-                     sum(p.nelement() * p.element_size() for p in self._annotation_model.parameters()) / 1e9)
-
-    def build(self, wav_paths: list[Path], cache_dir: Path) -> int:
-        from tmrvc_data.preprocessing import load_and_resample
-        from tmrvc_core.audio import compute_mel
-
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        # Phase 1: Load audio processing models (ASR, speaker, voice state, codec)
-        # LLM is loaded separately in Phase 2 to avoid VRAM exhaustion
-        self._load_whisper()
-        self._load_spk_encoder()
-        self._load_vs_estimator()
-        self._load_codec()
-
-        n_ok = 0
-        for i, wav_path in enumerate(wav_paths):
-            utt_id = f"v4full_{i:06d}"
-            speaker_id = f"spk_{wav_path.parent.name.replace(' ', '_')[:20]}"
-            utt_dir = cache_dir / "v4full" / "train" / speaker_id / utt_id
-
-            if (utt_dir / "meta.json").exists():
-                n_ok += 1
-                continue
-
-            try:
-                # --- Load audio ---
-                waveform, _ = load_and_resample(str(wav_path), target_sr=SAMPLE_RATE)
-                if waveform is None:
-                    continue
-                waveform_np = waveform.squeeze().cpu().numpy() if isinstance(waveform, torch.Tensor) else np.asarray(waveform).squeeze()
-                n_samples = len(waveform_np)
-
-                # EnCodec: 75 Hz (hop=320), voice state: 75 Hz (same rate)
-                CODEC_HOP = 320   # EnCodec 75 Hz
-                n_frames = n_samples // CODEC_HOP
-                n_codec_frames = n_frames
-                n_control_frames = n_frames
-                if n_frames < 20:
-                    continue
-                # No max_frames filter — include all utterances regardless of length
-
-                # --- Real ASR ---
-                import tempfile, soundfile as sf
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-                    sf.write(tmp.name, waveform_np, SAMPLE_RATE)
-                    segments, info = self._whisper.transcribe(tmp.name, beam_size=5, vad_filter=True)
-                    transcript = "".join(seg.text for seg in segments).strip()
-                    lang = info.language if hasattr(info, 'language') else "ja"
-                    asr_conf = info.language_probability if hasattr(info, 'language_probability') else 0.5
-
-                if not transcript:
-                    continue  # Skip empty transcripts
-
-                # --- Real G2P ---
-                from tmrvc_data.g2p import text_to_phonemes as g2p_func
-                g2p_result = g2p_func(transcript, language=lang)
-                phoneme_ids = g2p_result.phoneme_ids
-                if isinstance(phoneme_ids, torch.Tensor):
-                    phoneme_ids = phoneme_ids.detach().cpu().numpy()
-                phoneme_ids = np.asarray(phoneme_ids, dtype=np.int64)
-                if len(phoneme_ids) < 3:
-                    continue
-
-                # --- Real voice state (12-D DSP) ---
-                waveform_t = torch.from_numpy(waveform_np).float().unsqueeze(0)
-                mel = compute_mel(waveform_t).to(self.device)
-                f0 = torch.zeros(1, 1, mel.shape[-1], device=torch.device(self.device))
-                vs_raw = self._vs_estimator.estimate(mel, f0)
-                if isinstance(vs_raw, torch.Tensor):
-                    vs = vs_raw.detach().squeeze(0).cpu().numpy()
-                else:
-                    vs = np.zeros((n_frames, D_VOICE_STATE), dtype=np.float32)
-                vs = np.clip(vs[:n_frames], 0, 1).astype(np.float32)
-                if vs.shape[0] < n_frames:
-                    vs = np.pad(vs, ((0, n_frames - vs.shape[0]), (0, 0)), mode='edge')
-
-                # --- Real speaker embedding ---
-                spk = self._spk_encoder.extract(waveform_t, sample_rate=SAMPLE_RATE)
-                spk = spk.detach().cpu().numpy().flatten().astype(np.float32) if isinstance(spk, torch.Tensor) else np.zeros(D_SPEAKER, np.float32)
-
-                # --- LLM annotation deferred to pass 2 (VRAM constraint) ---
-                annotations = {"scene_summary": "", "dialogue_intent": "", "emotion_description": "", "acting_hint": ""}
-                enriched = transcript
-
-                # --- Real Mimi codec tokens (12.5 Hz) ---
-                waveform_t_codec = torch.from_numpy(waveform_np).float().unsqueeze(0).unsqueeze(0)  # [1, 1, T]
-                codec_tokens = self._mimi_codec.encode(waveform_t_codec)  # [1, 8, T_codec]
-                codec_tokens = codec_tokens.squeeze(0).numpy().astype(np.int64)  # [8, T_codec]
-
-                # --- Supervision tier ---
-                has_semantic = bool(annotations.get("emotion_description") or annotations.get("acting_hint"))
-                tier = "tier_a" if (asr_conf > 0.8 and has_semantic) else "tier_b"
-
-                # --- Observed mask & confidence ---
-                observed_mask = np.ones((n_frames, D_VOICE_STATE), dtype=bool)
-                observed_mask[:, 8:] = False  # new dims not yet reliable
-                confidence = np.ones((n_frames, D_VOICE_STATE), dtype=np.float32) * 0.8
-                confidence[:, 8:] = 0.1
-
-                # --- Write cache ---
-                utt_dir.mkdir(parents=True, exist_ok=True)
-                np.save(utt_dir / "codec_tokens.npy", codec_tokens)
-                np.save(utt_dir / "voice_state.npy", vs)
-                np.save(utt_dir / "spk_embed.npy", spk)
-                np.save(utt_dir / "phoneme_ids.npy", phoneme_ids)
-                np.save(utt_dir / "text_suprasegmentals.npy",
-                        np.zeros((len(phoneme_ids), 4), dtype=np.float32))
-                np.save(utt_dir / "voice_state_targets.npy", vs)
-                np.save(utt_dir / "voice_state_observed_mask.npy", observed_mask)
-                np.save(utt_dir / "voice_state_confidence.npy", confidence)
-
-                meta = {
-                    "utterance_id": utt_id,
-                    "speaker_id": speaker_id,
-                    "n_frames": int(n_frames),
-                    "n_codec_frames": int(n_codec_frames),
-                    "n_control_frames": int(n_control_frames),
-                    "text": transcript,
-                    "enriched_transcript": enriched,
-                    "language_id": {"ja": 0, "en": 1, "zh": 2, "ko": 3}.get(lang, 0),
-                    "language": lang,
-                    "duration_sec": n_samples / SAMPLE_RATE,
-                    "quality_score": 0.85,
-                    "supervision_tier": tier,
-                    "asr_confidence": float(asr_conf),
-                    "acting_annotations": annotations,
-                }
-                with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
-                    json.dump(meta, f, ensure_ascii=False, indent=2)
-
-                n_ok += 1
-                if (i + 1) % 10 == 0:
-                    logger.info(
-                        "Cache %d/%d | tier=%s | lang=%s | text=%.40s... | enriched=%.40s...",
-                        i + 1, len(wav_paths), tier, lang,
-                        transcript, enriched,
-                    )
-
-            except Exception as e:
-                logger.warning("Skip %s: %s", wav_path.name, e)
-
-        logger.info("Pass 1 complete: %d / %d utterances (audio features)", n_ok, len(wav_paths))
-
-        # --- Pass 2: LLM annotation (free audio models first) ---
-        if n_ok > 0:
-            logger.info("Pass 2: Unloading audio models, loading LLM for annotation...")
-            self._whisper = None
-            self._spk_encoder = None
-            self._vs_estimator = None
-            if self._mimi_codec is not None:
-                self._mimi_codec.unload()
-                self._mimi_codec = None
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            try:
-                self._load_annotation_llm()
-                annotated = 0
-                for meta_path in sorted(cache_dir.rglob("meta.json")):
-                    try:
-                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                        transcript = meta.get("text", "")
-                        if not transcript:
-                            continue
-                        lang = meta.get("language", "ja")
-                        prompt = self.ANNOTATION_PROMPT.format(lang=lang, text=transcript)
-                        annotations, enriched = self._run_annotation(prompt, transcript)
-                        meta["acting_annotations"] = annotations
-                        meta["enriched_transcript"] = enriched
-                        has_semantic = bool(annotations.get("emotion_description") or annotations.get("acting_hint"))
-                        asr_conf = meta.get("asr_confidence", 0.5)
-                        meta["supervision_tier"] = "tier_a" if (asr_conf > 0.8 and has_semantic) else "tier_b"
-                        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-                        annotated += 1
-                        if annotated % 50 == 0:
-                            logger.info("Annotated %d utterances", annotated)
-                    except Exception as e:
-                        logger.debug("Annotation skip: %s", e)
-                logger.info("Pass 2 complete: %d utterances annotated", annotated)
-            except Exception as e:
-                logger.warning("LLM annotation failed (proceeding without): %s", e)
-
-        logger.info("Cache complete: %d / %d utterances", n_ok, len(wav_paths))
-        return n_ok
-
-    def _run_annotation(self, prompt: str, fallback_text: str) -> tuple[dict, str]:
-        """Run LLM annotation, return (annotations_dict, enriched_transcript)."""
-        try:
-            inputs = self._annotation_tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=1024,
-            ).to(self._annotation_model.device)
-
-            with torch.inference_mode():
-                out = self._annotation_model.generate(
-                    **inputs, max_new_tokens=512,
-                    temperature=0.3, do_sample=True, top_p=0.9,
-                )
-            generated = out[0][inputs["input_ids"].shape[-1]:]
-            text = self._annotation_tokenizer.decode(generated, skip_special_tokens=True).strip()
-
-            # Parse JSON
-            # Try to find JSON in the output
-            json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = {}
-
-            annotations = {
-                "scene_summary": data.get("scene_summary", ""),
-                "dialogue_intent": data.get("dialogue_intent", ""),
-                "emotion_description": data.get("emotion_description", ""),
-                "acting_hint": data.get("acting_hint", ""),
-            }
-            enriched = data.get("enriched_transcript", fallback_text)
-
-            return annotations, enriched
-
-        except Exception as e:
-            logger.debug("Annotation failed: %s", e)
-            return {
-                "scene_summary": "", "dialogue_intent": "",
-                "emotion_description": "", "acting_hint": "",
-            }, fallback_text
-
-    def cleanup(self):
-        del self._whisper, self._spk_encoder, self._vs_estimator
-        del self._annotation_model, self._annotation_tokenizer
-        self._whisper = self._spk_encoder = self._vs_estimator = None
-        self._annotation_model = self._annotation_tokenizer = None
-        if self._mimi_codec is not None:
-            self._mimi_codec.unload()
-        self._mimi_codec = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logger.info("All bootstrap models unloaded, GPU freed for training")
-
+# Phase 1 (cache generation) is handled by manage_data.py.
+# See TRAIN_GUIDE.md for the canonical workflow.
 
 # =========================================================================
 # Phase 2: Training
@@ -417,34 +96,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Phase 1: Real cache ----
-    if not args.skip_cache:
-        logger.info("=" * 60)
-        logger.info("Phase 1: Bootstrap cache with ALL real models (%.1f%%)", args.sample_pct)
-        logger.info("  ASR: faster-whisper large-v3")
-        logger.info("  Speaker: ECAPA-TDNN")
-        logger.info("  Voice State: DSP 12-D")
-        logger.info("  LLM: %s → semantic + enriched transcripts", args.annotation_model)
-        logger.info("  Codec: Mimi (kyutai/mimi) frozen, 12.5 Hz, 8x2048")
-        logger.info("=" * 60)
-
-        all_wavs = sorted((ROOT / "data" / "raw").rglob("*.wav")) if (ROOT / "data" / "raw").exists() else []
-        n_sample = max(1, int(len(all_wavs) * args.sample_pct / 100))
-        random.seed(42)
-        wavs = random.sample(all_wavs, min(n_sample, len(all_wavs)))
-        logger.info("Sampled %d / %d audio files", len(wavs), len(all_wavs))
-
-        builder = FullBootstrapCacheBuilder(
-            device=args.device,
-            annotation_model=args.annotation_model,
-            max_frames=args.max_frames,
-        )
-        n = builder.build(wavs, cache_dir)
-        builder.cleanup()
-
-        if n == 0:
-            logger.error("No cache generated. Exiting.")
-            sys.exit(1)
+    # Cache is built by manage_data.py (canonical pipeline).
+    # Phase 1 builder has been removed. Use: manage_data.py add + build
 
     # ---- Phase 2: Model + Trainer ----
     logger.info("=" * 60)
@@ -661,9 +314,15 @@ def main():
         d["lengths"] = torch.tensor([T] * B, dtype=torch.long)
 
         # Convert bootstrap_alignment tensor [B, T] to dict expected by trainer
+        # Only use it if ALL samples in batch have real alignment (not zero-filled)
         ba = d.get("bootstrap_alignment")
         if ba is not None and isinstance(ba, torch.Tensor):
-            d["bootstrap_alignment"] = {"phoneme_indices": ba[:, :T_aligned]}
+            # Check per-sample: zero tensor means this sample had no alignment
+            has_real = (ba.abs().sum(dim=-1) > 0)  # [B]
+            if has_real.all():
+                d["bootstrap_alignment"] = {"phoneme_indices": ba[:, :T_aligned]}
+            else:
+                d["bootstrap_alignment"] = None  # Mixed batch: fall back to heuristic
         else:
             d["bootstrap_alignment"] = None
 

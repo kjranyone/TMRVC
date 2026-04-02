@@ -699,8 +699,10 @@ class UCLMTrainer:
                 losses["loss_physical_12d"] = phys_loss_scalar
 
         # --- v4 Phase 3: Tier-aware sample weighting (Task 3-1) ---
-        # Apply tier weighting ONLY to supervision-dependent terms (codec loss,
-        # physical loss, pointer loss) accumulated above.  Supervision-
+        # Currently: codec_loss excluded, other supervision-dependent terms scaled
+        # by single sample_weight. TODO: implement per-loss tier weights using
+        # v4_loss.py TierWeightConfig for finer control (physical=0.5, prosody=0.8, etc).
+        # Apply tier weighting to supervision-dependent terms only.  Supervision-
         # independent terms (biological constraints, acting latent KL,
         # disentanglement, semantic alignment) are added AFTER this block and
         # remain at full weight regardless of tier.
