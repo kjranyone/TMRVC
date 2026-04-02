@@ -279,7 +279,7 @@ class FullBootstrapCacheBuilder:
                     "n_control_frames": int(n_control_frames),
                     "text": transcript,
                     "enriched_transcript": enriched,
-                    "language_id": 0,
+                    "language_id": {"ja": 0, "en": 1, "zh": 2, "ko": 3}.get(lang, 0),
                     "language": lang,
                     "duration_sec": n_samples / SAMPLE_RATE,
                     "quality_score": 0.85,
@@ -490,7 +490,7 @@ def main():
         d_voice_state_explicit=D_VOICE_STATE, d_voice_state_ssl=D_VOICE_STATE_SSL,
         d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
         rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
-        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=100,
+        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=200,
         acting_tag_vocab_size=N_ACTING_TAGS,
         codec_condition=codec_cond,
     )
@@ -611,14 +611,20 @@ def main():
             "enriched_phoneme_ids": raw.get("enriched_phoneme_ids"),
             "use_enriched": raw.get("use_enriched"),
             "supervision_tier": raw.get("supervision_tier"),
-            # Generate missing keys — use real data where possible
+            # NOTE: ssl_state and bootstrap_alignment are not yet in cache.
+            # Acting-latent losses (KL, usage, disentanglement, semantic alignment)
+            # are effectively disabled until ssl_state is added to the cache pipeline.
             "ssl_state": raw.get("ssl_state", torch.zeros(B, T, D_VOICE_STATE_SSL)),
             "speaker_id": torch.tensor(
-                [int(hashlib.md5(s.encode()).hexdigest(), 16) % 100 if isinstance(s, str) else 0
+                [int(hashlib.md5(s.encode()).hexdigest(), 16) % 200 if isinstance(s, str) else 0
                  for s in (raw.get("speaker_id") or [""] * B)],
                 dtype=torch.long,
             ),
-            "language_id": raw.get("language_id", torch.zeros(B, dtype=torch.long)),
+            "language_id": torch.tensor(
+                [{"ja": 0, "en": 1, "zh": 2, "ko": 3}.get(l, 0) if isinstance(l, str) else (l if isinstance(l, int) else 0)
+                 for l in (raw.get("language") or [0] * B)],
+                dtype=torch.long,
+            ),
             "utterance_ids": raw.get("utterance_id", [f"unk_{i}" for i in range(B)]),
         }
 
