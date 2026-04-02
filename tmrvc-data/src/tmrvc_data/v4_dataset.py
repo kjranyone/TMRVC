@@ -256,10 +256,26 @@ class V4UCLMDataset(Dataset):
                 np.load(conf_path).astype(np.float32)
             )
 
+        # SSL state [T, 128] — WavLM features for acting-latent losses
+        ssl_path = utt_dir / "ssl_state.npy"
+        if ssl_path.exists():
+            result["ssl_state"] = torch.from_numpy(
+                np.load(ssl_path).astype(np.float32)
+            )
+
         # Ensure optional fields have defaults
+        # Bootstrap alignment [T] — phoneme index per frame
+        align_path = utt_dir / "bootstrap_alignment.npy"
+        if align_path.exists():
+            result["bootstrap_alignment"] = torch.from_numpy(
+                np.load(align_path).astype(np.int64)
+            )
+
         result.setdefault("physical_observed_mask", None)
         result.setdefault("physical_confidence", None)
         result.setdefault("codec_tokens_b", None)
+        result.setdefault("ssl_state", None)
+        result.setdefault("bootstrap_alignment", None)
 
         # v4: Acting texture latent target [24] or [T, 24] (optional)
         act_latent_path = utt_dir / "acting_texture_latent_target.npy"

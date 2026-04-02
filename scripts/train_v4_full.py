@@ -611,10 +611,8 @@ def main():
             "enriched_phoneme_ids": raw.get("enriched_phoneme_ids"),
             "use_enriched": raw.get("use_enriched"),
             "supervision_tier": raw.get("supervision_tier"),
-            # NOTE: ssl_state and bootstrap_alignment are not yet in cache.
-            # Acting-latent losses (KL, usage, disentanglement, semantic alignment)
-            # are effectively disabled until ssl_state is added to the cache pipeline.
             "ssl_state": raw.get("ssl_state", torch.zeros(B, T, D_VOICE_STATE_SSL)),
+            "bootstrap_alignment": raw.get("bootstrap_alignment"),
             "speaker_id": torch.tensor(
                 [int(hashlib.md5(s.encode()).hexdigest(), 16) % 200 if isinstance(s, str) else 0
                  for s in (raw.get("speaker_id") or [""] * B)],
@@ -661,6 +659,13 @@ def main():
 
         # Frame lengths from codec tokens
         d["lengths"] = torch.tensor([T] * B, dtype=torch.long)
+
+        # Convert bootstrap_alignment tensor [B, T] to dict expected by trainer
+        ba = d.get("bootstrap_alignment")
+        if ba is not None and isinstance(ba, torch.Tensor):
+            d["bootstrap_alignment"] = {"phoneme_indices": ba[:, :T_aligned]}
+        else:
+            d["bootstrap_alignment"] = None
 
         # VC source (clone of target_a)
         d["source_a_t"] = d["target_a"].clone()

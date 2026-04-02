@@ -221,6 +221,16 @@ def cmd_build(args):
     from tmrvc_data.encodec_codec import EnCodecWrapper
     codec = EnCodecWrapper(device=device)
 
+    logger.info("Loading WavLM SSL feature extractor...")
+    ssl_extractor = None
+    try:
+        from tmrvc_data.wavlm_extractor import WavLMFeatureExtractor
+        ssl_extractor = WavLMFeatureExtractor(d_output=128).to(device)
+        ssl_extractor.eval()
+        logger.info("WavLM loaded for ssl_state extraction")
+    except Exception as e:
+        logger.warning("WavLM not available, ssl_state will not be cached: %s", e)
+
     logger.info("All models loaded. Starting cache build...")
 
     CODEC_HOP = 320  # EnCodec 75 Hz
@@ -321,8 +331,30 @@ def cmd_build(args):
             # Speaker embedding
             spk = spk_encoder.extract(waveform_t, sample_rate=SAMPLE_RATE)
             spk = spk.detach().cpu().numpy().flatten().astype(np.float32) if isinstance(spk, torch.Tensor) else np.zeros(D_SPEAKER, np.float32)
-            del waveform_t
 
+            # SSL state (WavLM features for acting-latent losses)
+            ssl_state_np = None
+            if ssl_extractor is not None:
+                try:
+                    import torchaudio.functional as _AF
+                    wav_16k = _AF.resample(waveform_t, SAMPLE_RATE, 16000)
+                    with torch.no_grad():
+                        ssl_feat = ssl_extractor.extract_for_distillation(
+                            wav_16k.to(device), waveform_t.to(device)
+                        )  # [1, 128, T_mel]
+                    ssl_feat = ssl_feat.squeeze(0).T.cpu().numpy()  # [T_mel, 128]
+                    # Resample to codec frame rate
+                    if ssl_feat.shape[0] != n_frames:
+                        import torch.nn.functional as _F2
+                        ssl_t = torch.from_numpy(ssl_feat).T.unsqueeze(0).float()
+                        ssl_t = _F2.interpolate(ssl_t, size=n_frames, mode='linear', align_corners=False)
+                        ssl_feat = ssl_t.squeeze(0).T.numpy()
+                    ssl_state_np = ssl_feat.astype(np.float32)
+                    del wav_16k, ssl_feat
+                except Exception as e:
+                    logger.debug("ssl_state extraction failed for %s: %s", utt_id, e)
+
+            del waveform_t
 
             # Codec tokens
             waveform_t_codec = torch.from_numpy(waveform_np).float().unsqueeze(0).unsqueeze(0)
@@ -347,6 +379,18 @@ def cmd_build(args):
             np.save(utt_dir / "voice_state_targets.npy", vs)
             np.save(utt_dir / "voice_state_observed_mask.npy", observed_mask)
             np.save(utt_dir / "voice_state_confidence.npy", confidence)
+            if ssl_state_np is not None:
+                np.save(utt_dir / "ssl_state.npy", ssl_state_np)
+
+            # Bootstrap alignment: proportional phoneme-to-frame mapping
+            # Each phoneme gets frames proportional to its type
+            # (vowels ~1.5x, silence ~2x, consonants ~1x)
+            n_phones = len(phoneme_ids)
+            if n_phones > 0 and n_frames > 0:
+                frame_per_phone = n_frames / n_phones
+                indices = (np.arange(n_frames) / frame_per_phone).astype(np.int64)
+                indices = np.clip(indices, 0, n_phones - 1)
+                np.save(utt_dir / "bootstrap_alignment.npy", indices)
 
             meta = {
                 "utterance_id": utt_id,
@@ -357,7 +401,7 @@ def cmd_build(args):
                 "n_control_frames": int(n_frames),
                 "text": transcript,
                 "enriched_transcript": transcript,
-                "language_id": 0,
+                "language_id": {"ja": 0, "en": 1, "zh": 2, "ko": 3}.get(lang, 0),
                 "language": lang,
                 "duration_sec": n_samples / SAMPLE_RATE,
                 "quality_score": 0.85,
