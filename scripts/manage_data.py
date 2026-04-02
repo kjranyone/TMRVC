@@ -388,9 +388,8 @@ def cmd_build(args):
             if ssl_state_np is not None:
                 np.save(utt_dir / "ssl_state.npy", ssl_state_np)
 
-            # Bootstrap alignment: proportional phoneme-to-frame mapping
-            # Each phoneme gets frames proportional to its type
-            # (vowels ~1.5x, silence ~2x, consonants ~1x)
+            # Bootstrap alignment: uniform proportional mapping (heuristic, not MAS)
+            # Saved for convenience but flagged as heuristic in meta.json
             n_phones = len(phoneme_ids)
             if n_phones > 0 and n_frames > 0:
                 frame_per_phone = n_frames / n_phones
@@ -402,6 +401,7 @@ def cmd_build(args):
                 "utterance_id": utt_id,
                 "speaker_id": speaker,
                 "corpus": entry["corpus"],
+                "bootstrap_is_heuristic": True,  # uniform, not MAS-derived
                 "n_frames": int(n_frames),
                 "n_codec_frames": int(n_frames),
                 "n_control_frames": int(n_frames),

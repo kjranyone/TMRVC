@@ -143,7 +143,7 @@ def main():
         d_voice_state_explicit=D_VOICE_STATE, d_voice_state_ssl=D_VOICE_STATE_SSL,
         d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
         rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
-        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=200,
+        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=256,
         acting_tag_vocab_size=N_ACTING_TAGS,
         codec_condition=codec_cond,
     )
@@ -267,7 +267,7 @@ def main():
             "ssl_state": raw.get("ssl_state", torch.zeros(B, T, D_VOICE_STATE_SSL)),
             "bootstrap_alignment": raw.get("bootstrap_alignment"),
             "speaker_id": torch.tensor(
-                [int(hashlib.md5(s.encode()).hexdigest(), 16) % 200 if isinstance(s, str) else 0
+                [int(hashlib.md5(s.encode()).hexdigest(), 16) % 256 if isinstance(s, str) else 0
                  for s in (raw.get("speaker_id") or [""] * B)],
                 dtype=torch.long,
             ),
@@ -314,15 +314,24 @@ def main():
         d["lengths"] = torch.tensor([T] * B, dtype=torch.long)
 
         # Convert bootstrap_alignment tensor [B, T] to dict expected by trainer
-        # Only use it if ALL samples in batch have real alignment (not zero-filled)
         ba = d.get("bootstrap_alignment")
-        if ba is not None and isinstance(ba, torch.Tensor):
-            # Check per-sample: zero tensor means this sample had no alignment
-            has_real = (ba.abs().sum(dim=-1) > 0)  # [B]
-            if has_real.all():
-                d["bootstrap_alignment"] = {"phoneme_indices": ba[:, :T_aligned]}
+        ba_is_heuristic = raw.get("bootstrap_is_heuristic")
+        # Mark as heuristic if any sample in batch has heuristic alignment
+        is_heuristic = True
+        if ba_is_heuristic is not None:
+            if isinstance(ba_is_heuristic, (list, tuple)):
+                is_heuristic = any(ba_is_heuristic)
             else:
-                d["bootstrap_alignment"] = None  # Mixed batch: fall back to heuristic
+                is_heuristic = bool(ba_is_heuristic)
+        if ba is not None and isinstance(ba, torch.Tensor):
+            has_real = (ba.abs().sum(dim=-1) > 0)
+            if has_real.all():
+                d["bootstrap_alignment"] = {
+                    "phoneme_indices": ba[:, :T_aligned],
+                    "_heuristic": is_heuristic,
+                }
+            else:
+                d["bootstrap_alignment"] = None
         else:
             d["bootstrap_alignment"] = None
 

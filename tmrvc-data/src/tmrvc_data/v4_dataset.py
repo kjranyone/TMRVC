@@ -263,8 +263,9 @@ class V4UCLMDataset(Dataset):
                 np.load(ssl_path).astype(np.float32)
             )
 
-        # Ensure optional fields have defaults
         # Bootstrap alignment [T] — phoneme index per frame
+        # meta.bootstrap_is_heuristic distinguishes uniform from MAS-derived
+        result["bootstrap_is_heuristic"] = meta.get("bootstrap_is_heuristic", True)
         align_path = utt_dir / "bootstrap_alignment.npy"
         if align_path.exists():
             result["bootstrap_alignment"] = torch.from_numpy(

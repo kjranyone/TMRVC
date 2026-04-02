@@ -621,7 +621,11 @@ class UCLMTrainer:
             teacher_acting_latent = None
             cached_act_mu = None
             cached_act_logvar = None
+            # Per-sample validity: only samples with non-zero ssl_state are real
             ssl_is_real = ssl_state is not None and ssl_state.abs().sum() > 0
+            ssl_sample_mask = None  # [B] bool, True = real SSL
+            if ssl_state is not None and ssl_state.dim() == 3:
+                ssl_sample_mask = ssl_state.abs().sum(dim=(1, 2)) > 0  # [B]
             if self.enable_v4_losses and self.acting_latent_encoder is not None and ssl_is_real:
                 ssl_for_acting = ssl_state
                 d_input = self.acting_latent_encoder.encoder[0].in_features
@@ -763,6 +767,7 @@ class UCLMTrainer:
                 cached_act_mu=cached_act_mu,
                 cached_act_logvar=cached_act_logvar,
                 cached_act_latent=teacher_acting_latent,
+                ssl_sample_mask=ssl_sample_mask,
             )
 
         # Remove internal-only keys before backward
@@ -792,6 +797,7 @@ class UCLMTrainer:
         cached_act_mu: torch.Tensor | None = None,
         cached_act_logvar: torch.Tensor | None = None,
         cached_act_latent: torch.Tensor | None = None,
+        ssl_sample_mask: torch.Tensor | None = None,
     ) -> dict:
         """Compute all 9 v4 loss terms (Task 3-3).
 
@@ -827,13 +833,17 @@ class UCLMTrainer:
             else:
                 latent, mu, logvar = self.acting_latent_encoder(ssl_for_acting)
 
-            # KL regularization
-            kl_loss = acting_latent_kl_loss(mu, logvar)
+            # KL regularization (only on samples with real SSL)
+            if ssl_sample_mask is not None and not ssl_sample_mask.all():
+                # Mask out zero-SSL samples
+                valid = ssl_sample_mask
+                kl_loss = acting_latent_kl_loss(mu[valid], logvar[valid]) if valid.any() else torch.tensor(0.0, device=mu.device)
+                usage_loss = acting_latent_usage_loss(latent[valid]) if valid.any() else torch.tensor(0.0, device=mu.device)
+            else:
+                kl_loss = acting_latent_kl_loss(mu, logvar)
+                usage_loss = acting_latent_usage_loss(latent)
             losses["loss"] = losses["loss"] + self.acting_kl_weight * kl_loss
             losses["loss_acting_kl"] = kl_loss
-
-            # Usage loss (anti-collapse)
-            usage_loss = acting_latent_usage_loss(latent)
             losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_acting_usage * usage_loss
             losses["loss_acting_usage"] = usage_loss
 
