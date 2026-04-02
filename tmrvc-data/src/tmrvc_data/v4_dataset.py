@@ -402,11 +402,17 @@ def v4_collate_fn(batch: list[dict]) -> dict:
             collated[key] = None
             continue
 
-        # Non-tensor fields -> list
-        if not isinstance(values[0], torch.Tensor):
-            # Mixed None / non-tensor: keep as list
+        # Find first non-None value to determine type
+        non_none = [v for v in values if v is not None]
+        if not non_none or not isinstance(non_none[0], torch.Tensor):
+            # Non-tensor fields -> list
             collated[key] = values
             continue
+
+        # Replace None values with zero tensors matching non-None shape
+        if any(v is None for v in values):
+            template = non_none[0]
+            values = [v if v is not None else torch.zeros_like(template) for v in values]
 
         # Fixed-size tensors (e.g. speaker_embed [192]) -> stack directly
         if key not in _PAD_KEYS:

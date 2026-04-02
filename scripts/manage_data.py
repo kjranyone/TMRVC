@@ -142,8 +142,14 @@ def cmd_add(args):
         if args.speaker == "single":
             speaker = f"{name}_default"
         elif args.speaker_from_dir:
-            # Use immediate parent directory as speaker
-            speaker = f"{name}_{wav.parent.name}"
+            # Use directory at --speaker-depth levels above the file as speaker ID
+            # Default depth=1 (immediate parent). JVS needs depth=3 (jvs001).
+            depth = getattr(args, 'speaker_depth', 1)
+            parts = wav.relative_to(path).parts
+            if len(parts) > depth:
+                speaker = f"{name}_{parts[-depth - 1]}"
+            else:
+                speaker = f"{name}_{wav.parent.name}"
         else:
             speaker = f"{name}_default"
 
@@ -531,7 +537,9 @@ def main():
     p_add.add_argument("name", help="Corpus name (e.g. jvs, moe, my_voices)")
     p_add.add_argument("path", help="Path to audio directory")
     p_add.add_argument("--speaker-from-dir", action="store_true",
-                       help="Use parent directory name as speaker ID")
+                       help="Use directory name as speaker ID")
+    p_add.add_argument("--speaker-depth", type=int, default=1,
+                       help="Directory depth for speaker ID (1=parent, 3=three levels up for JVS)")
     p_add.add_argument("--speaker", default=None,
                        help="Speaker assignment: 'single' = one speaker for all")
     p_add.add_argument("--ext", default="wav",

@@ -45,7 +45,7 @@ sudo apt-get update && sudo apt-get install -y espeak-ng
 
 ```bash
 # 例: 初回セットアップ
-.venv/bin/python scripts/manage_data.py add jvs data/raw/jvs --lang ja --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add jvs data/raw/jvs --lang ja --speaker-from-dir --speaker-depth 3
 .venv/bin/python scripts/manage_data.py add moe data/raw/moe_voices --lang ja --speaker-from-dir
 .venv/bin/python scripts/manage_data.py add tsukuyomi data/raw/tsukuyomi --lang ja --speaker single
 .venv/bin/python scripts/manage_data.py add vctk data/raw/vctk --lang en --speaker-from-dir --ext flac

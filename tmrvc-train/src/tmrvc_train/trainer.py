@@ -719,7 +719,11 @@ class UCLMTrainer:
                     ) / len(supervision_tier)
                 else:
                     sample_weight = 1.0
-                losses["loss"] = losses["loss"] * sample_weight
+                # Tier weight applies to supervision-dependent terms only.
+                # Codec loss (loss_a) is supervision-independent — always valid.
+                codec_loss = losses.get("loss_a", torch.tensor(0.0))
+                supervision_loss = losses["loss"] - codec_loss
+                losses["loss"] = codec_loss + supervision_loss * sample_weight
                 losses["tier_sample_weight"] = torch.tensor(sample_weight)
 
         # --- v4 Phase 3: Biological constraint regularization (Task 3-2) ---
