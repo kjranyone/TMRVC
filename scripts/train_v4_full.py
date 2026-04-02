@@ -143,7 +143,7 @@ def main():
         d_voice_state_explicit=D_VOICE_STATE, d_voice_state_ssl=D_VOICE_STATE_SSL,
         d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
         rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
-        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=256,
+        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=n_speakers,
         acting_tag_vocab_size=N_ACTING_TAGS,
         codec_condition=codec_cond,
     )
@@ -237,6 +237,16 @@ def main():
         enriched_transcript_prob=0.5,
     )
     logger.info("Dataset: %d samples", len(dataset))
+
+    # Build deterministic speaker_id → int mapping (no hash collisions)
+    speaker_to_int = {}
+    for i in range(len(dataset)):
+        sid = dataset.utterances[i].get("speaker_id", dataset.utterances[i].get("pseudo_speaker_id", ""))
+        if sid not in speaker_to_int:
+            speaker_to_int[sid] = len(speaker_to_int)
+    n_speakers = len(speaker_to_int)
+    logger.info("Speaker mapping: %d unique speakers", n_speakers)
+
     if len(dataset) == 0:
         logger.error("Empty dataset. Exiting.")
         sys.exit(1)
@@ -267,7 +277,7 @@ def main():
             "ssl_state": raw.get("ssl_state", torch.zeros(B, T, D_VOICE_STATE_SSL)),
             "bootstrap_alignment": raw.get("bootstrap_alignment"),
             "speaker_id": torch.tensor(
-                [int(hashlib.md5(s.encode()).hexdigest(), 16) % 256 if isinstance(s, str) else 0
+                [speaker_to_int.get(s, 0) if isinstance(s, str) else 0
                  for s in (raw.get("speaker_id") or [""] * B)],
                 dtype=torch.long,
             ),

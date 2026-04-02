@@ -636,6 +636,9 @@ class UCLMTrainer:
                 # Detach latent for conditioning path — encoder gradients flow
                 # only via KL/usage loss, not through the main transformer.
                 teacher_acting_latent = teacher_acting_latent.detach()
+                # Zero out latent for samples without real SSL (prevents fake conditioning)
+                if ssl_sample_mask is not None and not ssl_sample_mask.all():
+                    teacher_acting_latent = teacher_acting_latent * ssl_sample_mask.float().unsqueeze(-1)
 
             losses = self._tts_pointer_step(
                 phonemes=phonemes,
@@ -850,14 +853,23 @@ class UCLMTrainer:
             # --- Loss 6: Disentanglement loss ---
             # v4: Prefer dedicated physical_pred head output for gradient flow.
             # disentanglement_loss expects [B, T, 12] — it pools internally.
-            physical_pred_for_dis = losses.get("_physical_pred")
-            if physical_pred_for_dis is not None:
-                dis_loss = disentanglement_loss(physical_pred_for_dis, latent)
-            elif explicit_state.dim() == 3 and explicit_state.shape[-1] >= 12:
-                physical_for_dis = explicit_state[:, :, :12]
-                dis_loss = disentanglement_loss(physical_for_dis, latent)
+            # Only compute disentanglement on samples with real SSL
+            if ssl_sample_mask is not None and not ssl_sample_mask.all():
+                valid = ssl_sample_mask
+                latent_for_dis = latent[valid] if valid.any() else None
             else:
-                dis_loss = None
+                valid = None
+                latent_for_dis = latent
+
+            dis_loss = None
+            if latent_for_dis is not None:
+                physical_pred_for_dis = losses.get("_physical_pred")
+                if physical_pred_for_dis is not None:
+                    phys = physical_pred_for_dis[valid] if valid is not None else physical_pred_for_dis
+                    dis_loss = disentanglement_loss(phys, latent_for_dis)
+                elif explicit_state.dim() == 3 and explicit_state.shape[-1] >= 12:
+                    phys = explicit_state[valid, :, :12] if valid is not None else explicit_state[:, :, :12]
+                    dis_loss = disentanglement_loss(phys, latent_for_dis)
             if dis_loss is not None:
                 losses["loss"] = losses["loss"] + self.disentanglement_weight * dis_loss
                 losses["loss_disentanglement"] = dis_loss
