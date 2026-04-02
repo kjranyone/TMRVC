@@ -805,6 +805,7 @@ class UCLMTrainer:
         # --- Loss 5: Acting latent regularization (KL) ---
         # Use cached encoder output from train_step if available (v4 integration)
         # ssl_for_acting is needed by semantic alignment loss below, so always prepare it.
+        ssl_is_real = ssl_state is not None and ssl_state.abs().sum() > 0
         ssl_for_acting = None
         if ssl_state is not None:
             ssl_for_acting = ssl_state
@@ -814,7 +815,7 @@ class UCLMTrainer:
                     if ssl_for_acting.shape[1] == d_input:
                         ssl_for_acting = ssl_for_acting.transpose(1, 2)
 
-        if self.acting_latent_encoder is not None and (cached_act_mu is not None or ssl_state is not None):
+        if self.acting_latent_encoder is not None and (cached_act_mu is not None or ssl_is_real):
             if cached_act_mu is not None and cached_act_logvar is not None and cached_act_latent is not None:
                 mu, logvar, latent = cached_act_mu, cached_act_logvar, cached_act_latent
             else:

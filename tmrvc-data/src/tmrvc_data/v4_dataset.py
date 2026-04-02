@@ -425,7 +425,12 @@ def v4_collate_fn(batch: list[dict]) -> dict:
             # Determine which axis varies: if shape[0] varies across samples, pad dim 0
             shapes_0 = [v.shape[0] for v in non_none]
             shapes_1 = [v.shape[1] for v in non_none]
-            pad_val = False if non_none[0].dtype == torch.bool else 0
+            if non_none[0].dtype == torch.bool:
+                pad_val = False
+            elif non_none[0].dtype in (torch.long, torch.int32, torch.int64) and key in ("codec_tokens_a", "codec_tokens_b", "target_a", "target_b"):
+                pad_val = -1  # matches ignore_index=-1 in cross_entropy
+            else:
+                pad_val = 0
 
             if len(set(shapes_1)) == 1 and len(set(shapes_0)) > 1:
                 # [T, D] format — T varies, D fixed. Pad along T (dim 0)

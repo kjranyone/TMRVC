@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import logging
 import random
@@ -563,6 +564,13 @@ def main():
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # Sync scheduler and trainer._global_step with resume point
+    if resume_step > 0:
+        trainer._global_step = resume_step
+        for _ in range(resume_step):
+            scheduler.step()
+        logger.info("Synced scheduler and trainer._global_step to step %d", resume_step)
+
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("Model: %.2fM trainable params", n_params / 1e6)
 
@@ -606,7 +614,8 @@ def main():
             # Generate missing keys — use real data where possible
             "ssl_state": raw.get("ssl_state", torch.zeros(B, T, D_VOICE_STATE_SSL)),
             "speaker_id": torch.tensor(
-                [hash(s) % 100 for s in (raw.get("speaker_id") or [""] * B)],
+                [int(hashlib.md5(s.encode()).hexdigest(), 16) % 100 if isinstance(s, str) else 0
+                 for s in (raw.get("speaker_id") or [""] * B)],
                 dtype=torch.long,
             ),
             "language_id": raw.get("language_id", torch.zeros(B, dtype=torch.long)),
