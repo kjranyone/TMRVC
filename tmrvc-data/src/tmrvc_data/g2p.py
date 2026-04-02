@@ -377,32 +377,48 @@ def _g2p_japanese(text: str) -> list[str]:
     return _g2p_grapheme_fallback(text)
 
 
+_phonemizer_backends: dict[str, object] = {}
+_phonemizer_separator: object | None = None
+
+
+def _get_phonemizer_backend(language: str):
+    """Get or create a cached EspeakBackend for the given language."""
+    global _phonemizer_separator
+    if language in _phonemizer_backends:
+        return _phonemizer_backends[language], _phonemizer_separator
+
+    from phonemizer.backend import EspeakBackend
+    from phonemizer.separator import Separator
+
+    if _phonemizer_separator is None:
+        _phonemizer_separator = Separator(phone=" ", word=" <sil> ", syllable="")
+
+    backend = EspeakBackend(
+        language=language,
+        preserve_punctuation=False,
+        with_stress=False,
+    )
+    _phonemizer_backends[language] = backend
+    logger.info("Cached phonemizer EspeakBackend for language=%s", language)
+    return backend, _phonemizer_separator
+
+
 def _g2p_phonemizer(text: str, language_options: list[str]) -> list[str]:
     """Convert text to phoneme list using phonemizer/espeak.
 
     Tries language codes in order and returns the first successful result.
+    Uses cached backends to avoid per-call memory leak in espeak-ng.
     """
-    try:
-        from phonemizer import phonemize
-        from phonemizer.separator import Separator
-    except ImportError:
-        raise ImportError(
-            "phonemizer is required for this G2P backend. "
-            "Install with: pip install phonemizer"
-        )
-
     last_error: Exception | None = None
     for lang in language_options:
         try:
-            result = phonemize(
-                text,
-                language=lang,
-                backend="espeak",
-                separator=Separator(phone=" ", word=" <sil> ", syllable=""),
+            backend, separator = _get_phonemizer_backend(lang)
+            result = backend.phonemize(
+                [text],
+                separator=separator,
                 strip=True,
-                preserve_punctuation=False,
             )
-            phonemes = [p for p in result.split() if p]
+            phonemes = [p for p in result[0].split() if p]
             if phonemes:
                 return phonemes
         except Exception as e:  # pragma: no cover - backend-dependent

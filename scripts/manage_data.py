@@ -154,6 +154,7 @@ def cmd_add(args):
             "corpus": name,
             "speaker": speaker,
             "wav_path": wav_str,
+            "lang": args.lang,
             "cached": False,
         })
 
@@ -183,6 +184,8 @@ def cmd_build(args):
         HOP_LENGTH, SAMPLE_RATE,
     )
     from tmrvc_core.audio import compute_mel
+    from tmrvc_data.preprocessing import load_and_resample
+    from tmrvc_data.g2p import text_to_phonemes
 
     entries = load_manifest()
     uncached = [e for e in entries if not e.get("cached", False)]
@@ -221,6 +224,7 @@ def cmd_build(args):
     logger.info("All models loaded. Starting cache build...")
 
     CODEC_HOP = 320  # EnCodec 75 Hz
+    GC_INTERVAL = 50  # gc.collect + empty_cache every N items
     n_ok = 0
     n_skip = 0
     n_fail = 0
@@ -244,14 +248,15 @@ def cmd_build(args):
             continue
 
         try:
+
             # Load and resample
-            from tmrvc_data.preprocessing import load_and_resample
             waveform, _ = load_and_resample(wav_path, target_sr=SAMPLE_RATE)
             if waveform is None:
                 n_skip += 1
                 continue
 
             waveform_np = waveform.squeeze().cpu().numpy() if isinstance(waveform, torch.Tensor) else np.asarray(waveform).squeeze()
+            del waveform
             n_samples = len(waveform_np)
             n_frames = n_samples // CODEC_HOP
 
@@ -259,28 +264,39 @@ def cmd_build(args):
                 n_skip += 1
                 continue
 
-            # ASR
+            # Language from manifest (set at add time)
+            lang = entry.get("lang")
+            if not lang:
+                logger.warning("Skip %s: no lang in manifest — re-add with --lang", utt_id)
+                n_skip += 1
+                continue
+
+            # ASR (language fixed, no auto-detect)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
                 sf.write(tmp.name, waveform_np, SAMPLE_RATE)
-                segments, info = whisper.transcribe(tmp.name, beam_size=5, vad_filter=True)
+                segments, info = whisper.transcribe(
+                    tmp.name, beam_size=5, vad_filter=False,
+                    language=lang,
+                )
                 transcript = "".join(seg.text for seg in segments).strip()
-                lang = info.language if hasattr(info, "language") else "ja"
-                asr_conf = info.language_probability if hasattr(info, "language_probability") else 0.5
+            del segments, info
+
 
             if not transcript:
                 n_skip += 1
                 continue
 
             # G2P
-            from tmrvc_data.g2p import text_to_phonemes
             g2p_result = text_to_phonemes(transcript, language=lang)
             phoneme_ids = g2p_result.phoneme_ids
             if isinstance(phoneme_ids, torch.Tensor):
                 phoneme_ids = phoneme_ids.detach().cpu().numpy()
             phoneme_ids = np.asarray(phoneme_ids, dtype=np.int64)
+            del g2p_result
             if len(phoneme_ids) < 3:
                 n_skip += 1
                 continue
+
 
             # Voice state (12-D)
             waveform_t = torch.from_numpy(waveform_np).float().unsqueeze(0)
@@ -291,17 +307,28 @@ def cmd_build(args):
                 vs = vs_raw.detach().squeeze(0).cpu().numpy()
             else:
                 vs = np.zeros((n_frames, D_VOICE_STATE), dtype=np.float32)
-            vs = np.clip(vs[:n_frames], 0, 1).astype(np.float32)
-            if vs.shape[0] < n_frames:
-                vs = np.pad(vs, ((0, n_frames - vs.shape[0]), (0, 0)), mode="edge")
+            del vs_raw, mel, f0
+            # Resample voice state from mel frame rate to codec frame rate (n_frames)
+            vs = np.clip(vs, 0, 1).astype(np.float32)
+            if vs.shape[0] != n_frames:
+                # Linear interpolation to match codec frame count
+                import torch.nn.functional as _F
+                vs_t = torch.from_numpy(vs).T.unsqueeze(0).float()  # [1, D, T_mel]
+                vs_t = _F.interpolate(vs_t, size=n_frames, mode='linear', align_corners=False)
+                vs = vs_t.squeeze(0).T.numpy()  # [n_frames, D]
+
 
             # Speaker embedding
             spk = spk_encoder.extract(waveform_t, sample_rate=SAMPLE_RATE)
             spk = spk.detach().cpu().numpy().flatten().astype(np.float32) if isinstance(spk, torch.Tensor) else np.zeros(D_SPEAKER, np.float32)
+            del waveform_t
+
 
             # Codec tokens
             waveform_t_codec = torch.from_numpy(waveform_np).float().unsqueeze(0).unsqueeze(0)
             codec_tokens = codec.encode(waveform_t_codec).squeeze(0).numpy().astype(np.int64)
+            del waveform_t_codec, waveform_np
+
 
             # Supervision metadata
             observed_mask = np.ones((n_frames, D_VOICE_STATE), dtype=bool)
@@ -335,7 +362,6 @@ def cmd_build(args):
                 "duration_sec": n_samples / SAMPLE_RATE,
                 "quality_score": 0.85,
                 "supervision_tier": "tier_b",
-                "asr_confidence": float(asr_conf),
                 "acting_annotations": {},
             }
             with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
@@ -356,8 +382,24 @@ def cmd_build(args):
             elapsed = time.time() - t0
             rate = done / elapsed
             remaining = (len(uncached) - done) / max(rate, 0.001)
-            logger.info("Progress: %d/%d (ok=%d, skip=%d, fail=%d) | %.1f/s | ETA %.0fm",
-                         done, len(uncached), n_ok, n_skip, n_fail, rate, remaining / 60)
+            # Read VmRSS from /proc for C++ heap visibility
+            vmrss_mb = 0
+            try:
+                with open("/proc/self/status") as _sf:
+                    for _line in _sf:
+                        if _line.startswith("VmRSS:"):
+                            vmrss_mb = int(_line.split()[1]) // 1024
+                            break
+            except Exception:
+                pass
+            logger.info("Progress: %d/%d (ok=%d, skip=%d, fail=%d) | %.1f/s | ETA %.0fm | RSS %dMB",
+                         done, len(uncached), n_ok, n_skip, n_fail, rate, remaining / 60, vmrss_mb)
+
+        # Periodic memory cleanup
+        if done % GC_INTERVAL == 0 and done > 0:
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
         # Periodic manifest save (every 500)
         if done % 500 == 0 and done > 0:
@@ -450,6 +492,8 @@ def main():
                        help="Speaker assignment: 'single' = one speaker for all")
     p_add.add_argument("--ext", default="wav",
                        help="Audio file extensions, comma-separated (default: wav)")
+    p_add.add_argument("--lang", required=True,
+                       help="Language code (ja, en, zh, ko)")
     p_add.add_argument("--force", action="store_true",
                        help="Replace existing corpus entries")
 

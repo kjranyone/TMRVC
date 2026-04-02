@@ -193,7 +193,7 @@ class V4UCLMDataset(Dataset):
         # Load required arrays
         result = {
             "utterance_id": meta.get("utterance_id", ""),
-            "speaker_id": meta.get("pseudo_speaker_id", ""),
+            "speaker_id": meta.get("speaker_id", meta.get("pseudo_speaker_id", "")),
             "language": meta.get("language", ""),
             "supervision_tier": meta.get("supervision_tier", "tier_d"),
             "quality_score": meta.get("quality_score", 0.0),

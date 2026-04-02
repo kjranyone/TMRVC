@@ -32,27 +32,27 @@ sudo apt-get update && sudo apt-get install -y espeak-ng
 
 ```bash
 # 話者がディレクトリで分かれている場合
-.venv/bin/python scripts/manage_data.py add <name> <path> --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add <name> <path> --lang ja --speaker-from-dir
 
 # 1 話者 or 話者不明の場合
-.venv/bin/python scripts/manage_data.py add <name> <path> --speaker single
+.venv/bin/python scripts/manage_data.py add <name> <path> --lang ja --speaker single
 
 # flac など wav 以外
-.venv/bin/python scripts/manage_data.py add <name> <path> --speaker-from-dir --ext flac
+.venv/bin/python scripts/manage_data.py add <name> <path> --lang en --speaker-from-dir --ext flac
 ```
 
 **冪等性**: 同じ wav は二重登録されない。`--force` で再登録。
 
 ```bash
 # 例: 初回セットアップ
-.venv/bin/python scripts/manage_data.py add jvs data/raw/jvs --speaker-from-dir
-.venv/bin/python scripts/manage_data.py add moe data/raw/moe_voices --speaker-from-dir
-.venv/bin/python scripts/manage_data.py add tsukuyomi data/raw/tsukuyomi --speaker single
-.venv/bin/python scripts/manage_data.py add vctk data/raw/vctk --speaker-from-dir --ext flac
+.venv/bin/python scripts/manage_data.py add jvs data/raw/jvs --lang ja --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add moe data/raw/moe_voices --lang ja --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add tsukuyomi data/raw/tsukuyomi --lang ja --speaker single
+.venv/bin/python scripts/manage_data.py add vctk data/raw/vctk --lang en --speaker-from-dir --ext flac
 
 # 例: 後から追加
-.venv/bin/python scripts/manage_data.py add my_voice ~/recordings --speaker single
-.venv/bin/python scripts/manage_data.py add drama ~/drama_corpus --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add my_voice ~/recordings --lang ja --speaker single
+.venv/bin/python scripts/manage_data.py add drama ~/drama_corpus --lang ja --speaker-from-dir
 ```
 
 確認:
@@ -164,7 +164,7 @@ sudo apt-get update && sudo apt-get install -y espeak-ng
 
 ```bash
 # 1. データ登録
-.venv/bin/python scripts/manage_data.py add new_corpus /path/to/wavs --speaker-from-dir
+.venv/bin/python scripts/manage_data.py add new_corpus /path/to/wavs --lang ja --speaker-from-dir
 
 # 2. cache 構築 (増分)
 .venv/bin/python scripts/manage_data.py build
@@ -179,7 +179,7 @@ sudo apt-get update && sudo apt-get install -y espeak-ng
 
 ```bash
 # 登録
-manage_data.py add <name> <path> [--speaker-from-dir] [--speaker single] [--ext wav] [--force]
+manage_data.py add <name> <path> --lang <code> [--speaker-from-dir] [--speaker single] [--ext wav] [--force]
 
 # cache 構築
 manage_data.py build [--max N] [--device auto]

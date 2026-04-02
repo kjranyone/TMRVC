@@ -120,6 +120,7 @@ def load_and_resample(
     data, sr = sf.read(str(path), dtype="float32")
     # soundfile returns [T] for mono, [T, C] for multi-channel
     waveform = torch.from_numpy(data)
+    del data  # break numpy↔tensor shared memory immediately
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)  # [1, T]
     else:
@@ -129,7 +130,7 @@ def load_and_resample(
         waveform = waveform.mean(dim=0, keepdim=True)
     if sr != target_sr:
         waveform = AF.resample(waveform, sr, target_sr)
-    return waveform, target_sr
+    return waveform.clone(), target_sr  # clone to detach from resampler internals
 
 
 # ---------------------------------------------------------------------------

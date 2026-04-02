@@ -101,8 +101,10 @@ class VoiceStateEncoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
+        # Causal temporal conv: left-pad only (no lookahead into future frames)
         self.temporal_conv = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
+            nn.ConstantPad1d((4, 0), 0.0),  # left-pad 4 for kernel_size=5
+            nn.Conv1d(d_model, d_model, kernel_size=5, padding=0),
             nn.GELU(),
         )
 

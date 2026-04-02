@@ -509,10 +509,12 @@ class CodecTransformer(nn.Module):
         self.prompt_resampler = PromptResampler(d_model, n_summary=n_prompt_summary_tokens, n_heads=n_heads)
 
         # Acoustic context embeds (Stream A) - past A_{t-1}
+        # Each codebook gets d_model//2 dims for sufficient representational capacity
+        self._a_ctx_dim = d_model // 2
         self.a_ctx_embeds = nn.ModuleList(
-            [nn.Embedding(rvq_vocab_size, d_model // n_codebooks) for _ in range(n_codebooks)]
+            [nn.Embedding(rvq_vocab_size, self._a_ctx_dim) for _ in range(n_codebooks)]
         )
-        self.a_ctx_fusion = nn.Linear(d_model, d_model)
+        self.a_ctx_fusion = nn.Linear(self._a_ctx_dim * n_codebooks, d_model)
 
         # Control context embeds (Stream B) - past B_{t-1}
         self.b_ctx_embeds = nn.ModuleList(
@@ -588,7 +590,7 @@ class CodecTransformer(nn.Module):
         a_ctx_curr = a_ctx[:, :, :T]
         a_embeds = torch.stack(
             [self.a_ctx_embeds[i](a_ctx_curr[:, i, :]) for i in range(self.n_codebooks)], dim=1,
-        )  # [B, 8, T, d_model//8]
+        )  # [B, 8, T, a_ctx_dim]
         a_ctx_fused = self.a_ctx_fusion(
             a_embeds.permute(0, 2, 1, 3).reshape(B, T, -1),
         )  # [B, T, d_model]

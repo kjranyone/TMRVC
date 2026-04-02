@@ -480,15 +480,16 @@ def uclm_loss(
             )
         loss_a = loss_a / n_cb
 
-    # 2. Control Loss (B_t)
-    loss_b = 0.0
-    for i in range(n_slots):
-        loss_b += F.cross_entropy(
-            logits_b[:, i, :, :].reshape(-1, vocab_b),
-            target_b[:, i, :].reshape(-1),
-            ignore_index=-1,
-        )
-    loss_b = loss_b / n_slots
+    # 2. Control Loss (B_t) — skip if all targets are masked (no real control tokens)
+    loss_b = torch.tensor(0.0, device=logits_b.device)
+    if (target_b != -1).any():
+        for i in range(n_slots):
+            loss_b = loss_b + F.cross_entropy(
+                logits_b[:, i, :, :].reshape(-1, vocab_b),
+                target_b[:, i, :].reshape(-1),
+                ignore_index=-1,
+            )
+        loss_b = loss_b / n_slots
 
     # 3. Total Loss
     total_loss = loss_a + loss_b

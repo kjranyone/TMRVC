@@ -49,12 +49,29 @@ class EnCodecWrapper:
         for param in self._model.parameters():
             param.requires_grad = False
 
+        # Remove weight_norm hooks to prevent per-forward memory accumulation
+        self._remove_weight_norms(self._model)
+
         logger.info(
             "EnCodec loaded: %.1fM params, %d codebooks × %d, %.0f Hz, %.1f kbps",
             sum(p.numel() for p in self._model.parameters()) / 1e6,
             self.N_QUANTIZERS, self.CODEBOOK_SIZE,
             self.FRAME_RATE, self.bandwidth,
         )
+
+    @staticmethod
+    def _remove_weight_norms(model):
+        """Remove all weight_norm hooks from model (safe for inference)."""
+        from torch.nn.utils import remove_weight_norm
+        removed = 0
+        for module in model.modules():
+            try:
+                remove_weight_norm(module)
+                removed += 1
+            except ValueError:
+                pass
+        if removed:
+            logger.info("Removed weight_norm from %d modules", removed)
 
     @torch.inference_mode()
     def encode(self, waveform: torch.Tensor) -> torch.Tensor:
