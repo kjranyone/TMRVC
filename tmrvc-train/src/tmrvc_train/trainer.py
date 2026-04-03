@@ -536,7 +536,19 @@ class UCLMTrainer:
         cached_act_mu = None
         cached_act_logvar = None
         ssl_sample_mask = None
-        tw = None  # tier weights, computed in TTS branch
+
+        # Compute tier weights before mode branch (needed by both VC and TTS)
+        tw = None
+        if self.enable_v4_losses:
+            from tmrvc_data.v4_dataset import get_tier_loss_weights
+            supervision_tier = batch.get("supervision_tier")
+            if supervision_tier is not None:
+                if isinstance(supervision_tier, (list, tuple)):
+                    tier_list = [get_tier_loss_weights(t) for t in supervision_tier]
+                    tw = {k: sum(d.get(k, 1.0) for d in tier_list) / len(tier_list)
+                          for k in tier_list[0]}
+                else:
+                    tw = get_tier_loss_weights(supervision_tier)
 
         if mode == "vc":
             source_a_t = batch["source_a_t"].to(self.device)
@@ -560,6 +572,7 @@ class UCLMTrainer:
                 adv_logits=out.get("adv_logits"),
                 speaker_labels=speaker_labels,
                 codec_condition=self.codec_condition,
+                tier_weights=tw,
             )
             # Add prompt VQ loss if present
             if prompt_vq_loss is not None:
@@ -589,19 +602,6 @@ class UCLMTrainer:
             # Use actual (pre-padding) frame count, not padded tensor length
             frame_mask = (target_a[:, 0, :] != -1)  # [B, T] True=real, False=pad
             target_length = frame_mask.sum(dim=1).max().item()
-
-            # Compute tier weights early so they're available for uclm_loss
-            tw = None
-            if self.enable_v4_losses:
-                from tmrvc_data.v4_dataset import get_tier_loss_weights
-                supervision_tier = batch.get("supervision_tier")
-                if supervision_tier is not None:
-                    if isinstance(supervision_tier, (list, tuple)):
-                        tier_list = [get_tier_loss_weights(t) for t in supervision_tier]
-                        tw = {k: sum(d.get(k, 1.0) for d in tier_list) / len(tier_list)
-                              for k in tier_list[0]}
-                    else:
-                        tw = get_tier_loss_weights(supervision_tier)
 
             # --- Replay Mix (Worker 02 Task 15) ---
             if is_replay:
