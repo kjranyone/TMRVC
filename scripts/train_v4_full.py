@@ -321,9 +321,6 @@ def main():
 
         d["lengths"] = torch.full((B,), T_aligned, dtype=torch.long)
 
-        # Frame lengths from codec tokens
-        d["lengths"] = torch.tensor([T] * B, dtype=torch.long)
-
         # Convert bootstrap_alignment tensor [B, T] to dict expected by trainer
         ba = d.get("bootstrap_alignment")
         ba_is_heuristic = raw.get("bootstrap_is_heuristic")

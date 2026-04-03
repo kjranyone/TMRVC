@@ -706,43 +706,54 @@ class UCLMTrainer:
                 losses["loss_physical_12d"] = phys_loss_scalar
 
         # --- v4 Phase 3: Per-loss tier weighting (Task 3-1) ---
-        # Uses get_tier_loss_weights() to scale each loss component independently.
-        # Biological constraints and acting regularization are added AFTER this block.
+        # Track lambda-weighted contributions alongside raw values so tier
+        # scaling can be applied correctly without losing lambda_*.
+        # uclm_loss returns raw component values in losses dict. The lambda-
+        # weighted sum is in losses["loss"]. To apply per-loss tier weights:
+        # new_loss = sum(lambda_i * raw_i * tier_w_i) = losses["loss"] - sum(lambda_i * raw_i * (1 - tier_w_i))
         if self.enable_v4_losses:
             from tmrvc_data.v4_dataset import get_tier_loss_weights
             supervision_tier = batch.get("supervision_tier")
             if supervision_tier is not None:
-                # Get per-loss weights for this tier
                 if isinstance(supervision_tier, (list, tuple)):
-                    # Mixed batch: average tier weights
                     tier_list = [get_tier_loss_weights(t) for t in supervision_tier]
                     tw = {k: sum(d.get(k, 1.0) for d in tier_list) / len(tier_list)
                           for k in tier_list[0]}
                 else:
                     tw = get_tier_loss_weights(supervision_tier)
 
-                # Rebuild loss with per-loss tier weights
-                total = torch.tensor(0.0, device=losses["loss"].device)
-                loss_key_map = {
+                # For each loss component: if tier_w < 1, reduce its contribution
+                # We know the lambda for each from the call sites above:
+                lambda_map = {
+                    "loss_adv": getattr(self, '_lambda_adv', 0.1),
+                    "loss_pointer": eff_pointer_weight if 'eff_pointer_weight' in dir() else self.pointer_loss_weight,
+                    "loss_progress": eff_progress_weight if 'eff_progress_weight' in dir() else self.progress_loss_weight,
+                    "loss_boundary_confidence": eff_boundary_weight if 'eff_boundary_weight' in dir() else self.boundary_confidence_loss_weight,
+                    "loss_voice_state": self.voice_state_loss_weight,
+                    "loss_physical_12d": self.v4_loss_config.lambda_physical if self.enable_v4_losses else 0,
+                    "loss_prosody": self.prosody_loss_weight,
+                }
+                tier_key_map = {
                     "loss_a": "codec_loss", "loss_b": "control_loss",
                     "loss_pointer": "pointer_loss", "loss_progress": "pointer_loss",
                     "loss_boundary_confidence": "pointer_loss",
+                    "loss_voice_state": "physical_loss",
                     "loss_physical_12d": "physical_loss",
                     "loss_adv": "speaker_loss",
-                    "loss_speaker_consistency": "speaker_loss",
-                    "loss_acting_kl": "acting_latent_loss",
-                    "loss_acting_usage": "acting_latent_loss",
-                    "loss_disentanglement": "disentanglement_loss",
-                    "loss_semantic_alignment": "semantic_loss",
                     "loss_prosody": "prosody_loss",
                 }
+                # Subtract (1 - tier_w) * lambda * raw from total
+                reduction = torch.tensor(0.0, device=losses["loss"].device)
                 for k, v in losses.items():
                     if k == "loss" or not isinstance(v, torch.Tensor):
                         continue
-                    tier_key = loss_key_map.get(k)
-                    w = tw.get(tier_key, 1.0) if tier_key else 1.0
-                    total = total + v * w
-                losses["loss"] = total
+                    tier_key = tier_key_map.get(k)
+                    if tier_key:
+                        tier_w = tw.get(tier_key, 1.0)
+                        if tier_w < 1.0:
+                            lam = lambda_map.get(k, 1.0)
+                            reduction = reduction + lam * v * (1.0 - tier_w)
+                losses["loss"] = losses["loss"] - reduction
 
         # --- v4 Phase 3: Biological constraint regularization (Task 3-2) ---
         # Supervision-independent: NOT tier-weighted.
@@ -771,8 +782,8 @@ class UCLMTrainer:
                 losses["loss_bio_implausibility"] = bio_losses["bio_implausibility_loss"]
 
         # --- v4 Phase 3: Full v4 loss composition (Task 3-3) ---
-        # Acting latent KL, disentanglement, semantic alignment are
-        # supervision-independent: NOT tier-weighted.
+        # Acting/semantic losses are tier-weighted via tw dict.
+        tier_weights = locals().get('tw', {})
         if self.enable_v4_losses:
             losses = self._compute_v4_additional_losses(
                 losses, batch, explicit_state, ssl_state, speaker_embed,
@@ -780,6 +791,7 @@ class UCLMTrainer:
                 cached_act_logvar=cached_act_logvar,
                 cached_act_latent=teacher_acting_latent,
                 ssl_sample_mask=ssl_sample_mask,
+                tier_weights=tier_weights,
             )
 
         # Remove internal-only keys before backward
@@ -810,6 +822,7 @@ class UCLMTrainer:
         cached_act_logvar: torch.Tensor | None = None,
         cached_act_latent: torch.Tensor | None = None,
         ssl_sample_mask: torch.Tensor | None = None,
+        tier_weights: dict | None = None,
     ) -> dict:
         """Compute all 9 v4 loss terms (Task 3-3).
 
@@ -854,9 +867,10 @@ class UCLMTrainer:
             else:
                 kl_loss = acting_latent_kl_loss(mu, logvar)
                 usage_loss = acting_latent_usage_loss(latent)
-            losses["loss"] = losses["loss"] + self.acting_kl_weight * kl_loss
+            tw_act = (tier_weights or {}).get("acting_latent_loss", 1.0)
+            losses["loss"] = losses["loss"] + self.acting_kl_weight * kl_loss * tw_act
             losses["loss_acting_kl"] = kl_loss
-            losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_acting_usage * usage_loss
+            losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_acting_usage * usage_loss * tw_act
             losses["loss_acting_usage"] = usage_loss
 
             # --- Loss 6: Disentanglement loss ---
@@ -880,7 +894,8 @@ class UCLMTrainer:
                     phys = explicit_state[valid, :, :12] if valid is not None else explicit_state[:, :, :12]
                     dis_loss = disentanglement_loss(phys, latent_for_dis)
             if dis_loss is not None:
-                losses["loss"] = losses["loss"] + self.disentanglement_weight * dis_loss
+                tw_dis = (tier_weights or {}).get("disentanglement_loss", 1.0)
+                losses["loss"] = losses["loss"] + self.disentanglement_weight * dis_loss * tw_dis
                 losses["loss_disentanglement"] = dis_loss
 
             # --- Loss 9: Semantic alignment loss (skip when ssl_state is zeros) ---
@@ -896,7 +911,8 @@ class UCLMTrainer:
 
                     predicted_latent = self.acting_latent_predictor(text_features)
                     sem_loss = semantic_alignment_loss(predicted_latent, latent[valid_ssl])
-                    losses["loss"] = losses["loss"] + self.semantic_alignment_weight * sem_loss
+                    tw_sem = (tier_weights or {}).get("semantic_loss", 1.0)
+                    losses["loss"] = losses["loss"] + self.semantic_alignment_weight * sem_loss * tw_sem
                     losses["loss_semantic_alignment"] = sem_loss
 
         # --- Loss 7: Speaker consistency loss ---
@@ -921,7 +937,8 @@ class UCLMTrainer:
                     positive_sim = (similarity_matrix * same_speaker).sum() / same_speaker.sum().clamp(min=1)
                     # Loss: 1 - average positive similarity
                     spk_loss = 1.0 - positive_sim
-                    losses["loss"] = losses["loss"] + self.speaker_consistency_weight * spk_loss
+                    tw_spk = (tier_weights or {}).get("speaker_loss", 1.0)
+                    losses["loss"] = losses["loss"] + self.speaker_consistency_weight * spk_loss * tw_spk
                     losses["loss_speaker_consistency"] = spk_loss
 
         return losses
