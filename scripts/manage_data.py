@@ -466,20 +466,14 @@ def cmd_build(args):
             if ssl_state_np is not None:
                 np.save(utt_dir / "ssl_state.npy", ssl_state_np)
 
-            # Bootstrap alignment: uniform proportional mapping (heuristic, not MAS)
-            # Saved for convenience but flagged as heuristic in meta.json
-            n_phones = len(phoneme_ids)
-            if n_phones > 0 and n_frames > 0:
-                frame_per_phone = n_frames / n_phones
-                indices = (np.arange(n_frames) / frame_per_phone).astype(np.int64)
-                indices = np.clip(indices, 0, n_phones - 1)
-                np.save(utt_dir / "bootstrap_alignment.npy", indices)
+            # Bootstrap alignment: not generated at cache time.
+            # MAS alignment is computed during training from text encoder + acoustic features.
+            # Real (non-heuristic) bootstrap requires a trained model — future pipeline step.
 
             meta = {
                 "utterance_id": utt_id,
                 "speaker_id": speaker,
                 "corpus": entry["corpus"],
-                "bootstrap_is_heuristic": True,  # uniform, not MAS-derived
                 "n_frames": int(n_frames),
                 "n_codec_frames": int(n_frames),
                 "n_control_frames": int(n_frames),

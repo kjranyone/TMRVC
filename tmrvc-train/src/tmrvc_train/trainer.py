@@ -662,6 +662,7 @@ class UCLMTrainer:
                 pointer_loss_weight=pointer_loss_weight,
                 acting_texture_latent=teacher_acting_latent,
                 frame_mask=frame_mask,
+                tier_weights=locals().get('tw'),
             )
             # Add prompt VQ loss if present
             if prompt_vq_loss is not None:
@@ -702,15 +703,14 @@ class UCLMTrainer:
                 else:
                     phys_loss_scalar = phys_loss.mean()
 
-                losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_physical * phys_loss_scalar
+                _tw_phys = locals().get('tw', {}).get("physical_loss", 1.0)
+                losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_physical * phys_loss_scalar * _tw_phys
                 losses["loss_physical_12d"] = phys_loss_scalar
 
         # --- v4 Phase 3: Per-loss tier weighting (Task 3-1) ---
-        # Track lambda-weighted contributions alongside raw values so tier
-        # scaling can be applied correctly without losing lambda_*.
-        # uclm_loss returns raw component values in losses dict. The lambda-
-        # weighted sum is in losses["loss"]. To apply per-loss tier weights:
-        # new_loss = sum(lambda_i * raw_i * tier_w_i) = losses["loss"] - sum(lambda_i * raw_i * (1 - tier_w_i))
+        # Tier weights are now applied directly inside uclm_loss() and
+        # _compute_v4_additional_losses() via tier_weights dict.
+        # Compute tier_weights here for use by downstream loss blocks.
         if self.enable_v4_losses:
             from tmrvc_data.v4_dataset import get_tier_loss_weights
             supervision_tier = batch.get("supervision_tier")
@@ -721,39 +721,6 @@ class UCLMTrainer:
                           for k in tier_list[0]}
                 else:
                     tw = get_tier_loss_weights(supervision_tier)
-
-                # For each loss component: if tier_w < 1, reduce its contribution
-                # We know the lambda for each from the call sites above:
-                lambda_map = {
-                    "loss_adv": getattr(self, '_lambda_adv', 0.1),
-                    "loss_pointer": eff_pointer_weight if 'eff_pointer_weight' in dir() else self.pointer_loss_weight,
-                    "loss_progress": eff_progress_weight if 'eff_progress_weight' in dir() else self.progress_loss_weight,
-                    "loss_boundary_confidence": eff_boundary_weight if 'eff_boundary_weight' in dir() else self.boundary_confidence_loss_weight,
-                    "loss_voice_state": self.voice_state_loss_weight,
-                    "loss_physical_12d": self.v4_loss_config.lambda_physical if self.enable_v4_losses else 0,
-                    "loss_prosody": self.prosody_loss_weight,
-                }
-                tier_key_map = {
-                    "loss_a": "codec_loss", "loss_b": "control_loss",
-                    "loss_pointer": "pointer_loss", "loss_progress": "pointer_loss",
-                    "loss_boundary_confidence": "pointer_loss",
-                    "loss_voice_state": "physical_loss",
-                    "loss_physical_12d": "physical_loss",
-                    "loss_adv": "speaker_loss",
-                    "loss_prosody": "prosody_loss",
-                }
-                # Subtract (1 - tier_w) * lambda * raw from total
-                reduction = torch.tensor(0.0, device=losses["loss"].device)
-                for k, v in losses.items():
-                    if k == "loss" or not isinstance(v, torch.Tensor):
-                        continue
-                    tier_key = tier_key_map.get(k)
-                    if tier_key:
-                        tier_w = tw.get(tier_key, 1.0)
-                        if tier_w < 1.0:
-                            lam = lambda_map.get(k, 1.0)
-                            reduction = reduction + lam * v * (1.0 - tier_w)
-                losses["loss"] = losses["loss"] - reduction
 
         # --- v4 Phase 3: Biological constraint regularization (Task 3-2) ---
         # Supervision-independent: NOT tier-weighted.
@@ -966,6 +933,7 @@ class UCLMTrainer:
         pointer_loss_weight: float,
         acting_texture_latent: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
+        tier_weights: dict | None = None,
     ) -> dict:
         """Pointer-mode TTS training step with full annealing schedule."""
         B = phonemes.shape[0]
@@ -1138,6 +1106,7 @@ class UCLMTrainer:
             prosody_speaker_embed=speaker_embed,
             lambda_prosody=self.prosody_loss_weight if prosody_targets is not None else 0.0,
             codec_condition=self.codec_condition,
+            tier_weights=tier_weights,
         )
 
         # Boundary confidence loss (with frame mask)
@@ -1148,7 +1117,8 @@ class UCLMTrainer:
             loss_boundary = boundary_confidence_loss(
                 out["boundary_confidence"], boundary_targets, mask=loss_frame_mask
             )
-            losses["loss"] = losses["loss"] + eff_boundary_weight * loss_boundary
+            _tw_ptr = (tier_weights or {}).get("pointer_loss", 1.0)
+            losses["loss"] = losses["loss"] + eff_boundary_weight * loss_boundary * _tw_ptr
             losses["loss_boundary_confidence"] = loss_boundary
 
         # CFG distillation loss (Stage 3 only)
@@ -1197,7 +1167,8 @@ class UCLMTrainer:
                 observed_mask=vs_observed_mask,
                 confidence=vs_confidence,
             )
-            losses["loss"] = losses["loss"] + self.voice_state_loss_weight * loss_vs
+            _tw_phys = (tier_weights or {}).get("physical_loss", 1.0)
+            losses["loss"] = losses["loss"] + self.voice_state_loss_weight * loss_vs * _tw_phys
             losses["loss_voice_state"] = loss_vs
 
         # Anti-collapse diagnostics (logged but not added to loss)

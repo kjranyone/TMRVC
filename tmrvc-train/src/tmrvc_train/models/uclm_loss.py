@@ -417,6 +417,7 @@ def uclm_loss(
     speaker_embeds: torch.Tensor | None = None,
     prosody_latents: torch.Tensor | None = None,
     codec_condition: str = "A",
+    tier_weights: dict | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the multi-task loss for Disentangled UCLM."""
     B, n_cb, T, vocab_a = logits_a.shape
@@ -491,8 +492,13 @@ def uclm_loss(
             )
         loss_b = loss_b / n_slots
 
-    # 3. Total Loss
-    total_loss = loss_a + loss_b
+    # Tier weight lookup helper
+    tw = tier_weights or {}
+    def _tw(key: str) -> float:
+        return tw.get(key, 1.0)
+
+    # 3. Total Loss (with per-loss tier weights)
+    total_loss = loss_a * _tw("codec_loss") + loss_b * _tw("control_loss")
 
     # 4. Optional Losses
     components["loss_a"] = loss_a
@@ -508,18 +514,18 @@ def uclm_loss(
         loss_adv = F.cross_entropy(
             adv_logits.reshape(-1, n_spk), labels_expanded.reshape(-1)
         )
-        total_loss = total_loss + lambda_adv * loss_adv
+        total_loss = total_loss + lambda_adv * loss_adv * _tw("speaker_loss")
         components["loss_adv"] = loss_adv
 
     # Pointer losses
     if pointer_logits is not None and advance_targets is not None:
         loss_ptr = pointer_advance_loss(pointer_logits, advance_targets, frame_mask)
-        total_loss = total_loss + lambda_pointer * loss_ptr
+        total_loss = total_loss + lambda_pointer * loss_ptr * _tw("pointer_loss")
         components["loss_pointer"] = loss_ptr
 
     if progress_delta is not None and progress_targets is not None:
         loss_prog = progress_regression_loss(progress_delta, progress_targets, frame_mask)
-        total_loss = total_loss + lambda_progress * loss_prog
+        total_loss = total_loss + lambda_progress * loss_prog * _tw("pointer_loss")
         components["loss_progress"] = loss_prog
 
     # Anti-collapse diversity regularizer
@@ -531,7 +537,7 @@ def uclm_loss(
     # Voice state supervision losses
     if lambda_voice_state > 0 and voice_state_pred is not None and voice_state_target is not None:
         loss_vs = voice_state_supervision_loss(voice_state_pred, voice_state_target, frame_mask)
-        total_loss = total_loss + lambda_voice_state * loss_vs
+        total_loss = total_loss + lambda_voice_state * loss_vs * _tw("physical_loss")
         components["loss_voice_state"] = loss_vs
 
     if lambda_delta_voice_state > 0 and delta_voice_state_pred is not None and delta_voice_state_target is not None:
@@ -545,7 +551,7 @@ def uclm_loss(
             prosody_predictor, phoneme_features, target_prosody,
             prosody_dialogue_context, prosody_speaker_embed,
         )
-        total_loss = total_loss + lambda_prosody * loss_prosody
+        total_loss = total_loss + lambda_prosody * loss_prosody * _tw("prosody_loss")
         components["loss_prosody"] = loss_prosody
 
     # Timbre-prosody contrastive loss
