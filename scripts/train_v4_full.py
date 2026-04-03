@@ -113,6 +113,29 @@ def main():
     codec_cond = args.codec_condition
     logger.info("Codec condition: %s", codec_cond)
 
+    # ---- Load dataset first to determine n_speakers ----
+    from tmrvc_data.v4_dataset import V4UCLMDataset, v4_collate_fn
+
+    dataset = V4UCLMDataset(
+        cache_dir=str(cache_dir),
+        max_frames=args.max_frames, min_frames=10,
+        use_enriched_transcript=True,
+        enriched_transcript_prob=0.5,
+    )
+    logger.info("Dataset: %d samples", len(dataset))
+
+    speaker_to_int = {}
+    for i in range(len(dataset)):
+        sid = dataset.utterances[i].get("speaker_id", dataset.utterances[i].get("pseudo_speaker_id", ""))
+        if sid not in speaker_to_int:
+            speaker_to_int[sid] = len(speaker_to_int)
+    n_speakers = len(speaker_to_int)
+    logger.info("Speaker mapping: %d unique speakers", n_speakers)
+
+    if len(dataset) == 0:
+        logger.error("Empty dataset. Run manage_data.py add + build first.")
+        sys.exit(1)
+
     # Infer d_model/n_layers from checkpoint when resuming (checkpoint may differ from constants.yaml)
     eff_d_model = D_MODEL
     eff_n_layers = None  # use default from constants
@@ -227,29 +250,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     logger.info("Model: %.2fM trainable params", n_params / 1e6)
 
-    # ---- Phase 3: Dataloader (V4UCLMDataset) ----
-    from tmrvc_data.v4_dataset import V4UCLMDataset, v4_collate_fn
-
-    dataset = V4UCLMDataset(
-        cache_dir=str(cache_dir),
-        max_frames=args.max_frames, min_frames=10,
-        use_enriched_transcript=True,
-        enriched_transcript_prob=0.5,
-    )
-    logger.info("Dataset: %d samples", len(dataset))
-
-    # Build deterministic speaker_id → int mapping (no hash collisions)
-    speaker_to_int = {}
-    for i in range(len(dataset)):
-        sid = dataset.utterances[i].get("speaker_id", dataset.utterances[i].get("pseudo_speaker_id", ""))
-        if sid not in speaker_to_int:
-            speaker_to_int[sid] = len(speaker_to_int)
-    n_speakers = len(speaker_to_int)
-    logger.info("Speaker mapping: %d unique speakers", n_speakers)
-
-    if len(dataset) == 0:
-        logger.error("Empty dataset. Exiting.")
-        sys.exit(1)
+    # ---- Phase 3: Dataloader ----
 
     def _collate(samples):
         """Collate V4UCLMDataset samples and map keys to Trainer expectations."""

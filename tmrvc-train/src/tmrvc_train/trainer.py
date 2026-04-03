@@ -726,8 +726,15 @@ class UCLMTrainer:
                 loss_key_map = {
                     "loss_a": "codec_loss", "loss_b": "control_loss",
                     "loss_pointer": "pointer_loss", "loss_progress": "pointer_loss",
+                    "loss_boundary_confidence": "pointer_loss",
                     "loss_physical_12d": "physical_loss",
                     "loss_adv": "speaker_loss",
+                    "loss_speaker_consistency": "speaker_loss",
+                    "loss_acting_kl": "acting_latent_loss",
+                    "loss_acting_usage": "acting_latent_loss",
+                    "loss_disentanglement": "disentanglement_loss",
+                    "loss_semantic_alignment": "semantic_loss",
+                    "loss_prosody": "prosody_loss",
                 }
                 for k, v in losses.items():
                     if k == "loss" or not isinstance(v, torch.Tensor):
@@ -878,18 +885,19 @@ class UCLMTrainer:
 
             # --- Loss 9: Semantic alignment loss (skip when ssl_state is zeros) ---
             if self.acting_latent_predictor is not None and ssl_is_real:
-                # Use text features if available, otherwise use a pooled ssl_state proxy
-                text_features = batch.get("text_features")
-                if text_features is not None:
-                    text_features = text_features.to(device)
-                else:
-                    # Pool ssl_state as proxy for text features
-                    text_features = ssl_for_acting.mean(dim=1)  # [B, d_ssl]
+                # Only use samples with real SSL for semantic alignment
+                valid_ssl = ssl_sample_mask if ssl_sample_mask is not None else torch.ones(latent.shape[0], dtype=torch.bool, device=latent.device)
+                if valid_ssl.any():
+                    text_features = batch.get("text_features")
+                    if text_features is not None:
+                        text_features = text_features.to(device)[valid_ssl]
+                    else:
+                        text_features = ssl_for_acting[valid_ssl].mean(dim=1)
 
-                predicted_latent = self.acting_latent_predictor(text_features)
-                sem_loss = semantic_alignment_loss(predicted_latent, latent)
-                losses["loss"] = losses["loss"] + self.semantic_alignment_weight * sem_loss
-                losses["loss_semantic_alignment"] = sem_loss
+                    predicted_latent = self.acting_latent_predictor(text_features)
+                    sem_loss = semantic_alignment_loss(predicted_latent, latent[valid_ssl])
+                    losses["loss"] = losses["loss"] + self.semantic_alignment_weight * sem_loss
+                    losses["loss_semantic_alignment"] = sem_loss
 
         # --- Loss 7: Speaker consistency loss ---
         # Encourage consistent speaker embeddings across same-speaker utterances
