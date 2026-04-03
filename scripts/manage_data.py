@@ -294,8 +294,15 @@ def cmd_build(args):
                     tmp.name, beam_size=5, vad_filter=False,
                     language=lang,
                 )
-                transcript = "".join(seg.text for seg in segments).strip()
-            del segments, info
+                seg_list = list(segments)
+                transcript = "".join(seg.text for seg in seg_list).strip()
+                # Compute ASR confidence from average log probability
+                if seg_list:
+                    avg_logprob = sum(s.avg_log_prob for s in seg_list) / len(seg_list)
+                    asr_confidence = max(0.0, min(1.0, 1.0 + avg_logprob / 2.0))  # map [-2,0] → [0,1]
+                else:
+                    asr_confidence = 0.0
+            del seg_list, info
 
 
             if not transcript:
@@ -406,13 +413,21 @@ def cmd_build(args):
                 "n_codec_frames": int(n_frames),
                 "n_control_frames": int(n_frames),
                 "text": transcript,
-                "enriched_transcript": transcript,
+                "enriched_transcript": transcript,  # TODO: LLM-enriched transcript
                 "language_id": {"ja": 0, "en": 1, "zh": 2, "ko": 3}.get(lang, 0),
                 "language": lang,
                 "duration_sec": n_samples / SAMPLE_RATE,
-                "quality_score": 0.85,
-                "supervision_tier": "tier_b",
-                "acting_annotations": {},
+                "asr_confidence": round(asr_confidence, 3),
+                "quality_score": round(asr_confidence, 3),
+                # Tier: A=high confidence+SSL, B=high confidence, C=low confidence, D=very low
+                "supervision_tier": (
+                    "tier_a" if asr_confidence >= 0.8 and ssl_state_np is not None else
+                    "tier_b" if asr_confidence >= 0.6 else
+                    "tier_c" if asr_confidence >= 0.3 else
+                    "tier_d"
+                ),
+                "has_ssl_state": ssl_state_np is not None,
+                "acting_annotations": {},  # TODO: LLM semantic annotation
             }
             with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
