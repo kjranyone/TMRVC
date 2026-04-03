@@ -535,6 +535,8 @@ class UCLMTrainer:
         teacher_acting_latent = None
         cached_act_mu = None
         cached_act_logvar = None
+        ssl_sample_mask = None
+        tw = None  # tier weights, computed in TTS branch
 
         if mode == "vc":
             source_a_t = batch["source_a_t"].to(self.device)
@@ -587,6 +589,19 @@ class UCLMTrainer:
             # Use actual (pre-padding) frame count, not padded tensor length
             frame_mask = (target_a[:, 0, :] != -1)  # [B, T] True=real, False=pad
             target_length = frame_mask.sum(dim=1).max().item()
+
+            # Compute tier weights early so they're available for uclm_loss
+            tw = None
+            if self.enable_v4_losses:
+                from tmrvc_data.v4_dataset import get_tier_loss_weights
+                supervision_tier = batch.get("supervision_tier")
+                if supervision_tier is not None:
+                    if isinstance(supervision_tier, (list, tuple)):
+                        tier_list = [get_tier_loss_weights(t) for t in supervision_tier]
+                        tw = {k: sum(d.get(k, 1.0) for d in tier_list) / len(tier_list)
+                              for k in tier_list[0]}
+                    else:
+                        tw = get_tier_loss_weights(supervision_tier)
 
             # --- Replay Mix (Worker 02 Task 15) ---
             if is_replay:
@@ -662,7 +677,7 @@ class UCLMTrainer:
                 pointer_loss_weight=pointer_loss_weight,
                 acting_texture_latent=teacher_acting_latent,
                 frame_mask=frame_mask,
-                tier_weights=locals().get('tw'),
+                tier_weights=tw,
             )
             # Add prompt VQ loss if present
             if prompt_vq_loss is not None:
@@ -703,24 +718,11 @@ class UCLMTrainer:
                 else:
                     phys_loss_scalar = phys_loss.mean()
 
-                _tw_phys = locals().get('tw', {}).get("physical_loss", 1.0)
+                _tw_phys = (tw or {}).get("physical_loss", 1.0)
                 losses["loss"] = losses["loss"] + self.v4_loss_config.lambda_physical * phys_loss_scalar * _tw_phys
                 losses["loss_physical_12d"] = phys_loss_scalar
 
-        # --- v4 Phase 3: Per-loss tier weighting (Task 3-1) ---
-        # Tier weights are now applied directly inside uclm_loss() and
-        # _compute_v4_additional_losses() via tier_weights dict.
-        # Compute tier_weights here for use by downstream loss blocks.
-        if self.enable_v4_losses:
-            from tmrvc_data.v4_dataset import get_tier_loss_weights
-            supervision_tier = batch.get("supervision_tier")
-            if supervision_tier is not None:
-                if isinstance(supervision_tier, (list, tuple)):
-                    tier_list = [get_tier_loss_weights(t) for t in supervision_tier]
-                    tw = {k: sum(d.get(k, 1.0) for d in tier_list) / len(tier_list)
-                          for k in tier_list[0]}
-                else:
-                    tw = get_tier_loss_weights(supervision_tier)
+        # tw was computed early in TTS branch (above). Use it for remaining losses.
 
         # --- v4 Phase 3: Biological constraint regularization (Task 3-2) ---
         # Supervision-independent: NOT tier-weighted.
@@ -750,7 +752,7 @@ class UCLMTrainer:
 
         # --- v4 Phase 3: Full v4 loss composition (Task 3-3) ---
         # Acting/semantic losses are tier-weighted via tw dict.
-        tier_weights = locals().get('tw', {})
+        tier_weights = tw if tw is not None else {}
         if self.enable_v4_losses:
             losses = self._compute_v4_additional_losses(
                 losses, batch, explicit_state, ssl_state, speaker_embed,
