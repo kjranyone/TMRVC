@@ -345,10 +345,16 @@ def cmd_build(args):
             waveform_np = waveform.squeeze().cpu().numpy() if isinstance(waveform, torch.Tensor) else np.asarray(waveform).squeeze()
             del waveform
             n_samples = len(waveform_np)
-            n_frames = n_samples // CODEC_HOP
+
+            # Codec tokens FIRST — actual codec length is source of truth
+            waveform_t_codec = torch.from_numpy(waveform_np).float().unsqueeze(0).unsqueeze(0)
+            codec_tokens = codec.encode(waveform_t_codec).squeeze(0).numpy().astype(np.int64)
+            del waveform_t_codec
+            n_frames = codec_tokens.shape[1]
 
             if n_frames < 20:
                 n_skip += 1
+                del waveform_np
                 continue
 
             # Language from manifest (set at add time)
@@ -356,6 +362,7 @@ def cmd_build(args):
             if not lang:
                 logger.warning("Skip %s: no lang in manifest — re-add with --lang", utt_id)
                 n_skip += 1
+                del waveform_np
                 continue
 
             # ASR (language fixed, no auto-detect)
@@ -367,17 +374,16 @@ def cmd_build(args):
                 )
                 seg_list = list(segments)
                 transcript = "".join(seg.text for seg in seg_list).strip()
-                # Compute ASR confidence from average log probability
                 if seg_list:
                     avg_logprob = sum(s.avg_log_prob for s in seg_list) / len(seg_list)
-                    asr_confidence = max(0.0, min(1.0, 1.0 + avg_logprob / 2.0))  # map [-2,0] → [0,1]
+                    asr_confidence = max(0.0, min(1.0, 1.0 + avg_logprob / 2.0))
                 else:
                     asr_confidence = 0.0
             del seg_list, info
 
-
             if not transcript:
                 n_skip += 1
+                del waveform_np
                 continue
 
             # G2P
@@ -389,10 +395,10 @@ def cmd_build(args):
             del g2p_result
             if len(phoneme_ids) < 3:
                 n_skip += 1
+                del waveform_np
                 continue
 
-
-            # Voice state (12-D)
+            # Voice state (12-D) — resample to n_frames (codec actual length)
             waveform_t = torch.from_numpy(waveform_np).float().unsqueeze(0)
             mel = compute_mel(waveform_t).to(device)
             f0 = torch.zeros(1, 1, mel.shape[-1], device=torch.device(device))
@@ -402,21 +408,18 @@ def cmd_build(args):
             else:
                 vs = np.zeros((n_frames, D_VOICE_STATE), dtype=np.float32)
             del vs_raw, mel, f0
-            # Resample voice state from mel frame rate to codec frame rate (n_frames)
             vs = np.clip(vs, 0, 1).astype(np.float32)
             if vs.shape[0] != n_frames:
-                # Linear interpolation to match codec frame count
                 import torch.nn.functional as _F
-                vs_t = torch.from_numpy(vs).T.unsqueeze(0).float()  # [1, D, T_mel]
+                vs_t = torch.from_numpy(vs).T.unsqueeze(0).float()
                 vs_t = _F.interpolate(vs_t, size=n_frames, mode='linear', align_corners=False)
-                vs = vs_t.squeeze(0).T.numpy()  # [n_frames, D]
-
+                vs = vs_t.squeeze(0).T.numpy()
 
             # Speaker embedding
             spk = spk_encoder.extract(waveform_t, sample_rate=SAMPLE_RATE)
             spk = spk.detach().cpu().numpy().flatten().astype(np.float32) if isinstance(spk, torch.Tensor) else np.zeros(D_SPEAKER, np.float32)
 
-            # SSL state (WavLM features for acting-latent losses)
+            # SSL state (WavLM) — resample to n_frames
             ssl_state_np = None
             if ssl_extractor is not None:
                 try:
@@ -425,9 +428,8 @@ def cmd_build(args):
                     with torch.no_grad():
                         ssl_feat = ssl_extractor.extract_for_distillation(
                             wav_16k.to(device), waveform_t.to(device)
-                        )  # [1, 128, T_mel]
-                    ssl_feat = ssl_feat.squeeze(0).T.cpu().numpy()  # [T_mel, 128]
-                    # Resample to codec frame rate
+                        )
+                    ssl_feat = ssl_feat.squeeze(0).T.cpu().numpy()
                     if ssl_feat.shape[0] != n_frames:
                         import torch.nn.functional as _F2
                         ssl_t = torch.from_numpy(ssl_feat).T.unsqueeze(0).float()
@@ -438,15 +440,7 @@ def cmd_build(args):
                 except Exception as e:
                     logger.debug("ssl_state extraction failed for %s: %s", utt_id, e)
 
-            del waveform_t
-
-            # Codec tokens
-            waveform_t_codec = torch.from_numpy(waveform_np).float().unsqueeze(0).unsqueeze(0)
-            codec_tokens = codec.encode(waveform_t_codec).squeeze(0).numpy().astype(np.int64)
-            del waveform_t_codec, waveform_np
-
-            # Use actual codec length as source of truth (may differ from n_samples // CODEC_HOP)
-            n_frames = codec_tokens.shape[1]
+            del waveform_t, waveform_np
 
             # Supervision metadata
             observed_mask = np.ones((n_frames, D_VOICE_STATE), dtype=bool)
