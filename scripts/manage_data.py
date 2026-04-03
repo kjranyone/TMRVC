@@ -375,7 +375,7 @@ def cmd_build(args):
                 seg_list = list(segments)
                 transcript = "".join(seg.text for seg in seg_list).strip()
                 if seg_list:
-                    avg_logprob = sum(s.avg_log_prob for s in seg_list) / len(seg_list)
+                    avg_logprob = sum(s.avg_logprob for s in seg_list) / len(seg_list)
                     asr_confidence = max(0.0, min(1.0, 1.0 + avg_logprob / 2.0))
                 else:
                     asr_confidence = 0.0
