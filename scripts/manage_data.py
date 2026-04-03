@@ -58,6 +58,77 @@ DATA_DIR = ROOT / "data"
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 CACHE_DIR = DATA_DIR / "cache" / "v4"
 
+
+# ---------------------------------------------------------------------------
+# Rule-based annotation (baseline until LLM annotation is available)
+# ---------------------------------------------------------------------------
+
+def annotate_text(text: str, lang: str) -> tuple[str, dict]:
+    """Generate enriched transcript and acting annotations from text.
+
+    Returns:
+        (enriched_transcript, acting_annotations)
+    """
+    annotations = {"emotion": "neutral", "intensity": 0.5}
+
+    # Punctuation-based emotion detection
+    if "！" in text or "!" in text:
+        annotations["intensity"] = min(1.0, annotations["intensity"] + 0.3)
+        if "？" in text or "?" in text:
+            annotations["emotion"] = "surprised"
+        else:
+            annotations["emotion"] = "excited"
+    elif "？" in text or "?" in text:
+        annotations["emotion"] = "questioning"
+    elif "…" in text or "。。。" in text or "..." in text:
+        annotations["emotion"] = "hesitant"
+        annotations["intensity"] = max(0.0, annotations["intensity"] - 0.2)
+
+    # Keyword-based (Japanese)
+    if lang == "ja":
+        sad_kw = ["悲しい", "辛い", "寂しい", "泣", "もう会えない", "さようなら"]
+        angry_kw = ["怒", "ふざけ", "いい加減", "バカ", "くそ"]
+        happy_kw = ["嬉しい", "楽しい", "ありがとう", "すごい", "やった"]
+        whisper_kw = ["ひそひそ", "内緒", "こっそり"]
+        for kw in sad_kw:
+            if kw in text:
+                annotations["emotion"] = "sad"
+                break
+        for kw in angry_kw:
+            if kw in text:
+                annotations["emotion"] = "angry"
+                annotations["intensity"] = min(1.0, annotations["intensity"] + 0.3)
+                break
+        for kw in happy_kw:
+            if kw in text:
+                annotations["emotion"] = "happy"
+                break
+        for kw in whisper_kw:
+            if kw in text:
+                annotations["emotion"] = "whisper"
+                annotations["intensity"] = max(0.0, annotations["intensity"] - 0.3)
+                break
+
+    # English keywords
+    elif lang == "en":
+        if any(w in text.lower() for w in ["sorry", "sad", "unfortunately", "miss"]):
+            annotations["emotion"] = "sad"
+        elif any(w in text.lower() for w in ["angry", "furious", "hate", "damn"]):
+            annotations["emotion"] = "angry"
+            annotations["intensity"] = min(1.0, annotations["intensity"] + 0.3)
+        elif any(w in text.lower() for w in ["happy", "great", "wonderful", "thank"]):
+            annotations["emotion"] = "happy"
+
+    # Enriched transcript: add emotion tag
+    emotion = annotations["emotion"]
+    if emotion != "neutral":
+        enriched = f"[{emotion}] {text}"
+    else:
+        enriched = text
+
+    annotations["source"] = "rule_based"
+    return enriched, annotations
+
 # ---------------------------------------------------------------------------
 # Manifest I/O
 # ---------------------------------------------------------------------------
@@ -413,7 +484,7 @@ def cmd_build(args):
                 "n_codec_frames": int(n_frames),
                 "n_control_frames": int(n_frames),
                 "text": transcript,
-                "enriched_transcript": transcript,  # TODO: LLM-enriched transcript
+                "enriched_transcript": annotate_text(transcript, lang)[0],
                 "language_id": {"ja": 0, "en": 1, "zh": 2, "ko": 3}.get(lang, 0),
                 "language": lang,
                 "duration_sec": n_samples / SAMPLE_RATE,
@@ -427,7 +498,7 @@ def cmd_build(args):
                     "tier_d"
                 ),
                 "has_ssl_state": ssl_state_np is not None,
-                "acting_annotations": {},  # TODO: LLM semantic annotation
+                "acting_annotations": annotate_text(transcript, lang)[1],
             }
             with open(utt_dir / "meta.json", "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
