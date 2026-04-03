@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
-"""v4 complete training pipeline — real models, no shortcuts.
+"""v4 training script.
 
-Phase 1: Bootstrap cache from raw audio using ALL real models:
-  - ASR: faster-whisper large-v3 (cached)
-  - G2P: real phoneme conversion
-  - Voice State: real DSP 12-D extraction
-  - Speaker Encoder: ECAPA-TDNN (cached)
-  - LLM Annotation: Qwen3.5-35B-A3B (cached) → semantic + enriched transcripts
-  - Codec: EnCodec 24kHz frozen pre-trained, 75 Hz, 8 RVQ x 1024 (condition A)
+Cache is built by manage_data.py (see TRAIN_GUIDE.md).
+Annotation: rule-based baseline (enriched_transcript, acting_annotations).
+LLM annotation (Qwen) is a future upgrade.
 
-Phase 2: v4 full training with:
-  - Enriched transcript path (inline acting tags)
-  - All 9 v4 loss terms
+Training with:
+  - Enriched transcript path (rule-based emotion tags)
+  - All 9 v4 loss terms (acting-latent losses require ssl_state in cache)
   - Biological constraint regularization
   - Acting latent encoder/predictor
   - Supervision tier weighting
@@ -360,8 +356,8 @@ def main():
     logger.info("  Real G2P phonemes ✓")
     logger.info("  Real 12-D voice state ✓")
     logger.info("  Real speaker embeddings ✓")
-    logger.info("  Real LLM enriched transcripts ✓")
-    logger.info("  All v4 losses ✓")
+    logger.info("  Enriched transcripts (rule-based)")
+    logger.info("  v4 losses (acting-latent requires ssl_state in cache)")
     logger.info("=" * 60)
 
     step = resume_step

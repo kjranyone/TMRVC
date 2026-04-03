@@ -445,6 +445,8 @@ def cmd_build(args):
             codec_tokens = codec.encode(waveform_t_codec).squeeze(0).numpy().astype(np.int64)
             del waveform_t_codec, waveform_np
 
+            # Use actual codec length as source of truth (may differ from n_samples // CODEC_HOP)
+            n_frames = codec_tokens.shape[1]
 
             # Supervision metadata
             observed_mask = np.ones((n_frames, D_VOICE_STATE), dtype=bool)
