@@ -157,11 +157,16 @@ def main():
         logger.info("Resume: d_model=%d, n_layers=%d, n_heads=%s (from checkpoint)",
                      eff_d_model, eff_n_layers, eff_n_heads)
 
+    # Condition D overrides: single codebook, larger vocab
+    n_codebooks_eff = 1 if codec_cond == "D" else N_CODEBOOKS
+    rvq_vocab_eff = 4096 if codec_cond == "D" else RVQ_VOCAB_SIZE
+    logger.info("Codec: n_codebooks=%d, vocab_size=%d", n_codebooks_eff, rvq_vocab_eff)
+
     init_kwargs = dict(
         d_model=eff_d_model,
         d_voice_state_explicit=D_VOICE_STATE, d_voice_state_ssl=D_VOICE_STATE_SSL,
-        d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
-        rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
+        d_speaker=D_SPEAKER, n_codebooks=n_codebooks_eff,
+        rvq_vocab_size=rvq_vocab_eff, control_vocab_size=CONTROL_VOCAB_SIZE,
         vocab_size=PHONEME_VOCAB_SIZE, num_speakers=n_speakers,
         acting_tag_vocab_size=N_ACTING_TAGS,
         codec_condition=codec_cond,

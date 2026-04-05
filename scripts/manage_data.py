@@ -294,9 +294,15 @@ def cmd_build(args):
     from tmrvc_data.voice_state import VoiceStateEstimator
     vs_estimator = VoiceStateEstimator(device=device)
 
-    logger.info("Loading codec (EnCodec 24kHz)...")
-    from tmrvc_data.encodec_codec import EnCodecWrapper
-    codec = EnCodecWrapper(device=device)
+    codec_type = getattr(args, 'codec', 'encodec')
+    if codec_type == "wavtokenizer":
+        logger.info("Loading codec (WavTokenizer 24kHz, single codebook)...")
+        from tmrvc_data.wavtokenizer_codec import WavTokenizerWrapper
+        codec = WavTokenizerWrapper(device=device)
+    else:
+        logger.info("Loading codec (EnCodec 24kHz, 8 codebooks)...")
+        from tmrvc_data.encodec_codec import EnCodecWrapper
+        codec = EnCodecWrapper(device=device)
 
     logger.info("Loading WavLM SSL feature extractor...")
     ssl_extractor = None
@@ -628,6 +634,8 @@ def main():
     # build
     p_build = sub.add_parser("build", help="Build cache for uncached entries")
     p_build.add_argument("--device", default="auto")
+    p_build.add_argument("--codec", default="encodec", choices=["encodec", "wavtokenizer"],
+                         help="Codec for tokenization (encodec=8CB, wavtokenizer=1CB)")
     p_build.add_argument("--max", type=int, default=None,
                          help="Max entries to process")
 
