@@ -265,10 +265,25 @@ def cmd_build(args):
     from tmrvc_data.g2p import text_to_phonemes
 
     entries = load_manifest()
-    uncached = [e for e in entries if not e.get("cached", False)]
+
+    # Determine cache directory based on codec
+    codec_type = getattr(args, 'codec', 'encodec')
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir)
+    elif codec_type == "wavtokenizer":
+        cache_dir = DATA_DIR / "cache" / "v4d"
+    else:
+        cache_dir = CACHE_DIR
+
+    # Check which entries are already cached on disk (codec-specific cache dir)
+    uncached = []
+    for e in entries:
+        utt_dir = cache_dir / "train" / e["speaker"] / e["utt_id"]
+        if not (utt_dir / "meta.json").exists():
+            uncached.append(e)
 
     if not uncached:
-        logger.info("All %d entries are cached. Nothing to build.", len(entries))
+        logger.info("All %d entries are cached in %s. Nothing to build.", len(entries), cache_dir)
         return
 
     if args.max and args.max < len(uncached):
@@ -331,7 +346,7 @@ def cmd_build(args):
         speaker = entry["speaker"]
         wav_path = entry["wav_path"]
 
-        utt_dir = CACHE_DIR / "train" / speaker / utt_id
+        utt_dir = cache_dir / "train" / speaker / utt_id
 
         # Skip if already cached on disk
         if (utt_dir / "meta.json").exists():
@@ -543,7 +558,7 @@ def cmd_build(args):
     logger.info("=" * 60)
     logger.info("Cache build complete: %d ok, %d skipped, %d failed (%.0fs)",
                  n_ok, n_skip, n_fail, elapsed)
-    logger.info("Cache dir: %s", CACHE_DIR)
+    logger.info("Cache dir: %s", cache_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +651,8 @@ def main():
     p_build.add_argument("--device", default="auto")
     p_build.add_argument("--codec", default="encodec", choices=["encodec", "wavtokenizer"],
                          help="Codec for tokenization (encodec=8CB, wavtokenizer=1CB)")
+    p_build.add_argument("--cache-dir", default=None,
+                         help="Override cache directory (default: data/cache/v4 for encodec, data/cache/v4d for wavtokenizer)")
     p_build.add_argument("--max", type=int, default=None,
                          help="Max entries to process")
 
