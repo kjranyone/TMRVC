@@ -81,13 +81,15 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # v4 cache: prefer new managed path, fall back to legacy
-    cache_dir = ROOT / "data" / "cache" / "v4"
+    # v4 cache: codec-specific directory
+    codec_cond_early = args.codec_condition
+    if codec_cond_early == "D":
+        cache_dir = ROOT / "data" / "cache" / "v4d"
+    else:
+        cache_dir = ROOT / "data" / "cache" / "v4"
     if not cache_dir.exists():
         legacy = ROOT / "data" / "cache"
-        if (legacy / "v4full").exists():
-            cache_dir = legacy
-        elif legacy.exists():
+        if legacy.exists():
             cache_dir = legacy
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
