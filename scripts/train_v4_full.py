@@ -186,7 +186,8 @@ def main():
     # Only model params here — trainer will add acting_enc/pred/bio params via add_param_group
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
-    # Resume from checkpoint
+    # Resume from checkpoint (model + acting only; optimizer state loaded after trainer init)
+    pending_optimizer_state = None
     if args.resume_from is not None:
         resume_path = output_dir / f"v4_step_{args.resume_from}.pt"
         logger.info("Loading checkpoint: %s", resume_path)
@@ -201,12 +202,8 @@ def main():
             logger.warning("Skipped %d keys with shape mismatch: %s", len(skipped), skipped)
         acting_enc.load_state_dict(ckpt["acting_encoder"])
         acting_pred.load_state_dict(ckpt["acting_predictor"])
-        # Optimizer state may have mismatched param groups due to model changes;
-        # load with best-effort
-        try:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        except (ValueError, RuntimeError) as e:
-            logger.warning("Optimizer state load failed (%s), starting fresh optimizer", e)
+        # Defer optimizer state load until trainer has added all param groups
+        pending_optimizer_state = ckpt["optimizer"]
         resume_step = ckpt["step"]
         del ckpt
         logger.info("Resumed from step %d (%d/%d model keys loaded)",
@@ -232,6 +229,15 @@ def main():
         enriched_transcript_prob=0.5,
         codec_condition=codec_cond,
     )
+
+    # Load optimizer state now that trainer has added v4 param groups
+    if pending_optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(pending_optimizer_state)
+            logger.info("Optimizer state restored (%d param groups)",
+                        len(optimizer.param_groups))
+        except (ValueError, RuntimeError) as e:
+            logger.warning("Optimizer state load failed (%s), starting fresh optimizer", e)
 
     # LR scheduler: linear warmup + cosine decay (after trainer adds param groups)
     import math
