@@ -373,6 +373,47 @@ class UCLMTrainer:
         durations = path.sum(dim=2)
         return self._generate_pointer_targets(durations, T)
 
+    def _build_cross_attn_window_mask(
+        self,
+        position_indices: torch.Tensor,
+        phoneme_ids: torch.Tensor,
+        w_left: int = 2,
+        w_right: int = 5,
+    ) -> torch.Tensor:
+        """Build a per-frame phoneme window mask for cross-attention.
+
+        Each frame `t` with phoneme index `p = position_indices[b, t]` can
+        attend to phonemes `[p - w_left, p + w_right]`, clipped to valid
+        phoneme positions (non-padding). Padding positions (phoneme_id == 0)
+        are always masked out.
+
+        Returns: [B, 1, T, L] additive mask (0 for visible, -inf for masked).
+        """
+        device = position_indices.device
+        B, T = position_indices.shape
+        L = phoneme_ids.shape[1]
+
+        phoneme_positions = torch.arange(L, device=device).view(1, 1, 1, L)
+        p = position_indices.view(B, 1, T, 1)
+        within_window = (phoneme_positions >= (p - w_left)) & (phoneme_positions <= (p + w_right))
+
+        pad_mask = (phoneme_ids != 0).view(B, 1, 1, L)
+        visible = within_window & pad_mask
+
+        # Ensure every frame has at least one visible position (fall back to the
+        # pointed-to phoneme if the window somehow clips to empty) to avoid
+        # all-(-inf) rows producing NaN after softmax.
+        any_visible = visible.any(dim=-1, keepdim=True)
+        if not torch.all(any_visible):
+            p_clamped = position_indices.clamp(min=0, max=max(L - 1, 0))
+            fallback = torch.zeros_like(visible)
+            fallback.scatter_(-1, p_clamped.view(B, 1, T, 1), True)
+            visible = visible | (~any_visible & fallback)
+
+        mask = torch.zeros(B, 1, T, L, device=device, dtype=torch.float32)
+        mask = mask.masked_fill(~visible, float("-inf"))
+        return mask
+
     def _generate_boundary_targets_from_advance(
         self, advance_targets: torch.Tensor
     ) -> torch.Tensor:
@@ -580,6 +621,16 @@ class UCLMTrainer:
                 losses["loss_prompt_vq"] = prompt_vq_loss
         else:
             # TTS path
+            # SSL leakage fix: ssl_state is target-audio-derived (WavLM features
+            # extracted from the audio we're trying to generate). Feeding it
+            # during TTS training creates an inference-time backdoor — the model
+            # learns to use it as the dominant conditioning signal, but at
+            # inference time it is unavailable (zeros) and the model collapses
+            # to OOD garbage. Zero it out for TTS so conditioning flows through
+            # text + speaker + a_ctx only. (VC path is unaffected: source SSL
+            # is legitimately available at inference there.)
+            if ssl_state is not None:
+                ssl_state = torch.zeros_like(ssl_state)
             phonemes = batch["phoneme_ids"].to(self.device)
             # --- v4: enriched transcript routing ---
             if (self.use_enriched_transcript
@@ -1022,29 +1073,78 @@ class UCLMTrainer:
         eff_progress_weight = 0.0 if skip_timing_losses else self.progress_loss_weight
         eff_boundary_weight = 0.0 if skip_timing_losses else self.boundary_confidence_loss_weight
 
-        # Single forward pass with MAS-derived alignment, no cross-attention mask
-        out = self.model.forward_tts_pointer(
-            phoneme_ids=phonemes,
-            language_ids=language_ids,
-            pointer_state=None,
-            speaker_embed=speaker_embed,
-            explicit_state=explicit_state,
-            ssl_state=ssl_state,
-            target_a=target_a,
-            target_b=target_b,
-            target_length=target_length,
-            f0_condition=f0_condition,
-            dialogue_context=dialogue_context,
-            acting_intent=acting_intent,
-            prosody_latent=prosody_targets,
-            acting_texture_latent=acting_texture_latent,
-            delta_voice_state=delta_voice_state,
-            prompt_kv_cache=prompt_kv_cache,
-            text_suprasegmentals=text_suprasegmentals,
+        # Cross-attention window mask forces queries to rely on phoneme memory
+        # (narrow, pointer-centered) — same constraint as inference-time.
+        ca_mask = self._build_cross_attn_window_mask(
             position_indices=pos_indices,
-            frame_offsets=frame_offsets,
-            cross_attn_mask=None,
+            phoneme_ids=phonemes,
         )
+
+        # Pure NAR mode: TTS 経路では a_ctx/b_ctx を常にゼロ化する。
+        # 過去の codec token (acoustic history) に依存させず、text + speaker +
+        # voice_state + pointer のみから codec を予測することを強制する。
+        # これにより AR の exposure bias は構造的に消える (推論は parallel)。
+        # 既存の確率的 noise/zero schedule は廃止 (ハーフ NAR では不十分だった)。
+        B_t = target_a.shape[0]
+        T_t = target_length
+        a_ctx_zero = torch.zeros_like(target_a)
+        b_ctx_zero = torch.zeros(B_t, 4, T_t, dtype=target_b.dtype, device=target_b.device)
+        acoustic_history = (a_ctx_zero, b_ctx_zero)
+
+        # Cross-attention alignment supervision: register a pre-forward hook
+        # on layer-0 cross-attn to capture attention weights (softmax over
+        # phonemes), so we can add a CE loss pushing weights to concentrate at
+        # position_indices. This directly teaches text→acoustic alignment.
+        attn_capture = {}
+
+        def _ca_pre_hook(module, args, kwargs):
+            import torch.nn.functional as _F
+            from tmrvc_train.models.uclm_transformer import CausalGQAttention
+            x_in = args[0] if args else kwargs.get("x")
+            mem_in = args[1] if len(args) > 1 else kwargs.get("memory")
+            mask_in = kwargs.get("attn_mask")
+            Bh, Th, _ = x_in.shape
+            Sh = mem_in.shape[1]
+            qh = module.q_proj(x_in).view(Bh, Th, module.n_heads, -1).transpose(1, 2)
+            kh = module.k_proj(mem_in).view(Bh, Sh, module.n_kv_heads, -1).transpose(1, 2)
+            k_exp = CausalGQAttention._expand_kv(kh, module.n_rep)
+            scores = (qh @ k_exp.transpose(-2, -1)) * module.scale
+            if mask_in is not None:
+                scores = scores + mask_in
+            attn_capture["weights"] = _F.softmax(scores, dim=-1)  # [B, H, T, S]
+            return None
+
+        _hook_handle = self.model.uclm_core.layers[0].cross_attn.register_forward_pre_hook(
+            _ca_pre_hook, with_kwargs=True
+        )
+
+        # Single forward pass with MAS-derived alignment and window cross-attn mask.
+        try:
+            out = self.model.forward_tts_pointer(
+                phoneme_ids=phonemes,
+                language_ids=language_ids,
+                pointer_state=None,
+                speaker_embed=speaker_embed,
+                explicit_state=explicit_state,
+                ssl_state=ssl_state,
+                target_a=target_a,
+                target_b=target_b,
+                target_length=target_length,
+                f0_condition=f0_condition,
+                dialogue_context=dialogue_context,
+                acting_intent=acting_intent,
+                prosody_latent=prosody_targets,
+                acting_texture_latent=acting_texture_latent,
+                delta_voice_state=delta_voice_state,
+                prompt_kv_cache=prompt_kv_cache,
+                acoustic_history=acoustic_history,
+                text_suprasegmentals=text_suprasegmentals,
+                position_indices=pos_indices,
+                frame_offsets=frame_offsets,
+                cross_attn_mask=ca_mask,
+            )
+        finally:
+            _hook_handle.remove()
 
         # Generate boundary confidence targets
         boundary_targets = self._generate_boundary_targets_from_advance(adv_targets)
@@ -1122,6 +1222,23 @@ class UCLMTrainer:
             _tw_ptr = (tier_weights or {}).get("pointer_loss", 1.0)
             losses["loss"] = losses["loss"] + eff_boundary_weight * loss_boundary * _tw_ptr
             losses["loss_boundary_confidence"] = loss_boundary
+
+        # Cross-attention alignment supervision (layer 0).
+        # CE loss pushing attn weights to concentrate at position_indices[b, t].
+        if "weights" in attn_capture and not skip_timing_losses:
+            w = attn_capture["weights"]  # [B, H, T, L]
+            Bw, Hw, Tw, Lw = w.shape
+            gather_idx = pos_indices.clamp(min=0, max=max(Lw - 1, 0)).view(Bw, 1, Tw, 1).expand(Bw, Hw, Tw, 1)
+            prob_at_target = w.gather(-1, gather_idx).squeeze(-1)  # [B, H, T]
+            # Valid-frame mask (same as loss_frame_mask: True means IGNORE)
+            if loss_frame_mask is not None:
+                valid = (~loss_frame_mask).to(prob_at_target.dtype).unsqueeze(1)  # [B, 1, T]
+                denom = valid.sum().clamp_min(1.0) * Hw
+                loss_align = -(prob_at_target.clamp_min(1e-10).log() * valid).sum() / denom
+            else:
+                loss_align = -prob_at_target.clamp_min(1e-10).log().mean()
+            losses["loss"] = losses["loss"] + 0.5 * loss_align
+            losses["loss_align"] = loss_align
 
         # CFG distillation loss (Stage 3 only)
         if (

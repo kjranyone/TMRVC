@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import sys
@@ -59,19 +60,30 @@ def _infer_hparams(state_dict: dict) -> dict:
     return {"d_model": d_model, "n_layers": n_layers, "n_heads": n_heads}
 
 
-def load_model(ckpt_path: str, device: str):
+def load_model(ckpt_path: str, device: str, codec_condition: str = "A"):
     from tmrvc_train.models.uclm_model import DisentangledUCLM
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     hp = _infer_hparams(ckpt["model"])
     logger.info("Checkpoint hparams: d_model=%d, n_layers=%d, n_heads=%d",
                 hp["d_model"], hp["n_layers"], hp["n_heads"])
+    # Condition D uses single codebook with larger vocab
+    n_codebooks_eff = 1 if codec_condition == "D" else N_CODEBOOKS
+    rvq_vocab_eff = 4096 if codec_condition == "D" else RVQ_VOCAB_SIZE
+    # Infer num_speakers from checkpoint
+    num_speakers = 256
+    for k, v in ckpt["model"].items():
+        if k.endswith("speaker_adv_classifier.weight") or "speaker_classifier" in k:
+            if hasattr(v, "shape") and len(v.shape) == 2:
+                num_speakers = v.shape[0]
+                break
     model = DisentangledUCLM(
         d_model=hp["d_model"], n_heads=hp["n_heads"], n_layers=hp["n_layers"],
         d_voice_state_explicit=D_VOICE_STATE,
         d_voice_state_ssl=D_VOICE_STATE_SSL,
-        d_speaker=D_SPEAKER, n_codebooks=N_CODEBOOKS,
-        rvq_vocab_size=RVQ_VOCAB_SIZE, control_vocab_size=CONTROL_VOCAB_SIZE,
-        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=100,
+        d_speaker=D_SPEAKER, n_codebooks=n_codebooks_eff,
+        rvq_vocab_size=rvq_vocab_eff, control_vocab_size=CONTROL_VOCAB_SIZE,
+        vocab_size=PHONEME_VOCAB_SIZE, num_speakers=num_speakers,
+        codec_condition=codec_condition,
     ).to(device)
     model_sd = model.state_dict()
     ckpt_sd = ckpt["model"]
@@ -93,6 +105,7 @@ def generate_speech(
     acting_texture_latent: torch.Tensor | None = None,
     max_frames: int = 1500, temperature: float = 0.8,
     pace: float = 1.0, max_frames_per_unit: int = 50,
+    codec_condition: str = "A",
 ) -> tuple[np.ndarray, dict]:
     """Proper pointer-based causal TTS generation with v4 acting latent."""
 
@@ -118,10 +131,17 @@ def generate_speech(
     progress = 0.0
     frames_on_unit = 0
 
-    # Generation state
+    # Generation state — use model's actual n_codebooks (may be 1 for Condition D)
+    n_cb = model.n_codebooks if hasattr(model, 'n_codebooks') else N_CODEBOOKS
     kv_caches = None
-    ctx_a = torch.zeros(B, N_CODEBOOKS, 1, dtype=torch.long, device=device)
+    ctx_a = torch.zeros(B, n_cb, 1, dtype=torch.long, device=device)
     ctx_b = torch.zeros(B, CONTROL_SLOTS, 1, dtype=torch.long, device=device)
+
+    # Estimate total frames (still used for logging / progress bounds).
+    estimated_total_frames = int(L * 10)
+
+    # Window for pointer-centered cross-attention (matches training-time mask).
+    W_LEFT, W_RIGHT = 2, 5
 
     a_tokens = []
     pointer_trace = []
@@ -133,11 +153,29 @@ def generate_speech(
         if text_index >= L:
             break
 
-        # Current phoneme features (pointer-indexed)
-        safe_idx = min(text_index, L - 1)
-        content_features = text_features[:, safe_idx:safe_idx+1, :]  # [B, 1, D]
+        # TEXTLESS queries: built from a learned slot + pointer scalars, NEVER
+        # from phoneme features. Text reaches acoustics only via cross-attention.
+        idx_t = torch.tensor([[min(text_index, L - 1)]], dtype=torch.long, device=device)
+        content_features = model._build_frame_queries(
+            batch_size=1,
+            target_length=1,
+            phoneme_count=L,
+            idx=idx_t,
+            device=device,
+            dtype=text_features.dtype,
+            pointer_state=None,
+        )
 
-        # Forward streaming (single frame) — v4 handles voice state + acting latent internally
+        # Per-frame cross-attention window mask: only phonemes in
+        # [text_index - W_LEFT, text_index + W_RIGHT] are visible.
+        phon_positions = torch.arange(L, device=device)
+        w_start = max(0, text_index - W_LEFT)
+        w_end = min(L, text_index + W_RIGHT + 1)
+        within = (phon_positions >= w_start) & (phon_positions < w_end)
+        ca_mask = torch.zeros(1, 1, 1, L, device=device, dtype=torch.float32)
+        ca_mask = ca_mask.masked_fill(~within.view(1, 1, 1, L), float("-inf"))
+
+        # Forward streaming (single frame)
         try:
             out = model.forward_streaming(
                 queries=content_features,
@@ -150,12 +188,16 @@ def generate_speech(
                 cfg_scale=1.0,
                 kv_caches=kv_caches,
                 frame_index=t,
+                frame_offsets=torch.tensor([[t]], dtype=torch.long, device=device),
+                cross_attn_mask=ca_mask,
             )
-            logits_a = out["logits_a"]  # [B, 8, 1, 1024]
+            logits_a = out["logits_a"]
             logits_b = out["logits_b"]
             kv_caches = out.get("kv_cache_out", None)
             hidden = out.get("hidden_states", None)
         except Exception as e:
+            if t == 0:
+                logger.warning("forward_streaming failed: %s — falling back to uclm_core", e)
             # Fallback: manual voice state encoding + uclm_core
             state_cond = model.voice_state_enc(
                 explicit_state=vs, ssl_state=ssl_zeros,
@@ -177,8 +219,8 @@ def generate_speech(
         # Sample tokens
         at = torch.stack([
             torch.multinomial(F.softmax(logits_a[:, i, 0, :] / temperature, dim=-1), 1)
-            for i in range(N_CODEBOOKS)
-        ], dim=1).squeeze(-1)  # [B, 8]
+            for i in range(n_cb)
+        ], dim=1).squeeze(-1)  # [B, n_cb]
 
         bt = torch.stack([
             torch.multinomial(F.softmax(logits_b[:, i, 0, :] / temperature, dim=-1), 1)
@@ -235,11 +277,15 @@ def generate_speech(
         return np.zeros(SAMPLE_RATE, dtype=np.float32), {"n_frames": 0, "error": "no frames"}
 
     # Stack and decode
-    all_a = torch.cat(a_tokens, dim=-1)  # [B, 8, T]
+    all_a = torch.cat(a_tokens, dim=-1)  # [B, n_cb, T]
 
     try:
-        from tmrvc_data.encodec_codec import EnCodecWrapper
-        codec = EnCodecWrapper(device=device)
+        if codec_condition == "D":
+            from tmrvc_data.wavtokenizer_codec import WavTokenizerWrapper
+            codec = WavTokenizerWrapper(device=device)
+        else:
+            from tmrvc_data.encodec_codec import EnCodecWrapper
+            codec = EnCodecWrapper(device=device)
         audio_t = codec.decode(all_a)
         audio_np = audio_t.squeeze().cpu().numpy()
     except Exception as e:
@@ -264,15 +310,23 @@ def generate_speech(
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", default=None,
+                        help="Checkpoint path (default: v4_full_final.pt)")
+    parser.add_argument("--codec-condition", default="A", choices=["A", "B", "C", "D"])
+    parser.add_argument("--output", default=None, help="Output dir")
+    parser.add_argument("--temperature", type=float, default=0.8)
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    output_dir = ROOT / "output" / "v4_samples"
+    output_dir = Path(args.output) if args.output else (ROOT / "output" / "v4_samples")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_path = ROOT / "checkpoints" / "v4_full" / "v4_full_final.pt"
-    model = load_model(str(ckpt_path), device)
+    ckpt_path = Path(args.checkpoint) if args.checkpoint else (ROOT / "checkpoints" / "v4_full" / "v4_full_final.pt")
+    model = load_model(str(ckpt_path), device, codec_condition=args.codec_condition)
 
     # Speaker embed from cache
-    cache_dir = ROOT / "data" / "cache" / "v4full" / "train"
+    cache_dir = ROOT / "data" / "cache" / ("v4d" if args.codec_condition == "D" else "v4") / "train"
     speaker_embed = None
     if cache_dir.exists():
         for spk_dir in sorted(cache_dir.iterdir()):
@@ -358,6 +412,8 @@ def main():
         audio, meta = generate_speech(
             model, phonemes, speaker_embed, vs, device,
             acting_texture_latent=act_latent,
+            temperature=args.temperature,
+            codec_condition=args.codec_condition,
         )
         wav_path = output_dir / f"{name}.wav"
         sf.write(str(wav_path), audio, SAMPLE_RATE)

@@ -549,6 +549,65 @@ class DisentangledUCLM(nn.Module):
             self.single_cb_embed = nn.Embedding(8192, d_model)
             self.single_cb_head = nn.Linear(d_model, 8192)
 
+        # Textless frame query builder.
+        # queries must NOT embed phoneme features directly — cross-attention is
+        # the only path for text → acoustic conditioning. Otherwise the queries
+        # trivially carry the answer and alignment is never learned.
+        self.frame_slot = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.pointer_scalar_proj = nn.Sequential(
+            nn.Linear(4, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, d_model),
+        )
+
+    def _build_frame_queries(
+        self,
+        batch_size: int,
+        target_length: int,
+        phoneme_count: int,
+        idx: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        pointer_state: PointerState | None = None,
+    ) -> torch.Tensor:
+        """Build textless frame queries from a learned slot + scalar pointer info.
+
+        idx: [B, T] phoneme index per frame (from pointer_state / position_indices /
+             bootstrap_alignment / fallback).
+        No access to phoneme_features is permitted here.
+        """
+        B, T, L = batch_size, target_length, phoneme_count
+        base = self.frame_slot.to(dtype=dtype).view(1, 1, -1).expand(B, T, -1)
+
+        idx_f = idx.to(dtype=dtype)
+        idx_norm = idx_f / max(L - 1, 1)
+        t_range = torch.arange(T, device=device, dtype=dtype)
+        frame_progress = (t_range / max(T - 1, 1)).view(1, T).expand(B, T)
+
+        # progress / boundary_confidence are scalar-valued on PointerState; we
+        # broadcast them per frame. Missing fields default to 0.
+        def _scalar_to_bt(val) -> torch.Tensor:
+            if val is None:
+                return torch.zeros(B, T, device=device, dtype=dtype)
+            if isinstance(val, torch.Tensor):
+                v = val.to(device=device, dtype=dtype)
+                if v.ndim == 0:
+                    return v.view(1, 1).expand(B, T)
+                if v.ndim == 1:
+                    return v.view(-1, 1).expand(B, T)
+                return v
+            return torch.full((B, T), float(val), device=device, dtype=dtype)
+
+        if pointer_state is not None:
+            progress = _scalar_to_bt(getattr(pointer_state, "progress", None))
+            bc = _scalar_to_bt(getattr(pointer_state, "boundary_confidence", None))
+        else:
+            progress = torch.zeros(B, T, device=device, dtype=dtype)
+            bc = torch.zeros(B, T, device=device, dtype=dtype)
+
+        scalars = torch.stack([idx_norm, frame_progress, progress, bc], dim=-1)  # [B, T, 4]
+        return base + self.pointer_scalar_proj(scalars)
+
     @staticmethod
     def apply_cfg_unconditional_mask(
         explicit_state: torch.Tensor,
@@ -697,6 +756,7 @@ class DisentangledUCLM(nn.Module):
         acting_intent: Optional[torch.Tensor] = None,
         prosody_latent: Optional[torch.Tensor] = None,
         position_indices: Optional[torch.Tensor] = None,
+        frame_offsets: Optional[torch.Tensor] = None,
         precomputed_film_params: Optional[torch.Tensor] = None,
         state_cond: Optional[torch.Tensor] = None,
         acting_texture_latent: Optional[torch.Tensor] = None,
@@ -740,6 +800,7 @@ class DisentangledUCLM(nn.Module):
             cfg_scale=cfg_scale,
             kv_caches=kv_caches,
             position_indices=position_indices,
+            frame_offsets=frame_offsets,
         )
         return {
             "logits_a": logits_a,
@@ -837,29 +898,34 @@ class DisentangledUCLM(nn.Module):
 
         B, L, D = phoneme_features.shape
 
-        # 2. Build base frame representation (Conditioning on text units)
+        # 2. Build base frame representation — TEXTLESS.
+        # queries must carry only positional/pointer scalars, never phoneme
+        # features. Text reaches acoustic frames exclusively via cross-attention.
         if pointer_state is not None and pointer_state.is_hard_bootstrapped:
-            # Stage 2 Annealing - Hard Phase: Use external alignment as truth
             if bootstrap_alignment is None:
                 raise ValueError("bootstrap_alignment required when is_hard_bootstrapped=True")
-            # bootstrap_alignment is expected to be [B, T] mapping frame -> phoneme index
             idx = bootstrap_alignment["phoneme_indices"]
-            content_features = phoneme_features[torch.arange(B).unsqueeze(1), idx, :]
         elif pointer_state is not None:
-            # Inference or Latent phase: Use pointer_state.text_index
-            # In streaming, text_index is usually [B], so we unsqueeze
             idx = pointer_state.text_index
             if idx.ndim == 1:
                 idx = idx.unsqueeze(1).expand(-1, target_length)
-            content_features = phoneme_features[torch.arange(B).unsqueeze(1), idx, :]
         elif position_indices is not None:
-            # Explicit teacher-forced indices (from MAS or bootstrap)
-            content_features = phoneme_features[torch.arange(B).unsqueeze(1), position_indices, :]
+            idx = position_indices
         else:
-            # Fallback: uniform distribution over phoneme sequence
             frame_indices = torch.arange(target_length, device=phoneme_features.device)
             idx = (frame_indices.float() * L / target_length).long().clamp(max=L - 1)
-            content_features = phoneme_features[:, idx, :]
+            idx = idx.unsqueeze(0).expand(B, -1)
+
+        idx = idx.clamp(min=0, max=max(L - 1, 0))
+        content_features = self._build_frame_queries(
+            batch_size=B,
+            target_length=target_length,
+            phoneme_count=L,
+            idx=idx,
+            device=phoneme_features.device,
+            dtype=phoneme_features.dtype,
+            pointer_state=pointer_state,
+        )
 
         # 3. F0 conditioning is applied inside uclm_core only (avoid double injection)
 
